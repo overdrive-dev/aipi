@@ -261,6 +261,7 @@ function executeUpdateStep({
   spawnSyncFn,
   log,
   errorLog,
+  platform = process.platform,
 }) {
   let { command, args } = step;
   if (step.kind === "pi") {
@@ -275,7 +276,11 @@ function executeUpdateStep({
   }
 
   log(`aipi update [${step.label}] -> ${formatCommand(command, args)}`);
-  const result = spawnSyncFn(command, args, { stdio: "inherit", env });
+  // Wrap `.cmd`/`.bat` (e.g. npm.cmd) through cmd.exe on Windows so spawnSync can
+  // find them; non-.cmd commands (git, node) pass through unchanged. The log above
+  // keeps showing the readable command.
+  const spawnSpec = step.kind === "pi" ? { command, args } : createCommandSpawnSpec(command, args, platform);
+  const result = spawnSyncFn(spawnSpec.command, spawnSpec.args, { stdio: "inherit", env });
   if (result.error || result.status !== 0) {
     errorLog(`aipi update [${step.label}] failed: ${result.error?.message ?? `exit ${result.status}`}`);
     process.exitCode = 1;
@@ -459,6 +464,7 @@ export function buildAipiUpdatePlan({
   packageRoot = defaultPackageRoot,
   existsSync = fs.existsSync,
   repoInfo = null,
+  platform = process.platform,
 } = {}) {
   const steps = [
     { label: "pi", kind: "pi", args: ["update", "--self"], note: "update the Pi runtime" },
@@ -471,8 +477,11 @@ export function buildAipiUpdatePlan({
   if (skip) {
     steps.push(skip);
   } else {
+    // npm on Windows is `npm.cmd` (a batch file); a bare `npm` spawn is ENOENT.
+    // git is `git.exe`, a real executable, so it stays as-is.
+    const npmCommand = platform === "win32" ? "npm.cmd" : "npm";
     steps.push({ label: "aipi", kind: "exec", command: "git", args: ["-C", packageRoot, "pull", "--ff-only"], note: "pull the latest AIPI" });
-    steps.push({ label: "aipi-deps", kind: "exec", command: "npm", args: ["install", "--prefix", packageRoot], note: "refresh AIPI dependencies without pruning dev SDKs" });
+    steps.push({ label: "aipi-deps", kind: "exec", command: npmCommand, args: ["install", "--prefix", packageRoot], note: "refresh AIPI dependencies without pruning dev SDKs" });
   }
 
   return steps;
@@ -486,6 +495,7 @@ export async function runAipiUpdate({
   userArgs = [],
   log = console.log,
   errorLog = console.error,
+  platform = process.platform,
 } = {}) {
   let options;
   try {
@@ -497,7 +507,7 @@ export async function runAipiUpdate({
   }
 
   const repoInfo = inspectAipiRepo({ packageRoot, existsSync, spawnSyncFn });
-  for (const step of buildAipiUpdatePlan({ packageRoot, existsSync, repoInfo })) {
+  for (const step of buildAipiUpdatePlan({ packageRoot, existsSync, repoInfo, platform })) {
     if (step.kind === "manual") {
       log(`aipi update [${step.label}] skipped: ${step.message}`);
       continue;
@@ -509,6 +519,7 @@ export async function runAipiUpdate({
       spawnSyncFn,
       log,
       errorLog,
+      platform,
     });
     if (!ok) {
       return;

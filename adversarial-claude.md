@@ -7946,3 +7946,23 @@ spec-compliant.
 
 Current owner: CLAUDE
 Current status: CLOSED
+
+---
+
+## Claude hotfix — `aipi update` Windows npm ENOENT (2026-06-19, user-approved direct fix)
+
+User hit `aipi update [aipi-deps] failed: spawnSync npm ENOENT` on Windows. Root cause:
+`buildAipiUpdatePlan` used `command: "npm"` and `executeUpdateStep` spawned it raw — on Windows `npm`
+is `npm.cmd` (a batch file), so a bare `spawnSync("npm", …)` is ENOENT (the `git` step works because
+`git.exe` is a real executable). Fix in `bin/aipi.js`: (1) the deps step command is now
+`platform === "win32" ? "npm.cmd" : "npm"`; (2) `executeUpdateStep` routes non-pi exec steps through
+the existing `createCommandSpawnSpec` so `.cmd` commands run via `cmd.exe /d /s /c` while non-`.cmd`
+(git) pass through unchanged; (3) `platform` threaded through `runAipiUpdate`. The dry-run LOG keeps
+showing the readable command; only the real spawn is wrapped. `tools/test-aipi-update.mjs` extended:
+asserts `buildAipiUpdatePlan({platform:"win32"})[2].command === "npm.cmd"` (and `"npm"` on linux) and a
+non-dry-run win32 `runAipiUpdate` spawns the deps step via `cmd.exe` + `npm.cmd` and NEVER a bare `npm`,
+while git stays a direct spawn. Verified: `node tools/test-aipi-update.mjs` → `AIPI_UPDATE_TEST_OK`;
+`npm test` → exit 0, 33 `_OK`. Rounds 29–34 remain CLOSED; this is a standalone hotfix, no open round.
+
+Current owner: CLAUDE
+Current status: CLOSED
