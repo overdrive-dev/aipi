@@ -5,8 +5,8 @@
 This file is the handoff channel between Claude reviewer and Codex implementer.
 
 Current owner: CLAUDE
-Current status: WAITING_FOR_CLAUDE
-Open review round: 35 (onboarding investigates via swarm; minimal recommendation-style asks); Rounds 29–34 CLOSED
+Current status: CLOSED
+Open review round: 35 CLOSED (swarm onboarding + bge-m3/1024 + readiness); Rounds 29–35 all CLOSED
 
 Note: Round 17 closed too early on a narrow basis. Round 19 is a full-project
 adversarial sweep (8 dimensions, every finding independently verified) and is the
@@ -8139,3 +8139,40 @@ Residual risk:
 Current owner: CLAUDE
 Current status: WAITING_FOR_CLAUDE
 Requested next action: verify Round 35 against the real code/tests; close if no findings remain or hand back concrete findings.
+
+## Claude verdict — Round 35 CLOSED (2026-06-19)
+
+Verified against real code + a green suite (`npm test` exit 0, 33 `_OK`; `validate` green), tests
+re-read for genuineness (WF-01/WF-02), and an independent grep confirming no stray `768`/`nomic`.
+- **Swarm investigation, ZERO interrogation (A).** For a fixture repo with code, onboarding spawns a
+  real multi-worker swarm via a live coordinator and asserts `investigation.mode==="swarm"`,
+  `spawned_count > 1`, `coordinator.spawned.length > 1`, AND `selectCalls.length === 0` +
+  `inputCalls.length === 0` (test-project-onboarding.mjs:16-20) — it investigates instead of asking. The
+  old env/business-rule/validation open prompts are gone (`rg` finds no `DEFAULT_QUESTIONS` /
+  `askOnboardingQuestions` / `runOnboardingInventoryWorker`). Memory is synthesized from code.
+- **Recommendation-style ask when needed.** A confirmation is presented via `ctx.ui.select` with 4
+  options whose last is `"Other / free text"` (`:102-105`) — best-guess + alternatives + free-text, not
+  an open question.
+- **Loud embedding readiness (B).** Stubbed `/api/tags → {"models":[]}` produces
+  `semantic_readiness.message` matching `/ollama pull bge-m3/` in the result AND the
+  `onboarding.jsonl` trace, while lexical graph/memory still complete (`:24-27`).
+- **bge-m3 / 1024 end-to-end (C).** `GRAPH_VECTOR_DIMENSIONS = 1024`; tests assert the `code_vectors`
+  table is `vec0(... float[1024])`, `graph.vector.dimensions === 1024`, `embedding_model === "bge-m3"`,
+  and an old-dimension (768) graph is detected as `embedding dimension mismatch` and REBUILT to
+  1024/bge-m3 — not errored (test-aipi-tools.mjs:385-390, 658-671). No `768`/`nomic-embed-text` remains
+  in extensions/tools/templates/docs.
+- **Round-31 guards intact:** non-interactive / no-model still skip with a nudge (zero spawns); idempotent
+  re-run preserves customized pages; `--no-onboard` copy-only. No regression to Rounds 29–34 (full suite green).
+
+**Zero open findings. Round 35 CLOSED. Rounds 29–35 all CLOSED.**
+
+### Live re-verify for the user
+1. `aipi-init` in a repo WITH code → it INVESTIGATES (spawns a worker swarm), writes real
+   code-derived project memory, and asks at most a recommendation pick (options + free-text) — no
+   env/business-rule interrogation.
+2. `ollama pull bge-m3` then rebuild (`aipi_semantic_search`/`aipi_impact` with rebuild) → `code_vectors`
+   populates at **1024 dims** (`meta.source` becomes semantic); without the model, you get the loud
+   "pull bge-m3" message and lexical fallback (markdown still works).
+
+Current owner: CLAUDE
+Current status: CLOSED
