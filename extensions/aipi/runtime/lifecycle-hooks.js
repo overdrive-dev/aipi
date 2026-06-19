@@ -1,3 +1,4 @@
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
@@ -23,6 +24,27 @@ const PROVIDER_BUDGET_REL_PATH = ".aipi/provider-budget.json";
 const CONTEXT_EVENT_LOG = ".aipi/runtime/context-events.jsonl";
 const AGENT_CATALOG_REL_PATH = ".aipi/agents/catalog.yaml";
 const DISCIPLINE_CATALOG_REL_PATH = ".aipi/disciplines/catalog.yaml";
+
+const BUG_ROOT_CAUSE_PIPELINE_STAGES = [
+  "reproduce",
+  "root_cause_hypotheses",
+  "verify_hypotheses",
+  "confirm_root_cause",
+  "fix_plan",
+  "implement_fix",
+  "regression_verify",
+  "cross_model_review",
+];
+
+const DEPLOY_PRECHECK_PIPELINE_STAGES = [
+  "classify_boundary",
+  "risk_blast_radius",
+  "rollback_readiness",
+  "evidence_check",
+  "confirm_before_execute",
+  "execute_after_confirm",
+  "post_deploy_verify",
+];
 const MAX_EXCERPT_CHARS = 1000;
 const MAX_CONTEXT_TOOL_RESULT_CHARS = 1200;
 const KEEP_FULL_AIPI_TOOL_RESULTS = 2;
@@ -231,7 +253,7 @@ export async function handleInput({
   if (!(await isAipiInstalled(projectRoot))) return { action: "continue" };
   const active = await readActiveRun(projectRoot).catch(() => null);
   const route = classifyAipiInputRoute(event?.text ?? "", { activeRun: active });
-  const codePipeline = classifyAipiCodePipeline(event?.text ?? "", { activeRun: active });
+  const codePipeline = classifyAipiCodePipeline(event?.text ?? "", { activeRun: active, projectRoot });
   if (codePipeline.trace) {
     await recordCodePipelineTrace({ projectRoot, pi, activeRun: active, pipeline: codePipeline }).catch(() => null);
   }
@@ -460,7 +482,7 @@ export function classifyAipiInputRoute(text, { activeRun = null } = {}) {
   };
 }
 
-export function classifyAipiCodePipeline(text, { activeRun = null } = {}) {
+export function classifyAipiCodePipeline(text, { activeRun = null, projectRoot = null, env = process.env } = {}) {
   const original = String(text ?? "").trim();
   if (!original || original.startsWith("/") || original.startsWith("@")) {
     return { classification: "bypass", substantive: false, trace: false, reason: "command_or_empty" };
@@ -470,9 +492,89 @@ export function classifyAipiCodePipeline(text, { activeRun = null } = {}) {
     return { classification: "bypass", substantive: false, trace: true, reason: "explicit_skip_phrase" };
   }
 
-  const codeIntent = /\b(implementar|implementa|corrigir|corrige|corrija|consertar|refatorar|refatora|alterar|altera|adicionar|adiciona|criar|bug|bugfix|feature|codigo|code|api|endpoint|funcao|componente|teste|tests?|pipeline)\b/.test(normalized);
+  const deployIntent = /\b(deploy|deployment|release|prod|producao|homolog|homologacao|migration|migracao|rollback|pipeline|ci|cd|infra)\b/.test(normalized);
+  const bugIntent = /\b(bug|bugfix|erro|falha|quebrou|regressao|defeito|consertar|conserta|corrigir|corrige|corrija)\b/.test(normalized);
+  const codeIntent = /\b(implementar|implementa|corrigir|corrige|corrija|consertar|refatorar|refatora|alterar|altera|adicionar|adiciona|criar|bug|bugfix|feature|codigo|code|api|endpoint|funcao|componente|teste|tests?)\b/.test(normalized);
   const trivialIntent = /\b(typo|ortografia|comentario|comentario|formatar|formatacao|renomear|rename|pequeno ajuste|ajuste simples|fix simples|texto|copy)\b/.test(normalized);
   const activeWorkflow = isContinuableActiveRun(activeRun);
+  if (deployIntent && !trivialIntent) {
+    const autoDeploy = resolveAutoDeployPolicy({ normalized, projectRoot, env });
+    return {
+      classification: "deploy_precheck",
+      substantive: true,
+      trace: true,
+      non_blocking: true,
+      active_run_id: activeRun?.runId ?? null,
+      workflow: "ops",
+      workflow_alignment: {
+        workflow: "ops.yaml",
+        stages: ["classify_boundary", "policy_gate", "plan", "human_review"],
+      },
+      stages: DEPLOY_PRECHECK_PIPELINE_STAGES,
+      precheck: {
+        required: true,
+        aligned_workflow: "ops.yaml",
+        checks: [
+          "environment_boundary",
+          "risk_blast_radius",
+          "rollback_readiness",
+          "evidence",
+        ],
+        evidence_sources: [
+          "project_memory",
+          "blast_radius_memory",
+          "tests_or_health_checks",
+          "rollback_plan",
+        ],
+      },
+      deploy_confirmation: {
+        gate: "confirm_before_execute",
+        required: !autoDeploy.enabled,
+        mode: autoDeploy.enabled ? "auto_deploy_after_precheck" : "human_confirm_before_irreversible_command",
+        scope: "irreversible_deploy_or_migration_command_only",
+        blocks_chat_or_editing: false,
+      },
+      auto_deploy: {
+        enabled: autoDeploy.enabled,
+        reason: autoDeploy.reason,
+        source: autoDeploy.source,
+        precheck_still_required: true,
+      },
+      default_action: autoDeploy.enabled ? "precheck_then_execute" : "precheck_then_confirm",
+    };
+  }
+  if (bugIntent && !trivialIntent) {
+    return {
+      classification: "root_cause_bugfix",
+      substantive: true,
+      trace: true,
+      non_blocking: true,
+      active_run_id: activeRun?.runId ?? null,
+      workflow: "bugfix",
+      workflow_alignment: {
+        workflow: "bugfix.yaml",
+        stages: ["triage", "reproduce", "fix", "verify"],
+      },
+      stages: BUG_ROOT_CAUSE_PIPELINE_STAGES,
+      root_cause: {
+        required: true,
+        assumptions_required: true,
+        evidence_required: true,
+        confirm_before_fix: true,
+        no_symptom_patch: true,
+      },
+      adversarial_review: {
+        target: "diagnosis",
+        challenge: "root_cause_hypotheses_and_evidence_before_diff",
+      },
+      cross_model_review: {
+        required: true,
+        reviewer_distinct_from_implementer: true,
+        applies_to: "diagnosis_and_fix",
+      },
+      default_action: activeWorkflow ? "continue_active_workflow" : "suggest_workflow_only",
+    };
+  }
   if (codeIntent && !trivialIntent) {
     return {
       classification: "substantive_code_work",
@@ -498,6 +600,61 @@ export function classifyAipiCodePipeline(text, { activeRun = null } = {}) {
   return { classification: "not_code_work", substantive: false, trace: false };
 }
 
+function resolveAutoDeployPolicy({ normalized, projectRoot = null, env = process.env }) {
+  if (/\b(auto[- ]?deploy|autodeploy|deploy automatico|implantacao automatica)\b/.test(normalized) ||
+    /\b(sem confirmacao|sem pedir confirmacao|nao pedir confirmacao|skip confirm|no confirm)\b/.test(normalized)) {
+    return { enabled: true, reason: "explicit_user_instruction", source: "input" };
+  }
+
+  if (isTruthyFlag(env?.AIPI_AUTO_DEPLOY) || isTruthyFlag(env?.AIPI_AUTODEPLOY)) {
+    return { enabled: true, reason: "config_flag", source: "env" };
+  }
+
+  const projectPolicy = readProjectAutoDeployPolicy(projectRoot);
+  if (projectPolicy.enabled) return projectPolicy;
+  return { enabled: false, reason: "human_confirmation_required", source: "default" };
+}
+
+function readProjectAutoDeployPolicy(projectRoot) {
+  if (!projectRoot) return { enabled: false, reason: "no_project_root", source: "project_memory" };
+  const policyFiles = [
+    ".aipi/memory/project/deployment.md",
+    ".aipi/memory/project/business-rules.md",
+    ".aipi/memory/project/procedures.md",
+  ];
+  for (const relPath of policyFiles) {
+    const filePath = path.join(projectRoot, relPath);
+    if (!fsSync.existsSync(filePath)) continue;
+    let text = "";
+    try {
+      text = normalizeInputText(fsSync.readFileSync(filePath, "utf8"));
+    } catch {
+      continue;
+    }
+    if (hasDenyingAutoDeployPolicy(text)) continue;
+    if (hasAllowingAutoDeployPolicy(text)) {
+      return { enabled: true, reason: "project_memory_autodeploy_policy", source: relPath };
+    }
+  }
+  return { enabled: false, reason: "no_project_memory_autodeploy_policy", source: "project_memory" };
+}
+
+function hasAllowingAutoDeployPolicy(normalizedText) {
+  const mentionsAutoDeploy = /\b(auto[- ]?deploy|autodeploy|deploy automatico|implantacao automatica)\b/.test(normalizedText);
+  const allows = /\b(permitido|permite|pode|autorizado|autoriza|allowed|enabled|habilitado|policy|politica)\b/.test(normalizedText);
+  const mentionsPrecheck = /\b(prechecks?|pre-checks?|pre checks?|checks?|validacao|evidencia|rollback|smoke)\b/.test(normalizedText);
+  return mentionsAutoDeploy && allows && mentionsPrecheck;
+}
+
+function hasDenyingAutoDeployPolicy(normalizedText) {
+  return /\b(nao|not|never|nunca|proibido|bloqueado|deny|disabled)\b.{0,80}\b(auto[- ]?deploy|autodeploy|deploy automatico|implantacao automatica)\b/.test(normalizedText) ||
+    /\b(auto[- ]?deploy|autodeploy|deploy automatico|implantacao automatica)\b.{0,80}\b(nao|not|never|nunca|proibido|bloqueado|deny|disabled)\b/.test(normalizedText);
+}
+
+function isTruthyFlag(value) {
+  return ["1", "true", "yes", "on", "enabled"].includes(String(value ?? "").toLowerCase());
+}
+
 function formatWorkflowSuggestion(workflow, command) {
   return `AIPI: isto parece ${workflow}; execute \`${command}\` se quiser abrir esse workflow.`;
 }
@@ -511,7 +668,15 @@ async function recordCodePipelineTrace({ projectRoot, pi, activeRun = null, pipe
     substantive: Boolean(pipeline.substantive),
     non_blocking: pipeline.non_blocking !== false,
     reason: pipeline.reason ?? null,
+    workflow: pipeline.workflow ?? null,
+    workflow_alignment: pipeline.workflow_alignment ?? null,
     stages: pipeline.stages ?? [],
+    root_cause: pipeline.root_cause ?? null,
+    precheck: pipeline.precheck ?? null,
+    deploy_confirmation: pipeline.deploy_confirmation ?? null,
+    auto_deploy: pipeline.auto_deploy ?? null,
+    adversarial_review: pipeline.adversarial_review ?? null,
+    cross_model_review: pipeline.cross_model_review ?? null,
     default_action: pipeline.default_action ?? "continue",
   };
   safeAppendEntry(pi, "aipi.code_pipeline.trace", entry);

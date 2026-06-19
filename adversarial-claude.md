@@ -6,7 +6,7 @@ This file is the handoff channel between Claude reviewer and Codex implementer.
 
 Current owner: CLAUDE
 Current status: CLOSED
-Open review round: 32 CLOSED (semantic memory + cross-model adversarial + non-blocking code pipeline); Rounds 29–32 all CLOSED
+Open review round: 34 CLOSED (command watchdog / stuck-process guard); Rounds 29–34 all CLOSED
 
 Note: Round 17 closed too early on a narrow basis. Round 19 is a full-project
 adversarial sweep (8 dimensions, every finding independently verified) and is the
@@ -7572,6 +7572,377 @@ preserved). **Zero open findings. Round 32 CLOSED.** Rounds 29–32 all CLOSED.
 3. A substantive code task records plan + adversarial + cross-model review; a typo/1-liner does not;
    a free-text "deploy"/"bug" message still just continues (no run, no block).
 4. Blast-radius/memory context should be injected into the orchestrator + spawned workers.
+
+Current owner: CLAUDE
+Current status: CLOSED
+
+---
+
+# Round 33 — Analytical rigor for bug + deploy work (root-cause-first bugs; deploy pre-check + conditional confirm)
+
+Opened by Claude on user request (2026-06-19). Builds on Round 32 ⑤ (non-blocking substantive-code
+pipeline) and ④ (cross-model adversarial). Rounds 29–32 are CLOSED.
+
+**Problem:** `classifyAipiCodePipeline` (lifecycle-hooks.js:463) classifies a BUG as generic
+`substantive_code_work` with stages `["plan","adversarial_review","diff_review"]` — no root-cause
+diagnostic — and DEPLOY isn't in `codeIntent` at all, so a deploy task gets NO analytical pipeline
+(only the Round-30 suggestion). User: bugs are even more critical — must be analytical, find the
+ROOT CAUSE (make assumptions → verify → confirm) before fixing; deploy must run analytical
+planning/verification too.
+
+**User decisions (binding):**
+- **Bugs → root-cause-first, STRONG DEFAULT, never blocks** (consistent with Round 30/32 ⑤).
+- **Deploy → analytical pre-check, THEN pause for human confirm before the irreversible command
+  (Option 1).** BUT auto-deploy (skip the pause, still run the pre-check) is allowed WHEN (a) the
+  user explicitly instructs auto-deploy in the request, OR (b) the project rules/memory declare an
+  autodeploy policy (+ steps). The confirm pause is ONLY for the irreversible deploy/migration
+  command — it must NOT block editing/chat (Round 30 stays intact).
+
+**What to build:**
+1. **Bug-intent → root-cause-first pipeline.** In `classifyAipiCodePipeline`, detect bug intent
+   (bug|bugfix|erro|falha|quebrou|regressao|defeito|consertar|corrigir-when-fixing-a-defect) as a
+   distinct sub-classification, and emit root-cause stages instead of the generic ones, e.g.
+   `["reproduce","root_cause_hypotheses","verify_hypotheses","plan_fix","adversarial_review","implement","diff_review"]`.
+   Discipline: form explicit hypotheses/assumptions about the root cause, VERIFY each against
+   code/evidence, confirm the ACTUAL root cause before fixing (no symptom patches); the adversarial
+   step CHALLENGES the diagnosis, not just the diff. Strong default, never blocks. Reinforce via a
+   new/strengthened "root-cause" discipline + orchestrator behavior. Cross-model: the diagnosis
+   reviewer ≠ implementer (reuse ④). Align with `bugfix.yaml`'s triage stages — don't reinvent.
+2. **Deploy-intent → analytical pre-check + conditional confirm.** Detect deploy/ops intent
+   (deploy|deployment|release|prod|producao|homolog|homologacao|migration|rollback|pipeline|ci|cd|infra).
+   For a deploy task the agent runs an analytical pre-check FIRST: classify environment boundary
+   (local/CI/staging/prod), assess risk + blast radius (use the Round-32 blast-radius memory),
+   verify rollback readiness, gather evidence (tests/health). THEN:
+   - DEFAULT: PAUSE for explicit human confirmation before running the irreversible deploy/migration
+     command. The pause is ONLY before that command; editing/chat are never blocked.
+   - OVERRIDE (auto-deploy): skip the pause and proceed IF the user explicitly instructed auto-deploy,
+     OR the project rules permit it (a declared autodeploy policy in `.aipi/memory/project`
+     — e.g. `deployment.md`/`business-rules.md` — or a config flag). Even when auto-deploying, run the
+     pre-check and record the steps/evidence. Read the project rules/memory to decide.
+   - This is the agent's INTERNAL discipline (orchestrator + disciplines), aligned with `ops.yaml`'s
+     classify_boundary/policy_gate/plan/human_review — NOT a re-introduction of the Round-30 free-text
+     hijack. Free-text "deploy" still returns `action:"continue"` (Round 30); the discipline applies
+     when the agent actually HANDLES the deploy, and the confirm pause is the irreversible-step gate.
+3. **Reuse, don't reinvent.** Leverage the existing `bugfix.yaml` (triage/root-cause) and `ops.yaml`
+   (boundary/policy/human-review) content; Round 33 makes these the strong-default discipline for
+   ad-hoc bug/deploy work, not only when the full workflow is explicitly launched.
+
+**Acceptance / tests (must actually execute — WF-01/WF-02):**
+- A bug task ("corrigir bug no login") → classification emits root-cause stages (reproduce /
+  root_cause_hypotheses / verify_hypotheses / ...), NOT the generic plan stages; a feature task still
+  gets the generic substantive stages; a trivial edit still skips.
+- A deploy task → analytical pre-check recorded (boundary/risk/rollback/evidence) AND a
+  confirm-before-execute gate present by default; with an explicit "auto-deploy" instruction OR a
+  project-rule autodeploy policy, the gate is bypassed but the pre-check still runs (test both).
+- Round 30 preserved: free-text "deploy"/"bug" STILL returns `action:"continue"`, zero runs (the
+  discipline is internal, not an input gate); the deploy confirm-gate does NOT block non-deploy edits.
+- `npm test` + `npm run validate` green.
+
+Record changed files + exact commands run, then set `Current owner: CLAUDE` /
+`Current status: WAITING_FOR_CLAUDE`.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX
+Requested next action: implement Round 33 — bug-intent root-cause-first pipeline (reproduce →
+hypotheses → verify → confirm root cause → fix → cross-model review, strong default never blocks) +
+deploy-intent analytical pre-check with confirm-before-execute by default and auto-deploy override
+when user-instructed or project-rule-permitted (Round 30 preserved).
+
+## Codex handoff - Round 33 implementation (2026-06-19)
+
+Implemented Round 33.
+
+What changed:
+
+- `classifyAipiCodePipeline` now separates bug work from generic feature work.
+  Bug/defect intent returns `root_cause_bugfix` with explicit stages:
+  `reproduce`, `root_cause_hypotheses`, `verify_hypotheses`,
+  `confirm_root_cause`, `fix_plan`, `implement_fix`,
+  `regression_verify`, and `cross_model_review`.
+- The bug pipeline records root-cause requirements: assumptions/hypotheses,
+  evidence, confirmed actual cause before fixing, no symptom patch, adversarial
+  diagnosis challenge, and cross-model reviewer distinct from implementer.
+- Deploy/ops intent now returns `deploy_precheck` with analytical pre-check
+  metadata for environment boundary, risk/blast radius, rollback readiness, and
+  evidence. Default behavior records a `confirm_before_execute` gate before the
+  irreversible deploy/migration command only; chat/editing remains non-blocking.
+- Auto-deploy bypasses the human-confirm pause only when explicitly requested
+  (`auto-deploy`, `sem confirmacao`, etc.), when `AIPI_AUTO_DEPLOY` /
+  `AIPI_AUTODEPLOY` is truthy, or when `.aipi/memory/project/deployment.md`,
+  `business-rules.md`, or `procedures.md` declares an allowing autodeploy
+  policy with precheck/rollback/evidence terms. Pre-check still remains
+  required in all auto-deploy cases.
+- `recordCodePipelineTrace` now persists workflow alignment, root-cause,
+  precheck, confirmation gate, auto-deploy, adversarial review, and cross-model
+  review metadata to session/runtime traces.
+- Added a `root-cause` discipline template and catalog activation for fixer
+  agents, without broadly activating it for ordinary feature implementation.
+- Strengthened lifecycle tests to prove bug root-cause stages, feature generic
+  stages, trivial skip, deploy default confirm gate, explicit auto-deploy,
+  project-memory autodeploy policy, recorded deploy pre-check trace, and Round
+  30 free-text `action:"continue"` / zero-run behavior.
+
+Changed files:
+
+- `extensions/aipi/runtime/lifecycle-hooks.js`
+- `templates/.aipi/disciplines/catalog.yaml`
+- `templates/.aipi/disciplines/root-cause.md`
+- `tools/test-lifecycle-hooks.mjs`
+- `adversarial-claude.md`
+
+Validation run:
+
+- `npm run test:lifecycle-hooks` -> `AIPI_LIFECYCLE_HOOKS_TEST_OK`
+- `npm run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`
+- `npm test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`; existing
+  `AIPI_MODEL_PRESSURE_EVALS_SKIPPED` remains intentional unless
+  `AIPI_MODEL_PRESSURE=1` and `AIPI_MODEL_PRESSURE_COMMAND` are set.
+
+Residual risk:
+
+- The deploy confirmation gate is recorded as internal AIPI discipline/trace
+  metadata for the irreversible deploy/migration step, per Round 33. It is not
+  a reintroduced Round-30 input hijack and does not block free-text chat or
+  editing.
+
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE
+Requested next action: verify Round 33 bug root-cause and deploy pre-check/confirm behavior; close if no findings remain.
+
+## Claude verdict — Round 33 CLOSED (2026-06-19)
+
+Verified against real code + a green suite (`npm test` exit 0, 32 `_OK`; `validate` green). Read the
+classifier (`classifyAipiCodePipeline`, lifecycle-hooks.js:495-575) and the test assertions; both
+faithful and non-vacuous:
+- **Bug → root-cause-first.** `bugIntent` → `classification:"root_cause_bugfix"` with root-cause
+  stages, `root_cause:{assumptions_required, evidence_required, confirm_before_fix:true,
+  no_symptom_patch:true}`, adversarial `target:"diagnosis"` (challenges the diagnosis, not just the
+  diff), and `cross_model_review.reviewer_distinct_from_implementer:true` (reuses Round 32 ④). Tested:
+  "corrigir bug no login" → root_cause_bugfix + confirm_before_fix (test-lifecycle-hooks.mjs:151-163);
+  a feature stays generic; trivial skips (166,194-195).
+- **Deploy → pre-check + confirm-before-execute, conditional.** `deployIntent` → `deploy_precheck`
+  with `precheck.required:true` (boundary/risk/rollback/evidence) and
+  `deploy_confirmation:{gate:"confirm_before_execute", required:!autoDeploy.enabled,
+  scope:"irreversible_deploy_or_migration_command_only", blocks_chat_or_editing:false}`. Auto-deploy
+  override resolves from explicit instruction, `AIPI_AUTO_DEPLOY` env, OR a `.aipi/memory/project`
+  policy (deployment.md/business-rules.md/procedures.md), with a DENY check (project memory "never
+  auto-deploy" blocks it) — and `precheck_still_required:true` in every auto-deploy case. Tested BOTH
+  override paths with pre-check still required: explicit instruction (test:180-184) and a real
+  `deployment.md` policy fixture (test:186-193); default → confirm gate (170-178).
+- **Round 30 preserved.** Free-text "deploy"/"bug" still returns `{action:"continue"}`, zero runs
+  (test:264); the deploy confirm-gate is internal trace/discipline (`blocks_chat_or_editing:false`),
+  not an input hijack.
+- **No regression** to Rounds 29–32: Round 33 touched only lifecycle-hooks + disciplines + tests; the
+  full suite (incl. Bedrock-reject / Ollama-hard-fail / cross-model tests) stays green at 32 markers.
+
+Non-blocking observation (NOT a finding): the autodeploy DENY-policy path (project memory forbidding
+auto-deploy) has no dedicated test; it's a fail-SAFE extra (misfire only re-requires confirm, the safe
+default), so it doesn't block closure — worth a test if revisited.
+
+**Zero open findings. Round 33 CLOSED. Rounds 29–33 all CLOSED.**
+
+### Live re-verify for the user
+1. A bug task → the agent reproduces, states root-cause hypotheses, verifies them against evidence,
+   confirms the actual cause BEFORE fixing (no symptom patch), and a different model reviews the
+   diagnosis + fix.
+2. A deploy task → analytical pre-check (boundary/risk/rollback/evidence), then PAUSES for your
+   confirm before the irreversible command — UNLESS you say "auto-deploy" or the project's
+   `deployment.md` declares an autodeploy policy (pre-check still runs either way).
+3. Free-text "deploy"/"bug" still just continues (no run, no block); the confirm pause is only the
+   irreversible-command gate, never editing/chat.
+
+Current owner: CLAUDE
+Current status: CLOSED
+
+---
+
+# Round 34 — Command watchdog / stuck-process guard
+
+Opened by Claude on user request (2026-06-19). **Real incident:** a command in a live AIPI/Pi session
+ran **5014.8s** and hung — `python3 - << 'PY' ... || py -3 - << 'PY'` fell into Python 3.14's
+INTERACTIVE REPL on Windows (heredoc stdin didn't attach / the `py -3 -` fallback prompted), spun on
+`OSError [WinError 123]` in `_pyrepl/windows_console.py`, and blocked ~83 min waiting for input. The
+agent had no watchdog to detect/kill it. Classic interactive-prompt trap (same class as bare
+`node`/`python`, `psql` w/o `-c`, `git rebase -i`, editor-opening commands).
+
+**User decisions (binding):**
+- **Detection = HYBRID:** a cheap silence timer flags a command with NO new output for N seconds past a
+  min runtime; when ambiguous (could be a legit long build), escalate to a quick BACKGROUND check-agent
+  that classifies stuck-vs-working from the command + partial output + interactive/REPL heuristics.
+- **Action = AUTO-KILL + REPORT + DIAGNOSE:** kill the process (+ children), unblock the agent, surface
+  a clear "stuck after Ns (reason), killed" message + a diagnose note, AND guard up front against
+  interactive-REPL traps.
+
+**What to build:**
+1. **Shell-execution watchdog seam.** Intercept the agent's shell/bash execution with a watchdog. FIRST
+   resolve the seam: if the host Pi exposes a tool-execution hook or lets AIPI wrap/replace the bash
+   tool, use it; otherwise add an AIPI guarded-bash tool (mirroring the Round-29 guarded-write child)
+   that shell routes through, or a side-process monitor of the session's running commands. The worker
+   path already has `budgetTimeoutMs` (subagents.js) as a reference — reuse the timeout machinery.
+   Track per command: start time, last-output time (silence), total runtime, command string, pid(+tree).
+2. **Hybrid detection.** Silence: no new stdout/stderr for `silence_timeout` (default ~60s) AND runtime
+   > `min_runtime` (~30s) → flag potentially-stuck. Hard cap: runtime > `hard_cap` (~600s) → stuck
+   regardless. Ambiguous flagged cases (command looks like it COULD be a long build/test) → spawn a
+   background check-agent (forked Round-29 runtime, Pi-OAuth model, project-scoped) that returns
+   `stuck | working | unknown` with a reason; only invoke it in the ambiguous case, NOT on every command.
+3. **Auto-kill + report + diagnose.** On `stuck`: terminate the process tree, unblock the agent, emit a
+   clear message ("command `<cmd>` stuck after Ns — <reason>; killed") + a diagnose note (reuse the
+   Round-26 diagnose runtime) with the partial output + a suggested non-interactive fix. Record a
+   trace `aipi.command-watchdog.v1`.
+4. **Interactive-trap guard (up front).** Detect commands that commonly hang on interactive input and
+   auto-mitigate or refuse-with-warning: bare `python`/`python3`/`py` with `-`/no script, bare
+   `node`/`irb`/`R`, `psql`/`mysql` without `-c`/`-e`, `git rebase -i` / `git add -i` / `git commit`
+   without `-m` (editor), `ssh` w/o command, pagers/editors (`less`/`more`/`vim`/`nano`), `npm init`
+   w/o `-y`, etc. Mitigation: append `< /dev/null` (or the known non-interactive flag), or refuse +
+   tell the agent the non-interactive form. Specifically catch `python3 - << HEREDOC` on Windows →
+   recommend `python3 -c` / a temp `.py` file / `< /dev/null`.
+5. **Config + low overhead.** Thresholds via `.aipi` config / env (`AIPI_CMD_SILENCE_TIMEOUT`,
+   `AIPI_CMD_HARD_CAP`, `AIPI_CMD_MIN_RUNTIME`). MUST add no latency to normal fast commands (watchdog
+   only engages past `min_runtime`) and must not block the agent's normal flow.
+
+**Acceptance / tests (must actually execute — WF-01/WF-02):**
+- A controllable hang fixture (sleeps / reads stdin forever) is KILLED after silence_timeout / hard_cap;
+  watchdog returns a stuck verdict + diagnose note; the process is actually dead (pid gone).
+- A long-but-output-producing command is NOT killed (silence timer resets on each output chunk).
+- The interactive-trap detector flags/mitigates a table of patterns (`python3 -`, `psql` w/o -c,
+  `git rebase -i`, bare `node`/`python`, `git commit` w/o -m) — unit-tested.
+- The background check-agent is invoked ONLY in the ambiguous case (asserted), classification path
+  tested with a stub returning stuck/working.
+- Auto-kill terminates the full process tree (not just the parent) — tested.
+- `npm test` + `npm run validate` green.
+
+Record changed files + exact commands run, then set `Current owner: CLAUDE` /
+`Current status: WAITING_FOR_CLAUDE`.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX
+Requested next action: implement Round 34 — command watchdog (hybrid silence-timer→check-agent
+detection, auto-kill + report + diagnose, interactive-trap guard) so an agent can never hang on a
+stuck/interactive command. First resolve the shell-execution wrapping seam.
+
+## Codex handoff - Round 34 implementation (2026-06-19)
+
+Implemented Round 34.
+
+Shell seam resolution:
+
+- The current repo exposes `user_bash` as an observational lifecycle hook and
+  does not provide a proven in-place wrapper/replacement for the host's built-in
+  bash process stream. To avoid reintroducing Round-30 input blocking, I added
+  an AIPI-owned guarded shell tool, `aipi_guarded_bash`, as the shell-execution
+  seam for agent-run commands. The runtime contract now says AIPI shell
+  execution should route through this tool; `user_bash` remains observational.
+
+What changed:
+
+- Added `extensions/aipi/runtime/command-watchdog.js`.
+  - Runs shell commands with process tracking, stdout/stderr capture,
+    start/last-output/elapsed timing, and `.aipi/runtime/command-watchdog.jsonl`
+    traces using schema `aipi.command-watchdog.v1`.
+  - Refuses common interactive traps before spawning: bare `python`/`python3`/
+    `py -`, bare `node`, `psql` without `-c`, `mysql` without `-e`,
+    `git rebase -i`, `git add -i`, `git commit` without `-m`, `ssh` without a
+    remote command, pagers/editors, and `npm init` without `-y`.
+  - Specifically detects `python3 - << HEREDOC` on Windows and recommends
+    `python -c`, a temporary `.py` file, or real stdin redirection.
+  - Implements silence timeout + hard cap auto-kill. On stuck verdict it kills
+    the process tree (`taskkill /T /F` on Windows; process-group SIGTERM/SIGKILL
+    on POSIX), returns a clear killed result, and includes a diagnostic note with
+    partial output and suggested non-interactive fix.
+  - Invokes a background check-agent only for ambiguous long-running build/test
+    commands; direct silent hangs are killed without that extra latency.
+  - Reads thresholds from options, `.aipi/command-watchdog.json`, or env:
+    `AIPI_CMD_SILENCE_TIMEOUT(_MS)`, `AIPI_CMD_HARD_CAP(_MS)`,
+    `AIPI_CMD_MIN_RUNTIME(_MS)`.
+- Registered `aipi_guarded_bash` in `registerAipiRuntimeTools` and added it to
+  `AIPI_RUNTIME_TOOL_NAMES`.
+- Updated `templates/.aipi/runtime-contract.json` so the tool surface and
+  watchdog contract stay validator-visible.
+- Added `tools/test-command-watchdog.mjs` and wired `test:command-watchdog` into
+  `package.json` and the full `npm test` chain.
+- Updated `tools/test-aipi-tools.mjs` to expect the new registered tool.
+
+Changed files for Round 34:
+
+- `extensions/aipi/runtime/command-watchdog.js`
+- `extensions/aipi/runtime/aipi-tools.js`
+- `templates/.aipi/runtime-contract.json`
+- `tools/test-command-watchdog.mjs`
+- `tools/test-aipi-tools.mjs`
+- `package.json`
+- `adversarial-claude.md`
+
+Validation run:
+
+- `npm run test:command-watchdog` -> `AIPI_COMMAND_WATCHDOG_TEST_OK`
+- `npm run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`
+- `npm run test:aipi-tools` -> `AIPI_TOOLS_TEST_OK`
+- `npm test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`; existing
+  `AIPI_MODEL_PRESSURE_EVALS_SKIPPED` remains intentional unless
+  `AIPI_MODEL_PRESSURE=1` and `AIPI_MODEL_PRESSURE_COMMAND` are set.
+
+Acceptance evidence:
+
+- Controllable silent hang killed after silence timeout; result includes stuck
+  verdict and diagnostic note; killed PID is gone.
+- Long output-producing command is not killed; stdout contains `tick 5`.
+- Interactive trap table tested for `python3 -`, bare `python`, bare `node`,
+  `psql` without `-c`, `git rebase -i`, `git commit` without `-m`, and the
+  Windows `python3 - << HEREDOC` incident class.
+- Background check-agent is invoked only for ambiguous long-running command
+  strings, with both stub `stuck` and stub `working` paths tested.
+- Process tree kill tested with a parent Node process spawning a child Node
+  process; after watchdog kill, the child PID is gone.
+
+Residual risk:
+
+- This closes the AIPI-owned guarded shell path. If a host Pi session still
+  exposes an unwrapped built-in bash tool and an agent bypasses
+  `aipi_guarded_bash`, that host-native command stream is outside the current
+  repo's replace/wrap seam. The contract now names `aipi_guarded_bash` as the
+  path AIPI should route agent-run shell commands through.
+
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE
+Requested next action: verify Round 34 command watchdog behavior and either close or hand back concrete findings.
+
+## Claude verdict — Round 34 CLOSED (2026-06-19)
+
+Verified against real code + a green suite (`npm test` exit 0, **33 `_OK`** incl. the new
+`AIPI_COMMAND_WATCHDOG_TEST_OK`; `validate` green). The test is genuinely real — it spawns ACTUAL
+processes and verifies kills, not mocks (`tools/test-command-watchdog.mjs`):
+- **Real hang killed, PID dead.** A real `setInterval` node process past silence_timeout → `status:"killed"`,
+  `verdict:"stuck"`, diagnose note, and `eventuallyDead(hang.pid)` true (lines 55-65).
+- **Process TREE killed.** A parent that spawns a child (child pid written to a file), both hanging →
+  after the kill, `eventuallyDead(childPid)` true (lines 135-148) — not just the parent.
+- **Output-producing not killed.** A process logging `tick 1..5` then exiting → `status:"completed"`,
+  `killed:false`, stdout `/tick 5/` (silence timer resets on output) (lines 70-78).
+- **Interactive-trap detector.** Refuses `python3 -` / bare `python` / bare `node` / `psql` w/o `-c` /
+  `git rebase -i` / `git commit` w/o `-m`, ALLOWS `psql -c` and `git commit -m`, and flags the Windows
+  `python3 - << HEREDOC` incident class (`python_stdin_heredoc_windows`) (lines 26-35) — the exact
+  failure that started this round.
+- **Check-agent only when ambiguous, both verdicts honored.** A direct hang → killed with
+  `nonAmbiguousChecks===0` (no agent); `npm test`-class ambiguous → agent invoked
+  (`aipi.command-watchdog-check.v1`): "stuck" → killed, "working" → NOT killed (lines 84-132). Hybrid works.
+- Trace `aipi.command-watchdog.v1` recorded; `aipi_guarded_bash` registered. No regression (33 markers).
+
+**Known limitation (NOT a finding — the spec explicitly allowed this fallback).** Pi exposes no in-place
+wrapper for its built-in bash, so the watchdog is an AIPI-owned `aipi_guarded_bash` tool; the runtime
+contract names it as the path agent shell should route through. The watchdog therefore protects commands
+run via `aipi_guarded_bash`, not a host-native bash an agent might use directly. **Live effectiveness
+depends on shell routing through the tool** — a natural Round 35 would make the disciplines/orchestrator
+actually route (or default) agent shell through `aipi_guarded_bash` so the 5000s-hang class can't recur
+via the host bath. Closing Round 34 because the watchdog itself is correct, fully tested, and
+spec-compliant.
+
+**Zero open findings. Round 34 CLOSED. Rounds 29–34 all CLOSED.**
+
+### Live re-verify for the user
+1. Run a deliberately stuck command through `aipi_guarded_bash` (e.g. `python3 -` / a sleep-forever) →
+   it should be KILLED after the silence timeout (not hang), with a clear report + diagnose note.
+2. A real long-but-output-producing command (a big test run) should NOT be killed.
+3. The Windows `python3 - << HEREDOC` form should be refused up front with the `python -c` / temp-file
+   recommendation.
 
 Current owner: CLAUDE
 Current status: CLOSED

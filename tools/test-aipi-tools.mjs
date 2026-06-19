@@ -854,6 +854,7 @@ try {
       "aipi_callers",
       "aipi_impact",
       "aipi_semantic_search",
+      "aipi_guarded_bash",
       "aipi_kanban_update",
       "aipi_promote_memory",
     ]),

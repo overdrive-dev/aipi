@@ -26,6 +26,9 @@ activation:
   review_complexity:
     disciplines: [complexity-review]
     pi_hooks: [before_agent_start, context]
+  before_root_cause_fix:
+    disciplines: [root-cause]
+    pi_hooks: [before_agent_start, context, tool_call]
 
 disciplines:
   - id: context-thrift
@@ -75,3 +78,9 @@ disciplines:
     file: .aipi/disciplines/complexity-review.md
     applies_to: [reviewer, implementer, fixer]
     purpose: Find unnecessary complexity to delete or shrink after verification.
+
+  - id: root-cause
+    status: predicted
+    file: .aipi/disciplines/root-cause.md
+    applies_to: [fixer]
+    purpose: Confirm the actual bug cause from evidence before implementing a fix.

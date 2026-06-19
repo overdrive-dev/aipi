@@ -282,10 +282,26 @@
       "aipi_callers",
       "aipi_impact",
       "aipi_semantic_search",
+      "aipi_guarded_bash",
       "aipi_kanban_update",
       "aipi_promote_memory"
     ],
     "specificationOnly": []
+  },
+  "commandWatchdog": {
+    "schema": "aipi.command-watchdog.v1",
+    "tool": "aipi_guarded_bash",
+    "traceLog": ".aipi/runtime/command-watchdog.jsonl",
+    "configPath": ".aipi/command-watchdog.json",
+    "env": [
+      "AIPI_CMD_SILENCE_TIMEOUT",
+      "AIPI_CMD_HARD_CAP",
+      "AIPI_CMD_MIN_RUNTIME",
+      "AIPI_CMD_SILENCE_TIMEOUT_MS",
+      "AIPI_CMD_HARD_CAP_MS",
+      "AIPI_CMD_MIN_RUNTIME_MS"
+    ],
+    "rule": "AIPI shell execution should route through aipi_guarded_bash for agent-run commands. The guard refuses common interactive REPL/editor traps before spawning, tracks start time, last stdout/stderr time, total runtime, command, pid, and process tree, kills stuck commands on silence timeout or hard cap, invokes a background stuck-vs-working check only for ambiguous long-running build/test commands, records a diagnostic note, and appends aipi.command-watchdog.v1 traces. The user_bash hook remains observational and must not reintroduce broad input blocking."
   },
   "lifecycleHooks": {
     "implementationPath": "extensions/aipi/runtime/lifecycle-hooks.js",

@@ -148,7 +148,49 @@ try {
     null,
   );
   assert.equal(classifyAipiInputRoute("me explica isso"), null);
-  assert.equal(classifyAipiCodePipeline("corrigir bug no login").classification, "substantive_code_work");
+  const bugPipeline = classifyAipiCodePipeline("corrigir bug no login");
+  assert.equal(bugPipeline.classification, "root_cause_bugfix");
+  assert.deepEqual(bugPipeline.stages, [
+    "reproduce",
+    "root_cause_hypotheses",
+    "verify_hypotheses",
+    "confirm_root_cause",
+    "fix_plan",
+    "implement_fix",
+    "regression_verify",
+    "cross_model_review",
+  ]);
+  assert.equal(bugPipeline.root_cause.confirm_before_fix, true);
+  assert.equal(bugPipeline.adversarial_review.target, "diagnosis");
+  assert.equal(bugPipeline.cross_model_review.reviewer_distinct_from_implementer, true);
+  const featurePipeline = classifyAipiCodePipeline("implementar nova tela");
+  assert.equal(featurePipeline.classification, "substantive_code_work");
+  assert.deepEqual(featurePipeline.stages, ["plan", "adversarial_review", "diff_review"]);
+  const deployDefaultPipeline = classifyAipiCodePipeline("deploy em prod");
+  assert.equal(deployDefaultPipeline.classification, "deploy_precheck");
+  assert.deepEqual(deployDefaultPipeline.precheck.checks, [
+    "environment_boundary",
+    "risk_blast_radius",
+    "rollback_readiness",
+    "evidence",
+  ]);
+  assert.equal(deployDefaultPipeline.deploy_confirmation.required, true);
+  assert.equal(deployDefaultPipeline.deploy_confirmation.gate, "confirm_before_execute");
+  assert.equal(deployDefaultPipeline.deploy_confirmation.blocks_chat_or_editing, false);
+  const explicitAutoDeployPipeline = classifyAipiCodePipeline("auto-deploy em homolog depois dos prechecks");
+  assert.equal(explicitAutoDeployPipeline.deploy_confirmation.required, false);
+  assert.equal(explicitAutoDeployPipeline.auto_deploy.enabled, true);
+  assert.equal(explicitAutoDeployPipeline.auto_deploy.reason, "explicit_user_instruction");
+  assert.equal(explicitAutoDeployPipeline.precheck.required, true);
+  await fs.appendFile(
+    path.join(tempRoot, ".aipi", "memory", "project", "deployment.md"),
+    "\n## Autodeploy policy\nAuto-deploy is allowed for homolog after prechecks pass and rollback is ready.\n",
+  );
+  const projectPolicyDeployPipeline = classifyAipiCodePipeline("deploy em homolog", { projectRoot: tempRoot });
+  assert.equal(projectPolicyDeployPipeline.deploy_confirmation.required, false);
+  assert.equal(projectPolicyDeployPipeline.auto_deploy.enabled, true);
+  assert.equal(projectPolicyDeployPipeline.auto_deploy.reason, "project_memory_autodeploy_policy");
+  assert.equal(projectPolicyDeployPipeline.precheck.required, true);
   assert.equal(classifyAipiCodePipeline("skip aipi pipeline e apenas responda").classification, "bypass");
   assert.equal(classifyAipiCodePipeline("pequeno ajuste de texto").classification, "trivial_or_mechanical");
 
@@ -205,8 +247,9 @@ try {
     await initProject({ sourceRoot, targetRoot: routerRoot });
     const routerRunnerCalls = [];
     const routerNotifications = [];
+    const routerEntries = [];
     const routerHandlers = createAipiLifecycleHandlers({
-      pi: { appendEntry() {} },
+      pi: { appendEntry(type, data) { routerEntries.push({ type, data }); } },
       projectRootResolver: () => routerRoot,
       workflowCommandRunner: async (input) => {
         routerRunnerCalls.push(input);
@@ -224,6 +267,17 @@ try {
     assert.equal(routerNotifications.length, 3);
     assert.match(routerNotifications[0].message, /\/aipi-workflow run ops/);
     assert.match(routerNotifications[1].message, /\/aipi-workflow run bugfix/);
+    const deployTrace = routerEntries.find(
+      (entry) => entry.type === "aipi.code_pipeline.trace" && entry.data.classification === "deploy_precheck",
+    );
+    assert.equal(deployTrace.data.precheck.checks.includes("rollback_readiness"), true);
+    assert.equal(deployTrace.data.deploy_confirmation.required, true);
+    assert.equal(deployTrace.data.deploy_confirmation.blocks_chat_or_editing, false);
+    const bugTrace = routerEntries.find(
+      (entry) => entry.type === "aipi.code_pipeline.trace" && entry.data.classification === "root_cause_bugfix",
+    );
+    assert.equal(bugTrace.data.stages.includes("verify_hypotheses"), true);
+    assert.equal(bugTrace.data.root_cause.confirm_before_fix, true);
     await assert.rejects(
       () => fs.access(path.join(routerRoot, ".aipi", "runtime", "runs", "active")),
       /ENOENT/,

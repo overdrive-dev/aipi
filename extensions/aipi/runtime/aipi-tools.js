@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { runGuardedCommand } from "./command-watchdog.js";
 
 export const AIPI_RUNTIME_TOOL_NAMES = [
   "aipi_memory_query",
@@ -9,6 +10,7 @@ export const AIPI_RUNTIME_TOOL_NAMES = [
   "aipi_callers",
   "aipi_impact",
   "aipi_semantic_search",
+  "aipi_guarded_bash",
   "aipi_kanban_update",
   "aipi_promote_memory",
 ];
@@ -365,6 +367,37 @@ export function registerAipiRuntimeTools(pi, { projectRootResolver = () => proce
     },
     async execute(_id, params, _signal, _onUpdate, ctx) {
       return jsonResult(await aipiSemanticSearch({ projectRoot: projectRootResolver(ctx), ...params }));
+    },
+  });
+
+  pi.registerTool({
+    name: "aipi_guarded_bash",
+    description:
+      "Run a non-interactive shell command through the AIPI command watchdog. Refuses common REPL/editor traps, kills stuck silent commands, and records a diagnostic trace.",
+    parameters: {
+      type: "object",
+      required: ["command"],
+      properties: {
+        command: { type: "string" },
+        cwd: { type: "string" },
+        min_runtime_ms: { type: "number" },
+        silence_timeout_ms: { type: "number" },
+        hard_cap_ms: { type: "number" },
+        allow_interactive: { type: "boolean" },
+      },
+    },
+    async execute(_id, params, _signal, onUpdate, ctx) {
+      const projectRoot = projectRootResolver(ctx);
+      return jsonResult(await runGuardedCommand({
+        projectRoot,
+        cwd: params.cwd ?? projectRoot,
+        command: params.command,
+        minRuntimeMs: params.min_runtime_ms,
+        silenceTimeoutMs: params.silence_timeout_ms,
+        hardCapMs: params.hard_cap_ms,
+        allowInteractive: params.allow_interactive === true,
+        onUpdate,
+      }));
     },
   });
 
