@@ -1,0 +1,7 @@
+{
+  "schema": "aipi.semantic-memory.v1",
+  "ollama_host": "http://localhost:11434",
+  "ollama_model": "nomic-embed-text",
+  "dimensions": 768,
+  "rule": "Semantic code search uses local Ollama embeddings. Run `ollama pull nomic-embed-text` before semantic-only search; aipi_callers and aipi_impact continue with exact/lexical fallback when embeddings are unavailable."
+}

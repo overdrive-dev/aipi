@@ -1,0 +1,9 @@
+{
+  "schema": "aipi.provider-pricing.v1",
+  "currency": "USD",
+  "checked_at": null,
+  "source_url": null,
+  "max_age_days": 30,
+  "rule": "Rates are intentionally empty by default. Add provider/model rates only from current official pricing pages and include source_url plus checked_at at either the file or rate level. AIPI ignores rates without fresh source metadata.",
+  "rates": {}
+}

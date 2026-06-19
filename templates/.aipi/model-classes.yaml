@@ -1,0 +1,110 @@
+version: 1
+name: aipi-model-classes
+description: >
+  Provider-agnostic model classes. Agents bind to capability classes; runtime
+  policy resolves each class to currently configured provider/model ids.
+
+classes:
+  orchestrator-heavy:
+    purpose: Long-horizon run ownership, BDD contract reconciliation, workflow control.
+    context_need: very_high
+    effort: xhigh
+    max_parallel: 1
+    capability_floor:
+      reasoning: frontier
+      context: very_high
+      tool_use: required
+      structured_outputs: required
+    preferred_families: [openai, anthropic, zai]
+    fallback_policy: Resolve to the strongest available long-context reasoning model; fail loudly if no configured provider satisfies the floor.
+
+  planner-heavy:
+    purpose: Requirements, BDD contracts, business-rule gaps, plan checks.
+    context_need: high
+    effort: high
+    max_parallel: 3
+    capability_floor:
+      reasoning: high
+      context: high
+      tool_use: required
+      structured_outputs: required
+    preferred_families: [openai, anthropic, zai]
+    fallback_policy: Prefer accuracy and context retention over cost; fail if the BDD contract cannot be held.
+
+  adversarial-heavy:
+    purpose: Contrarian review, hard code review, security/privacy challenges.
+    context_need: high
+    effort: high
+    max_parallel: 4
+    capability_floor:
+      reasoning: high
+      context: high
+      tool_use: read_only
+      structured_outputs: required
+    preferred_families: [anthropic, openai, zai]
+    fallback_policy: Prefer a different model family than the implementation model when configured.
+
+  research-heavy:
+    purpose: Domain and technical research with evidence and citations.
+    context_need: high
+    effort: high
+    max_parallel: 4
+    capability_floor:
+      reasoning: high
+      context: high
+      web: required_when_current_facts_matter
+      citations: required
+    preferred_families: [openai, anthropic, zai]
+    fallback_policy: Require web/search tools when claims depend on current facts.
+
+  code-strong:
+    purpose: Implementation, refactoring, code fixes, local technical decisions.
+    context_need: medium_high
+    effort: medium
+    max_parallel: 5
+    capability_floor:
+      coding: high
+      context: medium_high
+      tool_use: write_capable
+      structured_outputs: required
+    preferred_families: [openai, anthropic, zai]
+    fallback_policy: Use targeted context packets instead of full-run context; fail if write/tool support is unavailable.
+
+  test-strong:
+    purpose: TDD, regression tests, acceptance contracts, verification plans.
+    context_need: medium
+    effort: medium
+    max_parallel: 4
+    capability_floor:
+      coding: high
+      reasoning: medium_high
+      context: medium
+      structured_outputs: required
+    preferred_families: [openai, anthropic, zai]
+    fallback_policy: Escalate to planner-heavy when testability depends on business semantics.
+
+  context-fast:
+    purpose: Retrieval, codebase mapping, context packaging, memory summaries.
+    context_need: medium
+    effort: low
+    max_parallel: 8
+    capability_floor:
+      summarization: high
+      context: medium
+      tool_use: read_only
+      citations: required
+    preferred_families: [zai, openai, anthropic]
+    fallback_policy: Prefer speed and low cost; outputs must cite source paths.
+
+  verifier-fast:
+    purpose: Artifact checks, final acceptance verification, run hygiene.
+    context_need: medium
+    effort: low
+    max_parallel: 6
+    capability_floor:
+      reasoning: medium
+      context: medium
+      structured_outputs: required
+      evidence_audit: required
+    preferred_families: [anthropic, zai, openai]
+    fallback_policy: Prefer a model family different from code-strong when possible.

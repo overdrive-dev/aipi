@@ -1,0 +1,77 @@
+version: 1
+name: aipi-behavioral-disciplines
+description: >
+  Lifecycle behavioral contracts inspired by fable-skills and adapted for
+  aipi's BDD orchestrator, Pi runtime hooks, and multi-model agents.
+
+activation:
+  task_start:
+    disciplines: [context-thrift]
+    pi_hooks: [input, before_agent_start, context]
+  before_code_edit:
+    disciplines: [scope-discipline, native-code]
+    pi_hooks: [before_agent_start, tool_call]
+  before_claim:
+    disciplines: [prove-it]
+    pi_hooks: [message_end]
+  before_state_change:
+    disciplines: [prove-it]
+    pi_hooks: [tool_call, user_bash]
+  before_turn_end:
+    disciplines: [finish-turn, outcome-first]
+    pi_hooks: [agent_end, turn_end, message_end]
+  before_business_choice:
+    disciplines: [contract-first]
+    pi_hooks: [before_agent_start, tool_call]
+  review_complexity:
+    disciplines: [complexity-review]
+    pi_hooks: [before_agent_start, context]
+
+disciplines:
+  - id: context-thrift
+    status: predicted
+    file: .aipi/disciplines/context-thrift.md
+    applies_to: [orchestrator, planner, researcher, context, reviewer]
+    purpose: Spend context only on evidence that changes the next action.
+
+  - id: finish-turn
+    status: predicted
+    file: .aipi/disciplines/finish-turn.md
+    applies_to: [orchestrator, implementer, tester, fixer]
+    purpose: Finish reversible in-scope work before ending a working turn.
+
+  - id: prove-it
+    status: predicted
+    file: .aipi/disciplines/prove-it.md
+    applies_to: [orchestrator, implementer, tester, reviewer, verifier, ops]
+    purpose: Calibrate claims and state-changing actions to evidence rungs.
+
+  - id: scope-discipline
+    status: predicted
+    file: .aipi/disciplines/scope-discipline.md
+    applies_to: [implementer, fixer, frontend, tester]
+    purpose: Keep diffs inside the accepted BDD contract and owned-file set.
+
+  - id: native-code
+    status: predicted
+    file: .aipi/disciplines/native-code.md
+    applies_to: [implementer, fixer, frontend, tester]
+    purpose: Match local code idiom without defensive bloat or narration.
+
+  - id: outcome-first
+    status: predicted
+    file: .aipi/disciplines/outcome-first.md
+    applies_to: [orchestrator, reviewer, verifier, human-review]
+    purpose: Put the answer or result first in user-facing replies.
+
+  - id: contract-first
+    status: predicted
+    file: .aipi/disciplines/contract-first.md
+    applies_to: [orchestrator, planner, business-rule-keeper, reviewer]
+    purpose: Treat accepted BDD rules as the boundary for business-visible behavior.
+
+  - id: complexity-review
+    status: predicted
+    file: .aipi/disciplines/complexity-review.md
+    applies_to: [reviewer, implementer, fixer]
+    purpose: Find unnecessary complexity to delete or shrink after verification.

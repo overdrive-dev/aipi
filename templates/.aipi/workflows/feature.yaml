@@ -1,0 +1,237 @@
+version: 1
+name: aipi-feature
+mode: workflow-contract-v1
+description: >
+  Autonomous feature workflow after a BDD contract is accepted. The client owns
+  rules; the swarm owns mapping, TDD, implementation, review, verification, and
+  memory.
+params:
+  run_id: "{{ aipi.run_id }}"
+  contract_path: .aipi/runtime/runs/{{ run_id }}/BDD-CONTRACT.md
+artifact_policy:
+  namespace: .aipi/runtime/runs/{{ run_id }}/steps/{{ step_id }}
+  no_overwrite: true
+steps:
+  - id: load_contract
+    stage: planning
+    agents: [orchestration-reasoner]
+    name: Load accepted BDD contract
+    prompt: >
+      Under bdd-orchestrator control, load {{ contract_path }}, current rules,
+      decisions, project memory, and code graph freshness. Abort only if the
+      contract is missing, conflicted, or not accepted. When a user decision is
+      needed before planning can continue, include blocker_question with
+      question, 1-3 distinct short recommended options ordered best-first, and
+      allow_free_text: true; free-text is always available.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/load_contract/ORCHESTRATION.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED_TO_PLANNING: stop
+        BLOCKED: stop
+        FAIL: stop
+
+  - id: implementation_plan
+    stage: implementation-plan
+    agents: [codebase-mapper, context-curator, blast-radius]
+    name: Map context and implementation slices
+    prompt: >
+      Produce owned-file slices with no parallel same-file writers, relevant
+      tests, likely integration points, and the context packet needed for TDD.
+      If a business-visible gap forces BLOCKED_TO_PLANNING, include
+      blocker_question with question, 1-3 distinct short recommended options
+      ordered best-first, and allow_free_text: true; free-text is always
+      available.
+    requires: [load_contract]
+    context_from: [load_contract]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/implementation_plan/CODEBASE-MAP.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/implementation_plan/CONTEXT-PACKET.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/implementation_plan/BLAST-RADIUS.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED_TO_PLANNING: load_contract
+        BLOCKED: stop
+        FAIL: stop
+
+  - id: tdd
+    stage: tdd
+    agents: [workflow-tdd-gate, test-writer]
+    name: Write failing tests or contracts
+    prompt: >
+      For every Given/When/Then scenario, create a failing automated test or an
+      explicit verification contract. TDD may be skipped only when the gate
+      records a non-code/mechanics reason from the contract.
+    requires: [implementation_plan]
+    context_from: [load_contract, implementation_plan]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/tdd/TDD-GATE.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/tdd/TESTS.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS, SKIPPED]
+      allow_skip: true
+      skip_requires: explicit_tdd_waiver
+      on_verdict:
+        BLOCKED_TO_PLANNING: load_contract
+        BLOCKED: stop
+        FAIL: stop
+
+  - id: implement
+    stage: implementation
+    agents: [implementer, frontend-dev]
+    name: Implement scoped changes
+    prompt: >
+      Implement only inside owned-file scopes and cite the BDD rule each
+      behavior change implements. Use frontend-dev only when UI is affected.
+    requires: [tdd]
+    context_from: [load_contract, implementation_plan, tdd]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/implement/IMPLEMENTATION.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/implement/FRONTEND.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED_TO_PLANNING: load_contract
+        BLOCKED: stop
+        FAIL: stop
+
+  - id: local_verification
+    stage: local-verification
+    agents: [workflow-test-gate]
+    name: Run local verification
+    prompt: >
+      Execute relevant local tests, type checks, build, and UI smoke checks when
+      applicable. Capture commands, exit codes, and skipped-check reasons.
+    requires: [implement]
+    context_from: [tdd, implement]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/local_verification/TEST-GATE.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      require_evidence_rung: ran
+      on_verdict:
+        BLOCKED: stop
+        FAIL: implement
+
+  - id: review_swarm
+    stage: review
+    agents: [code-reviewer, complexity-reviewer, integration-checker, security-auditor, blast-radius]
+    name: Review swarm
+    prompt: >
+      Run review agents in parallel where read-only. Findings must be actionable
+      or include written absence analysis. Complexity findings stay separate
+      from correctness, security, and integration findings.
+    requires: [local_verification]
+    context_from: [load_contract, implementation_plan, implement, local_verification]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/review_swarm/CODE-REVIEW.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/review_swarm/COMPLEXITY-REVIEW.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/review_swarm/INTEGRATION.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/review_swarm/SECURITY.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/review_swarm/BLAST-RADIUS.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED_TO_PLANNING: load_contract
+        BLOCKED: stop
+        FAIL: fix_loop
+
+  - id: fix_loop
+    stage: fix
+    agents: [code-fixer]
+    name: Apply review fixes
+    prompt: >
+      If review_swarm produced critical or high findings, apply targeted fixes
+      and re-run targeted verification. Do not widen scope without returning to
+      planning.
+    requires: [review_swarm]
+    context_from: [review_swarm]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/fix_loop/FIXES.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS, SKIPPED]
+      allow_skip: true
+      skip_requires: no_actionable_findings
+      retry:
+        max: 2
+      on_verdict:
+        BLOCKED_TO_PLANNING: load_contract
+        BLOCKED: stop
+        FAIL: local_verification
+
+  - id: final_verification
+    stage: final-verification
+    agents: [verifier]
+    name: Verify accepted contract
+    prompt: >
+      Verify every accepted scenario and attach evidence. Prefer a different
+      model family than implementation when runtime routing allows it.
+    requires: [fix_loop]
+    context_from: [load_contract, tdd, local_verification, review_swarm, fix_loop]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/final_verification/VERIFICATION.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      require_evidence_rung: verified
+      on_verdict:
+        BLOCKED_TO_PLANNING: load_contract
+        BLOCKED: stop
+        FAIL: fix_loop
+
+  - id: deployment_suggestion
+    stage: deployment-plan
+    agents: [workflow-cicd]
+    name: Deployment and homologation suggestion
+    prompt: >
+      Produce deployment, homologation, rollback, and smoke suggestions. This is
+      advisory unless the tool_call policy layer is implemented and allows the
+      action.
+    requires: [final_verification]
+    context_from: [final_verification]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/deployment_suggestion/CICD.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS, SKIPPED]
+      allow_skip: true
+      skip_requires: no_deployment_surface
+      on_verdict:
+        BLOCKED: stop
+        FAIL: stop
+
+  - id: memory_promotion
+    stage: memory-promotion
+    agents: [knowledge-curator, user-profiler]
+    name: Promote durable memory
+    prompt: >
+      Propose reusable facts through orchestrator-owned memory tools. Agents
+      never write durable shared memory directly.
+    requires: [deployment_suggestion]
+    context_from: [final_verification, deployment_suggestion]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/memory_promotion/MEMORY-PROMOTION.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/memory_promotion/USER-PREFERENCES-CANDIDATES.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS, SKIPPED]
+      allow_skip: true
+      skip_requires: no_durable_memory_signal
+      on_verdict:
+        BLOCKED: stop
+        FAIL: stop

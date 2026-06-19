@@ -1,0 +1,20 @@
+name: aipi templates
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts --legacy-peer-deps
+      - run: npm install -g @earendil-works/pi-coding-agent@0.79.5
+      - run: npm test

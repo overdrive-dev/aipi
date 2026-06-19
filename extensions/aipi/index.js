@@ -1,0 +1,203 @@
+import { SubagentCoordinator, registerSubagentTools } from "./runtime/subagents.js";
+import {
+  formatInitSummary,
+  initProject,
+  parseInitArgs,
+  resolveProjectRoot,
+} from "./runtime/project-init.js";
+import {
+  aipiStatusKind,
+  buildAipiStatusReport,
+  formatAipiStatus,
+} from "./runtime/provider-auth.js";
+import {
+  formatWorkflowCommandResult,
+  runWorkflowCommand,
+} from "./runtime/run-state.js";
+import { createSubagentWorkflowAdapter } from "./runtime/workflow-executor.js";
+import { resolveStepModel } from "./runtime/model-router.js";
+import { registerAipiRuntimeTools } from "./runtime/aipi-tools.js";
+import {
+  formatMemoryCommandResult,
+  runMemoryCommand,
+} from "./runtime/memory-command.js";
+import {
+  formatOnboardingResult,
+  maybeRunPostInitOnboarding,
+  parseOnboardArgs,
+  runProjectOnboarding,
+} from "./runtime/onboarding.js";
+import {
+  formatDiagnoseCommandResult,
+  runDiagnoseCommand,
+} from "./runtime/diagnose.js";
+import {
+  formatPiSubagentsLiveSpike,
+  runPiSubagentsLiveSpike,
+} from "./runtime/pi-subagents.js";
+import { registerAipiLifecycleHooks } from "./runtime/lifecycle-hooks.js";
+import {
+  formatProbeAResult,
+  ProbeAController,
+} from "./runtime/probe-a.js";
+import {
+  formatProbeAPrimeResult,
+  runProbeAPrime,
+} from "./runtime/probe-a-prime.js";
+
+export default function aipiExtension(pi) {
+  const coordinator = new SubagentCoordinator(pi);
+  const probeA = new ProbeAController(pi);
+
+  // Stable AIPI tool surface (aipi_spawn_agent, _status, _collect, _cancel, _steer).
+  // The S0 Pi SDK spawn backend is wired for single in-process session workers;
+  // the workflow executor and reconciliation layer decide when to call it.
+  registerSubagentTools(pi, coordinator);
+  registerAipiRuntimeTools(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx) });
+  registerAipiLifecycleHooks(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx), coordinator });
+  probeA.registerHooks();
+
+  pi.registerCommand("aipi-init", {
+    description: "Install the AIPI project memory, workflow, agent, and protocol templates into the current repository.",
+    handler: async (args, ctx) => {
+      try {
+        const options = parseInitArgs(args ?? "");
+        const targetRoot = resolveProjectRoot(ctx, options.targetRoot);
+        const summary = await initProject({ ...options, targetRoot });
+        ctx.ui.notify(formatInitSummary(summary), "info");
+        const onboarding = await maybeRunPostInitOnboarding({
+          projectRoot: targetRoot,
+          ctx,
+          coordinator,
+          skip: options.noOnboard || options.dryRun,
+        });
+        ctx.ui.notify(formatOnboardingResult(onboarding), onboarding.action === "onboard" ? "info" : "warning");
+      } catch (error) {
+        ctx.ui.notify(`AIPI init failed: ${error.message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("aipi-onboard", {
+    description: "Inventory the repository and seed AIPI project memory pages.",
+    handler: async (args, ctx) => {
+      try {
+        const options = parseOnboardArgs(args ?? "");
+        const projectRoot = resolveProjectRoot(ctx, options.targetRoot);
+        const hostModel = ctx?.model ?? ctx?.current_model ?? ctx?.currentModel ?? coordinator.getHostModel?.();
+        const result = await runProjectOnboarding({
+          projectRoot,
+          ctx,
+          coordinator,
+          hostModel,
+          askUser: !options.noQuestions,
+          runWorker: !options.noQuestions && Boolean(hostModel),
+        });
+        ctx.ui.notify(formatOnboardingResult(result), "info");
+      } catch (error) {
+        ctx.ui.notify(`AIPI onboarding failed: ${error.message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("aipi-workflow", {
+    description: "List, inspect, or start an AIPI workflow run.",
+    handler: async (args, ctx) => {
+      try {
+        const projectRoot = resolveProjectRoot(ctx);
+        const adapter = createSubagentWorkflowAdapter(coordinator, {
+          modelResolver: (modelArgs) => resolveStepModel({ ...modelArgs, ctx }),
+        });
+        const result = await runWorkflowCommand({
+          args: args ?? "",
+          projectRoot,
+          adapter,
+          parentInteractiveToolCallHook: "registered_parent_interactive_tool_call_hook",
+        });
+        ctx.ui.notify(formatWorkflowCommandResult(result), "info");
+      } catch (error) {
+        ctx.ui.notify(`AIPI workflow failed: ${error.message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("aipi-memory", {
+    description: "Inspect AIPI Markdown memory and code graph state.",
+    handler: async (args, ctx) => {
+      try {
+        const projectRoot = resolveProjectRoot(ctx);
+        const result = await runMemoryCommand({ args: args ?? "", projectRoot });
+        ctx.ui.notify(formatMemoryCommandResult(result), "info");
+      } catch (error) {
+        ctx.ui.notify(`AIPI memory failed: ${error.message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("aipi-diagnose", {
+    description: "Explain the most recent failed or blocked AIPI run and write a redacted diagnostic report.",
+    handler: async (args, ctx) => {
+      try {
+        const projectRoot = resolveProjectRoot(ctx);
+        const result = await runDiagnoseCommand({ args: args ?? "", projectRoot });
+        ctx.ui.notify(formatDiagnoseCommandResult(result), result.help ? "info" : "warning");
+      } catch (error) {
+        ctx.ui.notify(`AIPI diagnose failed: ${error.message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("aipi-pi-subagents-spike", {
+    description: "Run the phase-1 pi-subagents provider-inheritance spike inside a live AIPI/Pi session.",
+    handler: async (_args, ctx) => {
+      try {
+        const projectRoot = resolveProjectRoot(ctx);
+        const result = await runPiSubagentsLiveSpike({ pi, projectRoot });
+        ctx.ui.notify(formatPiSubagentsLiveSpike(result), result.go_no_go === "GO_CANDIDATE" ? "info" : "warning");
+      } catch (error) {
+        ctx.ui.notify(`AIPI pi-subagents spike failed: ${error.message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("aipi-probe-a", {
+    description: "Run Probe A: check whether spawned worker tool_call events are attributable to a worker/session.",
+    handler: async (args, ctx) => {
+      try {
+        const projectRoot = resolveProjectRoot(ctx);
+        const result = await probeA.run({ projectRoot, ctx, args: args ?? "" });
+        const kind = result.verdict === "PASS" ? "info" : result.verdict === "RUNNING" ? "info" : "warning";
+        ctx.ui.notify(formatProbeAResult(result), kind);
+      } catch (error) {
+        ctx.ui.notify(`AIPI Probe A failed: ${error.message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("aipi-probe-a-prime", {
+    description: "Run Probe A': check whether wrapped worker write tools enforce owned-file scope in-process.",
+    handler: async (_args, ctx) => {
+      try {
+        const projectRoot = resolveProjectRoot(ctx);
+        const result = await runProbeAPrime({ projectRoot });
+        const kind = result.verdict === "IN_PROCESS_VIABLE" ? "info" : "warning";
+        ctx.ui.notify(formatProbeAPrimeResult(result), kind);
+      } catch (error) {
+        ctx.ui.notify(`AIPI Probe A' failed: ${error.message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("aipi-status", {
+    description: "Show AIPI package status.",
+    handler: async (_args, ctx) => {
+      try {
+        const projectRoot = resolveProjectRoot(ctx);
+        const report = await buildAipiStatusReport({ projectRoot });
+        ctx.ui.notify(formatAipiStatus(report), aipiStatusKind(report));
+      } catch (error) {
+        ctx.ui.notify(`AIPI status failed: ${error.message}`, "error");
+      }
+    },
+  });
+}

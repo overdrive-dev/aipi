@@ -1,0 +1,160 @@
+version: 1
+name: aipi-planning
+mode: workflow-contract-v1
+description: >
+  Business-first planning workflow. Produces an accepted BDD contract or a
+  focused business-rule blocker. Based on aihaus planning/routing gates.
+params:
+  run_id: "{{ aipi.run_id }}"
+  request: ""
+artifact_policy:
+  namespace: .aipi/runtime/runs/{{ run_id }}/steps/{{ step_id }}
+  no_overwrite: true
+steps:
+  - id: intake
+    stage: intake
+    agents: [orchestration-reasoner, workflow-intake]
+    name: Intake and route request
+    prompt: >
+      Classify "{{ request }}" as planning, feature, bugfix, research, ops, or
+      no-workflow. Create a run manifest if workflow value exists.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/intake/INTAKE.md
+    controller_updates:
+      - .aipi/runtime/runs/{{ run_id }}/RUN-MANIFEST.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED: stop
+        FAIL: stop
+
+  - id: context
+    stage: context
+    agents: [context-curator, codebase-mapper]
+    name: Build context packet
+    prompt: >
+      Retrieve relevant code graph, project memory, rules, decisions, and
+      analogous implementation patterns.
+    requires: [intake]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/context/CONTEXT-PACKET.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/context/CODEBASE-MAP.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED: stop
+        FAIL: stop
+
+  - id: requirements
+    stage: requirements
+    agents: [requirements-analyst]
+    name: Draft requirements and scenarios
+    prompt: >
+      Convert the request and context into business requirements, acceptance
+      criteria, and candidate Given/When/Then scenarios.
+    requires: [context]
+    context_from: [intake, context]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/requirements/REQUIREMENTS.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED_TO_PLANNING: intake
+        BLOCKED: stop
+        FAIL: requirements
+
+  - id: business_rule_check
+    stage: rule-check
+    agents: [business-rule-keeper, workflow-planning-gate]
+    name: Check rule coverage
+    prompt: >
+      Classify each business-visible decision as covered, gap, conflict, or
+      mechanics. Draft only the minimum focused user question when coverage is
+      insufficient. When returning BLOCKED_TO_PLANNING for a user decision,
+      include blocker_question with question, 1-3 distinct short recommended
+      options ordered best-first, and allow_free_text: true; free-text is always
+      available.
+    requires: [requirements]
+    context_from: [requirements]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/business_rule_check/BUSINESS-RULE-CHECK.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/business_rule_check/PLANNING-GATE.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED_TO_PLANNING: stop_for_user_question
+        BLOCKED: stop
+        FAIL: requirements
+
+  - id: research
+    stage: research
+    agents: [project-researcher, phase-researcher]
+    name: Optional research swarm
+    prompt: >
+      If the plan depends on unknown technical or domain facts, cite sources and
+      label claims as verified, cited, or assumed.
+    requires: [business_rule_check]
+    context_from: [context, requirements, business_rule_check]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/research/PROJECT-RESEARCH.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS, SKIPPED]
+      allow_skip: true
+      skip_requires: no_external_unknowns
+      on_verdict:
+        BLOCKED: stop
+        FAIL: business_rule_check
+
+  - id: adversarial
+    stage: review
+    agents: [plan-checker, contrarian]
+    name: Adversarial plan review
+    prompt: >
+      Find missing acceptance evidence, conflicting rules, risky assumptions, or
+      overbroad implementation scope.
+    requires: [research]
+    context_from: [requirements, business_rule_check, research]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/adversarial/PLAN-CHECK.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/adversarial/CHALLENGES.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED_TO_PLANNING: business_rule_check
+        BLOCKED: stop
+        FAIL: requirements
+
+  - id: contract
+    stage: planning
+    agents: [orchestration-reasoner]
+    name: Produce BDD contract package
+    prompt: >
+      Reconcile requirements, rule check, research, and adversarial findings.
+      Output either an accepted BDD contract or one focused business-rule
+      blocker. If the blocker needs a user decision, include blocker_question
+      with question, 1-3 distinct short recommended options ordered best-first,
+      and allow_free_text: true; free-text is always available.
+    requires: [adversarial]
+    context_from: [requirements, business_rule_check, research, adversarial]
+    produces: []
+    controller_updates:
+      - .aipi/runtime/runs/{{ run_id }}/BDD-CONTRACT.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED_TO_PLANNING: business_rule_check
+        BLOCKED: stop
+        FAIL: requirements

@@ -1,0 +1,163 @@
+version: 1
+name: aipi-bugfix
+mode: workflow-contract-v1
+description: >
+  Autonomous bugfix workflow grounded in reproduction, root cause, BDD rules,
+  regression tests, adversarial review, and memory promotion.
+params:
+  run_id: "{{ aipi.run_id }}"
+  bug: ""
+artifact_policy:
+  namespace: .aipi/runtime/runs/{{ run_id }}/steps/{{ step_id }}
+  no_overwrite: true
+steps:
+  - id: triage
+    stage: requirements
+    agents: [orchestration-reasoner, debugger, codebase-mapper, context-curator]
+    name: Triage and reproduce
+    prompt: >
+      Establish reproduction evidence, root-cause hypotheses, and the smallest
+      context packet for "{{ bug }}". If reproduction is blocked, record the
+      blocker explicitly.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/triage/TRIAGE.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/triage/CODEBASE-MAP.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/triage/CONTEXT-PACKET.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED: stop
+        FAIL: triage
+
+  - id: rule_impact
+    stage: rule-check
+    agents: [business-rule-keeper]
+    name: Business-rule impact
+    prompt: >
+      Determine which accepted rule is violated, or whether this is a gap or
+      conflict that must return to planning. When returning
+      BLOCKED_TO_PLANNING for a user decision, include blocker_question with
+      question, 1-3 distinct short recommended options ordered best-first, and
+      allow_free_text: true; free-text is always available.
+    requires: [triage]
+    context_from: [triage]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/rule_impact/BUSINESS-RULE-CHECK.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED_TO_PLANNING: stop_for_user_question
+        BLOCKED: stop
+        FAIL: triage
+
+  - id: regression_test
+    stage: tdd
+    agents: [test-writer, workflow-tdd-gate]
+    name: Write failing regression test
+    prompt: >
+      Create a failing regression test or explicit verification contract tied to
+      the violated rule.
+    requires: [rule_impact]
+    context_from: [triage, rule_impact]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/regression_test/TESTS.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/regression_test/TDD-GATE.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS, SKIPPED]
+      allow_skip: true
+      skip_requires: explicit_tdd_waiver
+      on_verdict:
+        BLOCKED_TO_PLANNING: rule_impact
+        BLOCKED: stop
+        FAIL: rule_impact
+
+  - id: fix
+    stage: implementation
+    agents: [implementer, code-fixer]
+    name: Fix root cause
+    prompt: >
+      Fix the root cause, not just the symptom, under an owned-file scope and
+      keep behavior aligned with the cited rule.
+    requires: [regression_test]
+    context_from: [triage, rule_impact, regression_test]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/fix/FIXES.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/fix/IMPLEMENTATION.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED_TO_PLANNING: rule_impact
+        BLOCKED: stop
+        FAIL: fix
+
+  - id: verify
+    stage: local-verification
+    agents: [workflow-test-gate, integration-checker, verifier]
+    name: Verify fix
+    prompt: >
+      Confirm the regression now passes and no related behavior regressed. Attach
+      commands, exit codes, and artifact paths.
+    requires: [fix]
+    context_from: [regression_test, fix]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/verify/TEST-GATE.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/verify/INTEGRATION.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/verify/VERIFICATION.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      require_evidence_rung: ran
+      on_verdict:
+        BLOCKED: stop
+        FAIL: fix
+
+  - id: review
+    stage: review
+    agents: [code-reviewer, complexity-reviewer, blast-radius, security-auditor]
+    name: Adversarial bugfix review
+    prompt: >
+      Look for incomplete root cause, hidden callers, new risk, and unnecessary
+      complexity introduced by the fix.
+    requires: [verify]
+    context_from: [triage, fix, verify]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/review/CODE-REVIEW.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/review/COMPLEXITY-REVIEW.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/review/BLAST-RADIUS.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/review/SECURITY.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED_TO_PLANNING: rule_impact
+        BLOCKED: stop
+        FAIL: fix
+
+  - id: memory_promotion
+    stage: memory-promotion
+    agents: [knowledge-curator]
+    name: Promote bug learnings
+    prompt: >
+      Propose durable root-cause lessons, gotchas, and rule/code links through
+      orchestrator-owned memory tools.
+    requires: [review]
+    context_from: [triage, rule_impact, verify, review]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/memory_promotion/MEMORY-PROMOTION.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS, SKIPPED]
+      allow_skip: true
+      skip_requires: no_durable_memory_signal
+      on_verdict:
+        BLOCKED: stop
+        FAIL: stop

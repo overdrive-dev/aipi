@@ -1,0 +1,402 @@
+version: 1
+name: aipi-agent-catalog
+description: >
+  Curated agent catalog ported from aihaus-flow's working agent set. This is
+  not a copy of Claude Code prompts; it is a Pi-neutral registry for aipi's BDD
+  orchestrator and swarm workflows.
+
+defaults:
+  memory_inputs:
+    - .aipi/memory/project/project.md
+    - .aipi/memory/project/business-rules.md
+    - .aipi/memory/project/decisions.md
+    - .aipi/memory/project/knowledge.md
+    - .aipi/memory/project/environment.md
+    - .aipi/memory/project/procedures.md
+    - .aipi/memory/project/deployment.md
+    - .aipi/memory/project/glossary.md
+  memory_write_rule: agents_propose_orchestrator_writes
+  artifact_rule: every_agent_returns_structured_artifact_in_step_namespace
+  stage_registry: .aipi/runtime-contract.json
+  role_disciplines:
+    orchestrator: [context-thrift, finish-turn, prove-it, outcome-first, contract-first]
+    planner: [context-thrift, contract-first]
+    researcher: [context-thrift]
+    context: [context-thrift]
+    reviewer: [context-thrift, prove-it, outcome-first, contract-first, complexity-review]
+    implementer: [finish-turn, prove-it, scope-discipline, native-code, complexity-review]
+    tester: [finish-turn, prove-it, scope-discipline, native-code]
+    fixer: [finish-turn, scope-discipline, native-code, complexity-review]
+    frontend: [scope-discipline, native-code]
+    verifier: [prove-it, outcome-first]
+    ops: [prove-it]
+    human-review: [outcome-first]
+    business-rule-keeper: [contract-first]
+
+agents:
+  - id: bdd-orchestrator
+    source_reference: workflow-orchestrator
+    class: orchestrator-heavy
+    runtime: controller
+    role_type: controller
+    role: orchestrator
+    spawnable: false
+    tools: [read, grep, find, ls, bash, aipi_memory_query, aipi_rule_lookup, aipi_spawn_agent, aipi_kanban_update, aipi_promote_memory]
+    stages: [intake, requirements, rule-check, planning, context, tdd, implementation-plan, implementation, execution-review, local-verification, blast-radius, review, fix, tests, final-verification, deployment-plan, homolog, human-review, prod, ops, memory-promotion]
+    purpose: Own the active run, route intent, preserve BDD contract authority, dispatch swarm agents, and remain the single writer for shared state.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/ORCHESTRATION.md
+      - .aipi/runtime/runs/{{ run_id }}/RUN-MANIFEST.md
+
+  - id: orchestration-reasoner
+    source_reference: workflow-orchestrator/reasoning-pass
+    class: planner-heavy
+    runtime: skill
+    role_type: spawned_agent
+    role: planner
+    tools: [read, grep, find, ls, bash, aipi_memory_query, aipi_rule_lookup]
+    stages: [intake, requirements, rule-check, planning, research, ops, final-verification]
+    purpose: Perform bounded orchestration analysis when the controller needs a spawned reasoning pass without delegating run ownership.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/ORCHESTRATION-REASONING.md
+
+  - id: workflow-intake
+    source_reference: workflow-intake
+    class: planner-heavy
+    runtime: skill
+    role: planner
+    tools: [read, write, grep, find, ls, bash, aipi_kanban_update]
+    stages: [intake, backlog]
+    purpose: Capture useful task intent without inventing scope; create backlog-ready items.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/INTAKE.md
+
+  - id: workflow-planning-gate
+    source_reference: workflow-planning-gate
+    class: planner-heavy
+    runtime: skill
+    role: planner
+    tools: [read, write, grep, find, ls, bash, aipi_rule_lookup, aipi_rule_gap, aipi_kanban_update]
+    stages: [rule-check, planning]
+    purpose: Decide whether a task has enough business-rule coverage to enter TDD.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/PLANNING-GATE.md
+
+  - id: workflow-tdd-gate
+    source_reference: workflow-tdd-gate
+    class: test-strong
+    runtime: skill
+    role: tester
+    tools: [read, write, grep, find, ls, bash, aipi_rule_lookup]
+    stages: [tdd]
+    purpose: Turn accepted BDD scenarios into failing tests or explicit verification contracts.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/TDD-GATE.md
+
+  - id: workflow-execution-review
+    source_reference: workflow-execution-review
+    class: adversarial-heavy
+    runtime: skill
+    role: reviewer
+    tools: [read, write, grep, find, ls, bash, aipi_memory_query]
+    stages: [implementation, execution-review]
+    purpose: Check implementation readiness before broad tests or deployment planning.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/EXECUTION-REVIEW.md
+
+  - id: workflow-test-gate
+    source_reference: workflow-test-gate
+    class: verifier-fast
+    runtime: skill
+    role: verifier
+    tools: [read, write, grep, find, ls, bash]
+    stages: [local-verification, tests, final-verification]
+    purpose: Coordinate automated checks and decide if test evidence is sufficient.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/TEST-GATE.md
+
+  - id: workflow-cicd
+    source_reference: workflow-cicd
+    class: code-strong
+    runtime: skill
+    role: ops
+    tools: [read, write, grep, find, ls, bash]
+    stages: [ops, deployment-plan, tests, homolog, prod]
+    purpose: Prepare repeatable CI/CD, deployment, rollback, and environment evidence.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/CICD.md
+
+  - id: workflow-dev-reviewer
+    source_reference: workflow-dev-reviewer
+    class: verifier-fast
+    runtime: skill
+    role: verifier
+    tools: [read, write, grep, find, ls, bash]
+    stages: [homolog]
+    purpose: Validate published homolog behavior and require browser evidence for UI/flow work.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/DEV-REVIEW.md
+
+  - id: workflow-human-review
+    source_reference: workflow-human-review
+    class: verifier-fast
+    runtime: skill
+    role: human-review
+    tools: [read, write, grep, find, ls, bash]
+    stages: [human-review]
+    purpose: Package business-facing evidence for human approval.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/HUMAN-REVIEW.md
+
+  - id: project-business-interviewer
+    source_reference: project-business-interviewer
+    class: planner-heavy
+    runtime: skill
+    role: planner
+    tools: [read, write, grep, find, ls, bash, aipi_rule_gap]
+    stages: [init, planning]
+    purpose: Ask only high-value business questions that cannot be inferred from repo evidence.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/BUSINESS-INTERVIEW.md
+
+  - id: requirements-analyst
+    source_reference: analyst/product-manager
+    class: planner-heavy
+    runtime: skill
+    role: planner
+    tools: [read, write, grep, find, ls, bash, aipi_memory_query]
+    stages: [requirements, planning, research]
+    purpose: Convert user intent into acceptance criteria and candidate Given/When/Then scenarios.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/REQUIREMENTS.md
+
+  - id: business-rule-keeper
+    source_reference: protocols/business-rules.md
+    class: planner-heavy
+    runtime: skill
+    role: business-rule-keeper
+    tools: [read, write, grep, find, ls, bash, aipi_rule_lookup, aipi_rule_gap]
+    stages: [rule-check, planning, tdd, review]
+    purpose: Determine covered/gap/conflict/mechanics for each business-visible decision.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/BUSINESS-RULE-CHECK.md
+
+  - id: plan-checker
+    source_reference: plan-checker
+    class: adversarial-heavy
+    runtime: skill
+    role: reviewer
+    tools: [read, grep, find, ls, bash, aipi_memory_query]
+    stages: [planning, review]
+    purpose: Adversarially review plans for missing goals, contradictions, and untested behavior.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/PLAN-CHECK.md
+
+  - id: plan-calibrator
+    source_reference: plan-calibrator
+    class: adversarial-heavy
+    runtime: skill
+    role: planner
+    tools: [read, grep, find, ls, bash, aipi_rule_gap]
+    stages: [planning]
+    purpose: Surface ambiguities and drive one-question-at-a-time business-rule calibration.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/BUSINESS-RULES-DRAFT.md
+
+  - id: contrarian
+    source_reference: contrarian
+    class: adversarial-heavy
+    runtime: skill
+    role: reviewer
+    tools: [read, grep, find, ls]
+    stages: [planning, review]
+    purpose: Challenge assumptions and missing stakeholder perspectives.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/CHALLENGES.md
+
+  - id: project-researcher
+    source_reference: project-researcher
+    class: research-heavy
+    runtime: session
+    role: researcher
+    tools: [read, write, grep, find, ls, web_search, web_fetch, aipi_memory_query]
+    stages: [research, planning]
+    purpose: Investigate project/domain context with explicit claim provenance.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/PROJECT-RESEARCH.md
+
+  - id: phase-researcher
+    source_reference: phase-researcher
+    class: research-heavy
+    runtime: session
+    role: researcher
+    tools: [read, write, grep, find, ls, web_search, web_fetch]
+    stages: [research, planning, implementation]
+    purpose: Research unknown technical options for a specific workflow phase.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/PHASE-RESEARCH.md
+
+  - id: codebase-mapper
+    source_reference: codebase-mapper
+    class: context-fast
+    runtime: skill
+    role: context
+    tools: [read, write, grep, find, ls, bash, aipi_memory_query]
+    stages: [init, requirements, context, implementation-plan, blast-radius]
+    purpose: Map affected files, symbols, tests, patterns, and architecture analogs.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/CODEBASE-MAP.md
+
+  - id: context-curator
+    source_reference: context-curator
+    class: context-fast
+    runtime: skill
+    role: context
+    tools: [read, grep, find, ls, aipi_memory_query]
+    stages: [any]
+    purpose: Build smallest useful context packets for each subagent.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/CONTEXT-PACKET.md
+
+  - id: implementer
+    source_reference: implementer
+    class: code-strong
+    runtime: session
+    role: implementer
+    tools: [read, write, edit, grep, find, ls, aipi_memory_query]
+    stages: [implementation]
+    purpose: Implement scoped code changes under an owned-file set and accepted BDD contract.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/IMPLEMENTATION.md
+
+  - id: debugger
+    source_reference: systematic-debugging/root-cause
+    class: code-strong
+    runtime: session
+    role: fixer
+    tools: [read, grep, find, ls, aipi_memory_query, aipi_callers]
+    stages: [requirements, implementation, local-verification]
+    purpose: Reproduce defects, isolate root cause, and produce falsifiable hypotheses before a bugfix changes code.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/TRIAGE.md
+
+  - id: frontend-dev
+    source_reference: frontend-dev
+    class: code-strong
+    runtime: session
+    role: frontend
+    tools: [read, write, edit, grep, find, ls]
+    stages: [implementation, local-verification]
+    purpose: Implement UI changes and local UI smoke checks under the BDD contract.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/FRONTEND.md
+
+  - id: test-writer
+    source_reference: test-writer
+    class: test-strong
+    runtime: session
+    role: tester
+    tools: [read, write, edit, grep, find, ls, aipi_rule_lookup]
+    stages: [tdd, tests]
+    purpose: Write failing tests or verification contracts for accepted scenarios.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/TESTS.md
+
+  - id: code-fixer
+    source_reference: code-fixer
+    class: code-strong
+    runtime: session
+    role: fixer
+    tools: [read, write, edit, grep, find, ls]
+    stages: [implementation, fix, review, tests]
+    purpose: Apply targeted fixes from review/test findings without widening scope.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/FIXES.md
+
+  - id: blast-radius
+    source_reference: integration-checker/codebase-mapper/aih-graph impact
+    class: context-fast
+    runtime: skill
+    role: context
+    tools: [read, write, grep, find, ls, bash, aipi_memory_query, aipi_impact, aipi_callers]
+    stages: [implementation-plan, blast-radius, review]
+    purpose: Identify likely impacted files, tests, rules, call sites, and deployment concerns.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/BLAST-RADIUS.md
+
+  - id: code-reviewer
+    source_reference: code-reviewer
+    class: adversarial-heavy
+    runtime: session
+    role: reviewer
+    tools: [read, grep, find, ls, aipi_memory_query, aipi_callers]
+    stages: [review]
+    purpose: Find correctness, maintainability, and regression risks; justify silence when clean.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/CODE-REVIEW.md
+
+  - id: complexity-reviewer
+    source_reference: DietrichGebert/ponytail skills/ponytail-review
+    class: context-fast
+    runtime: skill
+    role: reviewer
+    tools: [read, grep, find, ls, bash]
+    stages: [review, blast-radius]
+    purpose: Review the diff only for unnecessary complexity, deletions, stdlib/native replacements, YAGNI abstractions, and shorter equivalent code.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/COMPLEXITY-REVIEW.md
+
+  - id: integration-checker
+    source_reference: integration-checker
+    class: verifier-fast
+    runtime: skill
+    role: verifier
+    tools: [read, write, grep, find, ls, bash]
+    stages: [local-verification, review, tests]
+    purpose: Verify that changed pieces are wired together, not merely present.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/INTEGRATION.md
+
+  - id: security-auditor
+    source_reference: security-auditor
+    class: adversarial-heavy
+    runtime: session
+    role: reviewer
+    tools: [read, write, grep, find, ls]
+    stages: [review, homolog, prod, ops]
+    purpose: Review auth, secrets, privacy, production boundary, and abuse risks.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/SECURITY.md
+
+  - id: verifier
+    source_reference: verifier
+    class: verifier-fast
+    runtime: skill
+    role: verifier
+    tools: [read, write, grep, find, ls, bash, aipi_rule_lookup]
+    stages: [local-verification, tests, final-verification]
+    purpose: Verify every accepted scenario and artifact before completion.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/VERIFICATION.md
+
+  - id: knowledge-curator
+    source_reference: knowledge-curator
+    class: planner-heavy
+    runtime: skill
+    role: business-rule-keeper
+    tools: [read, grep, find, ls, bash, aipi_promote_memory]
+    stages: [memory-promotion]
+    purpose: Propose durable decisions, knowledge, workflow lessons, and agent memory updates.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/MEMORY-PROMOTION.md
+
+  - id: user-profiler
+    source_reference: user-profiler
+    class: context-fast
+    runtime: skill
+    role: context
+    tools: [read]
+    stages: [memory-promotion]
+    purpose: Propose user workflow/style preference candidates; orchestrator decides promotion.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/USER-PREFERENCES-CANDIDATES.md

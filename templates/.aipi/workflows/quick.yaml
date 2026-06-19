@@ -1,0 +1,126 @@
+version: 1
+name: aipi-quick
+mode: workflow-contract-v1
+description: >
+  Lightweight lane for small, low-risk, mechanically scoped changes. It keeps
+  BDD awareness and verification without running the full feature swarm.
+params:
+  run_id: "{{ aipi.run_id }}"
+  request: ""
+artifact_policy:
+  namespace: .aipi/runtime/runs/{{ run_id }}/steps/{{ step_id }}
+  no_overwrite: true
+route_constraints:
+  max_owned_files: 3
+  requires_existing_rule: true
+  disallow:
+    - production
+    - secrets
+    - auth
+    - schema_migration
+    - payment
+    - destructive_command
+steps:
+  - id: quick_scope
+    stage: intake
+    agents: [orchestration-reasoner, context-curator]
+    name: Confirm quick-lane eligibility
+    prompt: >
+      Confirm the request is covered by an existing business rule or purely
+      mechanical, touches at most three owned files, and avoids production,
+      secrets, auth, payments, schema migrations, and destructive commands.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/quick_scope/QUICK-SCOPE.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/quick_scope/CONTEXT-PACKET.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED_TO_PLANNING: escalate_to_planning
+        BLOCKED: stop
+        FAIL: escalate_to_planning
+
+  - id: quick_change
+    stage: implementation
+    agents: [implementer, code-fixer]
+    name: Apply scoped change
+    prompt: >
+      Apply the smallest change inside the owned-file set. If the change widens
+      scope, stop and escalate to the full planning or feature workflow.
+    requires: [quick_scope]
+    context_from: [quick_scope]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/quick_change/IMPLEMENTATION.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/quick_change/FIXES.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED_TO_PLANNING: escalate_to_planning
+        BLOCKED: stop
+        FAIL: quick_change
+
+  - id: quick_verify
+    stage: local-verification
+    agents: [workflow-test-gate, verifier]
+    name: Verify scoped change
+    prompt: >
+      Run the narrowest relevant automated or manual verification and record the
+      command, exit code, artifact, or explicit blocker.
+    requires: [quick_change]
+    context_from: [quick_scope, quick_change]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/quick_verify/TEST-GATE.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/quick_verify/VERIFICATION.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      require_evidence_rung: ran
+      on_verdict:
+        BLOCKED_TO_PLANNING: escalate_to_planning
+        BLOCKED: stop
+        FAIL: quick_change
+
+  - id: quick_review
+    stage: review
+    agents: [code-reviewer, complexity-reviewer]
+    name: Focused review
+    prompt: >
+      Review only the changed owned files for correctness risk and unnecessary
+      complexity. Escalate if broader blast radius appears.
+    requires: [quick_verify]
+    context_from: [quick_scope, quick_change, quick_verify]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/quick_review/CODE-REVIEW.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/quick_review/COMPLEXITY-REVIEW.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED_TO_PLANNING: escalate_to_planning
+        BLOCKED: stop
+        FAIL: quick_change
+
+  - id: quick_memory
+    stage: memory-promotion
+    agents: [knowledge-curator]
+    name: Promote quick-lane learnings
+    prompt: >
+      Record no-signal unless the quick run produced a reusable rule, decision,
+      gotcha, procedure, or user workflow preference candidate.
+    requires: [quick_review]
+    context_from: [quick_scope, quick_verify, quick_review]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/quick_memory/MEMORY-PROMOTION.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS, SKIPPED]
+      allow_skip: true
+      skip_requires: no_durable_memory_signal
+      on_verdict:
+        BLOCKED: stop
+        FAIL: stop

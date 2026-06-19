@@ -1,0 +1,9 @@
+{
+  "schema": "aipi.provider-budget.v1",
+  "enabled": false,
+  "default": {
+    "warn_at_ratio": 0.8
+  },
+  "providers": {},
+  "models": {}
+}

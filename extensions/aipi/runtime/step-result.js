@@ -1,0 +1,347 @@
+const defaultContract = {
+  stepResultSchema: {
+    id: "aipi.step-result.v1",
+    required: ["schema", "step_id", "agent_ids", "verdict", "evidence", "artifacts"],
+    // Additive, optional provenance stamped by the coordinator (backward compatible —
+    // absence is valid). Surfaces model-class resolution so a swap can't hide.
+    optional: [
+      "model_requested",
+      "model_resolved",
+      "model_fallback",
+      "model_warning",
+      "blocker_question",
+      "awaiting_user_input",
+    ],
+  },
+  stepVerdicts: ["PASS", "FAIL", "SKIPPED", "BLOCKED", "BLOCKED_TO_PLANNING"],
+  evidenceRungs: ["written", "ran", "verified", "blocked"],
+  policyDecisions: ["ALLOW", "BLOCK", "HUMAN_REVIEW_REQUIRED"],
+  skipConditions: {
+    explicit_tdd_waiver: { requiresEvidence: ["contract", "reason"] },
+    no_actionable_findings: { requiresEvidence: ["review_artifacts"] },
+    no_deployment_surface: { requiresEvidence: ["changed_surface"] },
+    no_durable_memory_signal: { requiresEvidence: ["memory_candidate_scan"] },
+    no_external_unknowns: { requiresEvidence: ["context_packet"] },
+    not_homolog_or_no_ui_flow: { requiresEvidence: ["ops_classification"] },
+    no_internal_context: { requiresEvidence: ["scope"] },
+    no_external_research_needed: { requiresEvidence: ["scope", "context_packet"] },
+  },
+};
+
+const evidenceRank = new Map([
+  ["written", 1],
+  ["ran", 2],
+  ["verified", 3],
+  ["blocked", 0],
+]);
+
+const nonExecutingEvidenceSources = new Set([
+  "aipi-local-executor",
+  "aipi-subagent-fanout",
+]);
+
+export function validateStepResult(result, { step = null, contract = defaultContract } = {}) {
+  const errors = [];
+  const warnings = [];
+  const schema = contract.stepResultSchema ?? defaultContract.stepResultSchema;
+
+  if (!isPlainObject(result)) {
+    return {
+      ok: false,
+      gatePassed: false,
+      verdict: null,
+      policyDecision: null,
+      errors: ["step result must be an object"],
+      warnings,
+    };
+  }
+
+  for (const field of schema.required ?? []) {
+    if (!(field in result)) errors.push(`missing required field: ${field}`);
+  }
+
+  if (result.schema !== schema.id) {
+    errors.push(`invalid schema: ${result.schema ?? "missing"}`);
+  }
+
+  const validVerdicts = new Set(contract.stepVerdicts ?? defaultContract.stepVerdicts);
+  if (!validVerdicts.has(result.verdict)) {
+    errors.push(`invalid verdict: ${result.verdict ?? "missing"}`);
+  }
+
+  if (!Array.isArray(result.agent_ids) || result.agent_ids.length === 0) {
+    errors.push("agent_ids must be a non-empty array");
+  }
+
+  if (!Array.isArray(result.evidence)) {
+    errors.push("evidence must be an array");
+  } else {
+    validateEvidence(result.evidence, contract, errors);
+  }
+
+  if (!Array.isArray(result.artifacts)) {
+    errors.push("artifacts must be an array");
+  }
+
+  validateModelProvenance(result, errors);
+  validateBlockerQuestion(result, errors);
+
+  const policyDecision = result.policy_decision ?? null;
+  if (!policyDecision && stepRequiresPolicyDecision(step)) {
+    errors.push("policy_decision is required for policy decision gates");
+  }
+  if (policyDecision) {
+    const validPolicyDecisions = new Set(contract.policyDecisions ?? defaultContract.policyDecisions);
+    if (!validPolicyDecisions.has(policyDecision)) {
+      errors.push(`invalid policy_decision: ${policyDecision}`);
+    }
+  }
+
+  const gatePassed =
+    errors.length === 0 &&
+    verdictPasses(result, step, contract, errors, warnings) &&
+    policyDecisionPasses(policyDecision, step);
+
+  return {
+    ok: errors.length === 0,
+    gatePassed,
+    verdict: result.verdict ?? null,
+    policyDecision,
+    errors,
+    warnings,
+  };
+}
+
+export function strongestEvidenceRung(evidence = []) {
+  let strongest = null;
+  let rank = -1;
+  for (const item of evidence) {
+    const itemRank = evidenceRank.get(item?.rung) ?? -1;
+    if (itemRank > rank) {
+      strongest = item?.rung ?? null;
+      rank = itemRank;
+    }
+  }
+  return strongest;
+}
+
+export function formatStepResultValidation(validation) {
+  if (validation.gatePassed) return "step result gate: PASS";
+  const lines = [`step result gate: BLOCKED (${validation.verdict ?? "no verdict"})`];
+  for (const error of validation.errors) lines.push(`- error: ${error}`);
+  for (const warning of validation.warnings) lines.push(`- warning: ${warning}`);
+  return lines.join("\n");
+}
+
+function validateEvidence(evidence, contract, errors) {
+  const validRungs = new Set(contract.evidenceRungs ?? defaultContract.evidenceRungs);
+  for (const [index, item] of evidence.entries()) {
+    if (!isPlainObject(item)) {
+      errors.push(`evidence[${index}] must be an object`);
+      continue;
+    }
+    if (!validRungs.has(item.rung)) errors.push(`evidence[${index}] has invalid rung: ${item.rung}`);
+    if (!item.source) errors.push(`evidence[${index}] missing source`);
+    if (!item.ref) errors.push(`evidence[${index}] missing ref`);
+    if (!item.result) errors.push(`evidence[${index}] missing result`);
+  }
+}
+
+function verdictPasses(result, step, contract, errors, warnings) {
+  const declaredPassVerdicts = passVerdictsForStep(step);
+  if (!declaredPassVerdicts.has(result.verdict)) {
+    errors.push(`verdict ${result.verdict} is not allowed by pass_verdicts: ${[...declaredPassVerdicts].join(", ")}`);
+    return false;
+  }
+
+  if (result.verdict === "PASS") {
+    return passEvidenceRule(result, step, errors);
+  }
+
+  if (result.verdict === "SKIPPED") {
+    if (step?.gate?.allow_skip !== true) {
+      errors.push("SKIPPED is allowed only when the step gate declares allow_skip: true");
+      return false;
+    }
+    if (step.gate.skip_requires && result.skip_condition !== step.gate.skip_requires) {
+      errors.push(`SKIPPED must cite skip_condition: ${step.gate.skip_requires}`);
+      return false;
+    }
+    const evidenceOk = skipEvidenceRule(result, step, contract, errors);
+    if (evidenceOk) warnings.push("SKIPPED passed only through an explicit workflow skip gate");
+    return evidenceOk;
+  }
+
+  errors.push(`verdict ${result.verdict} is listed in pass_verdicts but cannot pass this runtime gate`);
+  return false;
+}
+
+function passVerdictsForStep(step) {
+  const declared = Array.isArray(step?.gate?.pass_verdicts) ? step.gate.pass_verdicts : [];
+  return new Set(declared.length ? declared : ["PASS"]);
+}
+
+function skipEvidenceRule(result, step, contract, errors) {
+  const skipCondition = step?.gate?.skip_requires ?? result.skip_condition ?? null;
+  if (!skipCondition) {
+    errors.push("SKIPPED must cite a registered skip_condition");
+    return false;
+  }
+
+  const skipConditions = contract.skipConditions ?? defaultContract.skipConditions;
+  const rule = skipConditions?.[skipCondition] ?? null;
+  if (!rule) {
+    errors.push(`SKIPPED cites unknown skip_condition: ${skipCondition}`);
+    return false;
+  }
+
+  const required = Array.isArray(rule.requiresEvidence) ? rule.requiresEvidence : [];
+  if (!required.length) return true;
+
+  const covered = new Set();
+  for (const item of result.evidence ?? []) {
+    const explicit = [
+      item?.evidence_type,
+      item?.evidence_token,
+      item?.skip_evidence,
+      ...(Array.isArray(item?.covers) ? item.covers : []),
+    ].filter(Boolean);
+    for (const token of explicit) covered.add(String(token));
+
+    const text = `${item?.source ?? ""} ${item?.ref ?? ""} ${item?.result ?? ""}`;
+    for (const token of required) {
+      if (tokenMentioned(text, token)) covered.add(token);
+    }
+  }
+
+  let ok = true;
+  for (const token of required) {
+    if (!covered.has(token)) {
+      errors.push(`SKIPPED ${skipCondition} requires evidence token: ${token}`);
+      ok = false;
+    }
+  }
+  return ok;
+}
+
+function tokenMentioned(text, token) {
+  const escaped = escapeRegExp(String(token));
+  return new RegExp(`(^|[^A-Za-z0-9_-])${escaped}([^A-Za-z0-9_-]|$)`, "i").test(String(text ?? ""));
+}
+
+function passEvidenceRule(result, step, errors) {
+  const strongest = strongestGateEvidenceRung(result.evidence);
+  const required = step?.gate?.require_evidence_rung ?? null;
+
+  if (required) {
+    const requiredRank = evidenceRank.get(required) ?? Number.POSITIVE_INFINITY;
+    const strongestRank = evidenceRank.get(strongest) ?? -1;
+    if (strongestRank < requiredRank) {
+      errors.push(`PASS requires evidence rung ${required} or stronger`);
+      return false;
+    }
+    return true;
+  }
+
+  if (strongest !== "ran" && strongest !== "verified") {
+    errors.push("PASS requires ran or verified evidence unless the step declares a stronger specific requirement");
+    return false;
+  }
+  return true;
+}
+
+function strongestGateEvidenceRung(evidence = []) {
+  let strongest = null;
+  let rank = -1;
+  for (const item of evidence) {
+    const rung = gateEvidenceRung(item);
+    const itemRank = evidenceRank.get(rung) ?? -1;
+    if (itemRank > rank) {
+      strongest = rung;
+      rank = itemRank;
+    }
+  }
+  return strongest;
+}
+
+function gateEvidenceRung(item) {
+  if (
+    nonExecutingEvidenceSources.has(item?.source) &&
+    (item?.rung === "ran" || item?.rung === "verified")
+  ) {
+    return "written";
+  }
+  return item?.rung ?? null;
+}
+
+function policyDecisionPasses(policyDecision, step) {
+  if (!policyDecision) return true;
+  const passDecisions = new Set(step?.gate?.pass_decisions ?? ["ALLOW"]);
+  return passDecisions.has(policyDecision);
+}
+
+function stepRequiresPolicyDecision(step) {
+  const gate = step?.gate ?? {};
+  return Boolean(
+    gate.pass_decisions?.length ||
+      gate.approval_decisions?.length ||
+      gate.block_decisions?.length ||
+      Object.keys(gate.on_policy_decision ?? {}).length,
+  );
+}
+
+// Optional, additive model-provenance fields stamped by the coordinator. Absence is
+// valid (backward compatible); when present they must be well-typed.
+function validateModelProvenance(result, errors) {
+  if ("model_requested" in result && result.model_requested != null && typeof result.model_requested !== "string") {
+    errors.push("model_requested must be a string or null when present");
+  }
+  if ("model_resolved" in result && typeof result.model_resolved !== "string") {
+    errors.push("model_resolved must be a string when present");
+  }
+  if ("model_fallback" in result && typeof result.model_fallback !== "boolean") {
+    errors.push("model_fallback must be a boolean when present");
+  }
+}
+
+// Optional, additive blocker prompt metadata. It is used only when the workflow
+// branches to stop_for_user_question; ordinary historical blockers without this
+// object remain valid.
+function validateBlockerQuestion(result, errors) {
+  for (const field of ["blocker_question", "awaiting_user_input"]) {
+    if (!(field in result) || result[field] == null) continue;
+    const value = result[field];
+    if (!isPlainObject(value)) {
+      errors.push(`${field} must be an object when present`);
+      continue;
+    }
+    if (typeof value.question !== "string" || !value.question.trim()) {
+      errors.push(`${field}.question must be a non-empty string`);
+    }
+    if ("options" in value) {
+      if (!Array.isArray(value.options)) {
+        errors.push(`${field}.options must be an array when present`);
+      } else {
+        if (value.options.length < 1 || value.options.length > 3) {
+          errors.push(`${field}.options must contain 1-3 strings`);
+        }
+        for (const [index, option] of value.options.entries()) {
+          if (typeof option !== "string" || !option.trim()) {
+            errors.push(`${field}.options[${index}] must be a non-empty string`);
+          }
+        }
+      }
+    }
+    if ("allow_free_text" in value && value.allow_free_text !== true) {
+      errors.push(`${field}.allow_free_text must be true when present`);
+    }
+  }
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}

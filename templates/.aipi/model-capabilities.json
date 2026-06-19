@@ -1,0 +1,33 @@
+{
+  "schema": "aipi.model-capabilities.v1",
+  "classes": {
+    "orchestrator-heavy": "anthropic/claude-opus-4-8",
+    "planner-heavy": "anthropic/claude-opus-4-8",
+    "adversarial-heavy": "anthropic/claude-opus-4-8",
+    "research-heavy": "anthropic/claude-opus-4-8",
+    "code-strong": "anthropic/claude-opus-4-8",
+    "test-strong": "anthropic/claude-opus-4-8",
+    "context-fast": "anthropic/claude-opus-4-8",
+    "verifier-fast": "anthropic/claude-opus-4-8"
+  },
+  "models": {
+    "anthropic:claude-opus-4-8": {
+      "capabilities": {
+        "reasoning": "frontier",
+        "coding": "frontier",
+        "summarization": "high",
+        "context": "very_high",
+        "tool_use": "write_capable",
+        "structured_outputs": "supported",
+        "web": "supported",
+        "citations": "supported",
+        "evidence_audit": "supported"
+      },
+      "evidence": [
+        "Pi SDK Anthropic default/fallback model id; verified in the installed SDK model resolver and local ~/.pi/agent/settings.json.",
+        "AIPI beta default binds every class to a concrete Anthropic model; override with AIPI_MODEL_CLASS_* or .aipi/model-capabilities.json when a cheaper/faster class-specific model is available."
+      ]
+    }
+  },
+  "rule": "Classes must bind to concrete provider/model selections and models must carry capability evidence. AIPI treats missing mappings or missing capabilities as a readiness blocker before beta/adversarial-review claims. Defaults are overridable by AIPI_MODEL_CLASS_* env vars and project .aipi/model-capabilities.json."
+}

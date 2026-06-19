@@ -1,0 +1,395 @@
+{
+  "version": 1,
+  "name": "aipi-runtime-contract",
+  "status": "alpha_runtime_partial",
+  "canonicalStages": [
+    "init",
+    "backlog",
+    "intake",
+    "requirements",
+    "rule-check",
+    "planning",
+    "research",
+    "context",
+    "tdd",
+    "implementation-plan",
+    "implementation",
+    "execution-review",
+    "local-verification",
+    "blast-radius",
+    "review",
+    "fix",
+    "tests",
+    "final-verification",
+    "deployment-plan",
+    "homolog",
+    "human-review",
+    "prod",
+    "ops",
+    "memory-promotion"
+  ],
+  "stageSelectors": [
+    "any"
+  ],
+  "deprecatedStageAliases": {
+    "entendimento": "requirements",
+    "planejamento": "planning",
+    "review-execucao": "execution-review",
+    "testes": "tests",
+    "blast radius": "blast-radius",
+    "adversarial-review": "review"
+  },
+  "stepVerdicts": [
+    "PASS",
+    "FAIL",
+    "SKIPPED",
+    "BLOCKED",
+    "BLOCKED_TO_PLANNING"
+  ],
+  "policyDecisions": [
+    "ALLOW",
+    "BLOCK",
+    "HUMAN_REVIEW_REQUIRED"
+  ],
+  "terminalActions": [
+    "stop",
+    "stop_for_user_question",
+    "stop_for_human_approval",
+    "escalate_to_human",
+    "escalate_to_planning"
+  ],
+  "evidenceRungs": [
+    "written",
+    "ran",
+    "verified",
+    "blocked"
+  ],
+  "skipConditions": {
+    "explicit_tdd_waiver": {
+      "owner": "workflow-tdd-gate",
+      "requiresEvidence": [
+        "contract",
+        "reason"
+      ],
+      "definition": "Allowed only when the accepted BDD contract is mechanics-only, non-code, or otherwise not representable as an automated or manual verification contract."
+    },
+    "no_actionable_findings": {
+      "owner": "review_swarm",
+      "requiresEvidence": [
+        "review_artifacts"
+      ],
+      "definition": "All required review artifacts exist and contain no critical, high, or explicitly actionable findings."
+    },
+    "no_deployment_surface": {
+      "owner": "workflow-cicd",
+      "requiresEvidence": [
+        "changed_surface"
+      ],
+      "definition": "The accepted change has no deployable, published, environment, or release surface."
+    },
+    "no_durable_memory_signal": {
+      "owner": "knowledge-curator",
+      "requiresEvidence": [
+        "memory_candidate_scan"
+      ],
+      "definition": "The run produced no reusable business rule, decision, environment, procedure, deployment, glossary, agent, or user-preference update."
+    },
+    "no_external_unknowns": {
+      "owner": "project-researcher",
+      "requiresEvidence": [
+        "context_packet"
+      ],
+      "definition": "Planning does not depend on current external facts or unknown third-party behavior."
+    },
+    "not_homolog_or_no_ui_flow": {
+      "owner": "workflow-dev-reviewer",
+      "requiresEvidence": [
+        "ops_classification"
+      ],
+      "definition": "The target is not staging/homolog or the change has no UI/user-flow surface requiring browser evidence."
+    },
+    "no_internal_context": {
+      "owner": "context-curator",
+      "requiresEvidence": [
+        "scope"
+      ],
+      "definition": "The research question has no relevant repository, memory, code graph, decision, or prior-run context."
+    },
+    "no_external_research_needed": {
+      "owner": "project-researcher",
+      "requiresEvidence": [
+        "scope",
+        "context_packet"
+      ],
+      "definition": "The answer can be produced from project-local evidence and does not depend on current external facts."
+    }
+  },
+  "runLimits": {
+    "maxTotalStepVisits": 40,
+    "maxVisitsPerStep": 4,
+    "maxConsecutiveFailures": 3,
+    "onExhaustion": "escalate_to_human"
+  },
+  "stepResultSchema": {
+    "id": "aipi.step-result.v1",
+    "required": [
+      "schema",
+      "step_id",
+      "agent_ids",
+      "verdict",
+      "evidence",
+      "artifacts"
+    ],
+    "optional": [
+      "model_requested",
+      "model_resolved",
+      "model_fallback",
+      "model_warning",
+      "blocker_question",
+      "awaiting_user_input"
+    ],
+    "verdictRule": "Only PASS satisfies a normal gate. FAIL, BLOCKED, and BLOCKED_TO_PLANNING never pass. SKIPPED passes only when the step declares allow_skip: true.",
+    "evidenceRule": "A PASS result needs at least one evidence item with rung ran or verified unless the gate explicitly allows written evidence.",
+    "blockerQuestionRule": "When a step returns a blocker that routes to stop_for_user_question, it may include blocker_question: { question: string, options: 1-3 distinct short strings ordered best-first, allow_free_text: true }. The runtime persists these fields under awaiting_user_input and older blockers without options remain valid.",
+    "policyRule": "Workflow policy gates need policy_decision. HUMAN_REVIEW_REQUIRED and BLOCK stop execution at the workflow boundary. Parent-session permission profiles and tool-call approval gates are intentionally absent."
+  },
+  "runState": {
+    "runIdRule": "Runtime allocates a unique run_id before workflow start. Templates must not default to active for write paths.",
+    "contractPathRule": "contract_path must derive from run_id unless the user explicitly imports an external contract.",
+    "awaitingUserInputSchema": {
+      "question": "string",
+      "options": "optional 1-3 short strings ordered best-first",
+      "allow_free_text": true
+    },
+    "userInputPathRule": "When a blocked run is awaiting_user_input and the interactive picker records an answer, the runtime appends it to .aipi/runtime/runs/{{ run_id }}/USER-INPUT.jsonl before re-executing the blocked step. Headless free text is not silently consumed; the textual prompt is shown and the message continues to the model."
+  },
+  "artifactPolicy": {
+    "root": ".aipi/runtime/runs/{{ run_id }}",
+    "stepNamespace": ".aipi/runtime/runs/{{ run_id }}/steps/{{ step_id }}",
+    "noOverwrite": true,
+    "sharedArtifacts": [
+      "RUN-MANIFEST.md",
+      "BDD-CONTRACT.md"
+    ],
+    "sharedWriter": "bdd-orchestrator",
+    "sharedField": "controller_updates"
+  },
+  "contextMaterialization": {
+    "contextFromRule": "context_from references step ids. Runtime injects each referenced step's structured result summary first, then bounded artifact excerpts selected by context-curator.",
+    "maxArtifactsPerStep": 4,
+    "maxExcerptLinesPerArtifact": 80,
+    "missingArtifactRule": "A declared produces path missing at step end forces FAIL unless the step result marks that artifact as skipped with an allowed skip condition.",
+    "tokenBudgetRule": "Each agent class may set a budget; context-curator prunes by BDD rule relevance, owned files, recent failures, and evidence rung.",
+    "userInputRule": "Context packets include recent run USER-INPUT.jsonl records so business-rule blocker answers are available when the blocked step resumes."
+  },
+  "modelRouting": {
+    "modelClassesPath": ".aipi/model-classes.yaml",
+    "modelCapabilitiesPath": ".aipi/model-capabilities.json",
+    "readinessCheck": "model.capability_floors",
+    "capabilityFloorRule": "Every model class in .aipi/model-classes.yaml declares the floor it needs. Before beta/adversarial-review readiness, .aipi/model-capabilities.json must map each class to a configured provider/model and provide capability evidence for that model. Missing mappings, missing model capability entries, or unmet floors are local blockers, not external evidence gaps.",
+    "hostFallbackRule": "For local interactive worker execution, an unbound model_class falls back by default to the current host session model captured by lifecycle model_select/session_start/before_agent_start into SubagentCoordinator.setHostModel, then passes that real model into createAgentSession. Capture reads routing.model first, then defensive event/ctx shapes including event.model.id, ctx.model, and ctx.getModel(). Set allow_fallback:false to fail loud instead. Provenance must record model_resolved as the real host model id, not the host-default sentinel."
+  },
+  "codeGraph": {
+    "manifestPath": ".aipi/state/aipi-graph.json",
+    "sqlitePath": ".aipi/state/aipi-graph.sqlite",
+    "source": "sqlite+sqlite-vec+lexical",
+    "vectorStatus": "implemented_optional_sqlite_vec_extension_with_ollama_embeddings",
+    "vectorDimensions": 768,
+    "semanticConfigPath": ".aipi/semantic-memory.json",
+    "embeddingBackend": "ollama",
+    "embeddingModel": "nomic-embed-text",
+    "relationshipStatus": "implemented_rebuildable_edges",
+    "relationshipKinds": [
+      "defines",
+      "test_covers",
+      "mentions_file",
+      "mentions_symbol",
+      "business_rule_impacts_code",
+      "business_rule_conflicts",
+      "business_rule_implements_code",
+      "business_rule_relates_rule",
+      "business_rule_decided_by",
+      "decision_references_rule",
+      "decision_references_code",
+      "decision_references_test",
+      "bdd_contract_impacts_code",
+      "deployment_impacts_code",
+      "run_references_rule",
+      "run_verifies_rule",
+      "run_fails_rule",
+      "run_blocks_rule",
+      "run_skips_rule",
+      "run_outcome_impacts_code"
+    ],
+    "rule": "The code graph is rebuildable cache, not authority. AIPI writes a JSON manifest plus a node:sqlite sidecar for files, symbols, searchable code lines, relationship edges, run outcome summaries, and sqlite-vec code-line vectors when the platform extension loads. When sqlite-vec and local Ollama are available, vectors use 768-dimensional nomic-embed-text embeddings. Semantic-only search fails loudly if Ollama or nomic-embed-text is unavailable, while aipi_callers and aipi_impact continue through SQLite lexical or file lexical fallback. Rebuildable domain edges connect accepted business rules, BDD contracts, deployment memory, run artifacts, and source files so impact tools can cite business-rule and deployment context. Historical run artifacts distinguish PASS, FAIL, BLOCKED, and SKIPPED outcomes when linking runs back to business rules and impacted code. Domain edge inference canonicalizes deterministic PT/EN aliases and explicit source path references before falling back to token overlap, and records conservative implicit preserve-vs-replace, allow-vs-deny, required-vs-optional, automatic-vs-manual, numeric-mismatch, monetary-mismatch, threshold-direction-mismatch, or sequence-mismatch business-rule conflicts when related rules share enough canonical domain terms. If SQLite or sqlite-vec is unavailable, callers/impact tools fall back to SQLite lexical or file lexical scans plus manifest relationships. Markdown remains authoritative over generated index data."
+  },
+  "enforcementLevels": {
+    "prompt_only": "Instruction exists, but no runtime block exists.",
+    "runtime_gate": "Pi extension can block, mutate, branch, or require approval.",
+    "tool_enforced": "A tool_call hook or tool override blocks the unsafe action inside the current Pi process before that tool call executes. This is not a security boundary.",
+    "externally_contained": "Execution is isolated by a container, VM, micro-VM, remote sandbox, least-privilege credentials, or equivalent boundary outside the Pi process."
+  },
+  "agentRuntimes": [
+    "controller",
+    "skill",
+    "session"
+  ],
+  "runtimeFit": {
+    "subagentRule": "Pi has no native subagent lifecycle. AIPI workers run through the single AIPI-owned forked pi-subagents runtime behind the stable aipi_* tool surface.",
+    "skillRule": "Read-only, single-shot, or lifecycle discipline roles should prefer native Pi Skills before becoming spawned sessions.",
+    "toolScopeRule": "pi.setActiveTools is session-wide. Use it at spawned-session setup or restore carefully; use tool_call for per-call stage policy.",
+    "mutationQueueRule": "withFileMutationQueue protects mutations inside one runtime. Cross-session/process safety requires orchestrator-owned file allocation, worker-local ownership checks through wrapped write tools, and a shared lock registry.",
+    "communityBackendRule": "Community swarm packages may back session-agent lifecycle or messaging, but AIPI owns BDD gates, policy decisions, memory promotion, and workflow state."
+  },
+  "subagentBackendOptions": {
+    "preferredSpike": "pi_subagents",
+    "spawnBackends": [
+      "pi_subagents"
+    ],
+    "coordinationTransports": [],
+    "stableToolSurface": [
+      "aipi_spawn_agent",
+      "aipi_agent_status",
+      "aipi_collect_agent",
+      "aipi_cancel_agent",
+      "aipi_cleanup_agents",
+      "aipi_steer_agent"
+    ],
+    "eventEntry": "aipi.subagents.event",
+    "budgetRule": "Worker descriptors may set budget.timeout_ms, timeoutMs, max_runtime_ms, maxRuntimeMs, max_tool_calls, or maxToolCalls. The coordinator aborts the forked runtime on timeout with abort_reason=budget_timeout and fails a completed worker whose reported tool_call_count exceeds max_tool_calls with abort_reason=budget_max_tool_calls. State, counters, and aipi.subagents.event traces are persisted.",
+    "toolTraceRule": "The forked runtime reports aggregate tool_call_count and AIPI records it on status, step_result provenance, and lifecycle traces without persisting tool inputs or content.",
+    "lifecycleTraceRule": "Workers emit queued, started, aipi_forked_subagent_start, worker_prompt_start, worker_prompt_end, aipi_forked_subagent_end, done/failed/cancelled, and worker_cleanup events with elapsed_ms, prompt_elapsed_ms, budget, model provenance, runtime_root, and tool-call counters where available.",
+    "workerProviderRule": "Forked workers run through the host Pi runtime with the AIPI provider extension loaded by the wrapper. The coordinator passes the captured host-scoped model into the forked runtime, strips fallbackModels, limits availableModels to configured in-scope host providers, and rejects out-of-scope providers such as bedrock before owned-file allocation. Child sessions receive read/grep/find/ls as built-ins and AIPI's guarded write extension, not the unguarded builtin write.",
+    "hostModelFallbackRule": "When a spawn descriptor has an unresolved or unknown model_class and fallback is allowed, AIPI prefers the model captured in SubagentCoordinator.getHostModel from lifecycle model_select/session_start/before_agent_start, then falls back to tool-call ctx.model fields. aipi_agent_status and step_result provenance show model_requested, model_resolved as the real host model id, model_fallback=true, and a warning such as running on host model <id> (class <name> unbound). allow_fallback:false rejects the spawn before owned-file allocation. Provider-qualified resolved models may use in-scope host providers such as Anthropic, OpenAI, or Codex; bedrock, DeepSeek, GLM, Zai, and other out-of-scope providers are rejected.",
+    "piSubagentsPhaseOneRule": "pi-subagents source is forked from pi-subagents@0.28.0 under extensions/aipi/runtime/vendor/pi-subagents with LICENSE and VENDOR.md. The npm package pi-subagents is not a dependency or optionalDependency, there is no separately-loaded pi-subagents extension, and no backend-selection environment flag exists. AIPI owns runtime/pi-subagents.js, calls the vendored runSync entrypoint through jiti, writes agent/sessions/artifacts/results under .aipi/runtime/subagents, disables fallbackModels, passes AIPI_SUBAGENTS_PROJECT_ROOT/AIPI_SUBAGENTS_AGENT_ID/AIPI_SUBAGENTS_OWNED_FILES into the child, loads extensions/aipi/runtime/aipi-guarded-write-child.js as the worker write tool, and exposes the stable aipi_* tool surface by default. Non-auth utility deps kept are jiti@2.7.0 for loading the vendored TS runSync path and typebox@1.2.16 for the vendored structured-output validator; @earendil-works/pi-tui is not a direct AIPI dependency because the TUI extension surface is no longer loaded. Live provider-inheritance proof is manual: start a real AIPI/Pi session via `aipi` with provider auth/model selected, then run `/aipi-pi-subagents-spike`. GO requires assistant_text_ok=true for the child worker's OK reply, provider_event_observed=true from .aipi/runtime/provider-events.jsonl, project-scoped .aipi/runtime/subagents writes, and no bedrock/non-host provider attempt.",
+    "cleanupRule": "aipi_cleanup_agents applies retention cleanup only to terminal workers, releases owned-file allocations, emits a cleanup trace, returns aipi.subagents.cleanup.v1, and never deletes durable project/user memory.",
+    "steeringRule": "aipi_steer_agent is registered but returns accepted=false with an explicit reason until worker prompt/response boundaries are resumable.",
+    "redispatchRule": "Workflow adapters call coordinator.dispatch(descriptor). If a restored interrupted worker matches step_id, catalog agent id, and owned_files, the coordinator marks the old worker redispatched, releases its owned-file allocation, and spawns a fresh worker from the current descriptor/context.",
+    "criterionZero": "Probe A's host tool_call hooks observed zero worker calls, but live Round 29 evidence proved the forked pi-subagents runtime can spawn real workers through the host Pi/Anthropic OAuth path. AIPI now wraps that single runtime with owned-file allocation, no-shell worker policy, timeout/tool-count budgets, model provenance, and project-scoped runtime directories. The worker toolset remains read/grep/find/ls/write; bash/edit are absent from AIPI worker configuration. Probe A tested host tool_call attribution, a mechanism the design no longer relies on."
+  },
+  "aipiToolSurface": {
+    "rule": "Every aipi_* tool referenced by agents/catalog.yaml must be implemented in the AIPI Pi extension or explicitly listed as specificationOnly for a future surface. The validator fails on silent catalog/runtime drift.",
+    "implemented": [
+      "aipi_spawn_agent",
+      "aipi_agent_status",
+      "aipi_collect_agent",
+      "aipi_cancel_agent",
+      "aipi_cleanup_agents",
+      "aipi_steer_agent",
+      "aipi_memory_query",
+      "aipi_rule_lookup",
+      "aipi_rule_gap",
+      "aipi_callers",
+      "aipi_impact",
+      "aipi_semantic_search",
+      "aipi_kanban_update",
+      "aipi_promote_memory"
+    ],
+    "specificationOnly": []
+  },
+  "lifecycleHooks": {
+    "implementationPath": "extensions/aipi/runtime/lifecycle-hooks.js",
+    "verifiedHooks": [
+      "session_start",
+      "session_shutdown",
+      "before_agent_start",
+      "session_before_switch",
+      "session_before_fork",
+      "session_before_compact",
+      "session_before_tree",
+      "session_compact",
+      "session_tree",
+      "input",
+      "context",
+      "model_select",
+      "thinking_level_select",
+      "user_bash",
+      "tool_result",
+      "before_provider_request",
+      "after_provider_response"
+    ],
+    "declaredPromptOnlyHooks": [
+      {
+        "hook": "agent_end",
+        "status": "prompt_only",
+        "usedBy": [
+          "finish-turn",
+          "outcome-first"
+        ],
+        "source": "templates/.aipi/protocols/runtime-hooks.md"
+      },
+      {
+        "hook": "turn_end",
+        "status": "prompt_only",
+        "usedBy": [
+          "finish-turn",
+          "outcome-first"
+        ],
+        "source": "templates/.aipi/protocols/runtime-hooks.md"
+      },
+      {
+        "hook": "message_end",
+        "status": "prompt_only",
+        "usedBy": [
+          "prove-it",
+          "outcome-first"
+        ],
+        "source": "templates/.aipi/protocols/runtime-hooks.md"
+      }
+    ],
+    "lifecycleLog": ".aipi/runtime/lifecycle.jsonl",
+    "contextEventLog": ".aipi/runtime/context-events.jsonl",
+    "subagentRestoreEntry": "aipi.subagents.restore",
+    "inputRouteEntry": "aipi.input.route",
+    "toolResultLog": ".aipi/runtime/tool-results.jsonl",
+    "modelRoutingLog": ".aipi/runtime/model-routing.jsonl",
+    "providerEventLog": ".aipi/runtime/provider-events.jsonl",
+    "providerUsageLog": ".aipi/runtime/provider-usage.jsonl",
+    "providerBudgetLog": ".aipi/runtime/provider-budget.jsonl",
+    "providerPricingConfig": ".aipi/provider-pricing.json",
+    "providerBudgetConfig": ".aipi/provider-budget.json",
+    "handoffArtifact": ".aipi/runtime/runs/{{ run_id }}/SESSION-HANDOFF.md",
+    "providerPayloadPolicy": "before_provider_request redacts obvious secret patterns and prunes duplicate/oversized AIPI context messages before returning the replacement payload to Pi.",
+    "compactionSummarySchema": "aipi.compaction-summary.v1",
+    "rule": "Lifecycle hooks preserve active run pointers across session transitions, restore the latest aipi.subagents.state snapshot on session_start by marking queued/running workers interrupted, route recognized natural-language input through AIPI workflow commands before the agent turn, render the blocked-run picker with ctx.ui.select/ctx.ui.input when awaiting_user_input.options exists and ctx.hasUI is true, record picker answers before resuming awaiting_user_input runs, fall back to a visible textual prompt without swallowing headless free text, provide AIPI compaction summaries for active runs, inject and prune compact AIPI context pointers before provider calls, resolve model_select and thinking_level_select from event model_class, event agent_id, or the active workflow step using explicit env overrides, .aipi/model-capabilities.json class mappings, current-session models, and thinking-level policy, record manual model drift and unresolved class-only routes in .aipi/runtime/model-routing.jsonl, apply provider payload redaction/pruning before model calls, observe user_bash discipline hooks without blocking user commands through a permission policy, normalize provider token/cost usage when metadata is available, estimate missing cost only from fresh .aipi/provider-pricing.json rates that include source_url and checked_at metadata, report optional provider budget state from .aipi/provider-budget.json, record cost_unknown instead of zero spend when token usage has no provider cost or fresh local rate, and normalize tool/provider evidence without storing provider payloads or secrets. declaredPromptOnlyHooks records discipline hook names that are known from runtime-hooks.md but not implemented in verifiedHooks; they remain prompt_only until the runtime registers them."
+  },
+  "isolationModel": {
+    "v1": "pi_subagents",
+    "singleWorkerRuntime": "pi_subagents",
+    "projectRuntimeRoot": ".aipi/runtime/subagents",
+    "deferred": [],
+    "failClosedRule": "Any worker descriptor requesting an isolation other than pi_subagents is rejected before owned-file allocation instead of silently downgrading. Workers always run with cwd set to the project root and runtime paths under .aipi/runtime/subagents.",
+    "rule": "AIPI has one worker runtime: the AIPI-owned fork of pi-subagents. It is not an npm dependency, not loaded as a separate Pi extension, and not selected by an environment flag. AIPI supervises spawn/status/collect/cancel/cleanup/steer, owned-file allocation, timeout/tool-count budgets, model provenance, no-shell policy, and project-scoped runtime directories around the fork."
+  },
+  "workerToolPolicy": {
+    "singleWorktreeSessionAgents": {
+      "denyTools": [
+        "bash",
+        "user_bash"
+      ],
+      "unknownToolDefault": "BLOCK",
+      "shellRule": "Forked pi_subagents workers do not receive opaque shell tools from AIPI. Shell, build, format, test, and codegen commands run in serialized controller/skill steps, not inside spawned AIPI workers."
+    }
+  },
+  "providerAuth": {
+    "anthropic": {
+      "providerId": "anthropic",
+      "package": "@ersintarhan/pi-toolkit",
+      "version": "0.5.12",
+      "extensionPath": "./extensions/aipi/provider/anthropic-oauth-only.ts",
+      "adapterImport": "../../../node_modules/@ersintarhan/pi-toolkit/src/claude-oauth-adapter.ts",
+      "loginCommand": "/login anthropic",
+      "sidecarPath": "~/.pi/agent/auth.json",
+      "sidecarEnvOverride": "PI_CODING_AGENT_DIR",
+      "autoloadScope": "anthropic-oauth-only",
+      "blockedAutoloadPath": "./node_modules/@ersintarhan/pi-toolkit/index.ts",
+      "adapterTransitiveBehavior": {
+        "identityBlock": "The upstream adapter removes any system block equal to the Claude Code identity text before Anthropic OAuth requests.",
+        "billingHeader": "The upstream adapter preserves an existing x-anthropic-billing-header system text block or injects a synthetic one when absent.",
+        "docsContext": "The upstream adapter can strip and re-inject Pi docs context around Anthropic OAuth provider requests.",
+        "reviewRule": "Before package bumps, review src/claude-oauth-adapter.ts for identity-block, billing-header, docs-context, before_provider_request, and provider hook changes; docs/anthropic-auth-integration.md must disclose these transitive request mutations."
+      },
+      "rule": "AIPI keeps @ersintarhan/pi-toolkit pinned as the upstream source of the Anthropic OAuth adapter, but does not autoload the package's broad index.ts by default. The default provider extension is an AIPI-owned wrapper that imports only src/claude-oauth-adapter.ts. The wrapper intentionally inherits the adapter's disclosed Claude Code identity-block handling, x-anthropic-billing-header injection/preservation, Pi docs context handling, and provider hook mutations. AIPI still owns model-class routing, workflow gates, memory, and policy."
+    }
+  }
+}

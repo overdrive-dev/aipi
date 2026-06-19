@@ -1,0 +1,81 @@
+{
+  "name": "aipi-templates",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "aipi": "./bin/aipi.js"
+  },
+  "keywords": [
+    "pi-package",
+    "aipi",
+    "bdd",
+    "agent-orchestration"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/aipi/provider/anthropic-oauth-only.ts",
+      "./extensions/aipi/index.js"
+    ]
+  },
+  "overrides": {
+    "protobufjs": "7.6.4",
+    "ws": "8.21.0"
+  },
+  "files": [
+    "bin/**",
+    "extensions/**",
+    "templates/**",
+    "docs/**",
+    "NOTICE.md"
+  ],
+  "scripts": {
+    "validate": "node tools/validate-aipi-templates.mjs",
+    "test:init": "node tools/test-project-init.mjs",
+    "test:owned-files": "node tools/test-owned-files.mjs",
+    "test:bin": "node tools/test-aipi-bin.mjs",
+    "test:mcp": "node tools/test-mcp-bridge.mjs",
+    "test:update": "node tools/test-aipi-update.mjs",
+    "test:onboarding": "node tools/test-project-onboarding.mjs",
+    "test:provider-auth": "node tools/test-provider-auth.mjs",
+    "test:permission-removal": "node tools/test-permission-removal.mjs",
+    "test:lifecycle-hooks": "node tools/test-lifecycle-hooks.mjs",
+    "test:blocker-picker": "node tools/test-blocker-picker.mjs",
+    "test:provider-pricing": "node tools/test-provider-pricing.mjs",
+    "test:npm-audit-check": "node tools/test-npm-audit-check.mjs",
+    "test:release-check": "node tools/test-release-check.mjs",
+    "test:aipi-tools": "node tools/test-aipi-tools.mjs",
+    "test:context-builder": "node tools/test-context-builder.mjs",
+    "test:model-router": "node tools/test-model-router.mjs",
+    "test:model-class": "node tools/test-model-class-fallback.mjs",
+    "test:diagnose": "node tools/test-diagnose.mjs",
+    "test:probe-a": "node tools/test-probe-a.mjs",
+    "test:probe-a-prime": "node tools/test-probe-a-prime.mjs",
+    "test:subagents": "node tools/test-subagents.mjs",
+    "test:subagents-real-sdk": "node tools/test-subagents-real-sdk.mjs",
+    "test:run-state": "node tools/test-run-state.mjs",
+    "test:workflow-executor": "node tools/test-workflow-executor.mjs",
+    "test:fake-provider-workflows": "node tools/test-fake-provider-workflows.mjs",
+    "test:workflow-fixtures": "node tools/test-workflow-fixtures.mjs",
+    "test:pressure-evals": "node tools/test-pressure-evals.mjs",
+    "test:model-pressure-evals": "node tools/test-model-pressure-evals.mjs",
+    "test:credentialed-readiness": "node tools/test-credentialed-readiness.mjs",
+    "test:adversarial-readiness": "node tools/test-adversarial-readiness.mjs",
+    "test:release-fixture": "node tools/test-release-fixture.mjs",
+    "test:step-result": "node tools/test-step-result.mjs",
+    "test": "npm run validate && npm run test:owned-files && npm run test:bin && npm run test:mcp && npm run test:update && npm run test:init && npm run test:onboarding && npm run test:provider-auth && npm run test:permission-removal && npm run test:lifecycle-hooks && npm run test:blocker-picker && npm run test:provider-pricing && npm run test:npm-audit-check && npm run test:release-check && npm run test:aipi-tools && npm run test:context-builder && npm run test:model-router && npm run test:model-class && npm run test:diagnose && npm run test:probe-a && npm run test:probe-a-prime && npm run test:subagents && npm run test:subagents-real-sdk && npm run test:run-state && npm run test:workflow-executor && npm run test:fake-provider-workflows && npm run test:workflow-fixtures && npm run test:pressure-evals && npm run test:model-pressure-evals && npm run test:credentialed-readiness && npm run test:adversarial-readiness && npm run test:release-fixture && npm run test:step-result",
+    "readiness:credentialed": "node tools/run-credentialed-readiness.mjs",
+    "release:check": "node tools/run-release-check.mjs --strict",
+    "release:audit": "node tools/check-npm-audit.mjs --strict",
+    "smoke:subagent-live": "node tools/smoke-live-subagent.mjs",
+    "smoke:pi-subagents": "node tools/smoke-pi-subagents.mjs"
+  },
+  "dependencies": {
+    "@ersintarhan/pi-toolkit": "0.5.12",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@sinclair/typebox": "^0.34.49",
+    "jiti": "2.7.0",
+    "sqlite-vec": "0.1.9",
+    "typebox": "1.2.16"
+  }
+}

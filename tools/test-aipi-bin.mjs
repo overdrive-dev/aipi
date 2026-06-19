@@ -1,0 +1,456 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import {
+  aipiExtensionPaths,
+  aipiProviderExtensionPaths,
+  buildPiArgs,
+  classifyAipiInvocation,
+  createRawPiSpawnSpec,
+  createPiSpawnSpec,
+  formatAipiHelp,
+  formatAipiVersion,
+  pathCommandCandidates,
+  piCliJsCandidates,
+  parseAipiMemoryArgs,
+  parseAipiOnboardArgs,
+  parseAipiDiagnoseArgs,
+  parseAipiStatusArgs,
+  parseAipiWorkflowArgs,
+  quoteCmdArg,
+  hasAipiMcpConfig,
+  readAipiPackageVersion,
+  readPiVersion,
+  runAipiMemory,
+  runAipiOnboard,
+  runAipiDiagnose,
+  runAipiStatus,
+  runAipiWorkflow,
+} from "../bin/aipi.js";
+
+const packageRoot = path.join("C:", "repo", "aipi");
+const expectedAnthropic = path.join(
+  packageRoot,
+  "extensions",
+  "aipi",
+  "provider",
+  "anthropic-oauth-only.ts",
+);
+const expectedAipi = path.join(packageRoot, "extensions", "aipi", "index.js");
+const expectedMcp = path.join(packageRoot, "extensions", "aipi", "mcp-bridge.js");
+
+assert.deepEqual(
+  aipiExtensionPaths({ packageRoot, cwd: path.join("C:", "repo", "project"), existsSync: () => false }),
+  [expectedAnthropic, expectedAipi],
+);
+assert.deepEqual(
+  aipiExtensionPaths({
+    packageRoot,
+    cwd: path.join("C:", "repo", "project"),
+    existsSync: (candidate) => candidate === path.join("C:", "repo", "project", ".aipi", "mcp.json"),
+  }),
+  [expectedAnthropic, expectedMcp, expectedAipi],
+);
+assert.equal(hasAipiMcpConfig({
+  cwd: path.join("C:", "repo", "project"),
+  existsSync: (candidate) => candidate.endsWith(path.join(".aipi", "mcp.json")),
+}), true);
+assert.deepEqual(aipiProviderExtensionPaths({ packageRoot }), ["./extensions/aipi/provider/anthropic-oauth-only.ts"]);
+
+const customProviderContract = () => JSON.stringify({
+  providerAuth: {
+    custom: {
+      extensionPath: "./node_modules/@scope/custom-provider/index.js",
+    },
+  },
+});
+assert.deepEqual(aipiProviderExtensionPaths({ packageRoot, readFileSync: customProviderContract }), [
+  "./node_modules/@scope/custom-provider/index.js",
+]);
+assert.deepEqual(aipiExtensionPaths({
+  packageRoot,
+  readFileSync: customProviderContract,
+  cwd: path.join("C:", "repo", "project"),
+  existsSync: () => false,
+}), [
+  path.join(packageRoot, "node_modules", "@scope", "custom-provider", "index.js"),
+  expectedAipi,
+]);
+
+const userArgs = ["-p", "hello", "--provider", "openai-codex", "--model", "gpt-5.5"];
+assert.deepEqual(buildPiArgs(userArgs, {
+  packageRoot,
+  cwd: path.join("C:", "repo", "project"),
+  existsSync: () => false,
+}), [
+  "--extension",
+  expectedAnthropic,
+  "--extension",
+  expectedAipi,
+  ...userArgs,
+]);
+
+const cliJs = path.join("C:", "pi", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+const candidates = piCliJsCandidates({
+  env: {
+    AIPI_PI_CLI_JS: cliJs,
+    APPDATA: path.join("C:", "Users", "u", "AppData", "Roaming"),
+    npm_config_prefix: path.join("C:", "npm-prefix"),
+  },
+  homeDir: path.join("C:", "Users", "u"),
+  platform: "win32",
+});
+assert.equal(candidates[0], cliJs);
+assert.ok(candidates.some((candidate) => candidate.endsWith(path.join("npm", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"))));
+
+assert.deepEqual(classifyAipiInvocation([]), { kind: "pass-through" });
+assert.deepEqual(classifyAipiInvocation(["--version"]), { kind: "aipi-version" });
+assert.deepEqual(classifyAipiInvocation(["-v"]), { kind: "aipi-version" });
+assert.deepEqual(classifyAipiInvocation(["--help"]), { kind: "aipi-help" });
+assert.deepEqual(classifyAipiInvocation(["-h"]), { kind: "aipi-help" });
+assert.deepEqual(classifyAipiInvocation(["--pi-version"]), { kind: "raw-pi", args: ["--version"] });
+assert.deepEqual(classifyAipiInvocation(["--pi-help"]), { kind: "raw-pi", args: ["--help"] });
+assert.deepEqual(classifyAipiInvocation(["status", "--json"]), { kind: "aipi-status", args: ["--json"] });
+assert.deepEqual(classifyAipiInvocation(["doctor"]), { kind: "aipi-status", args: [] });
+assert.deepEqual(classifyAipiInvocation(["workflow", "list"]), { kind: "aipi-workflow", args: ["list"] });
+assert.deepEqual(classifyAipiInvocation(["workflows", "status"]), { kind: "aipi-workflow", args: ["status"] });
+assert.deepEqual(classifyAipiInvocation(["profile", "list"]), { kind: "pass-through" });
+assert.deepEqual(classifyAipiInvocation(["profiles", "status"]), { kind: "pass-through" });
+assert.deepEqual(classifyAipiInvocation(["memory", "refs"]), { kind: "aipi-memory", args: ["refs"] });
+assert.deepEqual(classifyAipiInvocation(["memories", "status"]), { kind: "aipi-memory", args: ["status"] });
+assert.deepEqual(classifyAipiInvocation(["onboard", "--no-questions"]), { kind: "aipi-onboard", args: ["--no-questions"] });
+assert.deepEqual(classifyAipiInvocation(["onboarding"]), { kind: "aipi-onboard", args: [] });
+assert.deepEqual(classifyAipiInvocation(["diagnose", "run-1"]), { kind: "aipi-diagnose", args: ["run-1"] });
+assert.deepEqual(classifyAipiInvocation(["diagnostics", "--json"]), { kind: "aipi-diagnose", args: ["--json"] });
+assert.deepEqual(classifyAipiInvocation(["--", "--version"]), { kind: "pass-through" });
+assert.deepEqual(parseAipiStatusArgs(["--target", "project", "--json", "--strict"], { cwd: path.join("C:", "repo") }), {
+  target: path.resolve(path.join("C:", "repo"), "project"),
+  json: true,
+  strict: true,
+});
+assert.deepEqual(parseAipiWorkflowArgs(["--target", "project", "--json", "list"], { cwd: path.join("C:", "repo") }), {
+  target: path.resolve(path.join("C:", "repo"), "project"),
+  json: true,
+  workflowArgs: ["list"],
+});
+assert.deepEqual(parseAipiMemoryArgs(["--target", "project", "--json", "query", "billing"], { cwd: path.join("C:", "repo") }), {
+  target: path.resolve(path.join("C:", "repo"), "project"),
+  json: true,
+  memoryArgs: ["query", "billing"],
+});
+assert.deepEqual(parseAipiOnboardArgs(["--target", "project", "--json", "--no-questions"], { cwd: path.join("C:", "repo") }), {
+  target: path.resolve(path.join("C:", "repo"), "project"),
+  json: true,
+  noQuestions: true,
+  onboardArgs: ["--target", "project", "--no-questions"],
+});
+assert.deepEqual(parseAipiDiagnoseArgs(["--target", "project", "--json", "--share", "run-1"], { cwd: path.join("C:", "repo") }), {
+  target: path.resolve(path.join("C:", "repo"), "project"),
+  json: true,
+  help: false,
+  diagnoseArgs: ["--target", "project", "--json", "--share", "run-1"],
+});
+
+assert.equal(
+  readAipiPackageVersion({
+    packageRoot,
+    readFileSync: () => JSON.stringify({ version: "0.1.0" }),
+  }),
+  "0.1.0",
+);
+assert.equal(formatAipiVersion({ aipiVersion: "0.1.0", piVersion: { ok: true, version: "0.75.5" } }), "aipi 0.1.0 (pi 0.75.5)");
+assert.equal(formatAipiVersion({ aipiVersion: "0.1.0", piVersion: { ok: false } }), "aipi 0.1.0 (pi: not found)");
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi 0\.1\.0 - BDD-contract agent harness on Pi/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi with no arguments starts an interactive Pi session/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-init \[--dry-run\] \[--force\] \[--reset-memory\]/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-onboard \[--target <dir>\] \[--no-questions\]/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-workflow \[list \| status \| start <name> \| run <name> \| execute\]/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-memory \[status \| refs \| query <terms>\]/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-diagnose \[<run_id>\] \[--share\] \[--json\]/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-mcp/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-pi-subagents-spike/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /--pi-help/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi status \[--target <dir>\] \[--json\] \[--strict\]/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi workflow \[--target <dir>\] \[--json\]/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi memory \[--target <dir>\] \[--json\]/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi onboard \[--target <dir>\] \[--json\] \[--no-questions\]/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi diagnose \[<run_id>\] \[--target <dir>\] \[--share\] \[--json\]/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi update \[--dry-run\]/);
+
+const readme = fs.readFileSync("README.md", "utf8");
+const installationDoc = fs.readFileSync(path.join("docs", "installation.md"), "utf8");
+const wrapperDoc = fs.readFileSync(path.join("docs", "aipi-cli-wrapper.md"), "utf8");
+assert.match(readme, /docs\/installation\.md`\]\(docs\/installation\.md\)/);
+assert.match(readme, /aipi\s+# starts an interactive Pi session with AIPI preloaded/);
+assert.match(installationDoc, /npm install -g @earendil-works\/pi-coding-agent/);
+assert.match(installationDoc, /npm link/);
+assert.match(installationDoc, /npm install -g \./);
+assert.match(installationDoc, /Bare `aipi` is the primary entry point/);
+assert.match(wrapperDoc, /`aipi` with no arguments starts an interactive Pi session/);
+
+const piVersion = readPiVersion({
+  env: { AIPI_PI_CLI_JS: cliJs },
+  existsSync: (candidate) => candidate === cliJs,
+  nodeExecPath: "node-custom",
+  packageRoot,
+  platform: "win32",
+  spawnSyncFn: (command, args) => {
+    assert.equal(command, "node-custom");
+    assert.deepEqual(args, [cliJs, "--version"]);
+    return { status: 0, stdout: "", stderr: "0.75.5\n" };
+  },
+});
+assert.deepEqual(piVersion, { ok: true, version: "0.75.5", error: null });
+
+const nodeSpec = createPiSpawnSpec({
+  env: { AIPI_PI_CLI_JS: cliJs },
+  existsSync: (candidate) => candidate === cliJs,
+  nodeExecPath: "node-custom",
+  packageRoot,
+  platform: "win32",
+  userArgs: ["--version"],
+  cwd: path.join("C:", "repo", "project"),
+});
+assert.equal(nodeSpec.command, "node-custom");
+assert.deepEqual(nodeSpec.args, [
+  cliJs,
+  "--extension",
+  expectedAnthropic,
+  "--extension",
+  expectedAipi,
+  "--version",
+]);
+
+const noFlagNodeSpec = createPiSpawnSpec({
+  env: { AIPI_PI_CLI_JS: cliJs },
+  existsSync: (candidate) => candidate === cliJs,
+  nodeExecPath: "node-custom",
+  packageRoot,
+  platform: "win32",
+  userArgs: ["--help"],
+  cwd: path.join("C:", "repo", "project"),
+});
+assert.equal(noFlagNodeSpec.command, "node-custom");
+assert.equal(noFlagNodeSpec.args.includes(path.join(packageRoot, "extensions", "aipi", ["pi", "subagents", "embedded"].join("-") + ".js")), false);
+assert.equal(noFlagNodeSpec.args.includes(path.join(packageRoot, "node_modules", "pi-subagents", "src", "extension", "index.ts")), false);
+
+const rawNodeSpec = createRawPiSpawnSpec({
+  env: { AIPI_PI_CLI_JS: cliJs },
+  existsSync: (candidate) => candidate === cliJs,
+  nodeExecPath: "node-custom",
+  platform: "win32",
+  userArgs: ["--help"],
+});
+assert.equal(rawNodeSpec.command, "node-custom");
+assert.deepEqual(rawNodeSpec.args, [cliJs, "--help"]);
+
+const cmdSpec = createPiSpawnSpec({
+  env: { AIPI_PI_BIN: path.join("C:", "npm", "pi.cmd") },
+  existsSync: () => false,
+  packageRoot,
+  platform: "win32",
+  userArgs: ["-p", "prompt with spaces"],
+});
+assert.equal(cmdSpec.command, "cmd.exe");
+assert.deepEqual(cmdSpec.args.slice(0, 3), ["/d", "/s", "/c"]);
+assert.match(cmdSpec.args[3], /pi\.cmd/);
+assert.match(cmdSpec.args[3], /prompt with spaces/);
+
+assert.equal(quoteCmdArg('a "quoted" value'), '"a \\"quoted\\" value"');
+
+const pathEnv = { PATH: [path.join("C:", "npm"), path.join("C:", "bin")].join(path.delimiter) };
+assert.ok(pathCommandCandidates("pi", { env: pathEnv, platform: "win32" }).some((candidate) => candidate.endsWith("pi.cmd")));
+
+const statusReport = {
+  readiness: { status: "ready_for_adversarial_review" },
+  project: { root: path.join("C:", "repo", "project") },
+};
+const formattedStatus = [];
+const returnedStatus = await runAipiStatus({
+  packageRoot,
+  cwd: path.join("C:", "repo"),
+  userArgs: ["--target", "project"],
+  log: (line) => formattedStatus.push(line),
+  statusFns: {
+    async buildAipiStatusReport({ projectRoot, root }) {
+      assert.equal(projectRoot, path.resolve(path.join("C:", "repo"), "project"));
+      assert.equal(root, packageRoot);
+      return statusReport;
+    },
+    formatAipiStatus: () => "AIPI STATUS OK",
+    aipiStatusKind: () => "info",
+  },
+});
+assert.equal(returnedStatus, statusReport);
+assert.deepEqual(formattedStatus, ["AIPI STATUS OK"]);
+
+const jsonStatus = [];
+await runAipiStatus({
+  userArgs: ["--json"],
+  log: (line) => jsonStatus.push(line),
+  statusFns: {
+    async buildAipiStatusReport() {
+      return statusReport;
+    },
+    formatAipiStatus: () => "unused",
+    aipiStatusKind: () => "info",
+  },
+});
+assert.deepEqual(JSON.parse(jsonStatus[0]), statusReport);
+
+process.exitCode = undefined;
+await runAipiStatus({
+  userArgs: ["--strict"],
+  log: () => {},
+  statusFns: {
+    async buildAipiStatusReport() {
+      return statusReport;
+    },
+    formatAipiStatus: () => "warning",
+    aipiStatusKind: () => "warning",
+  },
+});
+assert.equal(process.exitCode, 1);
+process.exitCode = undefined;
+
+const workflowOutput = [];
+const workflowResult = { action: "list", workflows: ["bugfix", "feature"] };
+const returnedWorkflow = await runAipiWorkflow({
+  cwd: path.join("C:", "repo"),
+  userArgs: ["--target", "project", "list"],
+  log: (line) => workflowOutput.push(line),
+  workflowFns: {
+    async runWorkflowCommand({ args, projectRoot }) {
+      assert.equal(args, "list");
+      assert.equal(projectRoot, path.resolve(path.join("C:", "repo"), "project"));
+      return workflowResult;
+    },
+    formatWorkflowCommandResult: () => "AIPI workflows: bugfix, feature",
+  },
+});
+assert.equal(returnedWorkflow, workflowResult);
+assert.deepEqual(workflowOutput, ["AIPI workflows: bugfix, feature"]);
+
+const jsonWorkflowOutput = [];
+await runAipiWorkflow({
+  userArgs: ["--json", "status"],
+  log: (line) => jsonWorkflowOutput.push(line),
+  workflowFns: {
+    async runWorkflowCommand({ args }) {
+      assert.equal(args, "status");
+      return { action: "status", active: null };
+    },
+    formatWorkflowCommandResult: () => "unused",
+  },
+});
+assert.deepEqual(JSON.parse(jsonWorkflowOutput[0]), { action: "status", active: null });
+
+const memoryOutput = [];
+const memoryResult = {
+  action: "status",
+  layers: { project: { status: "available", files: 6, lines: 100 }, user: { status: "missing", files: 0, lines: 0 } },
+  code_graph: { status: "missing", path: ".aipi/state/aipi-graph.json" },
+};
+const returnedMemory = await runAipiMemory({
+  cwd: path.join("C:", "repo"),
+  userArgs: ["--target", "project", "status"],
+  log: (line) => memoryOutput.push(line),
+  memoryFns: {
+    async runMemoryCommand({ args, projectRoot }) {
+      assert.equal(args, "status");
+      assert.equal(projectRoot, path.resolve(path.join("C:", "repo"), "project"));
+      return memoryResult;
+    },
+    formatMemoryCommandResult: () => "AIPI memory status: project=available",
+  },
+});
+assert.equal(returnedMemory, memoryResult);
+assert.deepEqual(memoryOutput, ["AIPI memory status: project=available"]);
+
+const onboardOutput = [];
+const onboardResult = {
+  schema: "aipi.project-onboarding.v1",
+  action: "onboard",
+  memory: { written: ["project.md"], skipped_customized: [] },
+};
+const returnedOnboard = await runAipiOnboard({
+  cwd: path.join("C:", "repo"),
+  userArgs: ["--target", "project", "--no-questions"],
+  log: (line) => onboardOutput.push(line),
+  onboardingFns: {
+    async runProjectOnboarding({ projectRoot, askUser, runWorker }) {
+      assert.equal(projectRoot, path.resolve(path.join("C:", "repo"), "project"));
+      assert.equal(askUser, false);
+      assert.equal(runWorker, false);
+      return onboardResult;
+    },
+    formatOnboardingResult: () => "AIPI onboarding complete",
+  },
+});
+assert.equal(returnedOnboard, onboardResult);
+assert.deepEqual(onboardOutput, ["AIPI onboarding complete"]);
+
+const jsonOnboardOutput = [];
+await runAipiOnboard({
+  userArgs: ["--json", "--no-questions"],
+  log: (line) => jsonOnboardOutput.push(line),
+  onboardingFns: {
+    async runProjectOnboarding() {
+      return onboardResult;
+    },
+    formatOnboardingResult: () => "unused",
+  },
+});
+assert.deepEqual(JSON.parse(jsonOnboardOutput[0]), onboardResult);
+
+const jsonMemoryOutput = [];
+await runAipiMemory({
+  userArgs: ["--json", "query", "billing"],
+  log: (line) => jsonMemoryOutput.push(line),
+  memoryFns: {
+    async runMemoryCommand({ args }) {
+      assert.equal(args, "query billing");
+      return { action: "query", query: "billing", refs: [] };
+    },
+    formatMemoryCommandResult: () => "unused",
+  },
+});
+assert.deepEqual(JSON.parse(jsonMemoryOutput[0]), { action: "query", query: "billing", refs: [] });
+
+const diagnoseOutput = [];
+const diagnoseResult = {
+  schema: "aipi.diagnose-result.v1",
+  report_path: ".aipi/runtime/diagnostics/report.md",
+  summary: "failed at review_swarm: provider not registered / model unbound in worker process",
+};
+const returnedDiagnose = await runAipiDiagnose({
+  cwd: path.join("C:", "repo"),
+  userArgs: ["--target", "project", "--json", "run-1"],
+  log: (line) => diagnoseOutput.push(line),
+  diagnoseFns: {
+    async runDiagnoseCommand({ args, projectRoot }) {
+      assert.equal(args, "--target project --json run-1");
+      assert.equal(projectRoot, path.join("C:", "repo"));
+      return diagnoseResult;
+    },
+    formatDiagnoseCommandResult: () => "unused",
+  },
+});
+assert.equal(returnedDiagnose, diagnoseResult);
+assert.deepEqual(JSON.parse(diagnoseOutput[0]), diagnoseResult);
+
+const diagnoseHelpOutput = [];
+await runAipiDiagnose({
+  userArgs: ["--help"],
+  log: (line) => diagnoseHelpOutput.push(line),
+  diagnoseFns: {
+    async runDiagnoseCommand({ args }) {
+      assert.equal(args, "--help");
+      return { schema: "aipi.diagnose-help.v1", help: true, text: "Usage: aipi diagnose" };
+    },
+    formatDiagnoseCommandResult: () => "unused",
+  },
+});
+assert.deepEqual(diagnoseHelpOutput, ["Usage: aipi diagnose"]);
+
+console.log("AIPI_BIN_TEST_OK");

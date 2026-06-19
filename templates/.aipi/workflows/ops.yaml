@@ -1,0 +1,125 @@
+version: 1
+name: aipi-ops
+mode: workflow-contract-v1
+description: >
+  Deployment, homologation, rollback, and production-readiness workflow. The
+  parent-session permission policy layer has been intentionally removed, so this
+  workflow only gates its own workflow execution and must not be presented as a
+  general tool-call permission system. Production safety still requires external
+  containment and least-privilege credentials.
+params:
+  run_id: "{{ aipi.run_id }}"
+  objective: ""
+artifact_policy:
+  namespace: .aipi/runtime/runs/{{ run_id }}/steps/{{ step_id }}
+  no_overwrite: true
+steps:
+  - id: classify_boundary
+    stage: ops
+    agents: [orchestration-reasoner, workflow-cicd]
+    name: Classify environment boundary
+    prompt: >
+      Classify whether "{{ objective }}" is local, CI, staging/homolog,
+      production, destructive, secret-touching, or read-only observation.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/classify_boundary/OPS-CLASSIFICATION.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/classify_boundary/CICD.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED: stop
+        FAIL: stop
+
+  - id: policy_gate
+    stage: ops
+    agents: [security-auditor, orchestration-reasoner]
+    name: Workflow execution review gate
+    prompt: >
+      Verify accepted contract, production boundary, human review needs,
+      rollback readiness, external containment, credential scope, and whether
+      the requested workflow execution should continue. When blocking for a
+      user/operator decision, include blocker_question with question, 1-3
+      distinct short recommended options ordered best-first, and
+      allow_free_text: true; free-text is always available.
+    requires: [classify_boundary]
+    context_from: [classify_boundary]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/policy_gate/SECURITY.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/policy_gate/POLICY-GATE.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      pass_decisions: [ALLOW]
+      approval_decisions: [HUMAN_REVIEW_REQUIRED]
+      block_decisions: [BLOCK]
+      allow_skip: false
+      on_policy_decision:
+        HUMAN_REVIEW_REQUIRED: stop_for_human_approval
+        BLOCK: stop
+      on_verdict:
+        BLOCKED: stop
+        FAIL: stop
+
+  - id: plan
+    stage: deployment-plan
+    agents: [workflow-cicd]
+    name: Prepare execution plan
+    prompt: >
+      If policy allows planning, produce commands, prechecks, smoke checks,
+      rollback, expected evidence, and stop conditions. Do not execute
+      production commands in this step.
+    requires: [policy_gate]
+    context_from: [classify_boundary, policy_gate]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/plan/OPS-PLAN.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED: stop
+        FAIL: policy_gate
+
+  - id: homolog_review
+    stage: homolog
+    agents: [workflow-dev-reviewer]
+    name: Homologation review package
+    prompt: >
+      When the target is homolog/staging, require browser or headless evidence
+      for UI or user-flow changes.
+    requires: [plan]
+    context_from: [plan]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/homolog_review/DEV-REVIEW.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS, SKIPPED]
+      allow_skip: true
+      skip_requires: not_homolog_or_no_ui_flow
+      on_verdict:
+        BLOCKED: stop
+        FAIL: plan
+
+  - id: human_review
+    stage: human-review
+    agents: [workflow-human-review]
+    name: Human approval package
+    prompt: >
+      Summarize business result, evidence, risk, rollback, and the exact
+      approval needed.
+    requires: [homolog_review]
+    context_from: [plan, homolog_review]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/human_review/HUMAN-REVIEW.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      approval_decisions: [HUMAN_REVIEW_REQUIRED]
+      allow_skip: false
+      on_policy_decision:
+        HUMAN_REVIEW_REQUIRED: stop_for_human_approval
+      on_verdict:
+        BLOCKED: stop
+        FAIL: plan

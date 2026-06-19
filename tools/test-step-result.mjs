@@ -1,0 +1,179 @@
+import assert from "node:assert/strict";
+import {
+  formatStepResultValidation,
+  strongestEvidenceRung,
+  validateStepResult,
+} from "../extensions/aipi/runtime/step-result.js";
+
+const baseResult = {
+  schema: "aipi.step-result.v1",
+  step_id: "local_verification",
+  agent_ids: ["workflow-test-gate"],
+  verdict: "PASS",
+  evidence: [
+    {
+      rung: "ran",
+      source: "command",
+      ref: "npm test",
+      result: "exit 0",
+    },
+  ],
+  artifacts: [".aipi/runtime/runs/run/steps/local_verification/TEST-GATE.md"],
+};
+
+assert.equal(strongestEvidenceRung([{ rung: "written" }, { rung: "verified" }, { rung: "ran" }]), "verified");
+
+const pass = validateStepResult(baseResult);
+assert.equal(pass.ok, true);
+assert.equal(pass.gatePassed, true);
+assert.equal(formatStepResultValidation(pass), "step result gate: PASS");
+
+const weakPass = validateStepResult({
+  ...baseResult,
+  evidence: [{ rung: "written", source: "note", ref: "analysis", result: "looks right" }],
+});
+assert.equal(weakPass.ok, false);
+assert.equal(weakPass.gatePassed, false);
+assert.match(formatStepResultValidation(weakPass), /PASS requires ran or verified evidence/);
+
+const verifiedRequired = validateStepResult(
+  {
+    ...baseResult,
+    evidence: [{ rung: "ran", source: "command", ref: "npm test", result: "exit 0" }],
+  },
+  { step: { gate: { require_evidence_rung: "verified" } } },
+);
+assert.equal(verifiedRequired.ok, false);
+assert.match(verifiedRequired.errors.join("\n"), /requires evidence rung verified/);
+
+const localSelfStampedVerified = validateStepResult(
+  {
+    ...baseResult,
+    evidence: [
+      {
+        rung: "verified",
+        source: "aipi-local-executor",
+        ref: "local adapter",
+        result: "self-stamped verified without executing a command",
+      },
+    ],
+  },
+  { step: { gate: { require_evidence_rung: "verified" } } },
+);
+assert.equal(localSelfStampedVerified.ok, false);
+assert.equal(localSelfStampedVerified.gatePassed, false);
+assert.match(localSelfStampedVerified.errors.join("\n"), /requires evidence rung verified/);
+
+const skipped = validateStepResult(
+  {
+    ...baseResult,
+    verdict: "SKIPPED",
+    skip_condition: "explicit_tdd_waiver",
+    evidence: [
+      { rung: "written", source: "contract", ref: "BDD", result: "mechanics-only" },
+      { rung: "written", source: "reason", ref: "waiver", result: "no automated behavior surface" },
+    ],
+  },
+  { step: { gate: { pass_verdicts: ["PASS", "SKIPPED"], allow_skip: true, skip_requires: "explicit_tdd_waiver" } } },
+);
+assert.equal(skipped.ok, true);
+assert.equal(skipped.gatePassed, true);
+
+const missingSkipEvidence = validateStepResult(
+  {
+    ...baseResult,
+    verdict: "SKIPPED",
+    skip_condition: "explicit_tdd_waiver",
+    evidence: [{ rung: "written", source: "contract", ref: "BDD", result: "mechanics-only" }],
+  },
+  { step: { gate: { pass_verdicts: ["PASS", "SKIPPED"], allow_skip: true, skip_requires: "explicit_tdd_waiver" } } },
+);
+assert.equal(missingSkipEvidence.ok, false);
+assert.equal(missingSkipEvidence.gatePassed, false);
+assert.match(missingSkipEvidence.errors.join("\n"), /requires evidence token: reason/);
+
+const badSkip = validateStepResult(
+  {
+    ...baseResult,
+    verdict: "SKIPPED",
+    evidence: [{ rung: "written", source: "contract", ref: "BDD", result: "mechanics-only" }],
+  },
+  { step: { gate: { pass_verdicts: ["PASS", "SKIPPED"], allow_skip: true, skip_requires: "explicit_tdd_waiver" } } },
+);
+assert.equal(badSkip.ok, false);
+assert.match(badSkip.errors.join("\n"), /skip_condition/);
+
+const undeclaredSkip = validateStepResult(
+  {
+    ...baseResult,
+    verdict: "SKIPPED",
+    skip_condition: "explicit_tdd_waiver",
+    evidence: [
+      { rung: "written", source: "contract", ref: "BDD", result: "mechanics-only" },
+      { rung: "written", source: "reason", ref: "waiver", result: "no automated behavior surface" },
+    ],
+  },
+  { step: { gate: { pass_verdicts: ["PASS"], allow_skip: true, skip_requires: "explicit_tdd_waiver" } } },
+);
+assert.equal(undeclaredSkip.ok, false);
+assert.equal(undeclaredSkip.gatePassed, false);
+assert.match(undeclaredSkip.errors.join("\n"), /not allowed by pass_verdicts/);
+
+const humanReviewRequired = validateStepResult(
+  {
+    ...baseResult,
+    policy_decision: "HUMAN_REVIEW_REQUIRED",
+  },
+  { step: { gate: { pass_decisions: ["ALLOW"] } } },
+);
+assert.equal(humanReviewRequired.ok, true);
+assert.equal(humanReviewRequired.gatePassed, false);
+
+const missingPolicyDecision = validateStepResult(baseResult, {
+  step: { gate: { pass_decisions: ["ALLOW"], on_policy_decision: { BLOCK: "stop" } } },
+});
+assert.equal(missingPolicyDecision.ok, false);
+assert.match(missingPolicyDecision.errors.join("\n"), /policy_decision is required/);
+
+const allowPolicyDecision = validateStepResult(
+  {
+    ...baseResult,
+    policy_decision: "ALLOW",
+  },
+  { step: { gate: { pass_decisions: ["ALLOW"] } } },
+);
+assert.equal(allowPolicyDecision.ok, true);
+assert.equal(allowPolicyDecision.gatePassed, true);
+
+const validBlockerQuestion = validateStepResult({
+  ...baseResult,
+  verdict: "BLOCKED_TO_PLANNING",
+  evidence: [{ rung: "blocked", source: "business-rule-keeper", ref: "rule gap", result: "needs user decision" }],
+  artifacts: [],
+  blocker_question: {
+    question: "Qual regra fiscal devemos aplicar?",
+    options: ["A", "B", "C"],
+    allow_free_text: true,
+  },
+});
+assert.equal(validBlockerQuestion.ok, false);
+assert.equal(validBlockerQuestion.errors.some((error) => error.includes("blocker_question")), false);
+
+const invalidBlockerQuestion = validateStepResult({
+  ...baseResult,
+  blocker_question: {
+    question: "",
+    options: ["A", "B", "C", "D"],
+    allow_free_text: false,
+  },
+});
+assert.equal(invalidBlockerQuestion.ok, false);
+assert.match(invalidBlockerQuestion.errors.join("\n"), /blocker_question\.question/);
+assert.match(invalidBlockerQuestion.errors.join("\n"), /1-3 strings/);
+assert.match(invalidBlockerQuestion.errors.join("\n"), /allow_free_text must be true/);
+
+const malformed = validateStepResult("not an object");
+assert.equal(malformed.ok, false);
+assert.match(malformed.errors.join("\n"), /must be an object/);
+
+console.log("AIPI_STEP_RESULT_TEST_OK");

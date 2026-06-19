@@ -1,0 +1,394 @@
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { executeWorkflowRun } from "./workflow-executor.js";
+
+const workflowAliases = new Map([
+  ["bug", "bugfix"],
+  ["bugfix", "bugfix"],
+  ["feature", "feature"],
+  ["ops", "ops"],
+  ["plan", "planning"],
+  ["planning", "planning"],
+  ["quick", "quick"],
+  ["research", "research"],
+]);
+
+export function parseWorkflowArgs(args = "") {
+  const tokens = String(args)
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  if (!tokens.length) return { action: "status" };
+
+  const [first, ...rest] = tokens;
+  if (first === "list") return { action: "list" };
+  if (first === "status") return { action: "status" };
+  if (first === "execute" || first === "continue") return { action: "execute" };
+
+  const shouldExecute = first === "run";
+  const workflowToken = first === "start" || first === "run" ? rest.shift() : first;
+  if (!workflowToken) throw new Error("Missing workflow name");
+
+  const options = {
+    action: shouldExecute ? "run" : "start",
+    workflow: resolveWorkflowName(workflowToken),
+    dryRun: false,
+    contractPath: null,
+  };
+
+  for (let index = 0; index < rest.length; index += 1) {
+    const token = rest[index];
+    if (token === "--dry-run") {
+      options.dryRun = true;
+      continue;
+    }
+    if (token === "--contract") {
+      const value = rest[index + 1];
+      if (!value) throw new Error("Missing value after --contract");
+      options.contractPath = value;
+      index += 1;
+      continue;
+    }
+    throw new Error(`Unknown /aipi-workflow option: ${token}`);
+  }
+
+  return options;
+}
+
+export async function runWorkflowCommand({
+  args = "",
+  projectRoot,
+  adapter = undefined,
+  parentInteractiveToolCallHook = "registered_parent_interactive_tool_call_hook",
+} = {}) {
+  if (!projectRoot) throw new Error("projectRoot is required");
+  const command = parseWorkflowArgs(args);
+
+  if (command.action === "list") {
+    return { action: "list", workflows: await listWorkflows(projectRoot) };
+  }
+
+  if (command.action === "status") {
+    return { action: "status", active: await readActiveRun(projectRoot) };
+  }
+
+  if (command.action === "execute") {
+    return {
+      action: "execute",
+      execution: await executeWorkflowRun({ projectRoot, adapter, parentInteractiveToolCallHook }),
+    };
+  }
+
+  const started = await startWorkflowRun({
+    projectRoot,
+    workflow: command.workflow,
+    contractPath: command.contractPath,
+    dryRun: command.dryRun,
+  });
+
+  if (command.action === "run" && !command.dryRun) {
+    return {
+      action: "run",
+      run: started,
+      execution: await executeWorkflowRun({ projectRoot, runId: started.runId, adapter, parentInteractiveToolCallHook }),
+    };
+  }
+
+  return {
+    action: "start",
+    run: started,
+  };
+}
+
+export async function listWorkflows(projectRoot) {
+  const workflowDir = path.join(projectRoot, ".aipi", "workflows");
+  const entries = await fs.readdir(workflowDir, { withFileTypes: true }).catch((error) => {
+    if (error.code === "ENOENT") {
+      throw new Error("AIPI workflows are not installed; run /aipi-init first");
+    }
+    throw error;
+  });
+
+  return entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".yaml"))
+    .map((entry) => path.basename(entry.name, ".yaml"))
+    .sort();
+}
+
+export async function startWorkflowRun({
+  projectRoot,
+  workflow,
+  contractPath = null,
+  dryRun = false,
+  now = () => new Date(),
+  randomBytes = (size) => crypto.randomBytes(size),
+} = {}) {
+  if (!projectRoot) throw new Error("projectRoot is required");
+  const root = path.resolve(projectRoot);
+  await assertAipiInstalled(root);
+
+  const workflowName = resolveWorkflowName(workflow);
+  const workflowRelPath = path.join(".aipi", "workflows", `${workflowName}.yaml`);
+  const workflowAbsPath = path.join(root, workflowRelPath);
+  const workflowDefinition = await readWorkflowDefinition(workflowAbsPath, workflowName);
+  const createdAt = now().toISOString();
+  const runId = generateRunId(now, randomBytes);
+  const runRelDir = path.join(".aipi", "runtime", "runs", runId);
+  const runDir = path.join(root, runRelDir);
+  const resolvedContractPath =
+    contractPath ?? path.join(runRelDir, "BDD-CONTRACT.md").replaceAll("\\", "/");
+
+  const state = {
+    schema: "aipi.run-state.v1",
+    run_id: runId,
+    workflow: workflowName,
+    workflow_name: workflowDefinition.name,
+    workflow_mode: workflowDefinition.mode,
+    status: "active",
+    created_at: createdAt,
+    source_workflow: workflowRelPath.replaceAll("\\", "/"),
+    run_rel_dir: runRelDir.replaceAll("\\", "/"),
+    contract_path: resolvedContractPath,
+    current_step: workflowDefinition.steps[0]?.id ?? null,
+    steps: workflowDefinition.steps.map((step) => ({
+      id: step.id,
+      stage: step.stage,
+      status: "pending",
+    })),
+  };
+
+  if (!dryRun) {
+    await fs.mkdir(path.join(runDir, "steps"), { recursive: true });
+    await fs.writeFile(path.join(runDir, "state.json"), `${JSON.stringify(state, null, 2)}\n`);
+    await fs.writeFile(path.join(runDir, "RUN-MANIFEST.md"), renderRunManifest(state));
+    await fs.writeFile(path.join(root, ".aipi", "runtime", "runs", "active"), `${runId}\n`);
+  }
+
+  return {
+    runId,
+    workflow: workflowName,
+    workflowRelPath: workflowRelPath.replaceAll("\\", "/"),
+    runRelDir: runRelDir.replaceAll("\\", "/"),
+    contractPath: resolvedContractPath,
+    dryRun,
+    state,
+  };
+}
+
+export async function readActiveRun(projectRoot) {
+  const activePath = path.join(projectRoot, ".aipi", "runtime", "runs", "active");
+  const runId = (await fs.readFile(activePath, "utf8").catch((error) => {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  })).trim();
+
+  if (!runId) return null;
+
+  const statePath = path.join(projectRoot, ".aipi", "runtime", "runs", runId, "state.json");
+  const state = JSON.parse(await fs.readFile(statePath, "utf8"));
+  return { runId, state };
+}
+
+export async function recordWorkflowUserInput({
+  projectRoot,
+  runId = null,
+  text = "",
+  source = "input",
+  now = () => new Date(),
+} = {}) {
+  if (!projectRoot) throw new Error("projectRoot is required");
+  const root = path.resolve(projectRoot);
+  const active = runId ? await readRun(root, runId) : await readActiveRun(root);
+  if (!active?.runId) throw new Error("No active AIPI run; start a workflow first");
+
+  const state = active.state;
+  const recordedAt = now().toISOString();
+  const relPath = path.posix.join(".aipi", "runtime", "runs", active.runId, "USER-INPUT.jsonl");
+  const record = {
+    schema: "aipi.user-input.v1",
+    recorded_at: recordedAt,
+    run_id: active.runId,
+    workflow: state.workflow ?? null,
+    step_id: state.awaiting_user_input?.step_id ?? state.current_step ?? null,
+    state_status: state.status ?? null,
+    source,
+    text: truncateUserInput(redactWorkflowUserInput(text), 2000),
+  };
+
+  const absPath = path.join(root, relPath);
+  await fs.mkdir(path.dirname(absPath), { recursive: true });
+  await fs.appendFile(absPath, `${JSON.stringify(record)}\n`);
+
+  state.last_user_input = {
+    path: relPath,
+    recorded_at: recordedAt,
+    step_id: record.step_id,
+    source,
+    text_excerpt: truncateUserInput(record.text, 240),
+  };
+  if (state.awaiting_user_input && state.awaiting_user_input.step_id === record.step_id) {
+    state.awaiting_user_input.answer_recorded_at = recordedAt;
+    state.awaiting_user_input.answer_path = relPath;
+  }
+  await persistRunState(root, state);
+
+  return { record, relPath };
+}
+
+export function formatWorkflowCommandResult(result) {
+  if (result.action === "list") {
+    return `AIPI workflows: ${result.workflows.join(", ")}`;
+  }
+
+  if (result.action === "status") {
+    if (!result.active) return "AIPI workflow: no active run.";
+    return [
+      `AIPI workflow active: ${result.active.runId}`,
+      `workflow=${result.active.state.workflow}`,
+      `status=${result.active.state.status}`,
+      `current_step=${result.active.state.current_step ?? "none"}`,
+    ].join("\n");
+  }
+
+  if (result.action === "execute") {
+    return formatExecutionResult("executed", result.execution);
+  }
+
+  if (result.action === "run") {
+    return [
+      `AIPI workflow ran: ${result.run.workflow}`,
+      `run_id=${result.run.runId}`,
+      `run_dir=${result.run.runRelDir}`,
+      `status=${result.execution.status}`,
+      `current_step=${result.execution.state.current_step ?? "none"}`,
+    ].join("\n");
+  }
+
+  const run = result.run;
+  const mode = run.dryRun ? "dry-run" : "started";
+  return [
+    `AIPI workflow ${mode}: ${run.workflow}`,
+    `run_id=${run.runId}`,
+    `run_dir=${run.runRelDir}`,
+    `contract_path=${run.contractPath}`,
+  ].join("\n");
+}
+
+function formatExecutionResult(mode, execution) {
+  return [
+    `AIPI workflow ${mode}: ${execution.state.workflow}`,
+    `run_id=${execution.runId}`,
+    `status=${execution.status}`,
+    `current_step=${execution.state.current_step ?? "none"}`,
+  ].join("\n");
+}
+
+function resolveWorkflowName(value) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  const resolved = workflowAliases.get(normalized);
+  if (!resolved) {
+    throw new Error(`Unknown AIPI workflow: ${value}`);
+  }
+  return resolved;
+}
+
+async function assertAipiInstalled(projectRoot) {
+  const contractPath = path.join(projectRoot, ".aipi", "runtime-contract.json");
+  try {
+    await fs.access(contractPath);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      throw new Error("AIPI is not installed in this project; run /aipi-init first");
+    }
+    throw error;
+  }
+}
+
+async function readRun(root, runId) {
+  const statePath = path.join(root, ".aipi", "runtime", "runs", runId, "state.json");
+  const state = JSON.parse(await fs.readFile(statePath, "utf8"));
+  return { runId, state };
+}
+
+async function persistRunState(root, state) {
+  const runDir = path.join(root, ".aipi", "runtime", "runs", state.run_id);
+  await fs.mkdir(runDir, { recursive: true });
+  await fs.writeFile(path.join(runDir, "state.json"), `${JSON.stringify(state, null, 2)}\n`);
+  await fs.writeFile(path.join(runDir, "RUN-MANIFEST.md"), renderRunManifest(state));
+}
+
+function redactWorkflowUserInput(text) {
+  return String(text ?? "")
+    .replace(/\b(sk-[A-Za-z0-9_-]{12,})\b/g, "sk-[REDACTED]")
+    .replace(/\b(gh[pousr]_[A-Za-z0-9_]{12,})\b/g, "gh_[REDACTED]")
+    .replace(/\b(api[_-]?key|token|secret|password)\s*[:=]\s*["']?([A-Za-z0-9._/+=-]{8,})["']?/gi, "$1=[REDACTED]");
+}
+
+function truncateUserInput(text, maxChars) {
+  const value = String(text ?? "");
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, maxChars)}\n[AIPI user input pruned ${value.length - maxChars} chars]`;
+}
+
+async function readWorkflowDefinition(workflowAbsPath, workflowName) {
+  const text = await fs.readFile(workflowAbsPath, "utf8").catch((error) => {
+    if (error.code === "ENOENT") throw new Error(`AIPI workflow not found: ${workflowName}`);
+    throw error;
+  });
+
+  const name = text.match(/^name:\s*([a-z0-9_-]+)$/m)?.[1] ?? workflowName;
+  const mode = text.match(/^mode:\s*([a-z0-9_-]+)$/m)?.[1] ?? null;
+  const steps = [];
+  let current = null;
+
+  for (const line of text.split(/\r?\n/)) {
+    const id = line.match(/^  - id:\s*([a-z0-9_-]+)$/);
+    if (id) {
+      current = { id: id[1], stage: null };
+      steps.push(current);
+      continue;
+    }
+    if (!current) continue;
+    const stage = line.match(/^    stage:\s*([a-z0-9_-]+)$/);
+    if (stage) current.stage = stage[1];
+  }
+
+  if (!steps.length) throw new Error(`AIPI workflow has no steps: ${workflowName}`);
+  return { name, mode, steps };
+}
+
+function generateRunId(now, randomBytes) {
+  const stamp = now()
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace(/\.\d{3}Z$/, "Z");
+  return `${stamp}-${randomBytes(3).toString("hex")}`;
+}
+
+function renderRunManifest(state) {
+  return `---
+schema: aipi.run-manifest.v1
+run_id: ${state.run_id}
+workflow: ${state.workflow}
+status: ${state.status}
+created_at: ${state.created_at}
+source_workflow: ${state.source_workflow}
+contract_path: ${state.contract_path}
+current_step: ${state.current_step ?? ""}
+---
+
+# AIPI Run ${state.run_id}
+
+- workflow: ${state.workflow}
+- status: ${state.status}
+- current_step: ${state.current_step ?? "none"}
+- source_workflow: ${state.source_workflow}
+- contract_path: ${state.contract_path}
+
+## Steps
+
+${state.steps.map((step) => `- ${step.id}: ${step.status}`).join("\n")}
+`;
+}

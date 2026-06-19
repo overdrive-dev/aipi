@@ -1,0 +1,16 @@
+{
+  "schema": "aipi.mcp.v1",
+  "mcpServers": {
+    "linear": {
+      "disabled": true,
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://mcp.linear.app/mcp"],
+      "env": {}
+    }
+  },
+  "notes": [
+    "Set disabled=false after you want AIPI to start this server.",
+    "AIPI currently supports stdio MCP servers. Remote OAuth servers should be run through mcp-remote.",
+    "Direct Streamable HTTP/SSE OAuth transports and MCP resources/prompts are deferred."
+  ]
+}

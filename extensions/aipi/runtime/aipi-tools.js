@@ -1,0 +1,3182 @@
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
+
+export const AIPI_RUNTIME_TOOL_NAMES = [
+  "aipi_memory_query",
+  "aipi_rule_lookup",
+  "aipi_rule_gap",
+  "aipi_callers",
+  "aipi_impact",
+  "aipi_semantic_search",
+  "aipi_kanban_update",
+  "aipi_promote_memory",
+];
+
+const PROJECT_MEMORY_KIND_TO_FILE = new Map([
+  ["business-rule", "business-rules.md"],
+  ["business-rules", "business-rules.md"],
+  ["decision", "decisions.md"],
+  ["decisions", "decisions.md"],
+  ["deployment", "deployment.md"],
+  ["environment", "environment.md"],
+  ["glossary", "glossary.md"],
+  ["knowledge", "knowledge.md"],
+  ["procedure", "procedures.md"],
+  ["procedures", "procedures.md"],
+  ["project", "project.md"],
+]);
+const MEMORY_PAGE_TYPES = new Set(["business-rule", "decision", "knowledge", "environment", "procedure", "deployment", "glossary", "project"]);
+const PROJECT_MEMORY_FILE_TO_TYPE = new Map([
+  ["business-rules.md", "business-rule"],
+  ["decisions.md", "decision"],
+  ["deployment.md", "deployment"],
+  ["environment.md", "environment"],
+  ["glossary.md", "glossary"],
+  ["knowledge.md", "knowledge"],
+  ["procedures.md", "procedure"],
+  ["project.md", "project"],
+]);
+const MEMORY_TYPE_OWNER = new Map([
+  ["business-rule", "product"],
+  ["decision", "engineering"],
+  ["deployment", "devops"],
+  ["environment", "devops"],
+  ["glossary", "product"],
+  ["knowledge", "engineering"],
+  ["procedure", "operations"],
+  ["project", "project"],
+]);
+
+const CODE_EXTENSIONS = new Set([
+  ".cjs",
+  ".css",
+  ".go",
+  ".html",
+  ".java",
+  ".js",
+  ".jsx",
+  ".json",
+  ".md",
+  ".mjs",
+  ".php",
+  ".py",
+  ".rb",
+  ".rs",
+  ".ts",
+  ".tsx",
+  ".yaml",
+  ".yml",
+]);
+
+const SKIP_DIRS = new Set([
+  ".git",
+  ".aipi",
+  "node_modules",
+  ".next",
+  "dist",
+  "build",
+  "coverage",
+  ".expo",
+  ".venv",
+  "venv",
+  "__pycache__",
+  ".turbo",
+  ".gradle",
+]);
+const SKIP_REL_DIRS = new Set(["ios/Pods", "android/build"]);
+const GRAPH_REL_PATH = ".aipi/state/aipi-graph.json";
+const GRAPH_SQLITE_REL_PATH = ".aipi/state/aipi-graph.sqlite";
+const GRAPH_VECTOR_DIMENSIONS = 768;
+const SEMANTIC_CONFIG_REL_PATH = ".aipi/semantic-memory.json";
+const DEFAULT_OLLAMA_HOST = "http://localhost:11434";
+const DEFAULT_OLLAMA_MODEL = "nomic-embed-text";
+const OLLAMA_EMBED_PATH = "/api/embed";
+const OLLAMA_INSTALL_MESSAGE =
+  "AIPI semantic search requires Ollama running with the 768-dim nomic-embed-text model. " +
+  "Start Ollama and run `ollama pull nomic-embed-text`, or set AIPI_OLLAMA_HOST / AIPI_OLLAMA_MODEL.";
+const MAX_GRAPH_RELATIONSHIPS = 2500;
+const RELATIONSHIP_PRIORITY = new Map([
+  ["test_covers", 0],
+  ["business_rule_impacts_code", 10],
+  ["bdd_contract_impacts_code", 20],
+  ["deployment_impacts_code", 30],
+  ["run_outcome_impacts_code", 40],
+  ["run_verifies_rule", 50],
+  ["run_fails_rule", 50],
+  ["run_blocks_rule", 50],
+  ["run_skips_rule", 50],
+  ["business_rule_conflicts", 60],
+  ["business_rule_implements_code", 61],
+  ["business_rule_relates_rule", 62],
+  ["business_rule_decided_by", 63],
+  ["decision_references_rule", 64],
+  ["decision_references_code", 65],
+  ["decision_references_test", 66],
+  ["mentions_file", 70],
+  ["mentions_symbol", 80],
+  ["defines", 90],
+]);
+const DOMAIN_TOKEN_ALIASES = new Map([
+  ["assinatura", "subscription"],
+  ["assinaturas", "subscription"],
+  ["billing", "billing"],
+  ["cobranca", "billing"],
+  ["cobrancas", "billing"],
+  ["discount", "discount"],
+  ["discounts", "discount"],
+  ["desconto", "discount"],
+  ["descontos", "discount"],
+  ["faturamento", "billing"],
+  ["invoice", "billing"],
+  ["invoices", "billing"],
+  ["preco", "price"],
+  ["precos", "price"],
+  ["price", "price"],
+  ["prices", "price"],
+  ["pricing", "price"],
+  ["renews", "renew"],
+  ["renewal", "renew"],
+  ["renewals", "renew"],
+  ["renewed", "renew"],
+  ["renewing", "renew"],
+  ["renovacao", "renew"],
+  ["renovacoes", "renew"],
+  ["renovada", "renew"],
+  ["renovadas", "renew"],
+  ["renovado", "renew"],
+  ["renovados", "renew"],
+  ["renovar", "renew"],
+  ["subscription", "subscription"],
+  ["subscriptions", "subscription"],
+  ["valor", "price"],
+  ["valores", "price"],
+]);
+const PRESERVE_RULE_TERMS = new Set([
+  "accepted",
+  "current",
+  "keep",
+  "keeps",
+  "maintain",
+  "preserve",
+  "preserved",
+  "preserves",
+  "same",
+  "aceito",
+  "atual",
+  "manter",
+  "mantem",
+  "preserva",
+  "preservam",
+]);
+const REPLACE_RULE_TERMS = new Set([
+  "always",
+  "different",
+  "new",
+  "override",
+  "recalculate",
+  "recalculated",
+  "replace",
+  "replaced",
+  "different",
+  "novo",
+  "nova",
+  "recalcula",
+  "recalculado",
+  "recalculada",
+  "substitui",
+]);
+const ALLOW_RULE_TERMS = new Set(["allow", "allowed", "permit", "permitted", "permite", "permitido"]);
+const DENY_RULE_TERMS = new Set(["block", "blocked", "deny", "denied", "never", "prohibit", "prohibited", "bloqueia", "nega", "nunca", "proibe"]);
+const REQUIRED_RULE_TERMS = new Set([
+  "deve",
+  "devem",
+  "mandatory",
+  "must",
+  "obligatory",
+  "obrigatoria",
+  "obrigatorias",
+  "obrigatorio",
+  "obrigatorios",
+  "require",
+  "required",
+  "requires",
+  "shall",
+]);
+const OPTIONAL_RULE_TERMS = new Set([
+  "dispensavel",
+  "may",
+  "omit",
+  "omite",
+  "omitem",
+  "omitir",
+  "omitted",
+  "optional",
+  "optionally",
+  "opcional",
+  "opcionais",
+  "pode",
+  "podem",
+  "skip",
+  "skippable",
+]);
+const BEFORE_RULE_TERMS = new Set(["antes", "before", "prior"]);
+const AFTER_RULE_TERMS = new Set(["after", "apos", "depois", "following"]);
+const AUTOMATIC_RULE_TERMS = new Set(["automatic", "automatically", "auto", "automated", "automatica", "automaticamente", "automatico", "automatizada", "automatizado"]);
+const MANUAL_RULE_TERMS = new Set(["manual", "manually", "manual-review", "manualmente", "revisao-manual"]);
+const DOMAIN_STOP_WORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "by",
+  "de",
+  "do",
+  "does",
+  "for",
+  "from",
+  "given",
+  "if",
+  "in",
+  "is",
+  "it",
+  "must",
+  "no",
+  "not",
+  "of",
+  "on",
+  "or",
+  "os",
+  "para",
+  "por",
+  "should",
+  "that",
+  "the",
+  "then",
+  "to",
+  "um",
+  "uma",
+  "when",
+  "with",
+]);
+
+export function registerAipiRuntimeTools(pi, { projectRootResolver = () => process.cwd() } = {}) {
+  pi.registerTool({
+    name: "aipi_memory_query",
+    description: "Query AIPI Markdown memory and return cited source snippets.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        layer: { type: "string", enum: ["project", "user", "all"] },
+        limit: { type: "number" },
+        type: { type: "string" },
+        owner: { type: "string" },
+        status: { type: "string" },
+        stale_before: { type: "string" },
+      },
+    },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      return jsonResult(await aipiMemoryQuery({ projectRoot: projectRootResolver(ctx), ...params }));
+    },
+  });
+
+  pi.registerTool({
+    name: "aipi_rule_lookup",
+    description: "Look up accepted business rules and BDD contracts with source citations.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        limit: { type: "number" },
+      },
+    },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      return jsonResult(await aipiRuleLookup({ projectRoot: projectRootResolver(ctx), ...params }));
+    },
+  });
+
+  pi.registerTool({
+    name: "aipi_rule_gap",
+    description: "Classify whether a business decision is covered, a gap, a conflict, or mechanics-only.",
+    parameters: {
+      type: "object",
+      required: ["query"],
+      properties: {
+        query: { type: "string" },
+        limit: { type: "number" },
+      },
+    },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      return jsonResult(await aipiRuleGap({ projectRoot: projectRootResolver(ctx), ...params }));
+    },
+  });
+
+  pi.registerTool({
+    name: "aipi_callers",
+    description: "Return lexical caller/reference matches for a symbol from the rebuildable AIPI code graph.",
+    parameters: {
+      type: "object",
+      required: ["symbol"],
+      properties: {
+        symbol: { type: "string" },
+        limit: { type: "number" },
+        rebuild: { type: "boolean" },
+      },
+    },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      return jsonResult(await aipiCallers({ projectRoot: projectRootResolver(ctx), ...params }));
+    },
+  });
+
+  pi.registerTool({
+    name: "aipi_impact",
+    description: "Return semantic + lexical impact candidates and related tests from the rebuildable AIPI code graph.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        symbol: { type: "string" },
+        path: { type: "string" },
+        limit: { type: "number" },
+        rebuild: { type: "boolean" },
+      },
+    },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      return jsonResult(await aipiImpact({ projectRoot: projectRootResolver(ctx), ...params }));
+    },
+  });
+
+  pi.registerTool({
+    name: "aipi_semantic_search",
+    description:
+      "Run semantic-only code search through Ollama nomic-embed-text. Fails loudly if semantic embeddings are unavailable.",
+    parameters: {
+      type: "object",
+      required: ["query"],
+      properties: {
+        query: { type: "string" },
+        limit: { type: "number" },
+        rebuild: { type: "boolean" },
+      },
+    },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      return jsonResult(await aipiSemanticSearch({ projectRoot: projectRootResolver(ctx), ...params }));
+    },
+  });
+
+  pi.registerTool({
+    name: "aipi_kanban_update",
+    description: "Append a structured workflow task/status event under .aipi/runtime.",
+    parameters: {
+      type: "object",
+      required: ["task", "status"],
+      properties: {
+        task: { type: "string" },
+        status: { type: "string" },
+        run_id: { type: "string" },
+        notes: { type: "string" },
+      },
+    },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      return jsonResult(await aipiKanbanUpdate({ projectRoot: projectRootResolver(ctx), ...params }));
+    },
+  });
+
+  pi.registerTool({
+    name: "aipi_promote_memory",
+    description:
+      "Promote approved reusable knowledge into Markdown memory, or record an unapproved candidate under runtime.",
+    parameters: {
+      type: "object",
+      required: ["kind", "content", "source_ref"],
+      properties: {
+        kind: { type: "string" },
+        title: { type: "string" },
+        content: { type: "string" },
+        source_ref: { type: "string" },
+        approved: { type: "boolean" },
+        approval_ref: { type: "string" },
+        user_memory: { type: "boolean" },
+        run_id: { type: "string" },
+      },
+    },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      return jsonResult(await aipiPromoteMemory({ projectRoot: projectRootResolver(ctx), ...params }));
+    },
+  });
+}
+
+export async function aipiMemoryQuery({
+  projectRoot,
+  query = "",
+  layer = "project",
+  limit = 8,
+  type = null,
+  owner = null,
+  status = null,
+  stale_before = null,
+  staleBefore = null,
+} = {}) {
+  const root = assertRoot(projectRoot);
+  const files = await memoryFiles(root, layer);
+  const filters = normalizeMemoryFilters({ type, owner, status, stale_before: stale_before ?? staleBefore });
+  const refs = await searchFiles({ root, files, query, limit, filters });
+  return {
+    schema: "aipi.tool-result.v1",
+    tool: "aipi_memory_query",
+    query,
+    layer,
+    filters,
+    refs,
+  };
+}
+
+export async function aipiRuleLookup({
+  projectRoot,
+  query = "",
+  limit = 8,
+} = {}) {
+  const root = assertRoot(projectRoot);
+  const files = [
+    path.join(root, ".aipi", "memory", "project", "business-rules.md"),
+    ...(await findRunContracts(root)),
+  ];
+  const refs = await searchFiles({ root, files, query, limit });
+  return {
+    schema: "aipi.tool-result.v1",
+    tool: "aipi_rule_lookup",
+    query,
+    refs,
+  };
+}
+
+export async function aipiRuleGap({
+  projectRoot,
+  query,
+  limit = 8,
+} = {}) {
+  if (!query?.trim()) throw new Error("aipi_rule_gap requires query");
+  const lookup = await aipiRuleLookup({ projectRoot, query, limit });
+  const joinedMatchedLines = lookup.refs.map((ref) => ref.text ?? "").join("\n").toLowerCase();
+  const normalizedQuery = query.toLowerCase();
+  let classification = "GAP";
+  if (/\b(mechanical|mechanics|mecanica|mecânico|refactor|format)\b/i.test(normalizedQuery)) {
+    classification = "MECHANICS";
+  } else if (
+    lookup.refs.length &&
+    (/\b(conflict|conflicts|contradict|contradiction|conflito|contradicao)\b/i.test(normalizedQuery) ||
+      /\b(conflict|conflicts|contradict|contradiction|conflito|contradicao)\b/i.test(joinedMatchedLines))
+  ) {
+    classification = "CONFLICT";
+  } else if (lookup.refs.length) {
+    classification = "COVERED";
+  }
+  return {
+    schema: "aipi.tool-result.v1",
+    tool: "aipi_rule_gap",
+    query,
+    classification,
+    refs: lookup.refs,
+    next_action:
+      classification === "GAP" || classification === "CONFLICT"
+        ? "ask one focused business-rule question before implementation"
+        : "continue workflow",
+  };
+}
+
+export async function rebuildCodeGraph({
+  projectRoot,
+  now = () => new Date(),
+  env = process.env,
+  embeddingFetch = globalThis.fetch,
+  previousGraph = null,
+} = {}) {
+  const root = assertRoot(projectRoot);
+  const files = await listProjectFiles(root);
+  const runReferenceFiles = await listRunReferenceFiles(root);
+  const runOutcomes = await summarizeRunOutcomes({ root, runReferenceFiles });
+  const graphFiles = [];
+  const symbols = [];
+
+  for (const rel of files) {
+    const abs = path.join(root, rel);
+    const content = await fs.readFile(abs, "utf8").catch(() => "");
+    const lines = content.split(/\r?\n/);
+    graphFiles.push({
+      path: rel,
+      line_count: lines.length,
+      size: Buffer.byteLength(content, "utf8"),
+      hash: contentHash(content),
+      memory_metadata: memoryFrontmatterForFile(rel, content),
+    });
+    for (const symbol of extractSymbols(content, rel)) {
+      symbols.push(symbol);
+    }
+  }
+
+  const graph = {
+    schema: "aipi.code-graph.v1",
+    built_at: now().toISOString(),
+    source: "sqlite+lexical",
+    stale: false,
+    files: graphFiles,
+    symbols,
+    run_outcomes: runOutcomes,
+    relationships: await buildRelationships({ root, files: graphFiles, symbols, runReferenceFiles, runOutcomes }),
+  };
+  graph.sqlite = await writeSqliteGraph({ root, graph, previousGraph, env, embeddingFetch });
+  graph.vector = graph.sqlite.vector ?? {
+    status: "unavailable",
+    engine: "sqlite-vec",
+    dimensions: GRAPH_VECTOR_DIMENSIONS,
+    reason: "sqlite sidecar unavailable",
+  };
+  graph.source = graph.vector.status === "available" ? "sqlite+sqlite-vec+lexical" : "sqlite+lexical";
+  graph.freshness = graphFreshnessFresh({ checkedAt: graph.built_at, fileCount: graph.files.length });
+  const graphPath = path.join(root, GRAPH_REL_PATH);
+  await fs.mkdir(path.dirname(graphPath), { recursive: true });
+  await fs.writeFile(graphPath, `${JSON.stringify(graph, null, 2)}\n`);
+  return graph;
+}
+
+export async function aipiCallers({
+  projectRoot,
+  symbol,
+  limit = 12,
+  rebuild = false,
+  env = process.env,
+  embeddingFetch = globalThis.fetch,
+} = {}) {
+  if (!symbol?.trim()) throw new Error("aipi_callers requires symbol");
+  const root = assertRoot(projectRoot);
+  const graph = await ensureGraph(root, { rebuild, env, embeddingFetch });
+  const refs = await graphRefs({ root, graph, query: symbol, limit, env, embeddingFetch });
+  return {
+    schema: "aipi.tool-result.v1",
+    tool: "aipi_callers",
+    symbol,
+    graph: graphSummary(graph),
+    refs,
+  };
+}
+
+export async function aipiImpact({
+  projectRoot,
+  query = "",
+  symbol = "",
+  path: targetPath = "",
+  limit = 16,
+  rebuild = false,
+  env = process.env,
+  embeddingFetch = globalThis.fetch,
+} = {}) {
+  const root = assertRoot(projectRoot);
+  const graph = await ensureGraph(root, { rebuild, env, embeddingFetch });
+  const needle = symbol || query || targetPath;
+  const refs = needle ? await graphRefs({ root, graph, query: needle, limit, env, embeddingFetch }) : [];
+  const relatedTests = graph.files
+    .map((file) => file.path)
+    .filter((rel) => /(^|\/)(test|tests|__tests__)\/|(\.test|\.spec)\./i.test(rel))
+    .filter((rel) => !targetPath || sharesStem(rel, targetPath))
+    .slice(0, Math.max(4, Math.min(limit, 12)));
+  const relationships = await graphRelationships({ root, graph, query: needle, targetPath, limit });
+
+  return {
+    schema: "aipi.tool-result.v1",
+    tool: "aipi_impact",
+    query: needle,
+    graph: graphSummary(graph),
+    refs,
+    relationships,
+    related_tests: relatedTests,
+  };
+}
+
+export async function aipiSemanticSearch({
+  projectRoot,
+  query = "",
+  limit = 12,
+  rebuild = false,
+  env = process.env,
+  embeddingFetch = globalThis.fetch,
+} = {}) {
+  if (!query?.trim()) throw new Error("aipi_semantic_search requires query");
+  const root = assertRoot(projectRoot);
+  const graph = await ensureGraph(root, { rebuild, env, embeddingFetch });
+  const refs = await graphRefs({ root, graph, query, limit, semanticOnly: true, env, embeddingFetch });
+  return {
+    schema: "aipi.tool-result.v1",
+    tool: "aipi_semantic_search",
+    query,
+    graph: graphSummary(graph),
+    refs,
+  };
+}
+
+export async function aipiKanbanUpdate({
+  projectRoot,
+  task,
+  status,
+  run_id = null,
+  notes = "",
+  now = () => new Date(),
+} = {}) {
+  const root = assertRoot(projectRoot);
+  if (!task?.trim()) throw new Error("aipi_kanban_update requires task");
+  if (!status?.trim()) throw new Error("aipi_kanban_update requires status");
+  const event = {
+    schema: "aipi.kanban-event.v1",
+    task,
+    status,
+    run_id,
+    notes,
+    recorded_at: now().toISOString(),
+  };
+  const runtimeDir = path.join(root, ".aipi", "runtime");
+  await fs.mkdir(runtimeDir, { recursive: true });
+  await appendJsonLine(path.join(runtimeDir, "kanban.jsonl"), event);
+  if (run_id) {
+    await appendJsonLine(path.join(runtimeDir, "runs", run_id, "events.jsonl"), {
+      ...event,
+      type: "kanban_update",
+    });
+  }
+  return {
+    schema: "aipi.tool-result.v1",
+    tool: "aipi_kanban_update",
+    event,
+    path: ".aipi/runtime/kanban.jsonl",
+  };
+}
+
+export async function aipiPromoteMemory({
+  projectRoot,
+  kind,
+  title = "",
+  content,
+  source_ref,
+  approved = false,
+  approval_ref = "",
+  user_memory = false,
+  run_id = null,
+  now = () => new Date(),
+} = {}) {
+  const root = assertRoot(projectRoot);
+  if (!kind?.trim()) throw new Error("aipi_promote_memory requires kind");
+  if (!content?.trim()) throw new Error("aipi_promote_memory requires content");
+  if (!source_ref?.trim()) throw new Error("aipi_promote_memory requires source_ref");
+
+  const timestamp = now().toISOString();
+  const approval = await inspectDurableMemoryApproval(root, approval_ref);
+  const approvedForDurableWrite = approval.ok;
+  const entry = renderMemoryEntry({ kind, title, content, source_ref, approval_ref, timestamp });
+
+  if (!approvedForDurableWrite) {
+    const candidateRel = path.posix.join(
+      ".aipi",
+      "runtime",
+      "memory-candidates",
+      `${timestamp.replace(/[:.]/g, "-")}-${slug(kind)}.md`,
+    );
+    await writeProjectFile(root, candidateRel, entry);
+    return {
+      schema: "aipi.tool-result.v1",
+      tool: "aipi_promote_memory",
+      status: "deferred",
+      reason: approval_ref
+        ? approval.reason
+        : "durable memory promotion requires approval_ref for an existing .aipi/runtime/approvals/approved artifact",
+      candidate_path: candidateRel,
+      approved_ignored: Boolean(approved),
+    };
+  }
+
+  const targetRel = user_memory
+    ? ".aipi/memory/user.local.md"
+    : path.posix.join(".aipi", "memory", "project", projectMemoryFileForKind(kind));
+  await insertMemoryEntry({ root, targetRel, entry, kind, timestamp });
+  if (run_id) {
+    await aipiKanbanUpdate({
+      projectRoot: root,
+      task: `memory:${kind}`,
+      status: "promoted",
+      run_id,
+      notes: targetRel,
+      now,
+    });
+  }
+  return {
+    schema: "aipi.tool-result.v1",
+    tool: "aipi_promote_memory",
+    status: "promoted",
+    path: targetRel,
+  };
+}
+
+async function memoryFiles(root, layer) {
+  const files = [];
+  if (layer === "project" || layer === "all") {
+    files.push(...(await listMarkdownFiles(path.join(root, ".aipi", "memory", "project"))));
+  }
+  if (layer === "user" || layer === "all") {
+    const userLocal = path.join(root, ".aipi", "memory", "user.local.md");
+    if (await pathExists(userLocal)) files.push(userLocal);
+  }
+  return files;
+}
+
+async function searchFiles({ root, files, query, limit, filters = {} }) {
+  const terms = tokenize(query);
+  const refs = [];
+  for (const file of files) {
+    if (!(await pathExists(file))) continue;
+    const rel = path.relative(root, file).replaceAll("\\", "/");
+    const text = await fs.readFile(file, "utf8");
+    const metadata = memoryFrontmatterForFile(rel, text);
+    if (!memoryMetadataMatches(metadata, filters)) continue;
+    const lines = text.split(/\r?\n/);
+    for (const [index, line] of lines.entries()) {
+      const score = terms.size ? scoreLine(line, terms) : (/^#{1,3}\s+/.test(line) ? 1 : 0);
+      if (score <= 0) continue;
+      refs.push({
+        path: rel,
+        line: index + 1,
+        score,
+        text: line,
+        excerpt: excerptAround(lines, index, 5),
+        metadata,
+      });
+    }
+  }
+  return refs.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path) || a.line - b.line).slice(0, limit);
+}
+
+function normalizeMemoryFilters({ type = null, owner = null, status = null, stale_before = null } = {}) {
+  const filters = {};
+  if (String(type ?? "").trim()) filters.type = slug(type);
+  if (String(owner ?? "").trim()) filters.owner = String(owner).trim();
+  if (String(status ?? "").trim()) filters.status = String(status).trim();
+  if (String(stale_before ?? "").trim()) filters.stale_before = String(stale_before).trim();
+  return filters;
+}
+
+function memoryMetadataMatches(metadata, filters = {}) {
+  if (!filters || !Object.keys(filters).length) return true;
+  const source = metadata ?? {};
+  if (filters.type && source.type !== filters.type) return false;
+  if (filters.owner && source.owner !== filters.owner) return false;
+  if (filters.status && source.status !== filters.status) return false;
+  if (filters.stale_before && !memoryReviewIsStale(source.last_reviewed, filters.stale_before)) return false;
+  return true;
+}
+
+function memoryReviewIsStale(lastReviewed, staleBefore) {
+  const cutoff = parseDateOnly(staleBefore);
+  if (!cutoff) return false;
+  const reviewed = parseDateOnly(lastReviewed);
+  if (!reviewed) return true;
+  return reviewed < cutoff;
+}
+
+function parseDateOnly(value) {
+  const text = String(value ?? "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
+  const date = new Date(`${text}T00:00:00.000Z`);
+  return Number.isNaN(date.getTime()) ? null : date.getTime();
+}
+
+export function parseMemoryFrontmatter(text) {
+  const lines = String(text ?? "").split(/\r?\n/);
+  if (lines[0] !== "---") return null;
+  const metadata = {};
+  for (let index = 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line === "---") return normalizeMemoryFrontmatter(metadata);
+    const field = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+    if (!field) continue;
+    const key = field[1].replaceAll("-", "_");
+    metadata[key] = field[2].trim();
+  }
+  return null;
+}
+
+function memoryFrontmatterForFile(rel, text) {
+  const metadata = parseMemoryFrontmatter(text);
+  if (!metadata) return null;
+  const inferredType = PROJECT_MEMORY_FILE_TO_TYPE.get(path.basename(rel));
+  return normalizeMemoryFrontmatter({
+    ...metadata,
+    type: metadata.type ?? inferredType,
+  });
+}
+
+function normalizeMemoryFrontmatter(metadata = {}) {
+  const rawType = String(metadata.type ?? "").trim();
+  const type = rawType ? slug(rawType) : null;
+  return {
+    type: MEMORY_PAGE_TYPES.has(type) ? type : type || null,
+    owner: String(metadata.owner ?? "").trim() || null,
+    status: String(metadata.status ?? "").trim() || null,
+    last_reviewed: String(metadata.last_reviewed ?? "").trim() || null,
+  };
+}
+
+async function findRunContracts(root) {
+  const runsDir = path.join(root, ".aipi", "runtime", "runs");
+  const entries = await fs.readdir(runsDir, { withFileTypes: true }).catch((error) => {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  });
+  return entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => path.join(runsDir, entry.name, "BDD-CONTRACT.md"));
+}
+
+async function ensureGraph(root, { rebuild = false, env = process.env, embeddingFetch = globalThis.fetch } = {}) {
+  if (!rebuild) {
+    const existing = await readJson(path.join(root, GRAPH_REL_PATH));
+    if (existing?.schema === "aipi.code-graph.v1" && !existing.stale && (await graphSidecarReady(root, existing))) {
+      const freshness = await inspectGraphFreshness(root, existing);
+      if (!freshness.stale) {
+        return { ...existing, stale: false, freshness };
+      }
+      const rebuilt = await rebuildCodeGraph({ projectRoot: root, previousGraph: existing, env, embeddingFetch });
+      return { ...rebuilt, rebuilt_from_stale: freshness };
+    }
+  }
+  const previousGraph = await readJson(path.join(root, GRAPH_REL_PATH)).catch(() => null);
+  return rebuildCodeGraph({ projectRoot: root, previousGraph, env, embeddingFetch });
+}
+
+async function graphSidecarReady(root, graph) {
+  if (graph.sqlite?.status !== "available") return true;
+  return pathExists(path.join(root, graph.sqlite.path ?? GRAPH_SQLITE_REL_PATH));
+}
+
+async function graphRefs({ root, graph, query, limit, semanticOnly = false, env = process.env, embeddingFetch = globalThis.fetch }) {
+  const sqlite = await sqliteRefs({ root, query, limit, semanticOnly, env, embeddingFetch });
+  if (sqlite) return sqlite;
+  if (semanticOnly) {
+    throw semanticUnavailableError("semantic-only search is unavailable because the SQLite vector index is missing.");
+  }
+  return lexicalRefs({ root, files: graph.files.map((file) => file.path), query, limit });
+}
+
+async function graphRelationships({ root, graph, query = "", targetPath = "", limit = 16 } = {}) {
+  const sqlite = await sqliteRelationshipRefs({ root, query, targetPath, limit });
+  if (sqlite) return sqlite;
+  return relationshipRefsFromGraph({ graph, query, targetPath, limit, source: "manifest" });
+}
+
+async function sqliteRefs({ root, query, limit, semanticOnly = false, env = process.env, embeddingFetch = globalThis.fetch }) {
+  const needle = String(query ?? "").trim();
+  if (!needle) return [];
+  const sqlite = await loadSqlite();
+  if (!sqlite) {
+    if (semanticOnly) throw semanticUnavailableError("semantic-only search requires node:sqlite.");
+    return null;
+  }
+  const sqlitePath = path.join(root, GRAPH_SQLITE_REL_PATH);
+  if (!(await pathExists(sqlitePath))) {
+    if (semanticOnly) throw semanticUnavailableError("semantic-only search requires a built AIPI SQLite graph.");
+    return null;
+  }
+
+  let db;
+  try {
+    db = new sqlite.DatabaseSync(sqlitePath, { readOnly: true, allowExtension: true });
+    const source = db.prepare("SELECT value FROM meta WHERE key = 'source'").get()?.value ?? "";
+    const vectorEnabled = String(source).includes("sqlite-vec");
+    const exactRows = db.prepare(`
+      SELECT path, line, text
+      FROM code_lines
+      WHERE text LIKE ? ESCAPE '\\'
+      ORDER BY path ASC, line ASC
+      LIMIT ?
+    `).all(`%${escapeLike(needle)}%`, Math.max(1, limit));
+    const exact = exactRows.map((row) => ({
+      path: row.path,
+      line: row.line,
+      excerpt: String(row.text ?? "").trim(),
+      source: "sqlite",
+    }));
+    if (!vectorEnabled && semanticOnly) {
+      throw semanticUnavailableError("semantic-only search requires a built sqlite-vec index.");
+    }
+    const vectorRows = vectorEnabled
+      ? await sqliteVectorRefs({ db, root, query: needle, limit, semanticOnly, env, embeddingFetch })
+      : [];
+    return semanticOnly ? vectorRows : mergeRefs([...exact, ...vectorRows], limit);
+  } catch (error) {
+    if (semanticOnly) throw asSemanticUnavailable(error);
+    return null;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      /* best-effort close */
+    }
+  }
+}
+
+async function sqliteRelationshipRefs({ root, query, targetPath, limit }) {
+  const sqlite = await loadSqlite();
+  if (!sqlite) return null;
+  const sqlitePath = path.join(root, GRAPH_SQLITE_REL_PATH);
+  if (!(await pathExists(sqlitePath))) return null;
+  const needle = String(targetPath || query || "").trim();
+  if (!needle) return [];
+  const fetchLimit = Math.max(64, Math.max(1, limit) * 8);
+
+  let db;
+  try {
+    db = new sqlite.DatabaseSync(sqlitePath, { readOnly: true });
+    const rows = db.prepare(`
+      SELECT source_kind, source_ref, relation, target_kind, target_ref, evidence
+      FROM relationships
+      WHERE source_ref LIKE ? ESCAPE '\\'
+        OR target_ref LIKE ? ESCAPE '\\'
+        OR relation LIKE ? ESCAPE '\\'
+        OR evidence LIKE ? ESCAPE '\\'
+      ORDER BY relation ASC, source_ref ASC, target_ref ASC
+      LIMIT ?
+    `).all(...Array(4).fill(`%${escapeLike(needle)}%`), fetchLimit);
+    return rows
+      .map((row) => ({
+        source_kind: row.source_kind,
+        source_ref: row.source_ref,
+        relation: row.relation,
+        target_kind: row.target_kind,
+        target_ref: row.target_ref,
+        evidence: row.evidence ?? null,
+        source: "sqlite",
+      }))
+      .sort((left, right) => compareRelationshipRefs(left, right, needle))
+      .slice(0, Math.max(1, limit));
+  } catch {
+    return null;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      /* best-effort close */
+    }
+  }
+}
+
+async function lexicalRefs({ root, files, query, limit }) {
+  const needle = String(query ?? "").trim();
+  if (!needle) return [];
+  const refs = [];
+  for (const rel of files) {
+    const abs = path.join(root, rel);
+    const lines = (await fs.readFile(abs, "utf8").catch(() => "")).split(/\r?\n/);
+    for (const [index, line] of lines.entries()) {
+      if (!line.toLowerCase().includes(needle.toLowerCase())) continue;
+      refs.push({
+        path: rel,
+        line: index + 1,
+        excerpt: excerptAround(lines, index, 5),
+        source: "lexical",
+      });
+      if (refs.length >= limit) return refs;
+    }
+  }
+  return refs;
+}
+
+async function listProjectFiles(root) {
+  const out = [];
+  const gitignore = await readGitignoreRules(root);
+  async function visit(dir) {
+    const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        const relDir = path.relative(root, path.join(dir, entry.name)).replaceAll("\\", "/");
+        if (shouldSkipProjectDir(relDir, entry.name, gitignore)) continue;
+        await visit(path.join(dir, entry.name));
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const abs = path.join(dir, entry.name);
+      const rel = path.relative(root, abs).replaceAll("\\", "/");
+      if (matchesGitignore(rel, false, gitignore)) continue;
+      if (!CODE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) continue;
+      const stat = await fs.stat(abs);
+      if (stat.size > 512_000) continue;
+      out.push(rel);
+    }
+  }
+  await visit(root);
+  return out.sort();
+}
+
+function shouldSkipProjectDir(relDir, name, gitignore = []) {
+  const normalized = normalizeRelDir(relDir);
+  if (normalized === ".aipi") return false;
+  if (normalized === ".aipi/memory") return false;
+  if (normalized.startsWith(".aipi/") && !normalized.startsWith(".aipi/memory/project")) return true;
+  if (SKIP_DIRS.has(name)) return true;
+  if ([...SKIP_REL_DIRS].some((skip) => normalized === skip || normalized.startsWith(`${skip}/`))) return true;
+  return matchesGitignore(normalized, true, gitignore);
+}
+
+async function readGitignoreRules(root) {
+  const text = await fs.readFile(path.join(root, ".gitignore"), "utf8").catch(() => "");
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#") && !line.startsWith("!"))
+    .map((pattern) => normalizeGitignorePattern(pattern));
+}
+
+function normalizeGitignorePattern(pattern) {
+  const directoryOnly = pattern.endsWith("/");
+  const anchored = pattern.startsWith("/");
+  const normalized = pattern.replace(/^\/+/, "").replace(/\/+$/, "").replaceAll("\\", "/");
+  return { pattern: normalized, directoryOnly, anchored };
+}
+
+function matchesGitignore(relPath, isDirectory, rules = []) {
+  const rel = String(relPath ?? "").replaceAll("\\", "/").replace(/^\/+/, "");
+  if (!rel) return false;
+  for (const rule of rules) {
+    if (rule.directoryOnly && !isDirectory) continue;
+    if (gitignoreRuleMatches(rel, rule)) return true;
+  }
+  return false;
+}
+
+function gitignoreRuleMatches(rel, rule) {
+  if (!rule.pattern) return false;
+  if (rule.pattern.includes("*")) return gitignoreGlobMatches(rel, rule.pattern);
+  if (rule.anchored || rule.pattern.includes("/")) {
+    return rel === rule.pattern || rel.startsWith(`${rule.pattern}/`);
+  }
+  return rel.split("/").includes(rule.pattern);
+}
+
+function gitignoreGlobMatches(rel, pattern) {
+  const escaped = pattern
+    .split("*")
+    .map((part) => part.replace(/[.+^${}()|[\]\\]/g, "\\$&"))
+    .join(".*");
+  return new RegExp(`(^|/)${escaped}($|/)`).test(rel);
+}
+
+function normalizeRelDir(relDir) {
+  return String(relDir ?? "").replaceAll("\\", "/").replace(/^\.\/+/, "").replace(/\/+$/, "");
+}
+
+async function buildRelationships({ root, files, symbols, runReferenceFiles = [], runOutcomes = [] }) {
+  const filePaths = files.map((file) => file.path);
+  const sourceFiles = filePaths.filter((rel) => !isTestFile(rel) && !isMemoryFile(rel));
+  const testFiles = filePaths.filter(isTestFile);
+  const memoryFilesInGraph = filePaths.filter(isMemoryFile);
+  const runOutcomesByRef = new Map(runOutcomes.map((outcome) => [outcome.ref, outcome]));
+  const edges = [];
+  const seen = new Set();
+
+  const add = (edge) => {
+    if (edges.length >= MAX_GRAPH_RELATIONSHIPS) return;
+    const normalized = {
+      source_kind: edge.source_kind,
+      source_ref: edge.source_ref,
+      relation: edge.relation,
+      target_kind: edge.target_kind,
+      target_ref: edge.target_ref,
+      evidence: edge.evidence ?? null,
+    };
+    if (!normalized.source_ref || !normalized.target_ref || !normalized.relation) return;
+    const key = [
+      normalized.source_kind,
+      normalized.source_ref,
+      normalized.relation,
+      normalized.target_kind,
+      normalized.target_ref,
+    ].join("\u0000");
+    if (seen.has(key)) return;
+    seen.add(key);
+    edges.push(normalized);
+  };
+
+  for (const symbol of symbols) {
+    add({
+      source_kind: "file",
+      source_ref: symbol.path,
+      relation: "defines",
+      target_kind: "symbol",
+      target_ref: symbol.name,
+      evidence: symbol.line ? `line ${symbol.line}` : null,
+    });
+  }
+
+  for (const testRel of testFiles) {
+    const content = await readProjectText(root, testRel);
+    const normalizedContent = content.toLowerCase();
+    for (const sourceRel of sourceFiles) {
+      if (!testRelatesToSource({ testRel, sourceRel, normalizedContent })) continue;
+      add({
+        source_kind: "test",
+        source_ref: testRel,
+        relation: "test_covers",
+        target_kind: "file",
+        target_ref: sourceRel,
+        evidence: sharesStem(testRel, sourceRel) ? "shared stem" : "source import/reference",
+      });
+    }
+  }
+
+  for (const memoryRel of memoryFilesInGraph) {
+    const content = await readProjectText(root, memoryRel);
+    const normalizedContent = content.toLowerCase();
+    const sourceKind = memorySourceKind(memoryRel);
+    for (const sourceRel of sourceFiles) {
+      if (!mentionsPath(normalizedContent, sourceRel)) continue;
+      add({
+        source_kind: sourceKind,
+        source_ref: memoryRel,
+        relation: "mentions_file",
+        target_kind: "file",
+        target_ref: sourceRel,
+        evidence: "memory text references path or basename",
+      });
+    }
+    for (const symbol of symbols.slice(0, 1000)) {
+      if (!mentionsWord(normalizedContent, symbol.name)) continue;
+      add({
+        source_kind: sourceKind,
+        source_ref: memoryRel,
+        relation: "mentions_symbol",
+        target_kind: "symbol",
+        target_ref: symbol.name,
+        evidence: `defined in ${symbol.path}`,
+      });
+    }
+  }
+
+  for (const runRel of runReferenceFiles) {
+    const content = await readProjectText(root, runRel);
+    const normalizedContent = content.toLowerCase();
+    const outcome = runOutcomesByRef.get(runRel) ?? extractRunOutcome({ rel: runRel, content });
+    for (const sourceRel of sourceFiles) {
+      if (!mentionsPath(normalizedContent, sourceRel)) continue;
+      add({
+        source_kind: "run_artifact",
+        source_ref: runRel,
+        relation: "mentions_file",
+        target_kind: "file",
+        target_ref: sourceRel,
+        evidence: "run artifact references path or basename",
+      });
+      if (outcome?.verdict) {
+        add({
+          source_kind: "run_artifact",
+          source_ref: runRel,
+          relation: "run_outcome_impacts_code",
+          target_kind: "file",
+          target_ref: sourceRel,
+          evidence: `${outcome.verdict} outcome references path or basename`,
+        });
+      }
+    }
+  }
+
+  await addDomainRelationships({
+    root,
+    files: filePaths,
+    sourceFiles,
+    memoryFilesInGraph,
+    runReferenceFiles,
+    add,
+  });
+
+  return edges;
+}
+
+async function addDomainRelationships({ root, files, sourceFiles, memoryFilesInGraph, runReferenceFiles, add }) {
+  const sourceDocs = [];
+  const fileSet = new Set(files);
+  for (const rel of sourceFiles.filter((candidate) => !candidate.startsWith(".aipi/"))) {
+    const content = await readProjectText(root, rel);
+    sourceDocs.push({
+      rel,
+      tokens: domainTokenSet(`${rel}\n${content.slice(0, 80_000)}`),
+    });
+  }
+
+  const businessRules = [];
+  const decisions = [];
+  const bddContracts = [];
+  const deploymentDocs = [];
+  for (const rel of memoryFilesInGraph) {
+    const content = await readProjectText(root, rel);
+    if (rel.endsWith("/business-rules.md")) {
+      businessRules.push(...extractBusinessRules(content, rel));
+    }
+    if (rel.endsWith("/decisions.md")) {
+      decisions.push(...extractDecisions(content, rel));
+    }
+    if (rel.endsWith("/deployment.md")) {
+      deploymentDocs.push({
+        kind: "deployment_surface",
+        ref: rel,
+        title: "deployment",
+        text: content,
+        tokens: domainTokenSet(`${rel}\n${content}`),
+      });
+    }
+  }
+
+  for (const rel of runReferenceFiles) {
+    const content = await readProjectText(root, rel);
+    if (rel.endsWith("/BDD-CONTRACT.md") || looksLikeBddContract(content)) {
+      bddContracts.push({
+        kind: "bdd_contract",
+        ref: rel,
+        title: firstMarkdownHeading(content) ?? path.basename(rel),
+        text: content,
+        tokens: domainTokenSet(`${rel}\n${content}`),
+      });
+    }
+  }
+
+  addDomainToSourceEdges({
+    add,
+    docs: businessRules,
+    sourceDocs,
+    relation: "business_rule_impacts_code",
+    sourceKind: "business_rule",
+  });
+  addDomainToSourceEdges({
+    add,
+    docs: bddContracts,
+    sourceDocs,
+    relation: "bdd_contract_impacts_code",
+    sourceKind: "bdd_contract",
+  });
+  addDomainToSourceEdges({
+    add,
+    docs: deploymentDocs,
+    sourceDocs,
+    relation: "deployment_impacts_code",
+    sourceKind: "deployment_surface",
+  });
+  addStructuredMemoryLinkEdges({ add, businessRules, decisions, fileSet });
+  addBusinessRuleConflictEdges({ add, businessRules });
+  await addRunRuleEdges({ root, add, runReferenceFiles, businessRules });
+}
+
+function addDomainToSourceEdges({ add, docs, sourceDocs, relation, sourceKind }) {
+  for (const doc of docs) {
+    for (const source of sourceDocs) {
+      const match = domainMatchEvidence(doc, source);
+      if (!match) continue;
+      add({
+        source_kind: sourceKind,
+        source_ref: doc.ref,
+        relation,
+        target_kind: "file",
+        target_ref: source.rel,
+        evidence: match.evidence,
+      });
+    }
+  }
+}
+
+function domainMatchEvidence(doc, source) {
+  const normalizedText = String(doc.text ?? "").toLowerCase();
+  const normalizedSourcePath = source.rel.toLowerCase();
+  const sourceBasename = path.basename(source.rel).replace(/\.[^.]+$/, "").toLowerCase();
+  if (normalizedText.includes(normalizedSourcePath)) {
+    return { evidence: `explicit source path: ${source.rel}` };
+  }
+  const overlap = tokenOverlap(doc.tokens, source.tokens).slice(0, 5);
+  if (overlap.length >= 2) {
+    return { evidence: `shared canonical domain terms: ${overlap.join(", ")}` };
+  }
+  if (doc.tokens.has(sourceBasename)) {
+    return { evidence: "source basename referenced" };
+  }
+  return null;
+}
+
+function addBusinessRuleConflictEdges({ add, businessRules }) {
+  const byId = new Map(businessRules.map((rule) => [rule.id.toLowerCase(), rule]));
+  for (const rule of businessRules) {
+    for (const conflictId of extractConflictRuleIds(rule.text)) {
+      const target = byId.get(conflictId.toLowerCase());
+      if (!target || target.ref === rule.ref) continue;
+      add({
+        source_kind: "business_rule",
+        source_ref: rule.ref,
+        relation: "business_rule_conflicts",
+        target_kind: "business_rule",
+        target_ref: target.ref,
+        evidence: `explicit conflict reference ${conflictId}`,
+      });
+    }
+  }
+  addImplicitBusinessRuleConflictEdges({ add, businessRules });
+}
+
+function addStructuredMemoryLinkEdges({ add, businessRules, decisions, fileSet }) {
+  const rulesById = new Map(businessRules.map((rule) => [rule.id.toLowerCase(), rule]));
+  const decisionsById = new Map(decisions.map((decision) => [decision.id.toLowerCase(), decision]));
+
+  for (const rule of businessRules) {
+    for (const targetPath of rule.links.implements ?? []) {
+      if (!fileSet.has(targetPath)) continue;
+      add({
+        source_kind: "business_rule",
+        source_ref: rule.ref,
+        relation: "business_rule_implements_code",
+        target_kind: isTestFile(targetPath) ? "test" : "file",
+        target_ref: targetPath,
+        evidence: `structured implements link ${targetPath}`,
+      });
+    }
+    for (const relatedId of rule.links.relates ?? []) {
+      const related = rulesById.get(relatedId.toLowerCase());
+      if (!related || related.ref === rule.ref) continue;
+      add({
+        source_kind: "business_rule",
+        source_ref: rule.ref,
+        relation: "business_rule_relates_rule",
+        target_kind: "business_rule",
+        target_ref: related.ref,
+        evidence: `structured relates link ${related.id}`,
+      });
+    }
+    for (const decisionId of rule.links["decided-by"] ?? []) {
+      const decision = decisionsById.get(decisionId.toLowerCase());
+      if (!decision) continue;
+      add({
+        source_kind: "business_rule",
+        source_ref: rule.ref,
+        relation: "business_rule_decided_by",
+        target_kind: "decision",
+        target_ref: decision.ref,
+        evidence: `structured decided-by link ${decision.id}`,
+      });
+    }
+  }
+
+  for (const decision of decisions) {
+    for (const ruleId of decision.links.rules ?? []) {
+      const rule = rulesById.get(ruleId.toLowerCase());
+      if (!rule) continue;
+      add({
+        source_kind: "decision",
+        source_ref: decision.ref,
+        relation: "decision_references_rule",
+        target_kind: "business_rule",
+        target_ref: rule.ref,
+        evidence: `structured rules link ${rule.id}`,
+      });
+    }
+    for (const codePath of decision.links.code ?? []) {
+      if (!fileSet.has(codePath)) continue;
+      add({
+        source_kind: "decision",
+        source_ref: decision.ref,
+        relation: "decision_references_code",
+        target_kind: isTestFile(codePath) ? "test" : "file",
+        target_ref: codePath,
+        evidence: `structured code link ${codePath}`,
+      });
+    }
+    for (const testPath of decision.links.tests ?? []) {
+      if (!fileSet.has(testPath)) continue;
+      add({
+        source_kind: "decision",
+        source_ref: decision.ref,
+        relation: "decision_references_test",
+        target_kind: "test",
+        target_ref: testPath,
+        evidence: `structured tests link ${testPath}`,
+      });
+    }
+  }
+}
+
+function addImplicitBusinessRuleConflictEdges({ add, businessRules }) {
+  for (let leftIndex = 0; leftIndex < businessRules.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < businessRules.length; rightIndex += 1) {
+      const left = businessRules[leftIndex];
+      const right = businessRules[rightIndex];
+      const conflict = implicitBusinessRuleConflict(left, right);
+      if (!conflict) continue;
+      add({
+        source_kind: "business_rule",
+        source_ref: right.ref,
+        relation: "business_rule_conflicts",
+        target_kind: "business_rule",
+        target_ref: left.ref,
+        evidence: `${implicitBusinessRuleConflictEvidence(conflict.reason)} over: ${conflict.overlap.join(", ")}`,
+      });
+    }
+  }
+}
+
+function implicitBusinessRuleConflictEvidence(reason) {
+  if (reason === "preserve-vs-replace") return "implicit preserve-vs-replace conflict";
+  if (reason === "allow-vs-deny") return "implicit allow-vs-deny conflict";
+  if (reason === "required-vs-optional") return "implicit required-vs-optional conflict";
+  if (reason === "automatic-vs-manual") return "implicit automatic-vs-manual conflict";
+  if (reason === "sequence-mismatch") return "implicit sequence mismatch conflict";
+  if (reason === "numeric-mismatch") return "implicit numeric mismatch conflict";
+  if (reason === "monetary-mismatch") return "implicit monetary mismatch conflict";
+  if (reason === "threshold-direction-mismatch") return "implicit threshold direction conflict";
+  if (reason === "date-mismatch") return "implicit date mismatch conflict";
+  if (reason === "time-mismatch") return "implicit time mismatch conflict";
+  if (reason === "enum-value-mismatch") return "implicit enum value mismatch conflict";
+  if (reason === "boolean-state-mismatch") return "implicit boolean state mismatch conflict";
+  if (reason === "cardinality-mismatch") return "implicit cardinality mismatch conflict";
+  return `implicit ${reason} conflict`;
+}
+
+function implicitBusinessRuleConflict(left, right) {
+  const overlap = tokenOverlap(left.tokens, right.tokens)
+    .filter((token) => !["accepted", "current", "new", "same"].includes(token))
+    .slice(0, 5);
+  if (overlap.length < 2) return null;
+  const leftPolarity = businessRulePolarity(left);
+  const rightPolarity = businessRulePolarity(right);
+  if ((leftPolarity.preserve && rightPolarity.replace) || (leftPolarity.replace && rightPolarity.preserve)) {
+    return { reason: "preserve-vs-replace", overlap };
+  }
+  if ((leftPolarity.allow && rightPolarity.deny) || (leftPolarity.deny && rightPolarity.allow)) {
+    return { reason: "allow-vs-deny", overlap };
+  }
+  if ((leftPolarity.required && rightPolarity.optional) || (leftPolarity.optional && rightPolarity.required)) {
+    return { reason: "required-vs-optional", overlap };
+  }
+  if ((leftPolarity.automatic && rightPolarity.manual) || (leftPolarity.manual && rightPolarity.automatic)) {
+    return { reason: "automatic-vs-manual", overlap };
+  }
+  if ((leftPolarity.before && rightPolarity.after) || (leftPolarity.after && rightPolarity.before)) {
+    return { reason: "sequence-mismatch", overlap };
+  }
+  const dateConflict = businessRuleDateConflict(left, right);
+  if (dateConflict) {
+    return {
+      reason: "date-mismatch",
+      overlap: [...new Set([...overlap, dateConflict.unit])].slice(0, 5),
+    };
+  }
+  const timeConflict = businessRuleTimeConflict(left, right);
+  if (timeConflict) {
+    return {
+      reason: "time-mismatch",
+      overlap: [...new Set([...overlap, timeConflict.unit])].slice(0, 5),
+    };
+  }
+  const enumConflict = businessRuleEnumConflict(left, right);
+  if (enumConflict) {
+    return {
+      reason: "enum-value-mismatch",
+      overlap: [...new Set([...overlap, enumConflict.unit])].slice(0, 5),
+    };
+  }
+  const booleanStateConflict = businessRuleBooleanStateConflict(left, right);
+  if (booleanStateConflict) {
+    return {
+      reason: "boolean-state-mismatch",
+      overlap: [...new Set([...overlap, booleanStateConflict.unit])].slice(0, 5),
+    };
+  }
+  const cardinalityConflict = businessRuleCardinalityConflict(left, right);
+  if (cardinalityConflict) {
+    return {
+      reason: "cardinality-mismatch",
+      overlap: [...new Set([...overlap, cardinalityConflict.unit])].slice(0, 5),
+    };
+  }
+  const numericConflict = businessRuleNumericConflict(left, right);
+  if (numericConflict) {
+    return {
+      reason: numericConflict.reason ?? "numeric-mismatch",
+      overlap: [...new Set([...overlap, numericConflict.unit])].slice(0, 5),
+    };
+  }
+  return null;
+}
+
+function businessRulePolarity(rule) {
+  const tokens = new Set([...rule.tokens, ...domainTokenSet(rule.text ?? "")]);
+  const rawTokens = businessRuleRawTokens(rule.text);
+  return {
+    preserve: hasAnyToken(tokens, PRESERVE_RULE_TERMS),
+    replace: hasAnyToken(tokens, REPLACE_RULE_TERMS),
+    allow: hasAnyToken(tokens, ALLOW_RULE_TERMS),
+    deny: hasAnyToken(tokens, DENY_RULE_TERMS),
+    required: hasAnyToken(rawTokens, REQUIRED_RULE_TERMS),
+    optional: hasAnyToken(rawTokens, OPTIONAL_RULE_TERMS),
+    automatic: hasAnyToken(rawTokens, AUTOMATIC_RULE_TERMS),
+    manual: hasAnyToken(rawTokens, MANUAL_RULE_TERMS),
+    before: hasAnyToken(rawTokens, BEFORE_RULE_TERMS),
+    after: hasAnyToken(rawTokens, AFTER_RULE_TERMS),
+  };
+}
+
+function hasAnyToken(tokens, candidates) {
+  for (const candidate of candidates) {
+    if (tokens.has(candidate)) return true;
+  }
+  return false;
+}
+
+function businessRuleRawTokens(text) {
+  const raw = String(text ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .match(/[a-z0-9_]+/g);
+  return new Set(raw ?? []);
+}
+
+function businessRuleDateConflict(left, right) {
+  const leftFacts = extractRuleDateFacts(left.text);
+  const rightFacts = extractRuleDateFacts(right.text);
+  for (const leftFact of leftFacts) {
+    for (const rightFact of rightFacts) {
+      if (leftFact.unit !== rightFact.unit) continue;
+      if (leftFact.value === rightFact.value) continue;
+      return {
+        unit: leftFact.unit,
+        left: leftFact.value,
+        right: rightFact.value,
+      };
+    }
+  }
+  return null;
+}
+
+function businessRuleTimeConflict(left, right) {
+  const leftFacts = extractRuleTimeFacts(left.text);
+  const rightFacts = extractRuleTimeFacts(right.text);
+  for (const leftFact of leftFacts) {
+    for (const rightFact of rightFacts) {
+      if (leftFact.unit !== rightFact.unit) continue;
+      if (leftFact.value === rightFact.value) continue;
+      return {
+        unit: leftFact.unit,
+        left: leftFact.value,
+        right: rightFact.value,
+      };
+    }
+  }
+  return null;
+}
+
+function businessRuleEnumConflict(left, right) {
+  const leftFacts = extractRuleEnumFacts(left.text);
+  const rightFacts = extractRuleEnumFacts(right.text);
+  for (const leftFact of leftFacts) {
+    for (const rightFact of rightFacts) {
+      if (leftFact.unit !== rightFact.unit) continue;
+      if (leftFact.value === rightFact.value) continue;
+      return {
+        unit: leftFact.unit,
+        left: leftFact.value,
+        right: rightFact.value,
+      };
+    }
+  }
+  return null;
+}
+
+function businessRuleBooleanStateConflict(left, right) {
+  const leftFacts = extractRuleBooleanStateFacts(left.text);
+  const rightFacts = extractRuleBooleanStateFacts(right.text);
+  for (const leftFact of leftFacts) {
+    for (const rightFact of rightFacts) {
+      if (leftFact.unit !== rightFact.unit) continue;
+      if (leftFact.value === rightFact.value) continue;
+      return {
+        unit: leftFact.unit,
+        left: leftFact.value,
+        right: rightFact.value,
+      };
+    }
+  }
+  return null;
+}
+
+function businessRuleCardinalityConflict(left, right) {
+  const leftFacts = extractRuleCardinalityFacts(left.text);
+  const rightFacts = extractRuleCardinalityFacts(right.text);
+  for (const leftFact of leftFacts) {
+    for (const rightFact of rightFacts) {
+      if (leftFact.unit !== rightFact.unit) continue;
+      if (leftFact.value === rightFact.value) continue;
+      return {
+        unit: leftFact.unit,
+        left: leftFact.value,
+        right: rightFact.value,
+      };
+    }
+  }
+  return null;
+}
+
+function businessRuleNumericConflict(left, right) {
+  const leftFacts = extractRuleNumericFacts(left.text);
+  const rightFacts = extractRuleNumericFacts(right.text);
+  for (const leftFact of leftFacts) {
+    for (const rightFact of rightFacts) {
+      if (leftFact.unit !== rightFact.unit) continue;
+      if (thresholdDirectionConflict(leftFact, rightFact)) {
+        return {
+          unit: leftFact.unit,
+          left: leftFact.value,
+          right: rightFact.value,
+          reason: "threshold-direction-mismatch",
+        };
+      }
+      if (thresholdFactsCompatible(leftFact, rightFact)) continue;
+      if (leftFact.value === rightFact.value) continue;
+      return {
+        unit: leftFact.unit,
+        left: leftFact.value,
+        right: rightFact.value,
+        reason: leftFact.reason ?? rightFact.reason ?? "numeric-mismatch",
+      };
+    }
+  }
+  return null;
+}
+
+function extractRuleNumericFacts(text) {
+  const normalized = String(text ?? "").replace(/\bBR-[A-Za-z0-9_-]+\b/g, " ");
+  const facts = [];
+  for (const match of normalized.matchAll(/\b(at\s+least|minimum|min|no\s+less\s+than|at\s+most|maximum|max|no\s+more\s+than)\s+(\d+(?:[.,]\d+)?)\s*(days?|dias?|hours?|horas?|attempts?|tentativas?|percent|percentage|%|por\s+cento)\b/gi)) {
+    const comparator = normalizeThresholdComparator(match[1]);
+    const value = parseLocaleNumber(match[2]);
+    const unit = normalizeNumericUnit(match[3]);
+    if (!comparator || !Number.isFinite(value) || !unit) continue;
+    facts.push({ value, unit, comparator, reason: "threshold-direction-mismatch" });
+  }
+  for (const match of normalized.matchAll(/\b(\d+(?:[.,]\d+)?)\s+or\s+(more|greater|higher|less|fewer)\s*(days?|dias?|hours?|horas?|attempts?|tentativas?|percent|percentage|%|por\s+cento)\b/gi)) {
+    const comparator = normalizeThresholdComparator(match[2]);
+    const value = parseLocaleNumber(match[1]);
+    const unit = normalizeNumericUnit(match[3]);
+    if (!comparator || !Number.isFinite(value) || !unit) continue;
+    facts.push({ value, unit, comparator, reason: "threshold-direction-mismatch" });
+  }
+  for (const match of normalized.matchAll(/(USD|US\$|\$|BRL|R\$)\s*(\d+(?:[.,]\d+)?)/gi)) {
+    const value = parseLocaleNumber(match[2]);
+    const unit = normalizeCurrencyUnit(match[1]);
+    if (!Number.isFinite(value) || !unit) continue;
+    facts.push({ value, unit, reason: "monetary-mismatch" });
+  }
+  for (const match of normalized.matchAll(/\b(\d+(?:[.,]\d+)?)\s*(USD|BRL|dollars?|reais)\b/gi)) {
+    const value = parseLocaleNumber(match[1]);
+    const unit = normalizeCurrencyUnit(match[2]);
+    if (!Number.isFinite(value) || !unit) continue;
+    facts.push({ value, unit, reason: "monetary-mismatch" });
+  }
+  for (const match of normalized.matchAll(/\b(\d+(?:\.\d+)?)\s*(days?|dias?|hours?|horas?|attempts?|tentativas?|percent|percentage|%|por\s+cento)\b/gi)) {
+    const value = Number(match[1]);
+    const unit = normalizeNumericUnit(match[2]);
+    if (!Number.isFinite(value) || !unit) continue;
+    facts.push({ value, unit });
+  }
+  return facts;
+}
+
+function extractRuleCardinalityFacts(text) {
+  const normalized = String(text ?? "")
+    .replace(/\bBR-[A-Za-z0-9_-]+\b/g, " ")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+  const facts = [];
+  for (const match of normalized.matchAll(/\b(?:only\s+one|exactly\s+one|one)\s+([a-z][a-z0-9_-]*(?:\s+[a-z][a-z0-9_-]*){0,3})\b/g)) {
+    const subject = normalizeCardinalitySubject(match[1]);
+    if (!subject) continue;
+    facts.push({ value: "single", unit: `cardinality:${subject}` });
+  }
+  for (const match of normalized.matchAll(/\b(?:multiple|many|several|more\s+than\s+one)\s+([a-z][a-z0-9_-]*(?:\s+[a-z][a-z0-9_-]*){0,3})\b/g)) {
+    const subject = normalizeCardinalitySubject(match[1]);
+    if (!subject) continue;
+    facts.push({ value: "multiple", unit: `cardinality:${subject}` });
+  }
+  return facts;
+}
+
+function extractRuleBooleanStateFacts(text) {
+  const normalized = String(text ?? "")
+    .replace(/\bBR-[A-Za-z0-9_-]+\b/g, " ")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+  const facts = [];
+  for (const match of normalized.matchAll(/\b([a-z][a-z0-9_-]*(?:\s+[a-z][a-z0-9_-]*){0,3})\s+(?:is|must\s+be|should\s+be|shall\s+be|stays?|remains?)\s+(enabled|disabled|active|inactive|on|off|true|false)\b/g)) {
+    const subject = normalizeBooleanSubject(match[1]);
+    const value = normalizeBooleanState(match[2]);
+    if (!subject || !value) continue;
+    facts.push({ value, unit: `boolean:${subject}` });
+  }
+  return facts;
+}
+
+function extractRuleEnumFacts(text) {
+  const normalized = String(text ?? "")
+    .replace(/\bBR-[A-Za-z0-9_-]+\b/g, " ")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+  const facts = [];
+  for (const match of normalized.matchAll(/\b([a-z][a-z0-9_-]*)\s+(status|state|stage|tier|plan|role|visibility|access|classification|mode|type|scope|provider|channel|source|owner|region|locale|language|environment|method|currency)\s+(?:is|must\s+be|must\s+equal|should\s+be|equals?|=|becomes?)\s+[`'"]?([a-z][a-z0-9_-]{1,40})[`'"]?\b/g)) {
+    const object = normalizeEnumToken(match[1]);
+    const field = normalizeEnumToken(match[2]);
+    const value = normalizeEnumToken(match[3]);
+    if (!object || !field || !value) continue;
+    facts.push({ value, unit: `enum:${object}:${field}` });
+  }
+  return facts;
+}
+
+function extractRuleTimeFacts(text) {
+  const normalized = String(text ?? "")
+    .replace(/\bBR-[A-Za-z0-9_-]+\b/g, " ")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+  const facts = [];
+  for (const match of normalized.matchAll(/\b([01]?\d|2[0-3]):([0-5]\d)\b/g)) {
+    const value = normalizeTimeParts(match[1], match[2]);
+    if (!value) continue;
+    facts.push({ value, unit: timeRoleForContext(normalized, match.index ?? 0) });
+  }
+  return facts;
+}
+
+function extractRuleDateFacts(text) {
+  const normalized = String(text ?? "")
+    .replace(/\bBR-[A-Za-z0-9_-]+\b/g, " ")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+  const facts = [];
+  for (const match of normalized.matchAll(/\b(\d{4})-(\d{2})-(\d{2})\b/g)) {
+    const value = normalizeDateParts(match[1], match[2], match[3]);
+    if (!value) continue;
+    facts.push({ value, unit: dateRoleForContext(normalized, match.index ?? 0) });
+  }
+  for (const match of normalized.matchAll(/\b(\d{1,2})\/(\d{1,2})\/(\d{4})\b/g)) {
+    const value = normalizeDateParts(match[3], match[2], match[1]);
+    if (!value) continue;
+    facts.push({ value, unit: dateRoleForContext(normalized, match.index ?? 0) });
+  }
+  return facts;
+}
+
+function thresholdDirectionConflict(leftFact, rightFact) {
+  if (!leftFact.comparator || !rightFact.comparator) return false;
+  if (leftFact.comparator === rightFact.comparator) return false;
+  if (leftFact.value === rightFact.value) return true;
+  const minValue = leftFact.comparator === "min" ? leftFact.value : rightFact.value;
+  const maxValue = leftFact.comparator === "max" ? leftFact.value : rightFact.value;
+  return minValue > maxValue;
+}
+
+function thresholdFactsCompatible(leftFact, rightFact) {
+  if (!leftFact.comparator || !rightFact.comparator) return false;
+  if (leftFact.comparator === rightFact.comparator) return true;
+  if (leftFact.value === rightFact.value) return false;
+  const minValue = leftFact.comparator === "min" ? leftFact.value : rightFact.value;
+  const maxValue = leftFact.comparator === "max" ? leftFact.value : rightFact.value;
+  return minValue <= maxValue;
+}
+
+function parseLocaleNumber(value) {
+  const normalized = String(value ?? "").replace(",", ".");
+  return Number(normalized);
+}
+
+function normalizeThresholdComparator(comparator) {
+  const normalized = String(comparator ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+  if (["at least", "minimum", "min", "no less than", "more", "greater", "higher"].includes(normalized)) {
+    return "min";
+  }
+  if (["at most", "maximum", "max", "no more than", "less", "fewer"].includes(normalized)) {
+    return "max";
+  }
+  return null;
+}
+
+function normalizeCurrencyUnit(unit) {
+  const normalized = String(unit ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+  if (["usd", "us$", "$", "dollar", "dollars"].includes(normalized)) return "currency:usd";
+  if (["brl", "r$", "real", "reais"].includes(normalized)) return "currency:brl";
+  return null;
+}
+
+function normalizeDateParts(year, month, day) {
+  const parsedYear = Number(year);
+  const parsedMonth = Number(month);
+  const parsedDay = Number(day);
+  if (
+    !Number.isInteger(parsedYear) ||
+    !Number.isInteger(parsedMonth) ||
+    !Number.isInteger(parsedDay) ||
+    parsedYear < 1900 ||
+    parsedYear > 2200 ||
+    parsedMonth < 1 ||
+    parsedMonth > 12 ||
+    parsedDay < 1 ||
+    parsedDay > 31
+  ) {
+    return null;
+  }
+  const date = new Date(Date.UTC(parsedYear, parsedMonth - 1, parsedDay));
+  if (
+    date.getUTCFullYear() !== parsedYear ||
+    date.getUTCMonth() !== parsedMonth - 1 ||
+    date.getUTCDate() !== parsedDay
+  ) {
+    return null;
+  }
+  return `${String(parsedYear).padStart(4, "0")}-${String(parsedMonth).padStart(2, "0")}-${String(parsedDay).padStart(2, "0")}`;
+}
+
+function normalizeTimeParts(hour, minute) {
+  const parsedHour = Number(hour);
+  const parsedMinute = Number(minute);
+  if (
+    !Number.isInteger(parsedHour) ||
+    !Number.isInteger(parsedMinute) ||
+    parsedHour < 0 ||
+    parsedHour > 23 ||
+    parsedMinute < 0 ||
+    parsedMinute > 59
+  ) {
+    return null;
+  }
+  return `${String(parsedHour).padStart(2, "0")}:${String(parsedMinute).padStart(2, "0")}`;
+}
+
+function normalizeEnumToken(token) {
+  const normalized = String(token ?? "").toLowerCase().replace(/[^a-z0-9_-]+/g, "").trim();
+  if (!normalized || ["new", "current", "same", "accepted", "proposed"].includes(normalized)) return null;
+  return normalized;
+}
+
+function normalizeBooleanSubject(subject) {
+  const rawTokens = String(subject ?? "")
+    .toLowerCase()
+    .match(/[a-z0-9_-]+/g) ?? [];
+  const tokens = rawTokens.filter((token) => !["the", "a", "an", "is", "must", "should", "shall"].includes(token));
+  if (!tokens.length || tokens.every((token) => ["feature", "flag", "setting", "status", "state"].includes(token))) return null;
+  return tokens.slice(-4).join("-");
+}
+
+function normalizeBooleanState(state) {
+  const normalized = String(state ?? "").toLowerCase().trim();
+  if (["enabled", "active", "on", "true"].includes(normalized)) return "enabled";
+  if (["disabled", "inactive", "off", "false"].includes(normalized)) return "disabled";
+  return null;
+}
+
+function normalizeCardinalitySubject(subject) {
+  const rawTokens = String(subject ?? "")
+    .toLowerCase()
+    .match(/[a-z0-9_-]+/g) ?? [];
+  const tokens = rawTokens
+    .filter((token) => !["the", "a", "an", "new", "current", "same", "allowed", "required", "requires"].includes(token))
+    .map((token, index, all) => {
+      if (index !== all.length - 1 || token.length <= 3 || !token.endsWith("s")) return token;
+      return token.slice(0, -1);
+    });
+  if (!tokens.length || tokens.every((token) => ["item", "items", "record", "records", "thing", "things"].includes(token))) return null;
+  return tokens.slice(-4).join("-");
+}
+
+function dateRoleForContext(text, index) {
+  const lower = String(text ?? "").toLowerCase();
+  const window = lower.slice(Math.max(0, index - 60), Math.min(lower.length, index + 40));
+  if (/\b(expires?|expiration|deadline|due|validade|vence|vencimento|expira|prazo)\b/.test(window)) {
+    return "date:deadline";
+  }
+  if (/\b(effective|starts?|begins?|inicio|inicia|vigencia|comeca)\b/.test(window)) {
+    return "date:effective";
+  }
+  if (/\b(created|creation|criado|criacao)\b/.test(window)) {
+    return "date:created";
+  }
+  return "date:unspecified";
+}
+
+function timeRoleForContext(text, index) {
+  const lower = String(text ?? "").toLowerCase();
+  const window = lower.slice(Math.max(0, index - 60), Math.min(lower.length, index + 40));
+  if (/\b(cutoff|cut-off|deadline|due|limit|limite|horario|fechamento|closes?|encerra|fim)\b/.test(window)) {
+    return "time:cutoff";
+  }
+  if (/\b(starts?|begins?|opens?|inicio|inicia|abre|abertura|comeca)\b/.test(window)) {
+    return "time:start";
+  }
+  return "time:unspecified";
+}
+
+function normalizeNumericUnit(unit) {
+  const normalized = String(unit ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+  if (["day", "days", "dia", "dias"].includes(normalized)) return "day";
+  if (["hour", "hours", "hora", "horas"].includes(normalized)) return "hour";
+  if (["attempt", "attempts", "tentativa", "tentativas"].includes(normalized)) return "attempt";
+  if (["percent", "percentage", "%", "por cento"].includes(normalized)) return "percent";
+  return null;
+}
+
+async function addRunRuleEdges({ root, add, runReferenceFiles, businessRules }) {
+  if (!businessRules.length) return;
+  for (const rel of runReferenceFiles) {
+    if (rel.endsWith("/BDD-CONTRACT.md")) continue;
+    const content = await readProjectText(root, rel);
+    const tokens = domainTokenSet(`${rel}\n${content}`);
+    const normalizedContent = content.toLowerCase();
+    const outcome = extractRunOutcome({ rel, content });
+    for (const rule of businessRules) {
+      const direct = normalizedContent.includes(rule.id.toLowerCase()) ||
+        (rule.title && normalizedContent.includes(rule.title.toLowerCase()));
+      const overlap = direct ? [] : tokenOverlap(tokens, rule.tokens).slice(0, 5);
+      if (!direct && overlap.length < 2) continue;
+      add({
+        source_kind: "run_artifact",
+        source_ref: rel,
+        relation: runOutcomeRuleRelation(outcome?.verdict) ?? "run_references_rule",
+        target_kind: "business_rule",
+        target_ref: rule.ref,
+        evidence: runRuleEvidence({ outcome, direct, rule, overlap }),
+      });
+    }
+  }
+}
+
+async function summarizeRunOutcomes({ root, runReferenceFiles }) {
+  const outcomes = [];
+  for (const rel of runReferenceFiles) {
+    const content = await readProjectText(root, rel);
+    const outcome = extractRunOutcome({ rel, content });
+    if (!outcome?.verdict) continue;
+    outcomes.push(outcome);
+  }
+  return outcomes;
+}
+
+function extractRunOutcome({ rel, content }) {
+  const text = String(content ?? "");
+  const verdict =
+    firstMatch(text, /\bVERDICT\s*:\s*(PASS|FAIL|BLOCKED|SKIPPED)\b/i) ??
+    firstMatch(text, /"verdict"\s*:\s*"(PASS|FAIL|BLOCKED|SKIPPED)"/i) ??
+    firstJsonLikeOutcome(text, "verdict") ??
+    firstJsonLikeOutcome(text, "status");
+  const normalizedVerdict = normalizeRunOutcome(verdict);
+  if (!normalizedVerdict) return null;
+  return {
+    ref: rel,
+    run_id: runIdFromRunRef(rel),
+    step_id: stepIdFromRunRef(rel),
+    verdict: normalizedVerdict,
+    evidence: `outcome=${normalizedVerdict}`,
+  };
+}
+
+function firstJsonLikeOutcome(text, key) {
+  for (const line of String(text ?? "").split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      const value = parsed?.[key] ?? parsed?.result?.[key] ?? parsed?.step_result?.[key];
+      const normalized = normalizeRunOutcome(value);
+      if (normalized) return normalized;
+    } catch {
+      /* ignore non-json lines */
+    }
+  }
+  try {
+    const parsed = JSON.parse(text);
+    return normalizeRunOutcome(parsed?.[key] ?? parsed?.result?.[key] ?? parsed?.step_result?.[key]);
+  } catch {
+    return null;
+  }
+}
+
+function firstMatch(text, pattern) {
+  return String(text ?? "").match(pattern)?.[1] ?? null;
+}
+
+function normalizeRunOutcome(value) {
+  const normalized = String(value ?? "").trim().toUpperCase().replaceAll("-", "_");
+  if (["PASS", "FAIL", "BLOCKED", "SKIPPED"].includes(normalized)) return normalized;
+  if (normalized === "PASSED") return "PASS";
+  if (normalized === "FAILED") return "FAIL";
+  return null;
+}
+
+function runOutcomeRuleRelation(verdict) {
+  if (verdict === "PASS") return "run_verifies_rule";
+  if (verdict === "FAIL") return "run_fails_rule";
+  if (verdict === "BLOCKED") return "run_blocks_rule";
+  if (verdict === "SKIPPED") return "run_skips_rule";
+  return null;
+}
+
+function runRuleEvidence({ outcome, direct, rule, overlap }) {
+  const matchEvidence = direct ? `mentions ${rule.id}` : `shared domain terms: ${overlap.join(", ")}`;
+  return outcome?.verdict ? `${outcome.verdict} outcome; ${matchEvidence}` : matchEvidence;
+}
+
+function runIdFromRunRef(rel) {
+  return String(rel ?? "").match(/(?:^|\/)\.aipi\/runtime\/runs\/([^/]+)/)?.[1] ?? null;
+}
+
+function stepIdFromRunRef(rel) {
+  return String(rel ?? "").match(/\/steps\/([^/]+)\//)?.[1] ?? null;
+}
+
+function extractBusinessRules(content, rel) {
+  const scanContent = stripFencedCodeBlocks(content);
+  const matches = [...scanContent.matchAll(/^###\s+(BR-[A-Za-z0-9_-]+)\s*-?\s*(.*?)\s*$/gim)];
+  return matches.map((match, index) => {
+    const start = match.index ?? 0;
+    const end = index + 1 < matches.length ? matches[index + 1].index ?? scanContent.length : scanContent.length;
+    const id = match[1];
+    const title = match[2]?.trim() ?? id;
+    const text = scanContent.slice(start, end).trim();
+    return {
+      id,
+      title,
+      ref: `${rel}#${id}`,
+      text,
+      links: extractStructuredLinks(text),
+      tokens: domainTokenSet(`${id} ${title}\n${text}`),
+    };
+  });
+}
+
+function extractDecisions(content, rel) {
+  const scanContent = stripFencedCodeBlocks(content);
+  const matches = [...scanContent.matchAll(/^###\s+(ADR-[A-Za-z0-9_-]+)\s*-?\s*(.*?)\s*$/gim)];
+  return matches.map((match, index) => {
+    const start = match.index ?? 0;
+    const end = index + 1 < matches.length ? matches[index + 1].index ?? scanContent.length : scanContent.length;
+    const id = match[1];
+    const title = match[2]?.trim() ?? id;
+    const text = scanContent.slice(start, end).trim();
+    return {
+      id,
+      title,
+      ref: `${rel}#${id}`,
+      text,
+      links: extractStructuredLinks(text),
+      tokens: domainTokenSet(`${id} ${title}\n${text}`),
+    };
+  });
+}
+
+function stripFencedCodeBlocks(content) {
+  const out = [];
+  let inFence = false;
+  for (const line of String(content ?? "").split(/\r?\n/)) {
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence;
+      out.push("");
+      continue;
+    }
+    out.push(inFence ? "" : line);
+  }
+  return out.join("\n");
+}
+
+function extractStructuredLinks(text) {
+  return {
+    implements: extractLinkValues(text, "implements"),
+    relates: extractLinkValues(text, "relates"),
+    "decided-by": extractLinkValues(text, "decided-by"),
+    rules: extractLinkValues(text, "rules"),
+    code: extractLinkValues(text, "code"),
+    tests: extractLinkValues(text, "tests"),
+  };
+}
+
+function extractLinkValues(text, key) {
+  const escaped = escapeRegex(key);
+  const match = String(text ?? "").match(new RegExp(`${escaped}\\s*:\\s*\\[([^\\]]*)\\]`, "i"));
+  if (!match) return [];
+  return match[1]
+    .split(",")
+    .map((item) => item.trim().replace(/^["'`]+|["'`]+$/g, ""))
+    .filter(Boolean);
+}
+
+function extractConflictRuleIds(text) {
+  const ids = new Set();
+  for (const match of String(text ?? "").matchAll(/\bconflicts?(?:-with)?\s*:\s*([^\n]+)/gi)) {
+    for (const id of match[1].match(/\bBR-[A-Za-z0-9_-]+\b/gi) ?? []) ids.add(id.toUpperCase());
+  }
+  return [...ids];
+}
+
+function looksLikeBddContract(content) {
+  const text = String(content ?? "").toLowerCase();
+  return text.includes("given ") && text.includes("when ") && text.includes("then ");
+}
+
+function firstMarkdownHeading(content) {
+  return String(content ?? "").match(/^#\s+(.+)$/m)?.[1]?.trim() ?? null;
+}
+
+function runArtifactLooksVerified(rel, content) {
+  const outcome = extractRunOutcome({ rel, content });
+  if (outcome?.verdict) return outcome.verdict === "PASS";
+  const text = `${rel}\n${content}`.toLowerCase();
+  return text.includes("verification") ||
+    text.includes("verified") ||
+    text.includes("verdict: pass") ||
+    text.includes('"verdict":"pass"') ||
+    text.includes('"verdict": "pass"');
+}
+
+function domainTokenSet(text) {
+  const raw = String(text ?? "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .match(/[a-z0-9_]+/g) ?? [];
+  const tokens = new Set();
+  for (const token of raw.map((item) => item.replace(/^_+|_+$/g, ""))) {
+    addDomainToken(tokens, token);
+  }
+  return tokens;
+}
+
+function addDomainToken(tokens, token) {
+  if (!token || token.length <= 2 || /^\d+$/.test(token) || DOMAIN_STOP_WORDS.has(token)) return;
+  tokens.add(token);
+  const alias = DOMAIN_TOKEN_ALIASES.get(token);
+  if (alias && !DOMAIN_STOP_WORDS.has(alias)) tokens.add(alias);
+  const singular = singularDomainToken(token);
+  if (singular && singular !== token && !DOMAIN_STOP_WORDS.has(singular)) {
+    tokens.add(singular);
+    const singularAlias = DOMAIN_TOKEN_ALIASES.get(singular);
+    if (singularAlias && !DOMAIN_STOP_WORDS.has(singularAlias)) tokens.add(singularAlias);
+  }
+}
+
+function singularDomainToken(token) {
+  if (token.endsWith("ies") && token.length > 4) return `${token.slice(0, -3)}y`;
+  if (token.endsWith("oes") && token.length > 4) return `${token.slice(0, -3)}ao`;
+  if (token.endsWith("es") && token.length > 4 && !token.endsWith("ses")) return token.slice(0, -2);
+  if (token.endsWith("s") && token.length > 3 && !token.endsWith("ss")) return token.slice(0, -1);
+  return token;
+}
+
+function tokenOverlap(left, right) {
+  const out = [];
+  for (const token of left) {
+    if (right.has(token)) out.push(token);
+  }
+  return out.sort();
+}
+
+async function listRunReferenceFiles(root, maxFiles = 80) {
+  const runsDir = path.join(root, ".aipi", "runtime", "runs");
+  const out = [];
+  async function visit(dir) {
+    if (out.length >= maxFiles) return;
+    const entries = await fs.readdir(dir, { withFileTypes: true }).catch((error) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    });
+    for (const entry of entries) {
+      if (out.length >= maxFiles) break;
+      const abs = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await visit(abs);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const ext = path.extname(entry.name).toLowerCase();
+      if (![".md", ".json", ".jsonl", ".txt"].includes(ext)) continue;
+      const stat = await fs.stat(abs);
+      if (stat.size > 128_000) continue;
+      out.push(path.relative(root, abs).replaceAll("\\", "/"));
+    }
+  }
+  await visit(runsDir);
+  return out.sort();
+}
+
+function extractSymbols(content, relPath) {
+  const symbols = [];
+  const patterns = [
+    /\b(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/g,
+    /\bclass\s+([A-Za-z_$][\w$]*)/g,
+    /\b(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=/g,
+    /\b(?:export\s+)?(?:let|var)\s+([A-Za-z_$][\w$]*)\s*=/g,
+  ];
+  for (const pattern of patterns) {
+    for (const match of content.matchAll(pattern)) {
+      symbols.push({ name: match[1], path: relPath, line: lineNumberForIndex(content, match.index ?? 0) });
+    }
+  }
+  return symbols;
+}
+
+function graphSummary(graph) {
+  return {
+    path: GRAPH_REL_PATH,
+    source: graph.source ?? "lexical",
+    built_at: graph.built_at ?? null,
+    stale: Boolean(graph.stale),
+    freshness: graph.freshness ?? { status: graph.stale ? "stale" : "unknown" },
+    rebuilt_from_stale: graph.rebuilt_from_stale ?? null,
+    file_count: graph.files?.length ?? 0,
+    memory_metadata_count: graph.files?.filter((file) => file.memory_metadata).length ?? 0,
+    symbol_count: graph.symbols?.length ?? 0,
+    relationship_count: graph.relationships?.length ?? 0,
+    run_outcome_count: graph.run_outcomes?.length ?? 0,
+    sqlite: graph.sqlite ?? { path: GRAPH_SQLITE_REL_PATH, status: "unknown" },
+    vector: graph.vector ?? graph.sqlite?.vector ?? { status: "unknown", engine: "sqlite-vec" },
+  };
+}
+
+async function inspectGraphFreshness(root, graph) {
+  const checkedAt = new Date().toISOString();
+  if (!Array.isArray(graph.files)) {
+    return graphFreshnessStale({
+      checkedAt,
+      reason: "graph missing file list",
+      expectedCount: 0,
+      actualCount: 0,
+    });
+  }
+  const indexed = new Map(graph.files.map((file) => [file.path, file]));
+  if ([...indexed.values()].some((file) => !file.hash)) {
+    return graphFreshnessStale({
+      checkedAt,
+      reason: "graph missing file hash metadata",
+      expectedCount: indexed.size,
+      actualCount: indexed.size,
+    });
+  }
+
+  const currentFiles = await listProjectFiles(root);
+  const current = new Map();
+  for (const rel of currentFiles) {
+    const content = await fs.readFile(path.join(root, rel), "utf8").catch(() => "");
+    current.set(rel, {
+      path: rel,
+      line_count: content.split(/\r?\n/).length,
+      size: Buffer.byteLength(content, "utf8"),
+      hash: contentHash(content),
+    });
+  }
+
+  for (const rel of indexed.keys()) {
+    if (!current.has(rel)) {
+      return graphFreshnessStale({
+        checkedAt,
+        reason: `indexed file removed: ${rel}`,
+        expectedCount: indexed.size,
+        actualCount: current.size,
+      });
+    }
+  }
+  for (const [rel, actual] of current.entries()) {
+    const expected = indexed.get(rel);
+    if (!expected) {
+      return graphFreshnessStale({
+        checkedAt,
+        reason: `new file not indexed: ${rel}`,
+        expectedCount: indexed.size,
+        actualCount: current.size,
+      });
+    }
+    if (
+      expected.hash !== actual.hash ||
+      expected.size !== actual.size ||
+      expected.line_count !== actual.line_count
+    ) {
+      return graphFreshnessStale({
+        checkedAt,
+        reason: `indexed file changed: ${rel}`,
+        expectedCount: indexed.size,
+        actualCount: current.size,
+      });
+    }
+  }
+  return graphFreshnessFresh({ checkedAt, fileCount: current.size });
+}
+
+function graphFreshnessFresh({ checkedAt, fileCount }) {
+  return {
+    status: "fresh",
+    stale: false,
+    checked_at: checkedAt,
+    reason: null,
+    indexed_file_count: fileCount,
+    current_file_count: fileCount,
+  };
+}
+
+function graphFreshnessStale({ checkedAt, reason, expectedCount, actualCount }) {
+  return {
+    status: "stale",
+    stale: true,
+    checked_at: checkedAt,
+    reason,
+    indexed_file_count: expectedCount,
+    current_file_count: actualCount,
+  };
+}
+
+function contentHash(content) {
+  return crypto.createHash("sha256").update(content).digest("hex");
+}
+
+async function writeSqliteGraph({
+  root,
+  graph,
+  previousGraph = null,
+  env = process.env,
+  embeddingFetch = globalThis.fetch,
+}) {
+  const sqlite = await loadSqlite();
+  const status = {
+    path: GRAPH_SQLITE_REL_PATH,
+    status: sqlite ? "available" : "unavailable",
+    engine: sqlite ? "node:sqlite" : null,
+  };
+  if (!sqlite) return status;
+
+  const sqlitePath = path.join(root, GRAPH_SQLITE_REL_PATH);
+  await fs.mkdir(path.dirname(sqlitePath), { recursive: true });
+  let db;
+  let transactionOpen = false;
+  try {
+    const embeddingConfig = await resolveSemanticEmbeddingConfig({ root, env });
+    const reusableEmbeddingCache = await readReusableEmbeddingCache({
+      sqlite,
+      sqlitePath,
+      previousGraph,
+      graph,
+      embeddingConfig,
+    });
+    await fs.rm(sqlitePath, { force: true }).catch(() => {});
+    db = new sqlite.DatabaseSync(sqlitePath, { allowExtension: true });
+    db.exec(`
+      DROP TABLE IF EXISTS meta;
+      DROP TABLE IF EXISTS files;
+      DROP TABLE IF EXISTS symbols;
+      DROP TABLE IF EXISTS code_lines;
+      DROP TABLE IF EXISTS relationships;
+      DROP TABLE IF EXISTS vector_items;
+      DROP TABLE IF EXISTS embedding_cache;
+      DROP TABLE IF EXISTS code_vectors;
+      CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE files (
+        path TEXT PRIMARY KEY,
+        line_count INTEGER NOT NULL,
+        size INTEGER NOT NULL,
+        memory_type TEXT,
+        memory_owner TEXT,
+        memory_status TEXT,
+        memory_last_reviewed TEXT
+      );
+      CREATE INDEX files_memory_metadata_idx ON files(memory_type, memory_owner, memory_status, memory_last_reviewed);
+      CREATE TABLE symbols (name TEXT NOT NULL, path TEXT NOT NULL, line INTEGER);
+      CREATE INDEX symbols_name_idx ON symbols(name);
+      CREATE INDEX symbols_path_idx ON symbols(path);
+      CREATE TABLE code_lines (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL, line INTEGER NOT NULL, text TEXT NOT NULL);
+      CREATE INDEX code_lines_path_idx ON code_lines(path);
+      CREATE INDEX code_lines_text_idx ON code_lines(text);
+      CREATE TABLE relationships (
+        source_kind TEXT NOT NULL,
+        source_ref TEXT NOT NULL,
+        relation TEXT NOT NULL,
+        target_kind TEXT NOT NULL,
+        target_ref TEXT NOT NULL,
+        evidence TEXT
+      );
+      CREATE INDEX relationships_source_idx ON relationships(source_kind, source_ref);
+      CREATE INDEX relationships_target_idx ON relationships(target_kind, target_ref);
+      CREATE INDEX relationships_relation_idx ON relationships(relation);
+      CREATE TABLE vector_items (vector_rowid INTEGER PRIMARY KEY, code_line_id INTEGER NOT NULL, source TEXT NOT NULL);
+      CREATE TABLE embedding_cache (
+        item_key TEXT PRIMARY KEY,
+        path TEXT NOT NULL,
+        file_hash TEXT NOT NULL,
+        dimensions INTEGER NOT NULL,
+        model TEXT NOT NULL,
+        host TEXT NOT NULL,
+        embedding TEXT NOT NULL
+      );
+    `);
+
+    let vector = withEmbeddingMetadata(await prepareSqliteVec(db), embeddingConfig);
+    if (vector.status === "available") {
+      db.exec(`CREATE VIRTUAL TABLE code_vectors USING vec0(embedding float[${GRAPH_VECTOR_DIMENSIONS}])`);
+    }
+
+    db.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+
+    const metaInsert = db.prepare("INSERT INTO meta(key, value) VALUES (?, ?)");
+    metaInsert.run("schema", graph.schema);
+    metaInsert.run("built_at", graph.built_at);
+
+    const fileInsert = db.prepare(
+      "INSERT INTO files(path, line_count, size, memory_type, memory_owner, memory_status, memory_last_reviewed) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    );
+    for (const file of graph.files) {
+      fileInsert.run(
+        file.path,
+        file.line_count,
+        file.size,
+        file.memory_metadata?.type ?? null,
+        file.memory_metadata?.owner ?? null,
+        file.memory_metadata?.status ?? null,
+        file.memory_metadata?.last_reviewed ?? null,
+      );
+    }
+
+    const symbolInsert = db.prepare("INSERT INTO symbols(name, path, line) VALUES (?, ?, ?)");
+    for (const symbol of graph.symbols) {
+      symbolInsert.run(symbol.name, symbol.path, symbol.line ?? null);
+    }
+
+    const relationshipInsert = db.prepare(
+      "INSERT INTO relationships(source_kind, source_ref, relation, target_kind, target_ref, evidence) VALUES (?, ?, ?, ?, ?, ?)",
+    );
+    for (const edge of graph.relationships ?? []) {
+      relationshipInsert.run(
+        edge.source_kind,
+        edge.source_ref,
+        edge.relation,
+        edge.target_kind,
+        edge.target_ref,
+        edge.evidence ?? null,
+      );
+    }
+
+    const lineInsert = db.prepare("INSERT INTO code_lines(path, line, text) VALUES (?, ?, ?)");
+    let vectorInsert = vector.status === "available" ? db.prepare("INSERT INTO code_vectors(embedding) VALUES (?)") : null;
+    let vectorMapInsert =
+      vector.status === "available"
+        ? db.prepare("INSERT INTO vector_items(vector_rowid, code_line_id, source) VALUES (?, ?, ?)")
+        : null;
+    const lastInsertId = db.prepare("SELECT last_insert_rowid() AS id");
+    const cacheInsert =
+      vector.status === "available"
+        ? db.prepare("INSERT OR REPLACE INTO embedding_cache(item_key, path, file_hash, dimensions, model, host, embedding) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        : null;
+    let vectorItemCount = 0;
+    const embeddingCache = new Map(reusableEmbeddingCache);
+    for (const file of graph.files) {
+      const content = await fs.readFile(path.join(root, file.path), "utf8").catch(() => "");
+      const lines = content.split(/\r?\n/);
+      for (const [index, line] of lines.entries()) {
+        if (!line.trim()) continue;
+        lineInsert.run(file.path, index + 1, line);
+        const codeLineId = lastInsertId.get().id;
+        if (vectorInsert && vectorMapInsert) {
+          try {
+            const itemKey = `${file.path}\n${line}`;
+            const embedding = embeddingCache.get(itemKey) ?? await vectorLiteral(itemKey, {
+              root,
+              env,
+              fetchFn: embeddingFetch,
+              cache: embeddingCache,
+            });
+            embeddingCache.set(itemKey, embedding);
+            vectorInsert.run(embedding);
+            const vectorRowid = lastInsertId.get().id;
+            vectorMapInsert.run(vectorRowid, codeLineId, "code_line");
+            cacheInsert?.run(
+              itemKey,
+              file.path,
+              file.hash,
+              GRAPH_VECTOR_DIMENSIONS,
+              embeddingConfig.model,
+              embeddingConfig.host,
+              embedding,
+            );
+            vectorItemCount += 1;
+          } catch (error) {
+            vector = semanticVectorUnavailable(error, embeddingConfig);
+            vector.item_count = vectorItemCount;
+            vectorInsert = null;
+            vectorMapInsert = null;
+          }
+        }
+      }
+    }
+
+    const source = vector.status === "available" ? "sqlite+sqlite-vec+lexical" : "sqlite+lexical";
+    metaInsert.run("source", source);
+    if (vector.status === "available") {
+      vector.item_count = vectorItemCount;
+    }
+
+    db.exec("COMMIT");
+    transactionOpen = false;
+
+    return {
+      ...status,
+      source,
+      file_count: graph.files.length,
+      symbol_count: graph.symbols.length,
+      relationship_count: graph.relationships?.length ?? 0,
+      vector,
+    };
+  } catch (error) {
+    if (transactionOpen) {
+      try {
+        db?.exec("ROLLBACK");
+      } catch {
+        /* best-effort rollback */
+      }
+    }
+    return {
+      ...status,
+      status: "unavailable",
+      error: String(error?.message ?? error),
+    };
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      /* best-effort close */
+    }
+  }
+}
+
+async function readReusableEmbeddingCache({
+  sqlite,
+  sqlitePath,
+  previousGraph,
+  graph,
+  embeddingConfig,
+} = {}) {
+  if (!sqlite || !previousGraph || !(await pathExists(sqlitePath))) return new Map();
+  const previousHashes = new Map((previousGraph.files ?? []).map((file) => [file.path, file.hash]));
+  const currentHashes = new Map((graph.files ?? []).map((file) => [file.path, file.hash]));
+  const unchanged = new Set();
+  for (const [rel, hash] of currentHashes.entries()) {
+    if (hash && previousHashes.get(rel) === hash) unchanged.add(rel);
+  }
+  if (!unchanged.size) return new Map();
+
+  let db;
+  try {
+    db = new sqlite.DatabaseSync(sqlitePath, { readOnly: true });
+    const rows = db.prepare(`
+      SELECT item_key, path, file_hash, dimensions, model, host, embedding
+      FROM embedding_cache
+      WHERE dimensions = ? AND model = ? AND host = ?
+    `).all(GRAPH_VECTOR_DIMENSIONS, embeddingConfig.model, embeddingConfig.host);
+    const cache = new Map();
+    for (const row of rows) {
+      if (!unchanged.has(row.path)) continue;
+      if (currentHashes.get(row.path) !== row.file_hash) continue;
+      cache.set(row.item_key, row.embedding);
+    }
+    return cache;
+  } catch {
+    return new Map();
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      /* best-effort close */
+    }
+  }
+}
+
+async function loadSqlite() {
+  try {
+    return await import("node:sqlite");
+  } catch {
+    return null;
+  }
+}
+
+async function prepareSqliteVec(db) {
+  try {
+    const sqliteVec = await import("sqlite-vec");
+    db.enableLoadExtension?.(true);
+    sqliteVec.load(db);
+    const version = db.prepare("SELECT vec_version() AS version").get()?.version ?? null;
+    return {
+      status: "available",
+      engine: "sqlite-vec",
+      version,
+      dimensions: GRAPH_VECTOR_DIMENSIONS,
+    };
+  } catch (error) {
+    return {
+      status: "unavailable",
+      engine: "sqlite-vec",
+      dimensions: GRAPH_VECTOR_DIMENSIONS,
+      reason: String(error?.message ?? error),
+    };
+  } finally {
+    try {
+      db.enableLoadExtension?.(false);
+    } catch {
+      /* best-effort hardening */
+    }
+  }
+}
+
+async function sqliteVectorRefs({ db, root, query, limit, semanticOnly = false, env = process.env, embeddingFetch = globalThis.fetch }) {
+  const vector = await prepareSqliteVec(db);
+  if (vector.status !== "available") return [];
+  try {
+    const embedding = await vectorLiteral(query, { root, env, fetchFn: embeddingFetch });
+    const rows = db.prepare(`
+      SELECT cl.path AS path, cl.line AS line, cl.text AS text, vectors.distance AS distance
+      FROM code_vectors AS vectors
+      JOIN vector_items AS items ON items.vector_rowid = vectors.rowid
+      JOIN code_lines AS cl ON cl.id = items.code_line_id
+      WHERE vectors.embedding MATCH ? AND k = ?
+      ORDER BY vectors.distance ASC
+      LIMIT ?
+    `).all(embedding, Math.max(1, limit), Math.max(1, limit));
+    return rows.map((row) => ({
+      path: row.path,
+      line: row.line,
+      excerpt: String(row.text ?? "").trim(),
+      source: "sqlite-vec",
+      distance: Number(row.distance),
+    }));
+  } catch (error) {
+    if (semanticOnly) throw asSemanticUnavailable(error);
+    return [];
+  }
+}
+
+function mergeRefs(refs, limit) {
+  const out = [];
+  const seen = new Set();
+  for (const ref of refs) {
+    const key = `${ref.path}:${ref.line}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(ref);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+function escapeLike(value) {
+  return String(value ?? "").replace(/[\\%_]/g, "\\$&");
+}
+
+async function vectorLiteral(text, options = {}) {
+  const vector = await embedText(text, options);
+  return JSON.stringify(Array.from(vector, (value) => Number(value.toFixed(6))));
+}
+
+export async function embedText(text, {
+  root = process.cwd(),
+  env = process.env,
+  fetchFn = globalThis.fetch,
+  cache = null,
+} = {}) {
+  const input = String(text ?? "");
+  const config = await resolveSemanticEmbeddingConfig({ root, env });
+  const cacheKey = `${config.host}\n${config.model}\n${input}`;
+  if (cache?.has(cacheKey)) return cache.get(cacheKey);
+  if (typeof fetchFn !== "function") {
+    throw semanticUnavailableError("Ollama embedding fetch API is unavailable.", config);
+  }
+
+  let response;
+  try {
+    response = await fetchFn(ollamaEmbedUrl(config.host), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: config.model,
+        input: [input],
+      }),
+    });
+  } catch (error) {
+    throw semanticUnavailableError(`Ollama embedding request failed: ${String(error?.message ?? error)}`, config);
+  }
+
+  if (!response?.ok) {
+    const status = response?.status ? `HTTP ${response.status}` : "unknown HTTP status";
+    throw semanticUnavailableError(`Ollama embedding request failed with ${status}.`, config);
+  }
+
+  let body;
+  try {
+    body = await response.json();
+  } catch (error) {
+    throw semanticUnavailableError(`Ollama embedding response was not valid JSON: ${String(error?.message ?? error)}`, config);
+  }
+
+  const vector = extractOllamaEmbedding(body);
+  if (!Array.isArray(vector)) {
+    throw semanticUnavailableError("Ollama embedding response did not include an embedding vector.", config);
+  }
+  if (vector.length !== GRAPH_VECTOR_DIMENSIONS) {
+    throw semanticUnavailableError(
+      `Ollama model ${config.model} returned ${vector.length} dimensions; AIPI requires ${GRAPH_VECTOR_DIMENSIONS}.`,
+      config,
+    );
+  }
+  const normalized = vector.map((value) => {
+    const number = Number(value);
+    if (!Number.isFinite(number)) throw semanticUnavailableError("Ollama embedding vector contains a non-numeric value.", config);
+    return number;
+  });
+  cache?.set(cacheKey, normalized);
+  return normalized;
+}
+
+function extractOllamaEmbedding(body) {
+  if (Array.isArray(body?.embeddings?.[0])) return body.embeddings[0];
+  if (Array.isArray(body?.embedding)) return body.embedding;
+  if (Array.isArray(body?.data?.[0]?.embedding)) return body.data[0].embedding;
+  return null;
+}
+
+async function resolveSemanticEmbeddingConfig({ root = process.cwd(), env = process.env } = {}) {
+  const config = await readJson(path.join(root, SEMANTIC_CONFIG_REL_PATH)).catch(() => null);
+  return {
+    host: normalizeOllamaHost(env.AIPI_OLLAMA_HOST ?? config?.ollama_host ?? config?.host ?? DEFAULT_OLLAMA_HOST),
+    model: String(env.AIPI_OLLAMA_MODEL ?? config?.ollama_model ?? config?.model ?? DEFAULT_OLLAMA_MODEL).trim() || DEFAULT_OLLAMA_MODEL,
+  };
+}
+
+function normalizeOllamaHost(value) {
+  const raw = String(value ?? DEFAULT_OLLAMA_HOST).trim() || DEFAULT_OLLAMA_HOST;
+  return /^https?:\/\//i.test(raw) ? raw.replace(/\/+$/, "") : `http://${raw.replace(/\/+$/, "")}`;
+}
+
+function ollamaEmbedUrl(host) {
+  return `${normalizeOllamaHost(host)}${OLLAMA_EMBED_PATH}`;
+}
+
+function withEmbeddingMetadata(vector, config) {
+  return {
+    ...vector,
+    dimensions: GRAPH_VECTOR_DIMENSIONS,
+    semantic_backend: "ollama",
+    embedding_model: config.model,
+    embedding_host: config.host,
+  };
+}
+
+function semanticVectorUnavailable(error, config = {}) {
+  return {
+    status: "unavailable",
+    engine: "sqlite-vec",
+    dimensions: GRAPH_VECTOR_DIMENSIONS,
+    semantic_backend: "ollama",
+    embedding_model: config.model ?? DEFAULT_OLLAMA_MODEL,
+    embedding_host: config.host ?? DEFAULT_OLLAMA_HOST,
+    reason: semanticUnavailableReason(error),
+  };
+}
+
+function semanticUnavailableReason(error) {
+  const message = String(error?.message ?? error ?? "").trim();
+  return message.includes(OLLAMA_INSTALL_MESSAGE) ? message : `${message || "semantic embeddings unavailable"} ${OLLAMA_INSTALL_MESSAGE}`;
+}
+
+function semanticUnavailableError(message, config = {}) {
+  const error = new Error(semanticUnavailableReason(message));
+  error.code = "AIPI_SEMANTIC_UNAVAILABLE";
+  error.details = {
+    semantic_backend: "ollama",
+    embedding_model: config.model ?? DEFAULT_OLLAMA_MODEL,
+    embedding_host: config.host ?? DEFAULT_OLLAMA_HOST,
+    dimensions: GRAPH_VECTOR_DIMENSIONS,
+  };
+  return error;
+}
+
+function asSemanticUnavailable(error) {
+  if (error?.code === "AIPI_SEMANTIC_UNAVAILABLE") return error;
+  return semanticUnavailableError(error);
+}
+
+function lineNumberForIndex(content, index) {
+  return content.slice(0, index).split(/\r?\n/).length;
+}
+
+function relationshipRefsFromGraph({ graph, query = "", targetPath = "", limit = 16, source = "manifest" } = {}) {
+  const needle = String(targetPath || query || "").trim().toLowerCase();
+  if (!needle) return [];
+  return (graph.relationships ?? [])
+    .filter((edge) => relationshipMatches(edge, needle))
+    .sort((left, right) => compareRelationshipRefs(left, right, needle))
+    .slice(0, Math.max(1, limit))
+    .map((edge) => ({ ...edge, source }));
+}
+
+function compareRelationshipRefs(left, right, needle = "") {
+  const leftRank = relationshipRank(left, needle);
+  const rightRank = relationshipRank(right, needle);
+  return leftRank - rightRank ||
+    String(left.relation ?? "").localeCompare(String(right.relation ?? "")) ||
+    String(left.source_ref ?? "").localeCompare(String(right.source_ref ?? "")) ||
+    String(left.target_ref ?? "").localeCompare(String(right.target_ref ?? ""));
+}
+
+function relationshipRank(edge, needle = "") {
+  const normalizedNeedle = String(needle ?? "").toLowerCase();
+  const sourceRef = String(edge.source_ref ?? "").toLowerCase();
+  const targetRef = String(edge.target_ref ?? "").toLowerCase();
+  const exactPathMatch = normalizedNeedle && (sourceRef === normalizedNeedle || targetRef === normalizedNeedle) ? 0 : 5;
+  return exactPathMatch + (RELATIONSHIP_PRIORITY.get(edge.relation) ?? 100);
+}
+
+function relationshipMatches(edge, needle) {
+  return [
+    edge.source_kind,
+    edge.source_ref,
+    edge.relation,
+    edge.target_kind,
+    edge.target_ref,
+    edge.evidence,
+  ]
+    .filter(Boolean)
+    .some((value) => String(value).toLowerCase().includes(needle));
+}
+
+async function readProjectText(root, rel) {
+  return fs.readFile(path.join(root, rel), "utf8").catch(() => "");
+}
+
+function isTestFile(rel) {
+  return /(^|\/)(test|tests|__tests__)\/|(\.test|\.spec)\./i.test(rel);
+}
+
+function isMemoryFile(rel) {
+  return rel.startsWith(".aipi/memory/project/") && rel.endsWith(".md");
+}
+
+function testRelatesToSource({ testRel, sourceRel, normalizedContent }) {
+  if (sharesStem(testRel, sourceRel)) return true;
+  const withoutExt = sourceRel.replace(/\.[^.]+$/, "").toLowerCase();
+  const basename = path.basename(withoutExt).toLowerCase();
+  return normalizedContent.includes(sourceRel.toLowerCase()) ||
+    normalizedContent.includes(withoutExt) ||
+    normalizedContent.includes(`/${basename}`) ||
+    normalizedContent.includes(`..\/${basename}`);
+}
+
+function mentionsPath(normalizedContent, rel) {
+  const normalizedRel = rel.toLowerCase();
+  const basename = path.basename(rel).toLowerCase();
+  const stem = basename.replace(/\.[^.]+$/, "");
+  return normalizedContent.includes(normalizedRel) ||
+    normalizedContent.includes(normalizedRel.replace(/\.[^.]+$/, "")) ||
+    normalizedContent.includes(basename) ||
+    normalizedContent.includes(stem);
+}
+
+function mentionsWord(normalizedContent, word) {
+  const normalized = String(word ?? "").toLowerCase();
+  if (!normalized || normalized.length < 3) return false;
+  return new RegExp(`(^|[^a-z0-9_$])${escapeRegex(normalized)}([^a-z0-9_$]|$)`, "i").test(normalizedContent);
+}
+
+function memorySourceKind(rel) {
+  if (rel.endsWith("/business-rules.md")) return "business_rule_memory";
+  if (rel.endsWith("/decisions.md")) return "decision_memory";
+  if (rel.endsWith("/deployment.md")) return "deployment_memory";
+  if (rel.endsWith("/environment.md")) return "environment_memory";
+  return "project_memory";
+}
+
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function sharesStem(a, b) {
+  const left = path.basename(a).replace(/\.(test|spec)\./i, ".").split(".")[0];
+  const right = path.basename(b).split(".")[0];
+  return left && right && (left.includes(right) || right.includes(left));
+}
+
+async function listMarkdownFiles(dir) {
+  const entries = await fs.readdir(dir, { withFileTypes: true }).catch((error) => {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  });
+  return entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
+    .map((entry) => path.join(dir, entry.name))
+    .sort();
+}
+
+function projectMemoryFileForKind(kind) {
+  const normalized = slug(kind);
+  return PROJECT_MEMORY_KIND_TO_FILE.get(normalized) ?? "knowledge.md";
+}
+
+function renderMemoryEntry({ kind, title, content, source_ref, approval_ref, timestamp }) {
+  const normalizedKind = slug(kind);
+  if (normalizedKind === "business-rule" || normalizedKind === "business-rules") {
+    return renderBusinessRuleEntry({ title, content, source_ref, approval_ref, timestamp });
+  }
+  if (normalizedKind === "decision" || normalizedKind === "decisions") {
+    return renderDecisionEntry({ title, content, source_ref, approval_ref, timestamp });
+  }
+  return [
+    `## ${title?.trim() || kind}`,
+    "",
+    `- promoted_at: ${timestamp}`,
+    `- kind: ${kind}`,
+    `- source_ref: ${source_ref}`,
+    `- approval_ref: ${approval_ref}`,
+    "",
+    content.trim(),
+    "",
+  ].join("\n");
+}
+
+function renderBusinessRuleEntry({ title, content, source_ref, approval_ref, timestamp }) {
+  const ruleId = extractBusinessRuleId(content) ?? generatedBusinessRuleId(timestamp);
+  const ruleTitle = title?.trim() || firstContentLine(content) || "Promoted business rule";
+  const statement = extractField(content, "statement") ?? stripMarkdownHeading(content).trim();
+  return [
+    `### ${ruleId} - ${ruleTitle}`,
+    "- **domain:** project",
+    `- **statement:** ${singleLine(statement)}`,
+    "- **scenarios:**",
+    "  - Given the accepted project context, When this rule applies, Then the statement above remains true.",
+    "- **status:** proposed",
+    `- **source:** ${source_ref}`,
+    `- **rationale:** Promoted through aipi_promote_memory at ${timestamp}.`,
+    "- **links:** implements:[], relates:[], decided-by:[]",
+    `- **approval-ref:** ${approval_ref}`,
+    `- **last-reviewed:** ${timestamp.slice(0, 10)}`,
+    "",
+  ].join("\n");
+}
+
+function renderDecisionEntry({ title, content, source_ref, approval_ref, timestamp }) {
+  const decisionId = generatedDecisionId(timestamp);
+  const decisionTitle = title?.trim() || firstContentLine(content) || "Promoted decision";
+  return [
+    `### ${decisionId} - ${decisionTitle}`,
+    "- **status:** accepted",
+    `- **context:** ${source_ref}`,
+    `- **decision:** ${singleLine(stripMarkdownHeading(content).trim())}`,
+    "- **consequences:** See source evidence and follow-up implementation artifacts.",
+    "- **links:** rules:[], code:[], tests:[]",
+    `- **approval-ref:** ${approval_ref}`,
+    `- **date:** ${timestamp.slice(0, 10)}`,
+    "",
+  ].join("\n");
+}
+
+async function inspectDurableMemoryApproval(root, approvalRef) {
+  if (!approvalRef?.trim()) {
+    return { ok: false, reason: "durable memory promotion requires approval_ref" };
+  }
+  const normalized = String(approvalRef).replaceAll("\\", "/").replace(/^\.\/+/, "");
+  if (!normalized.startsWith(".aipi/runtime/approvals/approved/")) {
+    return {
+      ok: false,
+      reason: "approval_ref must point under .aipi/runtime/approvals/approved/",
+    };
+  }
+  const abs = path.resolve(root, normalized);
+  const rootWithSep = root.endsWith(path.sep) ? root : `${root}${path.sep}`;
+  if (abs !== root && !abs.startsWith(rootWithSep)) {
+    return { ok: false, reason: "approval_ref escapes project root" };
+  }
+  if (!(await pathExists(abs))) {
+    return { ok: false, reason: `approval_ref does not exist: ${normalized}` };
+  }
+  return { ok: true, path: normalized };
+}
+
+async function insertMemoryEntry({ root, targetRel, entry, kind, timestamp }) {
+  const abs = path.join(root, targetRel);
+  await fs.mkdir(path.dirname(abs), { recursive: true });
+  const existing = await fs.readFile(abs, "utf8").catch((error) => {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  });
+  await writeProjectFile(root, targetRel, insertIntoCurrentTruth(existing, entry, { targetRel, kind, timestamp }));
+}
+
+function insertIntoCurrentTruth(existing, entry, { targetRel = "", kind = "", timestamp = new Date().toISOString() } = {}) {
+  const text = ensureMemoryPageShape(String(existing ?? ""), { targetRel, kind, timestamp });
+  const marker = "\n## Current truth";
+  const markerIndex = text.indexOf(marker);
+  if (markerIndex === -1) return `${text.trimEnd()}\n\n${entry}`;
+
+  const headingEnd = text.indexOf("\n", markerIndex + 1);
+  const afterHeading = headingEnd === -1 ? text.length : headingEnd + 1;
+  const before = `${text.slice(0, afterHeading).trimEnd()}\n\n`;
+  let after = text.slice(afterHeading).replace(/^\s+/, "");
+  after = after.replace(/^No .*(?:recorded yet|have been recorded yet)\.\r?\n\r?\n?/i, "");
+  return `${before}${entry}\n${after}`;
+}
+
+function ensureMemoryPageShape(existing, { targetRel = "", kind = "", timestamp = new Date().toISOString() } = {}) {
+  const text = String(existing ?? "");
+  if (text.trimStart().startsWith("---")) return text;
+  const type = memoryTypeForTarget(targetRel, kind);
+  const title = memoryTitleForType(type);
+  const header = [
+    "---",
+    `type: ${type}`,
+    `owner: ${MEMORY_TYPE_OWNER.get(type) ?? "engineering"}`,
+    `status: ${["business-rule", "decision", "knowledge"].includes(type) ? "active" : "draft"}`,
+    "last_reviewed: -",
+    "---",
+    "",
+    `# ${title}`,
+    "",
+    "## Current truth",
+    "",
+  ].join("\n");
+  if (!text.trim()) return header;
+  return `${header}${text.trimStart()}`;
+}
+
+function memoryTypeForTarget(targetRel, kind) {
+  const fromKind = slug(kind);
+  if (MEMORY_PAGE_TYPES.has(fromKind)) return fromKind;
+  if (fromKind === "business-rules") return "business-rule";
+  if (fromKind === "decisions") return "decision";
+  if (fromKind === "procedures") return "procedure";
+  return PROJECT_MEMORY_FILE_TO_TYPE.get(path.basename(targetRel)) ?? "knowledge";
+}
+
+function memoryTitleForType(type) {
+  return {
+    "business-rule": "Business Rules",
+    decision: "Decisions",
+    deployment: "Deployment",
+    environment: "Environment",
+    glossary: "Glossary",
+    knowledge: "Knowledge",
+    procedure: "Procedures",
+    project: "Project Context",
+  }[type] ?? "Knowledge";
+}
+
+function extractBusinessRuleId(content) {
+  return String(content ?? "").match(/\bBR-[A-Za-z0-9_-]+\b/)?.[0]?.toUpperCase() ?? null;
+}
+
+function generatedBusinessRuleId(timestamp) {
+  return `BR-${timestamp.replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z")}`;
+}
+
+function generatedDecisionId(timestamp) {
+  return `ADR-${timestamp.replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z")}`;
+}
+
+function firstContentLine(content) {
+  return String(content ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^#+\s*/, "").trim())
+    .find(Boolean) ?? "";
+}
+
+function stripMarkdownHeading(content) {
+  return String(content ?? "").replace(/^#{1,6}\s+.*\r?\n?/, "");
+}
+
+function extractField(content, field) {
+  const pattern = new RegExp(`^- \\*\\*${escapeRegex(field)}:\\*\\*\\s*(.+)$`, "im");
+  return String(content ?? "").match(pattern)?.[1]?.trim() ?? null;
+}
+
+function singleLine(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim() || "See source reference.";
+}
+
+async function appendJsonLine(filePath, value) {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.appendFile(filePath, `${JSON.stringify(value)}\n`);
+}
+
+async function writeProjectFile(root, relPath, content) {
+  const abs = path.resolve(root, relPath);
+  const rootWithSep = root.endsWith(path.sep) ? root : `${root}${path.sep}`;
+  if (abs !== root && !abs.startsWith(rootWithSep)) {
+    throw new Error(`AIPI tool write escapes project root: ${relPath}`);
+  }
+  await fs.mkdir(path.dirname(abs), { recursive: true });
+  await fs.writeFile(abs, content);
+}
+
+async function readJson(filePath) {
+  try {
+    return JSON.parse(await fs.readFile(filePath, "utf8"));
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    return null;
+  }
+}
+
+async function pathExists(candidate) {
+  try {
+    await fs.access(candidate);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function tokenize(text) {
+  return new Set(
+    String(text ?? "")
+      .toLowerCase()
+      .split(/[^a-z0-9_/-]+/)
+      .filter((token) => token.length >= 3),
+  );
+}
+
+function scoreLine(line, terms) {
+  const normalized = line.toLowerCase();
+  let score = 0;
+  for (const term of terms) {
+    if (normalized.includes(term)) score += 1;
+  }
+  return score;
+}
+
+function excerptAround(lines, index, radius) {
+  const start = Math.max(0, index - Math.floor(radius / 2));
+  return lines.slice(start, start + radius).join("\n");
+}
+
+function slug(value) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "memory";
+}
+
+function assertRoot(projectRoot) {
+  if (!projectRoot) throw new Error("projectRoot is required");
+  return path.resolve(projectRoot);
+}
+
+function jsonResult(value) {
+  return { content: [{ type: "text", text: JSON.stringify(value, null, 2) }] };
+}

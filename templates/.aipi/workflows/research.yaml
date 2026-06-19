@@ -1,0 +1,111 @@
+version: 1
+name: aipi-research
+mode: workflow-contract-v1
+description: >
+  Source-backed research swarm for business, product, technical, or deployment
+  questions. Produces evidence, challenges, and decision-ready synthesis.
+params:
+  run_id: "{{ aipi.run_id }}"
+  topic: ""
+artifact_policy:
+  namespace: .aipi/runtime/runs/{{ run_id }}/steps/{{ step_id }}
+  no_overwrite: true
+steps:
+  - id: scope
+    stage: research
+    agents: [orchestration-reasoner, requirements-analyst]
+    name: Scope research question
+    prompt: >
+      Define the exact question for "{{ topic }}", decision needed, and whether
+      the result affects a business rule.
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/scope/RESEARCH-SCOPE.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED: stop
+        FAIL: stop
+
+  - id: context
+    stage: context
+    agents: [context-curator, codebase-mapper]
+    name: Retrieve internal context
+    prompt: >
+      Retrieve relevant project memory, code graph nodes, rules, decisions, and
+      prior gotchas.
+    requires: [scope]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/context/CONTEXT-PACKET.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/context/CODEBASE-MAP.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS, SKIPPED]
+      allow_skip: true
+      skip_requires: no_internal_context
+      on_verdict:
+        BLOCKED: stop
+        FAIL: scope
+
+  - id: external_research
+    stage: research
+    agents: [project-researcher, phase-researcher]
+    name: External research
+    prompt: >
+      Use web/search tools when the answer depends on current external facts.
+      Label every claim and cite sources.
+    requires: [context]
+    context_from: [scope, context]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/external_research/PROJECT-RESEARCH.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/external_research/PHASE-RESEARCH.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS, SKIPPED]
+      allow_skip: true
+      skip_requires: no_external_research_needed
+      on_verdict:
+        BLOCKED: stop
+        FAIL: context
+
+  - id: adversarial
+    stage: review
+    agents: [contrarian, plan-checker]
+    name: Challenge research
+    prompt: >
+      Challenge source quality, missing alternatives, hidden assumptions, and
+      impact on business rules.
+    requires: [external_research]
+    context_from: [scope, context, external_research]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/adversarial/CHALLENGES.md
+      - .aipi/runtime/runs/{{ run_id }}/steps/adversarial/PLAN-CHECK.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED_TO_PLANNING: scope
+        BLOCKED: stop
+        FAIL: external_research
+
+  - id: synthesis
+    stage: planning
+    agents: [orchestration-reasoner]
+    name: Synthesize decision package
+    prompt: >
+      Produce a decision-ready summary, including rule implications,
+      implementation suggestions, risks, and unresolved questions.
+    requires: [adversarial]
+    context_from: [scope, context, external_research, adversarial]
+    produces:
+      - .aipi/runtime/runs/{{ run_id }}/steps/synthesis/RESEARCH-SYNTHESIS.md
+    gate:
+      schema: aipi.step-result.v1
+      pass_verdicts: [PASS]
+      allow_skip: false
+      on_verdict:
+        BLOCKED_TO_PLANNING: scope
+        BLOCKED: stop
+        FAIL: external_research
