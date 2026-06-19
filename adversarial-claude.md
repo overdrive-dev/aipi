@@ -7954,15 +7954,22 @@ Current status: CLOSED
 User hit `aipi update [aipi-deps] failed: spawnSync npm ENOENT` on Windows. Root cause:
 `buildAipiUpdatePlan` used `command: "npm"` and `executeUpdateStep` spawned it raw — on Windows `npm`
 is `npm.cmd` (a batch file), so a bare `spawnSync("npm", …)` is ENOENT (the `git` step works because
-`git.exe` is a real executable). Fix in `bin/aipi.js`: (1) the deps step command is now
-`platform === "win32" ? "npm.cmd" : "npm"`; (2) `executeUpdateStep` routes non-pi exec steps through
-the existing `createCommandSpawnSpec` so `.cmd` commands run via `cmd.exe /d /s /c` while non-`.cmd`
-(git) pass through unchanged; (3) `platform` threaded through `runAipiUpdate`. The dry-run LOG keeps
-showing the readable command; only the real spawn is wrapped. `tools/test-aipi-update.mjs` extended:
-asserts `buildAipiUpdatePlan({platform:"win32"})[2].command === "npm.cmd"` (and `"npm"` on linux) and a
-non-dry-run win32 `runAipiUpdate` spawns the deps step via `cmd.exe` + `npm.cmd` and NEVER a bare `npm`,
-while git stays a direct spawn. Verified: `node tools/test-aipi-update.mjs` → `AIPI_UPDATE_TEST_OK`;
-`npm test` → exit 0, 33 `_OK`. Rounds 29–34 remain CLOSED; this is a standalone hotfix, no open round.
+`git.exe` is a real executable). **First attempt** (cmd.exe + per-token quoting via the existing
+`createCommandSpawnSpec`) FAILED on real Windows: `spawnSync` re-escaped the pre-quoted string and cmd
+saw `\"npm.cmd\"` (`'\"npm.cmd\"' não é reconhecido`). Empirically tested 4 spawn approaches on the
+machine; the per-token `cmd /c "npm.cmd" "…"` form is broken (cmd /c strips outer quotes), while a
+single command-line string via `{ shell: true }` works. **Shipped fix in `bin/aipi.js`:** (1) deps step
+command is `platform === "win32" ? "npm.cmd" : "npm"`; (2) `executeUpdateStep` runs a win32 `.cmd`/`.bat`
+step as ONE shell command line — `spawnSync(toShellCommandLine(cmd, args), { shell: true })` (new helper
+quotes only space-bearing tokens; a single string, not an args array, avoids the DEP0190 warning); git
+and POSIX commands spawn directly (no shell); (3) `platform` threaded through `runAipiUpdate`. Dry-run
+LOG still shows the readable command. `tools/test-aipi-update.mjs` extended: asserts
+`buildAipiUpdatePlan({platform:"win32"})[2].command === "npm.cmd"` (and `"npm"` on linux) and a
+non-dry-run win32 `runAipiUpdate` runs the deps step as a single `npm.cmd … --prefix …` line with
+`shell:true`, NEVER a bare `npm`, while git stays a direct spawn. Verified BOTH unit
+(`AIPI_UPDATE_TEST_OK`; `npm test` exit 0, 33 `_OK`) AND end-to-end — ran the real shipped mechanism:
+`npm install --prefix <root>` via the shell single-string → EXIT 0, "added 234 packages … 0
+vulnerabilities" (the deps were genuinely incomplete before). Rounds 29–34 remain CLOSED; standalone hotfix.
 
 Current owner: CLAUDE
 Current status: CLOSED

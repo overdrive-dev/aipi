@@ -105,14 +105,15 @@ assert.equal(inspectedDirtyRepo.dirty, true);
 const logs = [];
 const spawnCalls = [];
 const gitOnlyRepoProbe = (command, args) => {
-  const gitArgs = args.slice(2);
-  if (command === "git" && gitArgs.join(" ") === "rev-parse --verify HEAD") {
+  if (command !== "git" || !Array.isArray(args)) return null;
+  const gitArgs = args.slice(2).join(" ");
+  if (gitArgs === "rev-parse --verify HEAD") {
     return { status: 0, stdout: "abc123\n", stderr: "" };
   }
-  if (command === "git" && gitArgs.join(" ") === "rev-parse --abbrev-ref --symbolic-full-name @{u}") {
+  if (gitArgs === "rev-parse --abbrev-ref --symbolic-full-name @{u}") {
     return { status: 0, stdout: "origin/main\n", stderr: "" };
   }
-  if (command === "git" && gitArgs.join(" ") === "status --porcelain") {
+  if (gitArgs === "status --porcelain") {
     return { status: 0, stdout: "", stderr: "" };
   }
   return null;
@@ -138,8 +139,9 @@ assert.ok(logs.some((message) => message.includes("aipi update [aipi] would run:
 assert.ok(logs.some((message) => message.includes("aipi update [aipi-deps] would run: npm install --prefix")));
 assert.ok(logs.includes("aipi update dry-run complete."));
 
-// Regression: a real (non-dry-run) Windows update must spawn npm through cmd.exe
-// + npm.cmd, NOT a bare `npm` (which is ENOENT on Windows). git stays unwrapped.
+// Regression: a real (non-dry-run) Windows update must run npm.cmd via a shell as a
+// single command string, NOT a bare `npm` (ENOENT) and NOT fragile cmd.exe per-arg
+// quoting. git stays a direct git.exe spawn.
 const winSpawns = [];
 await runAipiUpdate({
   packageRoot,
@@ -149,20 +151,21 @@ await runAipiUpdate({
   existsSync: (candidate) => candidate.endsWith(".git"),
   log: () => {},
   errorLog: () => {},
-  spawnSyncFn: (command, args) => {
-    const probe = gitOnlyRepoProbe(command, args);
+  spawnSyncFn: (command, second) => {
+    const probe = gitOnlyRepoProbe(command, second);
     if (probe) return probe;
-    winSpawns.push([command, args]);
+    winSpawns.push([command, second]);
     return { status: 0, stdout: "", stderr: "" };
   },
 });
 const winDeps = winSpawns.find(
-  (call) => call[0] === "cmd.exe" && call[1].some((arg) => /npm\.cmd/.test(String(arg)) && /--prefix/.test(String(arg))),
+  (call) => typeof call[0] === "string" && /\bnpm\.cmd\b/.test(call[0]) && /--prefix/.test(call[0]),
 );
-assert.ok(winDeps, "windows deps step must spawn npm.cmd through cmd.exe (not a bare npm)");
-assert.ok(winDeps[1].includes("/c"), "windows npm.cmd must run via cmd.exe /c");
+assert.ok(winDeps, "windows deps step must run npm.cmd via a shell (not a bare npm spawn)");
+assert.equal(winDeps[1] && winDeps[1].shell, true, "windows npm.cmd step must use shell:true");
+assert.ok(/^npm\.cmd /.test(winDeps[0]), "command line must start with the bare npm.cmd (no broken cmd.exe quoting)");
 assert.ok(!winSpawns.some((call) => call[0] === "npm"), "must never spawn a bare `npm` on win32 (ENOENT)");
-const winGit = winSpawns.find((call) => call[0] === "git" && call[1].includes("pull"));
-assert.ok(winGit, "windows git pull stays a direct git.exe spawn (no cmd.exe wrap)");
+const winGit = winSpawns.find((call) => call[0] === "git" && Array.isArray(call[1]) && call[1].includes("pull"));
+assert.ok(winGit, "windows git pull stays a direct git.exe spawn (no shell)");
 
 console.log("AIPI_UPDATE_TEST_OK");

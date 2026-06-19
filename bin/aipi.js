@@ -276,11 +276,13 @@ function executeUpdateStep({
   }
 
   log(`aipi update [${step.label}] -> ${formatCommand(command, args)}`);
-  // Wrap `.cmd`/`.bat` (e.g. npm.cmd) through cmd.exe on Windows so spawnSync can
-  // find them; non-.cmd commands (git, node) pass through unchanged. The log above
-  // keeps showing the readable command.
-  const spawnSpec = step.kind === "pi" ? { command, args } : createCommandSpawnSpec(command, args, platform);
-  const result = spawnSyncFn(spawnSpec.command, spawnSpec.args, { stdio: "inherit", env });
+  // On Windows a `.cmd`/`.bat` (e.g. npm.cmd) can't be spawned directly, and per-arg
+  // cmd.exe quoting is fragile (cmd /c strips outer quotes). Run it through a shell as
+  // ONE command string instead. git.exe and POSIX commands spawn directly (no shell).
+  const useShell = step.kind !== "pi" && platform === "win32" && /\.(cmd|bat)$/i.test(command);
+  const result = useShell
+    ? spawnSyncFn(toShellCommandLine(command, args), { stdio: "inherit", env, shell: true })
+    : spawnSyncFn(command, args, { stdio: "inherit", env });
   if (result.error || result.status !== 0) {
     errorLog(`aipi update [${step.label}] failed: ${result.error?.message ?? `exit ${result.status}`}`);
     process.exitCode = 1;
@@ -404,6 +406,17 @@ function createCommandSpawnSpec(command, args, platform) {
   }
 
   return { command, args };
+}
+
+// Build a single shell command line (used with spawnSync(..., { shell: true })) so a
+// `.cmd`/`.bat` resolves via the shell. Quote only tokens that contain spaces/quotes;
+// passing one string (not an args array) avoids the shell+args DEP0190 warning.
+function toShellCommandLine(command, args) {
+  const quote = (value) => {
+    const text = String(value);
+    return /[\s"]/.test(text) ? `"${text.replace(/"/g, '\\"')}"` : text;
+  };
+  return [command, ...args].map(quote).join(" ");
 }
 
 export function classifyAipiInvocation(userArgs = []) {
