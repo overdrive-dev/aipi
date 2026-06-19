@@ -21,38 +21,88 @@ try {
   assert.match(originalProjectMemory, /seeded by `\/aipi-init`/i);
 
   let graphBuilderCalled = false;
+  const coordinator = createDoneCoordinator();
+  const selectCalls = [];
+  const inputCalls = [];
   const onboarded = await runProjectOnboarding({
     projectRoot: tempRoot,
-    answers: {
-      purpose: "Nora App coordinates mobile care workflows.",
-      domain: "patients, appointments, clinical tasks",
-      validation: "npm test; pytest",
+    ctx: {
+      hasUI: true,
+      ui: {
+        select(question, options) {
+          selectCalls.push({ question, options });
+          return options[0];
+        },
+        input(question) {
+          inputCalls.push(question);
+          return "";
+        },
+      },
     },
-    askUser: false,
-    runWorker: false,
+    coordinator,
+    hostModel: { provider: "anthropic", id: "claude-sonnet-4-6" },
+    askUser: true,
+    runWorker: true,
     now: () => new Date("2026-06-19T12:00:00.000Z"),
     graphBuilder: async (input) => {
       graphBuilderCalled = true;
-      return rebuildCodeGraph(input);
+      return rebuildCodeGraph({ ...input, embeddingFetch: fakeMissingModelFetch() });
     },
   });
 
   assert.equal(onboarded.action, "onboard");
   assert.equal(graphBuilderCalled, true);
+  assert.equal(onboarded.investigation.mode, "swarm");
+  assert.equal(onboarded.investigation.spawned_count > 1, true);
+  assert.equal(coordinator.spawned.length > 1, true);
+  assert.equal(selectCalls.length, 0);
+  assert.equal(inputCalls.length, 0);
   assert.equal(onboarded.memory.written.includes("project.md"), true);
   assert.equal(onboarded.graph.sqlite_path, ".aipi/state/aipi-graph.sqlite");
   assert.ok(onboarded.graph.file_count > 0);
+  assert.equal(onboarded.graph.embedding_model, "bge-m3");
+  assert.match(onboarded.semantic_readiness.message, /ollama pull bge-m3/);
   await fs.access(path.join(tempRoot, ".aipi", "state", "aipi-graph.json"));
+  assert.match(await fs.readFile(path.join(tempRoot, ".aipi", "runtime", "onboarding", "onboarding.jsonl"), "utf8"), /model_missing|bge-m3/);
   if (onboarded.graph.sqlite_status === "available") {
     await fs.access(path.join(tempRoot, ".aipi", "state", "aipi-graph.sqlite"));
   }
 
   const seededProjectMemory = await fs.readFile(projectMemoryPath, "utf8");
   assert.doesNotMatch(seededProjectMemory, /Replace this section during/);
-  assert.match(seededProjectMemory, /Nora App coordinates mobile care workflows/);
+  assert.match(seededProjectMemory, /nora-app appears|React Native/);
   assert.match(seededProjectMemory, /React Native/);
   assert.match(seededProjectMemory, /Python/);
   assert.match(seededProjectMemory, /frontend\/|backend\//);
+  assert.doesNotMatch(seededProjectMemory, /Which validation command|Which business rules|safe for builder role/);
+
+  const businessRulesMemory = await fs.readFile(path.join(tempRoot, ".aipi", "memory", "project", "business-rules.md"), "utf8");
+  assert.match(businessRulesMemory, /Candidate business\/domain context inferred from code/);
+  assert.match(businessRulesMemory, /care workflows|patient|clinical|task/);
+
+  const emptyRoot = path.join(tempRoot, "empty-repo");
+  await fs.mkdir(emptyRoot, { recursive: true });
+  await initProject({ sourceRoot, targetRoot: emptyRoot });
+  const recommendationCalls = [];
+  const recommendationRun = await runProjectOnboarding({
+    projectRoot: emptyRoot,
+    ctx: {
+      hasUI: true,
+      ui: {
+        select(question, options) {
+          recommendationCalls.push({ question, options });
+          return options[0];
+        },
+      },
+    },
+    askUser: true,
+    runWorker: false,
+    materializeGraph: false,
+  });
+  assert.equal(recommendationRun.recommendations.asked.length, 1);
+  assert.equal(recommendationCalls.length, 1);
+  assert.equal(recommendationCalls[0].options.length, 4);
+  assert.equal(recommendationCalls[0].options.at(-1), "Other / free text");
 
   const customized = `${seededProjectMemory}\n<!-- user-customized -->\n`;
   await fs.writeFile(projectMemoryPath, customized);
@@ -110,6 +160,45 @@ try {
   await fs.rm(tempRoot, { recursive: true, force: true });
 }
 
+function createDoneCoordinator() {
+  const jobs = new Map();
+  const coordinator = {
+    spawned: [],
+    spawn(params) {
+      const agentId = `${params.agent_id}:${coordinator.spawned.length + 1}`;
+      coordinator.spawned.push({ agent_id: agentId, params });
+      jobs.set(agentId, params);
+      return { agent_id: agentId };
+    },
+    status(agentId) {
+      assert.ok(jobs.has(agentId), `unknown worker ${agentId}`);
+      return { state: "done" };
+    },
+    collect(agentId) {
+      const params = jobs.get(agentId);
+      return {
+        ready: true,
+        step_result: { verdict: "PASS" },
+        artifacts: params.expected_artifacts ?? [],
+      };
+    },
+  };
+  return coordinator;
+}
+
+function fakeMissingModelFetch() {
+  return async (url) => {
+    assert.match(String(url), /\/api\/tags$/);
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return { models: [] };
+      },
+    };
+  };
+}
+
 async function writeFixtureRepo(root) {
   await fs.mkdir(path.join(root, "frontend", "src"), { recursive: true });
   await fs.mkdir(path.join(root, "backend"), { recursive: true });
@@ -135,6 +224,8 @@ async function writeFixtureRepo(root) {
   );
   await fs.writeFile(path.join(root, "frontend", "src", "App.tsx"), "export default function App() { return null; }\n");
   await fs.writeFile(path.join(root, "backend", "app.py"), "def health():\n    return {'ok': True}\n");
+  await fs.writeFile(path.join(root, "backend", "patients.py"), "class PatientCarePlan:\n    pass\n");
+  await fs.writeFile(path.join(root, "backend", "appointments.py"), "def schedule_clinical_task():\n    return True\n");
   await fs.writeFile(path.join(root, "backend", "requirements.txt"), "fastapi\npytest\n");
   await fs.writeFile(path.join(root, ".github", "workflows", "ci.yml"), "name: ci\n");
   await fs.writeFile(path.join(root, "Dockerfile"), "FROM python:3.12-slim\n");

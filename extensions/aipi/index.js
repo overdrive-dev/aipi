@@ -91,7 +91,7 @@ export default function aipiExtension(pi) {
           coordinator,
           hostModel,
           askUser: !options.noQuestions,
-          runWorker: !options.noQuestions && Boolean(hostModel),
+          runWorker: Boolean(hostModel),
         });
         ctx.ui.notify(formatOnboardingResult(result), "info");
       } catch (error) {

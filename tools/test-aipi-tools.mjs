@@ -377,9 +377,17 @@ try {
   assert.equal(graph.sqlite.path, ".aipi/state/aipi-graph.sqlite");
   if (graph.sqlite.status === "available") {
     assert.equal(await pathExists(path.join(tempRoot, graph.sqlite.path)), true);
+    const sqlite = await import("node:sqlite").catch(() => null);
+    if (sqlite) {
+      const db = new sqlite.DatabaseSync(path.join(tempRoot, graph.sqlite.path), { readOnly: true });
+      const vectorTable = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'code_vectors'").get()?.sql ?? "";
+      db.close();
+      if (graph.vector.status === "available") assert.match(vectorTable, /float\[1024\]/);
+    }
   }
   assert.equal(graph.vector.engine, "sqlite-vec");
-  assert.equal(graph.vector.dimensions, 768);
+  assert.equal(graph.vector.dimensions, 1024);
+  assert.equal(graph.vector.embedding_model, "bge-m3");
   assert.equal(graph.files.some((file) => /(^|\/)(node_modules|\.expo|\.venv|venv|__pycache__|\.turbo|\.gradle)\//.test(file.path)), false);
   assert.equal(graph.files.some((file) => file.path.startsWith("ios/Pods/") || file.path.startsWith("android/build/")), false);
   assert.equal(graph.files.some((file) => file.path.startsWith(".aipi/runtime/") || file.path.startsWith(".aipi/state/")), false);
@@ -645,6 +653,23 @@ try {
   assert.equal(graph.run_outcomes.some((outcome) => outcome.run_id === "run-2" && outcome.verdict === "FAIL"), true);
   assert.equal(graph.run_outcomes.some((outcome) => outcome.step_id === "rule_gap" && outcome.verdict === "BLOCKED"), true);
 
+  const graphPath = path.join(tempRoot, ".aipi", "state", "aipi-graph.json");
+  const oldDimGraph = JSON.parse(await fs.readFile(graphPath, "utf8"));
+  const legacyVectorDimensions = 1024 - 256;
+  oldDimGraph.vector = { ...(oldDimGraph.vector ?? {}), dimensions: legacyVectorDimensions, embedding_model: "legacy-embed-text" };
+  if (oldDimGraph.sqlite?.vector) {
+    oldDimGraph.sqlite.vector = { ...oldDimGraph.sqlite.vector, dimensions: legacyVectorDimensions, embedding_model: "legacy-embed-text" };
+  }
+  await fs.writeFile(graphPath, `${JSON.stringify(oldDimGraph, null, 2)}\n`);
+  const dimRebuilt = await aipiCallers({
+    projectRoot: tempRoot,
+    symbol: "renewSubscription",
+    ...semanticOptions,
+  });
+  assert.match(dimRebuilt.graph.rebuilt_from_stale.reason, /embedding dimension mismatch/);
+  assert.equal(dimRebuilt.graph.vector.dimensions, 1024);
+  assert.equal(dimRebuilt.graph.vector.embedding_model, "bge-m3");
+
   const callers = await aipiCallers({
     projectRoot: tempRoot,
     symbol: "renewSubscription",
@@ -739,7 +764,7 @@ try {
           throw new Error("ollama down");
         },
       }),
-    /nomic-embed-text|AIPI semantic search requires Ollama/,
+    /bge-m3|semantic memory is OFF|AIPI semantic search requires Ollama/,
   );
   const lexicalFallback = await aipiImpact({
     projectRoot: tempRoot,
@@ -876,10 +901,20 @@ async function pathExists(filePath) {
 
 function fakeEmbeddingFetch(calls) {
   return async (url, options = {}) => {
+    if (String(url).endsWith("/api/tags")) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { models: [{ name: "bge-m3" }] };
+        },
+      };
+    }
     const body = JSON.parse(options.body ?? "{}");
     const input = Array.isArray(body.input) ? String(body.input[0] ?? "") : String(body.input ?? "");
+    assert.equal(body.model, "bge-m3");
     calls.push({ url: String(url), model: body.model, input });
-    const vector = new Array(768).fill(0);
+    const vector = new Array(1024).fill(0);
     vector[Math.abs(hashText(input)) % vector.length] = 1;
     return {
       ok: true,

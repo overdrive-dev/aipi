@@ -89,14 +89,15 @@ const SKIP_DIRS = new Set([
 const SKIP_REL_DIRS = new Set(["ios/Pods", "android/build"]);
 const GRAPH_REL_PATH = ".aipi/state/aipi-graph.json";
 const GRAPH_SQLITE_REL_PATH = ".aipi/state/aipi-graph.sqlite";
-const GRAPH_VECTOR_DIMENSIONS = 768;
+const GRAPH_VECTOR_DIMENSIONS = 1024;
 const SEMANTIC_CONFIG_REL_PATH = ".aipi/semantic-memory.json";
 const DEFAULT_OLLAMA_HOST = "http://localhost:11434";
-const DEFAULT_OLLAMA_MODEL = "nomic-embed-text";
+const DEFAULT_OLLAMA_MODEL = "bge-m3";
 const OLLAMA_EMBED_PATH = "/api/embed";
+const OLLAMA_TAGS_PATH = "/api/tags";
 const OLLAMA_INSTALL_MESSAGE =
-  "AIPI semantic search requires Ollama running with the 768-dim nomic-embed-text model. " +
-  "Start Ollama and run `ollama pull nomic-embed-text`, or set AIPI_OLLAMA_HOST / AIPI_OLLAMA_MODEL.";
+  "semantic memory is OFF - run `ollama pull bge-m3`, then re-run onboarding / rebuild. " +
+  "AIPI semantic search requires Ollama running with the 1024-dim bge-m3 model, or set AIPI_OLLAMA_HOST / AIPI_OLLAMA_MODEL / AIPI_OLLAMA_DIMENSIONS.";
 const MAX_GRAPH_RELATIONSHIPS = 2500;
 const RELATIONSHIP_PRIORITY = new Map([
   ["test_covers", 0],
@@ -355,7 +356,7 @@ export function registerAipiRuntimeTools(pi, { projectRootResolver = () => proce
   pi.registerTool({
     name: "aipi_semantic_search",
     description:
-      "Run semantic-only code search through Ollama nomic-embed-text. Fails loudly if semantic embeddings are unavailable.",
+      "Run semantic-only code search through Ollama bge-m3. Fails loudly if semantic embeddings are unavailable.",
     parameters: {
       type: "object",
       required: ["query"],
@@ -873,7 +874,7 @@ async function ensureGraph(root, { rebuild = false, env = process.env, embedding
   if (!rebuild) {
     const existing = await readJson(path.join(root, GRAPH_REL_PATH));
     if (existing?.schema === "aipi.code-graph.v1" && !existing.stale && (await graphSidecarReady(root, existing))) {
-      const freshness = await inspectGraphFreshness(root, existing);
+      const freshness = await inspectGraphFreshness(root, existing, { env });
       if (!freshness.stale) {
         return { ...existing, stale: false, freshness };
       }
@@ -2281,8 +2282,26 @@ function graphSummary(graph) {
   };
 }
 
-async function inspectGraphFreshness(root, graph) {
+async function inspectGraphFreshness(root, graph, { env = process.env } = {}) {
   const checkedAt = new Date().toISOString();
+  const embeddingConfig = await resolveSemanticEmbeddingConfig({ root, env });
+  const graphVector = graph.vector ?? graph.sqlite?.vector ?? null;
+  if (graphVector?.dimensions && graphVector.dimensions !== embeddingConfig.dimensions) {
+    return graphFreshnessStale({
+      checkedAt,
+      reason: `embedding dimension mismatch: indexed ${graphVector.dimensions}, configured ${embeddingConfig.dimensions}`,
+      expectedCount: graph.files?.length ?? 0,
+      actualCount: graph.files?.length ?? 0,
+    });
+  }
+  if (graphVector?.embedding_model && graphVector.embedding_model !== embeddingConfig.model) {
+    return graphFreshnessStale({
+      checkedAt,
+      reason: `embedding model mismatch: indexed ${graphVector.embedding_model}, configured ${embeddingConfig.model}`,
+      expectedCount: graph.files?.length ?? 0,
+      actualCount: graph.files?.length ?? 0,
+    });
+  }
   if (!Array.isArray(graph.files)) {
     return graphFreshnessStale({
       checkedAt,
@@ -2396,6 +2415,7 @@ async function writeSqliteGraph({
   let transactionOpen = false;
   try {
     const embeddingConfig = await resolveSemanticEmbeddingConfig({ root, env });
+    const semanticReadiness = await checkSemanticEmbeddingReadiness({ config: embeddingConfig, fetchFn: embeddingFetch });
     const reusableEmbeddingCache = await readReusableEmbeddingCache({
       sqlite,
       sqlitePath,
@@ -2454,9 +2474,17 @@ async function writeSqliteGraph({
       );
     `);
 
-    let vector = withEmbeddingMetadata(await prepareSqliteVec(db), embeddingConfig);
+    let vector = withEmbeddingMetadata(await prepareSqliteVec(db, embeddingConfig), embeddingConfig);
+    if (semanticReadiness.status !== "ready") {
+      const sqliteVecStatus = vector;
+      vector = {
+        ...semanticVectorUnavailable(semanticReadiness.message, embeddingConfig, semanticReadiness),
+        sqlite_vec_status: sqliteVecStatus.status,
+        sqlite_vec_reason: sqliteVecStatus.reason ?? null,
+      };
+    }
     if (vector.status === "available") {
-      db.exec(`CREATE VIRTUAL TABLE code_vectors USING vec0(embedding float[${GRAPH_VECTOR_DIMENSIONS}])`);
+      db.exec(`CREATE VIRTUAL TABLE code_vectors USING vec0(embedding float[${embeddingConfig.dimensions}])`);
     }
 
     db.exec("BEGIN IMMEDIATE");
@@ -2537,7 +2565,7 @@ async function writeSqliteGraph({
               itemKey,
               file.path,
               file.hash,
-              GRAPH_VECTOR_DIMENSIONS,
+              embeddingConfig.dimensions,
               embeddingConfig.model,
               embeddingConfig.host,
               embedding,
@@ -2615,7 +2643,7 @@ async function readReusableEmbeddingCache({
       SELECT item_key, path, file_hash, dimensions, model, host, embedding
       FROM embedding_cache
       WHERE dimensions = ? AND model = ? AND host = ?
-    `).all(GRAPH_VECTOR_DIMENSIONS, embeddingConfig.model, embeddingConfig.host);
+    `).all(embeddingConfig.dimensions, embeddingConfig.model, embeddingConfig.host);
     const cache = new Map();
     for (const row of rows) {
       if (!unchanged.has(row.path)) continue;
@@ -2642,7 +2670,8 @@ async function loadSqlite() {
   }
 }
 
-async function prepareSqliteVec(db) {
+async function prepareSqliteVec(db, embeddingConfig = {}) {
+  const dimensions = embeddingConfig.dimensions ?? GRAPH_VECTOR_DIMENSIONS;
   try {
     const sqliteVec = await import("sqlite-vec");
     db.enableLoadExtension?.(true);
@@ -2652,13 +2681,13 @@ async function prepareSqliteVec(db) {
       status: "available",
       engine: "sqlite-vec",
       version,
-      dimensions: GRAPH_VECTOR_DIMENSIONS,
+      dimensions,
     };
   } catch (error) {
     return {
       status: "unavailable",
       engine: "sqlite-vec",
-      dimensions: GRAPH_VECTOR_DIMENSIONS,
+      dimensions,
       reason: String(error?.message ?? error),
     };
   } finally {
@@ -2671,7 +2700,8 @@ async function prepareSqliteVec(db) {
 }
 
 async function sqliteVectorRefs({ db, root, query, limit, semanticOnly = false, env = process.env, embeddingFetch = globalThis.fetch }) {
-  const vector = await prepareSqliteVec(db);
+  const embeddingConfig = await resolveSemanticEmbeddingConfig({ root, env });
+  const vector = await prepareSqliteVec(db, embeddingConfig);
   if (vector.status !== "available") return [];
   try {
     const embedding = await vectorLiteral(query, { root, env, fetchFn: embeddingFetch });
@@ -2763,9 +2793,9 @@ export async function embedText(text, {
   if (!Array.isArray(vector)) {
     throw semanticUnavailableError("Ollama embedding response did not include an embedding vector.", config);
   }
-  if (vector.length !== GRAPH_VECTOR_DIMENSIONS) {
+  if (vector.length !== config.dimensions) {
     throw semanticUnavailableError(
-      `Ollama model ${config.model} returned ${vector.length} dimensions; AIPI requires ${GRAPH_VECTOR_DIMENSIONS}.`,
+      `Ollama model ${config.model} returned ${vector.length} dimensions; AIPI requires ${config.dimensions}.`,
       config,
     );
   }
@@ -2787,10 +2817,22 @@ function extractOllamaEmbedding(body) {
 
 async function resolveSemanticEmbeddingConfig({ root = process.cwd(), env = process.env } = {}) {
   const config = await readJson(path.join(root, SEMANTIC_CONFIG_REL_PATH)).catch(() => null);
+  const model = String(env.AIPI_OLLAMA_MODEL ?? config?.ollama_model ?? config?.model ?? DEFAULT_OLLAMA_MODEL).trim() || DEFAULT_OLLAMA_MODEL;
   return {
     host: normalizeOllamaHost(env.AIPI_OLLAMA_HOST ?? config?.ollama_host ?? config?.host ?? DEFAULT_OLLAMA_HOST),
-    model: String(env.AIPI_OLLAMA_MODEL ?? config?.ollama_model ?? config?.model ?? DEFAULT_OLLAMA_MODEL).trim() || DEFAULT_OLLAMA_MODEL,
+    model,
+    dimensions: resolveEmbeddingDimensions({
+      raw: env.AIPI_OLLAMA_DIMENSIONS ?? config?.ollama_dimensions ?? config?.dimensions ?? config?.vector_dimensions,
+      model,
+    }),
   };
+}
+
+function resolveEmbeddingDimensions({ raw, model }) {
+  const parsed = Number(raw);
+  if (Number.isInteger(parsed) && parsed > 0) return parsed;
+  if (String(model ?? "").trim() === DEFAULT_OLLAMA_MODEL) return GRAPH_VECTOR_DIMENSIONS;
+  return GRAPH_VECTOR_DIMENSIONS;
 }
 
 function normalizeOllamaHost(value) {
@@ -2802,25 +2844,92 @@ function ollamaEmbedUrl(host) {
   return `${normalizeOllamaHost(host)}${OLLAMA_EMBED_PATH}`;
 }
 
+function ollamaTagsUrl(host) {
+  return `${normalizeOllamaHost(host)}${OLLAMA_TAGS_PATH}`;
+}
+
+async function checkSemanticEmbeddingReadiness({ config, fetchFn = globalThis.fetch } = {}) {
+  const normalized = {
+    host: normalizeOllamaHost(config?.host ?? DEFAULT_OLLAMA_HOST),
+    model: String(config?.model ?? DEFAULT_OLLAMA_MODEL),
+  };
+  if (typeof fetchFn !== "function") {
+    return semanticReadinessOff("ollama_unreachable", normalized, "Ollama fetch API is unavailable.");
+  }
+  let response;
+  try {
+    response = await fetchFn(ollamaTagsUrl(normalized.host), { method: "GET" });
+  } catch (error) {
+    return semanticReadinessOff("ollama_unreachable", normalized, `Ollama is unreachable: ${String(error?.message ?? error)}`);
+  }
+  if (!response?.ok) {
+    const status = response?.status ? `HTTP ${response.status}` : "unknown HTTP status";
+    return semanticReadinessOff("ollama_unreachable", normalized, `Ollama /api/tags failed with ${status}.`);
+  }
+  let body;
+  try {
+    body = await response.json();
+  } catch (error) {
+    return semanticReadinessOff("ollama_unreachable", normalized, `Ollama /api/tags returned invalid JSON: ${String(error?.message ?? error)}`);
+  }
+  const names = new Set((body?.models ?? []).map((item) => {
+    if (typeof item === "string") return item;
+    return String(item?.name ?? item?.model ?? "").trim();
+  }).filter(Boolean));
+  const found = [...names].some((name) => name === normalized.model || name.startsWith(`${normalized.model}:`));
+  if (!found) {
+    return semanticReadinessOff(
+      "model_missing",
+      normalized,
+      `Ollama is running but model ${normalized.model} is not pulled.`,
+    );
+  }
+  return {
+    status: "ready",
+    host: normalized.host,
+    model: normalized.model,
+    message: `semantic memory is ON - Ollama model ${normalized.model} is available.`,
+    action: null,
+  };
+}
+
+function semanticReadinessOff(status, config, reason) {
+  return {
+    status,
+    host: config.host,
+    model: config.model,
+    reason,
+    message: `${reason} ${OLLAMA_INSTALL_MESSAGE}`,
+    action: `ollama pull ${config.model}`,
+  };
+}
+
 function withEmbeddingMetadata(vector, config) {
   return {
     ...vector,
-    dimensions: GRAPH_VECTOR_DIMENSIONS,
+    dimensions: config.dimensions ?? GRAPH_VECTOR_DIMENSIONS,
     semantic_backend: "ollama",
     embedding_model: config.model,
     embedding_host: config.host,
   };
 }
 
-function semanticVectorUnavailable(error, config = {}) {
+function semanticVectorUnavailable(error, config = {}, readiness = null) {
   return {
     status: "unavailable",
     engine: "sqlite-vec",
-    dimensions: GRAPH_VECTOR_DIMENSIONS,
+    dimensions: config.dimensions ?? GRAPH_VECTOR_DIMENSIONS,
     semantic_backend: "ollama",
     embedding_model: config.model ?? DEFAULT_OLLAMA_MODEL,
     embedding_host: config.host ?? DEFAULT_OLLAMA_HOST,
     reason: semanticUnavailableReason(error),
+    readiness: readiness
+      ? {
+          status: readiness.status,
+          message: readiness.message,
+          action: readiness.action ?? null,
+        }
+      : null,
   };
 }
 
@@ -2836,7 +2945,7 @@ function semanticUnavailableError(message, config = {}) {
     semantic_backend: "ollama",
     embedding_model: config.model ?? DEFAULT_OLLAMA_MODEL,
     embedding_host: config.host ?? DEFAULT_OLLAMA_HOST,
-    dimensions: GRAPH_VECTOR_DIMENSIONS,
+    dimensions: config.dimensions ?? GRAPH_VECTOR_DIMENSIONS,
   };
   return error;
 }

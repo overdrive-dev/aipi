@@ -236,8 +236,8 @@ Claim evidence anchors for the live runtime surfaces are `test:workflow-executor
   backend.
 - Round 33: added an optional `sqlite-vec` backend to the rebuildable code
   graph. When the platform extension and local Ollama are available,
-  `rebuildCodeGraph` creates a `vec0` table with 768-dimensional
-  `nomic-embed-text` code-line embeddings; `aipi_callers` and `aipi_impact`
+  `rebuildCodeGraph` creates a `vec0` table with 1024-dimensional
+  `bge-m3` code-line embeddings; `aipi_callers` and `aipi_impact`
   merge exact SQLite refs with vector refs and fall back to lexical search when
   semantic embeddings are unavailable.
 - Round 34: added rebuildable graph relationship edges. The JSON manifest and

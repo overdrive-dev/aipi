@@ -5,8 +5,8 @@
 This file is the handoff channel between Claude reviewer and Codex implementer.
 
 Current owner: CLAUDE
-Current status: CLOSED
-Open review round: 34 CLOSED (command watchdog / stuck-process guard); Rounds 29–34 all CLOSED
+Current status: WAITING_FOR_CLAUDE
+Open review round: 35 (onboarding investigates via swarm; minimal recommendation-style asks); Rounds 29–34 CLOSED
 
 Note: Round 17 closed too early on a narrow basis. Round 19 is a full-project
 adversarial sweep (8 dimensions, every finding independently verified) and is the
@@ -7973,3 +7973,169 @@ vulnerabilities" (the deps were genuinely incomplete before). Rounds 29–34 rem
 
 Current owner: CLAUDE
 Current status: CLOSED
+
+---
+
+# Round 35 — Onboarding INVESTIGATES (swarm) instead of interrogating; minimal recommendation-style asks; loud embedding-model readiness
+
+Opened by Claude on user feedback (2026-06-19). Builds on Round 31 (onboarding), Round 29 (forked
+worker swarm), Round 32 (semantic/blast-radius memory + injection), Round 22 (blocker picker).
+
+**Problem (user):** for a repo that ALREADY has code, `aipi-init`/onboarding asks open questions
+(purpose, business/domain, validation/environment) — but those are mostly inferable from the code.
+The environment + business-rule questions are redundant. User: "investigate instead of asking — always
+spawn several agents to interpret the project; and if you must ask the client, bring recommendations
+to choose from." Separately, a live diagnostic showed the semantic graph degraded to `sqlite+lexical`
+SILENTLY because Ollama was running but `nomic-embed-text` was not pulled (`/api/tags → {"models":[]}`)
+— the build should say so loudly.
+
+**User decisions (binding):**
+- Repo WITH code → INVESTIGATE autonomously via a multi-agent swarm; do NOT interrogate.
+- DROP the redundant open questions (environment, business-rules, validation) — infer from code.
+- Ask the client ONLY what genuinely can't be inferred, and ALWAYS as a RECOMMENDATION pick
+  (best guess first + 1–3 alternatives + free-text), reusing the Round-22 blocker picker.
+
+**What to build:**
+1. **Swarm investigation (default for repos with code).** Replace the open-question interview with a
+   multi-agent investigation: spawn several forked workers (Round-29 runtime, Pi-OAuth, project-scoped),
+   each interpreting a dimension — (a) architecture/components & entry points, (b) stack/build/test/CI,
+   (c) domain & business rules from the actual models/services, (d) conventions (lint/format/patterns),
+   (e) deployment & environment from docker/configs/.env.example. Build the Round-32 graph first and let
+   agents use `aipi_impact`/`aipi_callers`/`aipi_semantic_search` + blast-radius. Reuse the existing
+   codebase-mapper-style agents / catalog; do not reinvent the swarm.
+2. **Synthesize → write project memory.** Merge the agents' structured findings into
+   `.aipi/memory/project/*.md` (architecture/components, business-rules, decisions, knowledge,
+   environment, procedures, deployment, glossary), replacing the stubs. Keep Round-31 guards: idempotent
+   (don't clobber customized pages), preserve frontmatter, memory-only.
+3. **Ask minimally, WITH recommendations.** Remove the environment + business-rule + validation open
+   prompts. For anything the swarm can't confidently infer (typically the project's current
+   GOAL/priorities, or a genuinely ambiguous domain term), surface a recommendation-style question via
+   the Round-22 `ctx.ui.select` blocker picker: AIPI's best guess first + 1–3 distinct alternatives +
+   free-text. If nothing needs confirming, write the memory with ZERO questions. (General principle:
+   AIPI questions to the user should default to recommendation-pick, not open-ended.)
+4. **Loud embedding-model readiness (from the live diagnostic).** During onboarding/graph build, detect
+   the three states: (i) Ollama unreachable, (ii) Ollama up but the configured model (`bge-m3`)
+   NOT pulled (`/api/tags` has no match), (iii) ready. For (i)/(ii) the build still proceeds in lexical
+   mode BUT emits a LOUD, actionable line ("semantic memory is OFF — run `ollama pull bge-m3`,
+   then re-run onboarding / rebuild") and records it in the onboarding result + trace — not a silent
+   `meta.source=sqlite+lexical`. Offer (or, if a flag is set, auto) rebuild once the model is present.
+6. **Switch the default embedding model: `nomic-embed-text` (768-dim) → `bge-m3` (1024-dim)**
+   (user decision 2026-06-19 — more robust + multilingual for the PT-BR domain). Change
+   `GRAPH_VECTOR_DIMENSIONS` 768 → 1024; recreate `code_vectors USING vec0(embedding float[1024])`;
+   default `semantic-memory.json` model + `AIPI_OLLAMA_MODEL` → `bge-m3`; update the hard-fail / readiness
+   message text; update EVERY Round-32 test/assertion that hard-coded 768 or `nomic-embed-text`. Prefer
+   the dimension be derived from / validated against the model's returned vector length and stored in
+   `semantic-memory.json` (so a future model swap is a config change). A graph built at the old 768 dim
+   must be DETECTED as a dimension mismatch and REBUILT (drop+recreate the vec0 table), not error.
+5. **Empty/new repo fallback.** Little/no code to investigate → minimal recommendation-style prompt or
+   just scaffold + nudge; no heavy swarm. Keep: auto-run only when interactive + host model resolvable
+   (else nudge); `--no-onboard` copy-only.
+
+**Acceptance / tests (must actually execute — WF-01/WF-02):**
+- For a fixture repo WITH code, onboarding runs a multi-agent investigation (assert >1 worker spawned /
+  the investigation path executes) and writes project memory derived from the code WITHOUT issuing the
+  environment/business-rule/validation prompts (assert those are NOT asked).
+- Memory pages gain code-derived facts (components/stack) absent from the stubs.
+- A needed confirmation is presented as a recommendation pick (options + free-text via the blocker
+  picker), NOT an open question — tested.
+- Embedding-model readiness: with Ollama-up-but-model-missing (stub `/api/tags` → `{"models":[]}`), the
+  onboarding/build result surfaces the loud actionable "pull bge-m3" message (not a silent
+  lexical fallback) — tested; markdown + lexical still work.
+- Embedding model = `bge-m3`, dim = 1024: a test asserts `code_vectors` is `vec0(... float[1024])`, the
+  default model is `bge-m3`, the embedding client validates a 1024-length vector, and no test/assertion
+  still hard-codes 768 or `nomic-embed-text`; a 768-built graph is detected as a dim mismatch and rebuilt.
+- Idempotent re-run preserves customized pages; non-interactive/no-model still skips with a nudge.
+- `npm test` + `npm run validate` green.
+
+Record changed files + exact commands run, then set `Current owner: CLAUDE` /
+`Current status: WAITING_FOR_CLAUDE`.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX
+Requested next action: implement Round 35 — onboarding investigates via a multi-agent swarm (no
+redundant questions; recommendation-style asks only) + loud embedding-model readiness (Ollama-up-but-
+model-missing surfaces an actionable pull message instead of silent lexical fallback) + switch the
+default embedding model nomic-embed-text(768) → bge-m3(1024-dim) end to end (dims, vec0 table, config,
+message, all Round-32 tests; rebuild on dim mismatch).
+
+## Codex handoff - Round 35 implementation (2026-06-19)
+
+Implemented Round 35.
+
+What changed:
+
+- Onboarding now builds the code graph before memory synthesis, then uses a multi-worker investigation
+  path for repositories with code. The swarm spawns five focused workers: architecture/entry points,
+  stack/build/test/CI, domain/business rules, conventions, and deployment/environment. The workers write
+  runtime artifacts only and do not write durable memory.
+- The previous open-ended purpose/domain/validation questionnaire was removed. AIPI now asks only when a
+  genuinely low-confidence confirmation remains, using `ctx.ui.select` with best-guess-first
+  recommendations plus a free-text option. Repos with inferable code facts write memory with zero user
+  questions.
+- Project memory rendering now synthesizes code-derived project facts, candidate domains/rules,
+  high-signal files, validation commands, environment/config evidence, deployment evidence, and glossary
+  terms from the repository inventory plus investigation result, while preserving Round-31 guards
+  against clobbering customized pages.
+- Onboarding records `.aipi/runtime/onboarding/onboarding.jsonl` traces with memory, graph,
+  investigation, recommendation, and semantic-readiness metadata. The formatted onboarding result
+  includes investigation mode/worker count and a loud semantic-readiness message when embeddings are off.
+- Semantic memory default moved from `nomic-embed-text`/768 to `bge-m3`/1024 end to end:
+  `GRAPH_VECTOR_DIMENSIONS`, `templates/.aipi/semantic-memory.json`, runtime contract, capabilities,
+  docs, validation, tests, and `vec0(embedding float[1024])`.
+- Graph rebuild now checks `.aipi/semantic-memory.json` / env dimensions and model. A manifest built with
+  an old dimension/model is marked stale and rebuilt instead of reused. Embedding cache reuse is keyed by
+  configured dimensions/model/host.
+- Graph build checks Ollama `/api/tags` before embedding. If Ollama is unreachable or running without
+  `bge-m3`, it proceeds in lexical mode but records a loud actionable readiness object/message:
+  "semantic memory is OFF - run `ollama pull bge-m3`, then re-run onboarding / rebuild".
+- `package-lock.json` also contains npm's small bin-path normalization for the installed Pi package
+  (`dist/cli.js` -> `./dist/cli.js`).
+
+Changed files:
+
+- `extensions/aipi/runtime/onboarding.js`
+- `extensions/aipi/runtime/aipi-tools.js`
+- `extensions/aipi/index.js`
+- `extensions/aipi/runtime/capabilities.js`
+- `templates/.aipi/semantic-memory.json`
+- `templates/.aipi/runtime-contract.json`
+- `tools/test-project-onboarding.mjs`
+- `tools/test-aipi-tools.mjs`
+- `tools/validate-aipi-templates.mjs`
+- `docs/adversarial-remediation.md`
+- `docs/pre-adversarial-completion-plan.md`
+- `package-lock.json`
+- `adversarial-claude.md`
+
+Validation run:
+
+- `node tools/test-project-onboarding.mjs` -> `AIPI_PROJECT_ONBOARDING_TEST_OK`
+- `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`
+- `npm.cmd run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`
+- `git diff --check` -> no whitespace errors (line-ending warnings only)
+- `npm.cmd test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`; existing
+  `AIPI_MODEL_PRESSURE_EVALS_SKIPPED` remains intentional unless
+  `AIPI_MODEL_PRESSURE=1` and `AIPI_MODEL_PRESSURE_COMMAND` are set.
+
+Acceptance evidence:
+
+- Fixture repo with code spawns more than one onboarding worker and records `investigation.mode="swarm"`.
+- The same fixture asks zero `ctx.ui.select`/`ctx.ui.input` questions because code-derived facts are
+  sufficient, and memory no longer contains the old environment/business-rule/validation open prompts.
+- Empty/new repo fallback presents a recommendation pick with three options plus free text.
+- Stubbed Ollama `/api/tags -> {"models":[]}` produces the loud `ollama pull bge-m3` readiness message
+  in onboarding result and trace while lexical graph/memory still complete.
+- Tests assert default model `bge-m3`, vector dimensions 1024, `code_vectors` created as
+  `vec0(... float[1024])`, and old-dimension graph manifests are detected as stale and rebuilt.
+- `rg` found no active `nomic-embed-text`, `768`, `DEFAULT_QUESTIONS`, `askOnboardingQuestions`, or
+  `runOnboardingInventoryWorker` references in `tools`, `extensions`, `templates`, `docs`, or `README.md`.
+
+Residual risk:
+
+- Live autonomous investigation still depends on an interactive session with a host-scoped model and the
+  AIPI coordinator available. Without that, auto post-init onboarding preserves the existing safe nudge;
+  manual onboarding still writes deterministic memory rather than interrogating the user.
+
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE
+Requested next action: verify Round 35 against the real code/tests; close if no findings remain or hand back concrete findings.

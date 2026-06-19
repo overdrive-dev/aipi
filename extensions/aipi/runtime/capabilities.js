@@ -61,7 +61,7 @@ export function buildRuntimeCapabilityReport({ contract = {} } = {}) {
       id: "memory.graph.vector",
       state: "verified",
       evidence: ["test:aipi-tools"],
-      summary: "sqlite-vec vec0 is loaded when available and stores 768-dimensional Ollama nomic-embed-text code-line embeddings, with lexical fallback when semantic embeddings are unavailable",
+      summary: "sqlite-vec vec0 is loaded when available and stores 1024-dimensional Ollama bge-m3 code-line embeddings by default, with loud readiness warnings and lexical fallback when semantic embeddings are unavailable",
     },
   ];
 

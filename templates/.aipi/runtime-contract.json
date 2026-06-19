@@ -194,10 +194,10 @@
     "sqlitePath": ".aipi/state/aipi-graph.sqlite",
     "source": "sqlite+sqlite-vec+lexical",
     "vectorStatus": "implemented_optional_sqlite_vec_extension_with_ollama_embeddings",
-    "vectorDimensions": 768,
+    "vectorDimensions": 1024,
     "semanticConfigPath": ".aipi/semantic-memory.json",
     "embeddingBackend": "ollama",
-    "embeddingModel": "nomic-embed-text",
+    "embeddingModel": "bge-m3",
     "relationshipStatus": "implemented_rebuildable_edges",
     "relationshipKinds": [
       "defines",
@@ -221,7 +221,7 @@
       "run_skips_rule",
       "run_outcome_impacts_code"
     ],
-    "rule": "The code graph is rebuildable cache, not authority. AIPI writes a JSON manifest plus a node:sqlite sidecar for files, symbols, searchable code lines, relationship edges, run outcome summaries, and sqlite-vec code-line vectors when the platform extension loads. When sqlite-vec and local Ollama are available, vectors use 768-dimensional nomic-embed-text embeddings. Semantic-only search fails loudly if Ollama or nomic-embed-text is unavailable, while aipi_callers and aipi_impact continue through SQLite lexical or file lexical fallback. Rebuildable domain edges connect accepted business rules, BDD contracts, deployment memory, run artifacts, and source files so impact tools can cite business-rule and deployment context. Historical run artifacts distinguish PASS, FAIL, BLOCKED, and SKIPPED outcomes when linking runs back to business rules and impacted code. Domain edge inference canonicalizes deterministic PT/EN aliases and explicit source path references before falling back to token overlap, and records conservative implicit preserve-vs-replace, allow-vs-deny, required-vs-optional, automatic-vs-manual, numeric-mismatch, monetary-mismatch, threshold-direction-mismatch, or sequence-mismatch business-rule conflicts when related rules share enough canonical domain terms. If SQLite or sqlite-vec is unavailable, callers/impact tools fall back to SQLite lexical or file lexical scans plus manifest relationships. Markdown remains authoritative over generated index data."
+    "rule": "The code graph is rebuildable cache, not authority. AIPI writes a JSON manifest plus a node:sqlite sidecar for files, symbols, searchable code lines, relationship edges, run outcome summaries, and sqlite-vec code-line vectors when the platform extension loads. When sqlite-vec and local Ollama are available, vectors use 1024-dimensional bge-m3 embeddings by default, with dimensions read from semantic-memory.json or AIPI_OLLAMA_DIMENSIONS for future model swaps. Semantic-only search fails loudly if Ollama or bge-m3 is unavailable, while aipi_callers and aipi_impact continue through SQLite lexical or file lexical fallback. Onboarding and graph rebuild detect Ollama-up-but-model-missing through /api/tags and surface 'semantic memory is OFF - run `ollama pull bge-m3`, then re-run onboarding / rebuild' instead of silently reporting sqlite+lexical only. A graph built with an old embedding dimension is stale and rebuilt with a matching vec0 table. Rebuildable domain edges connect accepted business rules, BDD contracts, deployment memory, run artifacts, and source files so impact tools can cite business-rule and deployment context. Historical run artifacts distinguish PASS, FAIL, BLOCKED, and SKIPPED outcomes when linking runs back to business rules and impacted code. Domain edge inference canonicalizes deterministic PT/EN aliases and explicit source path references before falling back to token overlap, and records conservative implicit preserve-vs-replace, allow-vs-deny, required-vs-optional, automatic-vs-manual, numeric-mismatch, monetary-mismatch, threshold-direction-mismatch, or sequence-mismatch business-rule conflicts when related rules share enough canonical domain terms. If SQLite or sqlite-vec is unavailable, callers/impact tools fall back to SQLite lexical or file lexical scans plus manifest relationships. Markdown remains authoritative over generated index data."
   },
   "enforcementLevels": {
     "prompt_only": "Instruction exists, but no runtime block exists.",

@@ -55,18 +55,36 @@ const LANGUAGE_EXTENSIONS = new Map([
   [".html", "HTML"],
 ]);
 
-const DEFAULT_QUESTIONS = [
+const ONBOARDING_SWARM_DIMENSIONS = [
   {
-    key: "purpose",
-    question: "Qual e o proposito do projeto em uma frase?",
+    id: "architecture",
+    agent_id: "onboarding-architecture",
+    title: "Architecture, components, and entry points",
+    memory_files: ["project.md", "knowledge.md"],
   },
   {
-    key: "domain",
-    question: "Quais dominios ou regras de negocio sao mais importantes agora?",
+    id: "stack-validation",
+    agent_id: "onboarding-stack-validation",
+    title: "Stack, build, test, and CI",
+    memory_files: ["environment.md", "procedures.md"],
   },
   {
-    key: "validation",
-    question: "Quais comandos validam uma mudanca localmente?",
+    id: "domain-rules",
+    agent_id: "onboarding-domain-rules",
+    title: "Domain and business rules from models/services",
+    memory_files: ["business-rules.md", "glossary.md"],
+  },
+  {
+    id: "conventions",
+    agent_id: "onboarding-conventions",
+    title: "Conventions, lint, format, and patterns",
+    memory_files: ["decisions.md", "procedures.md"],
+  },
+  {
+    id: "deployment-environment",
+    agent_id: "onboarding-deployment-environment",
+    title: "Deployment and environment from configs",
+    memory_files: ["environment.md", "deployment.md"],
   },
 ];
 
@@ -146,28 +164,34 @@ export async function runProjectOnboarding({
 } = {}) {
   const root = assertProjectRoot(projectRoot);
   const inventory = await inventoryRepository(root);
+  const graph = materializeGraph
+    ? await graphBuilder({ projectRoot: root, now })
+    : null;
+  const investigation = await runOnboardingInvestigation({
+    coordinator,
+    hostModel,
+    inventory,
+    graph,
+    now,
+    enabled: Boolean(runWorker),
+  });
+  const recommendations = askUser
+    ? await askRecommendationQuestions({ ctx, inventory, investigation })
+    : { asked: [], answers: {} };
   const collectedAnswers = {
     ...answers,
-    ...(askUser ? await askOnboardingQuestions(ctx) : {}),
+    ...recommendations.answers,
   };
-  const worker = runWorker
-    ? await runOnboardingInventoryWorker({ coordinator, hostModel, inventory, now }).catch((error) => ({
-        status: "failed",
-        error: String(error?.message ?? error),
-      }))
-    : { status: "not_run" };
   const memory = await seedProjectMemory({
     projectRoot: root,
     inventory,
     answers: collectedAnswers,
+    investigation,
     now,
     force: false,
   });
-  const graph = materializeGraph
-    ? await graphBuilder({ projectRoot: root, now })
-    : null;
 
-  return {
+  const result = {
     schema: "aipi.project-onboarding.v1",
     action: "onboard",
     source,
@@ -181,11 +205,18 @@ export async function runProjectOnboarding({
           sqlite_path: graph.sqlite?.path ?? ".aipi/state/aipi-graph.sqlite",
           sqlite_status: graph.sqlite?.status ?? "unknown",
           vector_status: graph.vector?.status ?? graph.sqlite?.vector?.status ?? "unknown",
+          vector_dimensions: graph.vector?.dimensions ?? graph.sqlite?.vector?.dimensions ?? null,
+          embedding_model: graph.vector?.embedding_model ?? graph.sqlite?.vector?.embedding_model ?? null,
+          semantic_readiness: graph.vector?.readiness ?? null,
           file_count: graph.files?.length ?? 0,
         }
       : null,
-    worker,
+    semantic_readiness: graph?.vector?.readiness ?? null,
+    investigation,
+    recommendations,
   };
+  await recordOnboardingTrace(root, result);
+  return result;
 }
 
 export function formatOnboardingResult(result) {
@@ -193,11 +224,17 @@ export function formatOnboardingResult(result) {
   if (result?.action !== "onboard") return "AIPI onboarding did not run.";
   const memory = result.memory ?? {};
   const graph = result.graph ?? {};
-  return [
+  const lines = [
     "AIPI onboarding complete:",
     `${memory.written?.length ?? 0} memory pages written, ${memory.skipped_customized?.length ?? 0} customized pages preserved.`,
     `graph=${graph.path ?? "not-built"} sqlite=${graph.sqlite_status ?? "unknown"} path=${graph.sqlite_path ?? ".aipi/state/aipi-graph.sqlite"}`,
-  ].join("\n");
+    `investigation=${result.investigation?.mode ?? "unknown"} workers=${result.investigation?.spawned_count ?? 0}`,
+  ];
+  const readiness = result.semantic_readiness ?? graph.semantic_readiness;
+  if (readiness?.status && readiness.status !== "ready") {
+    lines.push(readiness.message ?? "semantic memory is OFF - run `ollama pull bge-m3`, then re-run onboarding / rebuild.");
+  }
+  return lines.join("\n");
 }
 
 export async function inventoryRepository(projectRoot) {
@@ -211,10 +248,15 @@ export async function inventoryRepository(projectRoot) {
   const languages = languageSummary(files);
   const entryPoints = inferEntryPoints(files, packageManifests);
   const commands = inferCommands(packageManifests, python);
+  const codeFiles = files.filter(isInvestigableCodeFile).slice(0, 120);
+  const configFiles = files.filter((file) => /(^|\/)(\.env\.example|\.env\.sample|docker-compose\.ya?ml|Dockerfile|package\.json|pyproject\.toml|requirements.*\.txt)$/i.test(file));
 
   return {
     top_level: topLevel,
     files_sample: files.slice(0, 80),
+    has_code: codeFiles.length > 0,
+    code_files: codeFiles,
+    config_files: configFiles,
     languages,
     package_manifests: packageManifests,
     python,
@@ -223,6 +265,7 @@ export async function inventoryRepository(projectRoot) {
     entry_points: entryPoints,
     commands,
     stack: inferStack({ files, packageManifests, python }),
+    domains: inferDomains(files),
   };
 }
 
@@ -235,6 +278,7 @@ export async function seedProjectMemory({
   projectRoot,
   inventory,
   answers = {},
+  investigation = null,
   now = () => new Date(),
   force = false,
 } = {}) {
@@ -266,6 +310,7 @@ export async function seedProjectMemory({
       frontmatter,
       inventory,
       answers,
+      investigation,
       date: now().toISOString().slice(0, 10),
     });
     await fs.writeFile(target, content);
@@ -290,8 +335,32 @@ function nudge(reason, log) {
   return result;
 }
 
+async function recordOnboardingTrace(root, result) {
+  const trace = {
+    schema: "aipi.project-onboarding.trace.v1",
+    recorded_at: new Date().toISOString(),
+    source: result.source,
+    action: result.action,
+    memory: result.memory,
+    graph: result.graph,
+    semantic_readiness: result.semantic_readiness,
+    investigation: {
+      mode: result.investigation?.mode ?? null,
+      status: result.investigation?.status ?? null,
+      spawned_count: result.investigation?.spawned_count ?? 0,
+    },
+    recommendations: {
+      asked_count: result.recommendations?.asked?.length ?? 0,
+      keys: Object.keys(result.recommendations?.answers ?? {}),
+    },
+  };
+  const tracePath = path.join(root, ".aipi", "runtime", "onboarding", "onboarding.jsonl");
+  await fs.mkdir(path.dirname(tracePath), { recursive: true });
+  await fs.appendFile(tracePath, `${JSON.stringify(trace)}\n`);
+}
+
 function isInteractiveContext(ctx) {
-  return Boolean(ctx?.hasUI === true && typeof ctx?.ui?.input === "function");
+  return Boolean(ctx?.hasUI === true && (typeof ctx?.ui?.select === "function" || typeof ctx?.ui?.input === "function"));
 }
 
 function resolveOnboardingHostModel({ ctx = {}, coordinator = null } = {}) {
@@ -317,40 +386,123 @@ function resolveOnboardingHostModel({ ctx = {}, coordinator = null } = {}) {
   return { ok: false, model: null };
 }
 
-async function askOnboardingQuestions(ctx) {
-  const answers = {};
-  if (typeof ctx?.ui?.input !== "function") return answers;
-  for (const item of DEFAULT_QUESTIONS) {
-    const answer = await Promise.resolve(ctx.ui.input(item.question));
-    if (answer != null && String(answer).trim()) answers[item.key] = String(answer).trim();
+async function askRecommendationQuestions({ ctx, inventory, investigation }) {
+  const question = buildRecommendationQuestion({ inventory, investigation });
+  if (!question) return { asked: [], answers: {} };
+  const asked = [{ key: question.key, question: question.question, options: question.options, allow_free_text: true }];
+  if (typeof ctx?.ui?.select !== "function") {
+    return { asked, answers: {}, skipped_reason: "select_unavailable" };
   }
-  return answers;
+  const selected = await Promise.resolve(ctx.ui.select(question.question, [...question.options, "Other / free text"]));
+  const answer = String(selected ?? "").trim();
+  if (!answer) return { asked, answers: {} };
+  return {
+    asked,
+    answers: {
+      [question.key]: answer === "Other / free text" && typeof ctx?.ui?.input === "function"
+        ? String(await Promise.resolve(ctx.ui.input("Describe the project priority in one sentence.")) ?? "").trim()
+        : answer,
+    },
+  };
 }
 
-async function runOnboardingInventoryWorker({ coordinator, hostModel, inventory, now }) {
-  const runId = `onboarding-${now().toISOString().replace(/[^0-9A-Za-z]+/g, "-")}`;
-  const artifact = `.aipi/runtime/onboarding/${runId}/INVENTORY.md`;
-  const { agent_id: agentId } = coordinator.spawn({
-    agent_id: "onboarding-inventory",
-    step_id: "project_onboarding_inventory",
-    model: hostModel,
-    context_packet: [
-      "Inventory this repository for AIPI onboarding.",
-      "Write a concise markdown inventory artifact. Do not write durable memory.",
-      `Current deterministic inventory: ${JSON.stringify(inventory).slice(0, 4000)}`,
-    ].join("\n"),
-    owned_files: [artifact],
-    expected_artifacts: [artifact],
-    artifact_target: path.posix.dirname(artifact),
-    budget: { timeout_ms: 120000, max_tool_calls: 20 },
-  });
-  await waitForCoordinatorDone(coordinator, agentId);
-  const collected = coordinator.collect(agentId);
+function buildRecommendationQuestion({ inventory }) {
+  if (!inventory?.has_code) {
+    return {
+      key: "purpose",
+      question: "No code was found yet. Which project direction should AIPI assume?",
+      options: [
+        "Scaffold only and keep memory minimal",
+        "Prepare for a new application",
+        "Import context later",
+      ],
+    };
+  }
+  const purpose = inferProjectPurpose(inventory);
+  if (purpose.confidence >= 0.6) return null;
   return {
-    status: collected.ready ? "done" : "not_ready",
-    agent_id: agentId,
-    verdict: collected.step_result?.verdict ?? null,
-    artifacts: collected.artifacts ?? [],
+    key: "purpose",
+    question: "AIPI inferred several possible project priorities. Which should it record?",
+    options: [
+      purpose.text,
+      "Stabilize the existing application",
+      "Map the codebase before feature work",
+    ].filter(Boolean).slice(0, 3),
+  };
+}
+
+async function runOnboardingInvestigation({ coordinator, hostModel, inventory, graph, now, enabled }) {
+  if (!inventory.has_code) {
+    return {
+      mode: "empty_repo",
+      status: "skipped_empty_repo",
+      spawned_count: 0,
+      dimensions: [],
+      summary: "No substantive code files were detected; onboarding used the lightweight scaffold path.",
+    };
+  }
+  if (!enabled || !coordinator || !hostModel) {
+    return {
+      mode: "deterministic",
+      status: "worker_unavailable",
+      spawned_count: 0,
+      dimensions: [],
+      summary: "Repository facts were inferred deterministically because no project-scoped worker swarm was available.",
+    };
+  }
+  const runId = `onboarding-${now().toISOString().replace(/[^0-9A-Za-z]+/g, "-")}`;
+  const spawned = [];
+  for (const dimension of ONBOARDING_SWARM_DIMENSIONS) {
+    const artifact = `.aipi/runtime/onboarding/${runId}/${dimension.id}.md`;
+    const { agent_id: agentId } = coordinator.spawn({
+      agent_id: dimension.agent_id,
+      step_id: `project_onboarding_${dimension.id}`,
+      model: hostModel,
+      context_packet: [
+        `Investigate this repository for AIPI onboarding: ${dimension.title}.`,
+        "Use repository-local evidence and AIPI graph tools when available: aipi_impact, aipi_callers, aipi_semantic_search.",
+        "Write a concise markdown artifact with facts and confidence. Do not ask the user and do not write durable memory.",
+        `Memory pages this finding can inform: ${dimension.memory_files.join(", ")}`,
+        `Graph source: ${graph?.source ?? "not-built"}; semantic readiness: ${graph?.vector?.readiness?.status ?? graph?.vector?.status ?? "unknown"}`,
+        `Deterministic inventory: ${JSON.stringify(inventory).slice(0, 5000)}`,
+      ].join("\n"),
+      owned_files: [artifact],
+      expected_artifacts: [artifact],
+      artifact_target: path.posix.dirname(artifact),
+      budget: { timeout_ms: 120000, max_tool_calls: 20 },
+    });
+    spawned.push({ ...dimension, agent_id: agentId, artifact });
+  }
+  const dimensions = [];
+  for (const worker of spawned) {
+    try {
+      await waitForCoordinatorDone(coordinator, worker.agent_id);
+      const collected = coordinator.collect(worker.agent_id);
+      dimensions.push({
+        id: worker.id,
+        title: worker.title,
+        agent_id: worker.agent_id,
+        status: collected.ready ? "done" : "not_ready",
+        verdict: collected.step_result?.verdict ?? null,
+        artifacts: collected.artifacts?.length ? collected.artifacts : [worker.artifact],
+      });
+    } catch (error) {
+      dimensions.push({
+        id: worker.id,
+        title: worker.title,
+        agent_id: worker.agent_id,
+        status: "failed",
+        error: String(error?.message ?? error),
+        artifacts: [worker.artifact],
+      });
+    }
+  }
+  return {
+    mode: "swarm",
+    status: dimensions.every((item) => item.status === "done") ? "done" : "partial",
+    spawned_count: spawned.length,
+    dimensions,
+    summary: "Project onboarding investigated architecture, stack/validation, domain rules, conventions, and deployment/environment via spawned workers.",
   };
 }
 
@@ -499,12 +651,34 @@ function inferStack({ files, packageManifests, python }) {
   return [...new Set(stack)];
 }
 
+function isInvestigableCodeFile(file) {
+  const ext = path.extname(file).toLowerCase();
+  if (![".js", ".jsx", ".ts", ".tsx", ".py", ".go", ".rs", ".rb", ".php", ".java", ".cs"].includes(ext)) return false;
+  return !/(^|\/)(node_modules|dist|build|coverage|\.aipi)\//.test(file);
+}
+
+function inferDomains(files) {
+  const domains = [];
+  const joined = files.join("\n").toLowerCase();
+  for (const [label, pattern] of [
+    ["authentication", /\b(auth|login|session|user|account)\b/],
+    ["billing", /\b(billing|payment|invoice|subscription|checkout|price)\b/],
+    ["care workflows", /\b(patient|appointment|clinical|care|task)\b/],
+    ["content", /\b(post|article|cms|media|asset)\b/],
+    ["operations", /\b(order|workflow|queue|job|ticket)\b/],
+    ["deployment", /\b(docker|deploy|k8s|helm|terraform)\b/],
+  ]) {
+    if (pattern.test(joined)) domains.push(label);
+  }
+  return domains;
+}
+
 function extractFrontmatter(content) {
   const match = String(content ?? "").match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
   return match ? match[0] : "";
 }
 
-function renderMemoryPage({ file, frontmatter, inventory, answers, date }) {
+function renderMemoryPage({ file, frontmatter, inventory, answers, investigation, date }) {
   const renderers = {
     "project.md": renderProjectPage,
     "business-rules.md": renderBusinessRulesPage,
@@ -515,17 +689,18 @@ function renderMemoryPage({ file, frontmatter, inventory, answers, date }) {
     "deployment.md": renderDeploymentPage,
     "glossary.md": renderGlossaryPage,
   };
-  const body = (renderers[file] ?? renderKnowledgePage)({ inventory, answers, date });
+  const insights = deriveProjectInsights({ inventory, answers, investigation });
+  const body = (renderers[file] ?? renderKnowledgePage)({ inventory, answers, investigation, insights, date });
   return `${frontmatter || ""}${body}\n`;
 }
 
-function renderProjectPage({ inventory, answers, date }) {
+function renderProjectPage({ inventory, insights, date }) {
   return [
     "# Project Context",
     "",
     "## Current truth",
     "",
-    answers.purpose || "Project purpose was not provided during onboarding.",
+    insights.purpose,
     "",
     "## Details",
     "",
@@ -545,10 +720,9 @@ function renderProjectPage({ inventory, answers, date }) {
     "",
     listOrNone(inventory.commands),
     "",
-    "## Open questions",
+    "### Investigation",
     "",
-    answers.validation ? "- Confirm whether the listed validation commands are authoritative." : "- Which validation command is authoritative for local changes?",
-    answers.domain ? "- Convert the stated domain context into accepted business rules." : "- Which business rules are authoritative for this project?",
+    listOrNone(insights.investigationFacts),
     "",
     "## Links",
     "",
@@ -558,27 +732,27 @@ function renderProjectPage({ inventory, answers, date }) {
     "",
     "## Timeline",
     "",
-    `- ${date}: Project memory seeded by /aipi-onboard from repository inventory.`,
+    `- ${date}: Project memory seeded by /aipi-onboard from repository investigation.`,
   ].join("\n");
 }
 
-function renderBusinessRulesPage({ answers, date }) {
+function renderBusinessRulesPage({ insights, date }) {
   return [
     "# Business Rules",
     "",
     "## Current truth",
     "",
-    answers.domain || "No accepted business rules were provided during onboarding.",
+    insights.businessSummary,
     "",
     "## Details",
     "",
     "### Candidate domains",
     "",
-    answers.domain ? listOrNone(splitListish(answers.domain)) : "- To be confirmed with the user before implementation decisions.",
+    listOrNone(insights.domains),
     "",
-    "## Open questions",
+    "### Candidate rules from code",
     "",
-    "- Which candidate rules are accepted product policy?",
+    listOrNone(insights.candidateRules),
     "",
     "## Links",
     "",
@@ -587,17 +761,17 @@ function renderBusinessRulesPage({ answers, date }) {
     "",
     "## Timeline",
     "",
-    `- ${date}: Seeded from /aipi-onboard answers; treat as candidate context until accepted.`,
+    `- ${date}: Seeded from /aipi-onboard repository investigation; treat candidate rules as inferred until accepted.`,
   ].join("\n");
 }
 
-function renderDecisionsPage({ inventory, date }) {
+function renderDecisionsPage({ inventory, insights, date }) {
   return [
     "# Decisions",
     "",
     "## Current truth",
     "",
-    "No durable architecture/product decisions were confirmed during onboarding.",
+    "Observed technical choices were inferred from repository files; keep them as candidate decisions until explicitly changed.",
     "",
     "## Details",
     "",
@@ -605,9 +779,9 @@ function renderDecisionsPage({ inventory, date }) {
     "",
     listOrNone(inventory.stack.map((item) => `Uses ${item}`)),
     "",
-    "## Open questions",
+    "### Conventions evidence",
     "",
-    "- Which observed technical choices are deliberate decisions versus inherited defaults?",
+    listOrNone(insights.conventions),
     "",
     "## Links",
     "",
@@ -620,7 +794,7 @@ function renderDecisionsPage({ inventory, date }) {
   ].join("\n");
 }
 
-function renderKnowledgePage({ inventory, date }) {
+function renderKnowledgePage({ inventory, insights, date }) {
   return [
     "# Knowledge",
     "",
@@ -642,9 +816,9 @@ function renderKnowledgePage({ inventory, date }) {
       inventory.python.pyproject,
     ].filter(Boolean)),
     "",
-    "## Open questions",
+    "### High-signal files",
     "",
-    "- Which files are the highest-signal context for common changes?",
+    listOrNone(insights.highSignalFiles),
     "",
     "## Links",
     "",
@@ -656,7 +830,7 @@ function renderKnowledgePage({ inventory, date }) {
   ].join("\n");
 }
 
-function renderEnvironmentPage({ inventory, answers, date }) {
+function renderEnvironmentPage({ inventory, insights, date }) {
   return [
     "# Environment",
     "",
@@ -674,15 +848,19 @@ function renderEnvironmentPage({ inventory, answers, date }) {
     "",
     listOrNone(inventory.ci),
     "",
+    "### Config files",
+    "",
+    listOrNone(inventory.config_files),
+    "",
     "### Credentials",
     "",
     "- Anthropic OAuth sidecar: `~/.pi/agent/anthropic-auth.json`",
     "- Anthropic OAuth sidecar override: `PI_ANTHROPIC_AUTH_FILE`",
     "- Login command: `/login anthropic`",
     "",
-    "## Open questions",
+    "### Readiness notes",
     "",
-    answers.validation ? `- User stated validation context: ${answers.validation}` : "- Which commands are safe for builder role?",
+    listOrNone(insights.environmentNotes),
     "",
     "## Timeline",
     "",
@@ -690,7 +868,7 @@ function renderEnvironmentPage({ inventory, answers, date }) {
   ].join("\n");
 }
 
-function renderProceduresPage({ inventory, answers, date }) {
+function renderProceduresPage({ inventory, insights, date }) {
   return [
     "# Procedures",
     "",
@@ -702,11 +880,11 @@ function renderProceduresPage({ inventory, answers, date }) {
     "",
     "### Local validation",
     "",
-    listOrNone(answers.validation ? splitListish(answers.validation) : inventory.commands),
+    listOrNone(inventory.commands),
     "",
-    "## Open questions",
+    "### Recommended sequence",
     "",
-    "- What is the required pre-merge validation sequence?",
+    listOrNone(insights.validationSequence),
     "",
     "## Links",
     "",
@@ -718,7 +896,7 @@ function renderProceduresPage({ inventory, answers, date }) {
   ].join("\n");
 }
 
-function renderDeploymentPage({ inventory, date }) {
+function renderDeploymentPage({ inventory, insights, date }) {
   return [
     "# Deployment",
     "",
@@ -736,10 +914,9 @@ function renderDeploymentPage({ inventory, date }) {
     "",
     listOrNone([...inventory.docker, ...inventory.ci]),
     "",
-    "## Open questions",
+    "### Deployment notes",
     "",
-    "- What is the production approval record format?",
-    "- What rollback command is safe and tested?",
+    listOrNone(insights.deploymentNotes),
     "",
     "## Timeline",
     "",
@@ -747,17 +924,14 @@ function renderDeploymentPage({ inventory, date }) {
   ].join("\n");
 }
 
-function renderGlossaryPage({ inventory, answers, date }) {
-  const terms = [
-    ...inventory.stack,
-    ...splitListish(answers.domain ?? ""),
-  ].slice(0, 20);
+function renderGlossaryPage({ insights, date }) {
+  const terms = insights.glossaryTerms.slice(0, 20);
   return [
     "# Glossary",
     "",
     "## Current truth",
     "",
-    "Glossary terms are candidates from onboarding and need product confirmation.",
+    "Glossary terms are inferred from repository stack, domains, and file names.",
     "",
     "## Details",
     "",
@@ -765,14 +939,112 @@ function renderGlossaryPage({ inventory, answers, date }) {
     "",
     listOrNone(terms),
     "",
-    "## Open questions",
-    "",
-    "- Which terms have project-specific meanings?",
-    "",
     "## Timeline",
     "",
     `- ${date}: Seeded by /aipi-onboard.`,
   ].join("\n");
+}
+
+function deriveProjectInsights({ inventory, answers = {}, investigation = null }) {
+  const purpose = String(answers.purpose ?? "").trim() || inferProjectPurpose(inventory).text;
+  const domains = [...new Set([
+    ...splitListish(answers.domain ?? ""),
+    ...(inventory.domains ?? []),
+    ...inferDomainTermsFromPaths(inventory.code_files ?? []),
+  ])].slice(0, 12);
+  const candidateRules = inferCandidateRules({ inventory, domains });
+  const highSignalFiles = [
+    ...(inventory.entry_points ?? []),
+    ...(inventory.code_files ?? []).filter((file) => /(^|\/)(app|main|index|server|api|routes|models|services)\./i.test(file)),
+    ...(inventory.package_manifests ?? []).map((manifest) => manifest.path),
+  ].slice(0, 20);
+  const investigationFacts = [
+    investigation?.mode === "swarm" ? `Swarm investigation ran with ${investigation.spawned_count} workers.` : investigation?.summary,
+    ...(investigation?.dimensions ?? []).map((item) => `${item.title}: ${item.status}`),
+  ].filter(Boolean);
+  const conventions = [
+    inventory.commands.some((command) => /lint/i.test(command)) ? "Lint command detected." : null,
+    inventory.commands.some((command) => /test|jest|pytest/i.test(command)) ? "Automated test command detected." : null,
+    inventory.languages.some((item) => /TypeScript/.test(item.language)) ? "TypeScript is part of the codebase." : null,
+  ].filter(Boolean);
+  const environmentNotes = [
+    inventory.ci.length ? "CI workflow files were detected." : "No CI workflow file detected.",
+    inventory.docker.length ? "Docker/deployment config was detected." : "No Docker deployment file detected.",
+    inventory.config_files.length ? "Configuration files were found and should be used before asking for environment details." : null,
+  ].filter(Boolean);
+  const validationSequence = inventory.commands.filter((command) => /test|lint|build|typecheck/i.test(command));
+  const deploymentNotes = [
+    ...inventory.docker.map((file) => `Deployment evidence: ${file}`),
+    ...inventory.ci.map((file) => `CI evidence: ${file}`),
+    inventory.docker.length || inventory.ci.length ? "Keep production execution gated; onboarding records evidence only." : "No deployment path inferred from repository files.",
+  ];
+  const glossaryTerms = [...new Set([
+    ...inventory.stack,
+    ...domains,
+    ...inferDomainTermsFromPaths(inventory.code_files ?? []),
+  ])];
+  return {
+    purpose,
+    domains,
+    businessSummary: domains.length
+      ? `Candidate business/domain context inferred from code: ${domains.join(", ")}.`
+      : "No accepted business rules were found; onboarding recorded code-derived candidates only.",
+    candidateRules,
+    highSignalFiles,
+    investigationFacts,
+    conventions,
+    environmentNotes,
+    validationSequence,
+    deploymentNotes,
+    glossaryTerms,
+  };
+}
+
+function inferProjectPurpose(inventory = {}) {
+  const names = (inventory.package_manifests ?? []).map((manifest) => manifest.name).filter(Boolean);
+  const stack = inventory.stack ?? [];
+  const domains = inventory.domains ?? [];
+  if (names.length && stack.length) {
+    return {
+      confidence: 0.75,
+      text: `${names[0]} appears to be a ${stack.join(" + ")} project${domains.length ? ` for ${domains.slice(0, 3).join(", ")}` : ""}.`,
+    };
+  }
+  if (stack.length) {
+    return {
+      confidence: 0.65,
+      text: `This appears to be a ${stack.join(" + ")} project inferred from repository files.`,
+    };
+  }
+  return {
+    confidence: 0.35,
+    text: "Map the existing repository before feature work.",
+  };
+}
+
+function inferDomainTermsFromPaths(files = []) {
+  const terms = new Set();
+  for (const file of files) {
+    for (const segment of file.split(/[\/_.-]+/)) {
+      if (/^(src|lib|app|index|main|test|tests|spec|components|utils|hooks|pages|api)$/i.test(segment)) continue;
+      if (segment.length >= 4 && /^[a-z][a-z0-9]+$/i.test(segment)) terms.add(segment.toLowerCase());
+    }
+  }
+  return [...terms].slice(0, 12);
+}
+
+function inferCandidateRules({ inventory, domains }) {
+  const rules = [];
+  if (inventory.commands.length) {
+    rules.push("Local changes should be validated with the detected repository commands before handoff.");
+  }
+  if (inventory.ci.length) {
+    rules.push("CI workflow definitions are part of the delivery contract.");
+  }
+  for (const domain of domains.slice(0, 5)) {
+    rules.push(`Changes touching ${domain} should preserve behavior inferred from related models, services, and tests.`);
+  }
+  return rules;
 }
 
 function listOrNone(items) {

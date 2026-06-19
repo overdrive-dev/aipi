@@ -346,7 +346,7 @@ Work:
   memory and require approval before promotion.
 - Implemented: build a rebuildable JSON manifest plus `node:sqlite` sidecar
   over code files, symbols, searchable code lines, and optional `sqlite-vec`
-  768-dimensional Ollama `nomic-embed-text` code-line vectors. The graph also stores rebuildable
+  1024-dimensional Ollama `bge-m3` code-line vectors. The graph also stores rebuildable
   relationship edges for symbol definitions, test coverage candidates, memory
   mentions, run-artifact path mentions, accepted business rules, BDD contracts,
   explicit rule conflicts, deployment surfaces, and verification artifacts.

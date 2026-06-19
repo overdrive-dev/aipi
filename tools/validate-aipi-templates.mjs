@@ -223,14 +223,14 @@ if (contract.codeGraph?.source !== "sqlite+sqlite-vec+lexical") {
 if (contract.codeGraph?.vectorStatus !== "implemented_optional_sqlite_vec_extension_with_ollama_embeddings") {
   errors.push("runtime-contract codeGraph.vectorStatus must mark sqlite-vec plus Ollama embeddings implemented as optional");
 }
-if (contract.codeGraph?.vectorDimensions !== 768) {
-  errors.push("runtime-contract codeGraph.vectorDimensions must be 768");
+if (contract.codeGraph?.vectorDimensions !== 1024) {
+  errors.push("runtime-contract codeGraph.vectorDimensions must be 1024");
 }
 if (contract.codeGraph?.semanticConfigPath !== ".aipi/semantic-memory.json") {
   errors.push("runtime-contract codeGraph.semanticConfigPath must be .aipi/semantic-memory.json");
 }
-if (contract.codeGraph?.embeddingBackend !== "ollama" || contract.codeGraph?.embeddingModel !== "nomic-embed-text") {
-  errors.push("runtime-contract codeGraph must document Ollama nomic-embed-text embeddings");
+if (contract.codeGraph?.embeddingBackend !== "ollama" || contract.codeGraph?.embeddingModel !== "bge-m3") {
+  errors.push("runtime-contract codeGraph must document Ollama bge-m3 embeddings");
 }
 if (contract.codeGraph?.relationshipStatus !== "implemented_rebuildable_edges") {
   errors.push("runtime-contract codeGraph.relationshipStatus must mark rebuildable edges implemented");
@@ -258,10 +258,11 @@ for (const relation of [
 if (!contract.codeGraph?.rule?.includes("run outcome summaries")) {
   errors.push("runtime-contract codeGraph.rule must document run outcome summaries");
 }
-if (!contract.codeGraph?.rule?.includes("nomic-embed-text") ||
+if (!contract.codeGraph?.rule?.includes("bge-m3") ||
+  !contract.codeGraph?.rule?.includes("semantic memory is OFF") ||
   !contract.codeGraph?.rule?.includes("Semantic-only search fails loudly") ||
   !contract.codeGraph?.rule?.includes("lexical fallback")) {
-  errors.push("runtime-contract codeGraph.rule must document Ollama/nomic semantic failure and lexical fallback");
+  errors.push("runtime-contract codeGraph.rule must document Ollama/bge-m3 semantic failure, loud readiness, and lexical fallback");
 }
 
 const backendOptions = contract.subagentBackendOptions;
