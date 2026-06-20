@@ -18,6 +18,7 @@ import {
   runWorkflowCommand,
   startWorkflowRun,
 } from "../extensions/aipi/runtime/run-state.js";
+import { rebuildCodeGraph } from "../extensions/aipi/runtime/aipi-tools.js";
 
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-workflow-executor-"));
 const sourceRoot = path.resolve("templates/.aipi");
@@ -27,6 +28,14 @@ const fixedRandom = () => Buffer.from((0xabc000 + randomCounter++).toString(16).
 
 try {
   await initProject({ sourceRoot, targetRoot: tempRoot });
+  await forceFastSemanticFallback(tempRoot);
+  await rebuildCodeGraph({
+    projectRoot: tempRoot,
+    now: () => new Date("2026-06-20T16:05:00.000Z"),
+    embeddingFetch: async () => {
+      throw new Error("ollama disabled for deterministic workflow-executor test");
+    },
+  });
 
   const quickText = await fs.readFile(path.join(tempRoot, ".aipi", "workflows", "quick.yaml"), "utf8");
   const quick = parseWorkflowDefinition(quickText, "quick");
@@ -783,4 +792,13 @@ async function patchRunLimits(projectRoot, runLimits) {
   const contract = JSON.parse(await fs.readFile(contractPath, "utf8"));
   contract.runLimits = runLimits;
   await fs.writeFile(contractPath, `${JSON.stringify(contract, null, 2)}\n`);
+}
+
+async function forceFastSemanticFallback(projectRoot) {
+  const configPath = path.join(projectRoot, ".aipi", "semantic-memory.json");
+  const config = JSON.parse(await fs.readFile(configPath, "utf8"));
+  await fs.writeFile(
+    configPath,
+    `${JSON.stringify({ ...config, ollama_host: "http://127.0.0.1:9" }, null, 2)}\n`,
+  );
 }

@@ -278,7 +278,7 @@ try {
   await fs.mkdir(path.join(tempRoot, ".aipi", "runtime", "runs", "run-3", "steps", "rule_gap"), { recursive: true });
   await fs.writeFile(
     path.join(tempRoot, "src", "billing.js"),
-    "export function renewSubscription(account) {\n  return account.price;\n}\n",
+    "export function renewSubscription(account) {\n  const sharedRenewalNeedle = 'enterprise renewal vector';\n  const sharedRenewalNeedle = 'enterprise renewal vector';\n  return account.price;\n}\n",
   );
   await fs.writeFile(
     path.join(tempRoot, "tests", "billing.test.js"),
@@ -390,9 +390,11 @@ try {
   const mechanics = await aipiRuleGap({ projectRoot: tempRoot, query: "mechanical format change" });
   assert.equal(mechanics.classification, "MECHANICS");
 
+  const vectorProgressEvents = [];
   const graph = await rebuildCodeGraph({
     projectRoot: tempRoot,
     now: () => new Date("2026-06-16T00:00:00.000Z"),
+    onProgress: (event) => vectorProgressEvents.push(event),
     ...semanticOptions,
   });
   assert.equal(graph.schema, "aipi.code-graph.v1");
@@ -405,15 +407,63 @@ try {
     assert.equal(await pathExists(path.join(tempRoot, graph.sqlite.path)), true);
     const sqlite = await import("node:sqlite").catch(() => null);
     if (sqlite) {
-      const db = new sqlite.DatabaseSync(path.join(tempRoot, graph.sqlite.path), { readOnly: true });
-      const vectorTable = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'code_vectors'").get()?.sql ?? "";
-      db.close();
-      if (graph.vector.status === "available") assert.match(vectorTable, /float\[1024\]/);
+      const db = new sqlite.DatabaseSync(path.join(tempRoot, graph.sqlite.path), { readOnly: true, allowExtension: true });
+      try {
+        const sqliteVec = await import("sqlite-vec").catch(() => null);
+        if (sqliteVec) {
+          db.enableLoadExtension?.(true);
+          sqliteVec.load(db);
+          db.enableLoadExtension?.(false);
+        }
+        const vectorTable = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'code_vectors'").get()?.sql ?? "";
+        if (graph.vector.status === "available") {
+          assert.match(vectorTable, /float\[1024\]/);
+          const cacheRows = db.prepare(`
+            SELECT item_key, typeof(embedding) AS storage_type, length(embedding) AS bytes
+            FROM embedding_cache
+          `).all();
+          const vectorRowCount = db.prepare("SELECT COUNT(*) AS count FROM code_vectors").get()?.count ?? 0;
+          const vectorMapCount = db.prepare("SELECT COUNT(*) AS count FROM vector_items").get()?.count ?? 0;
+          assert.equal(cacheRows.length, vectorRowCount);
+          assert.equal(cacheRows.every((row) => String(row.item_key).startsWith("sha256:")), true);
+          assert.equal(cacheRows.every((row) => row.storage_type === "blob"), true);
+          assert.equal(cacheRows.every((row) => row.bytes === 1024 * 4), true);
+          assert.equal(vectorRowCount, graph.vector.unique_item_count);
+          assert.equal(vectorMapCount, graph.vector.item_count);
+          assert.equal(vectorRowCount < vectorMapCount, true);
+          const duplicateVectorRows = db.prepare(`
+            SELECT COUNT(*) AS line_count, COUNT(DISTINCT items.vector_rowid) AS vector_count
+            FROM code_lines AS lines
+            JOIN vector_items AS items ON items.code_line_id = lines.id
+            WHERE lines.text = ?
+          `).get("  const sharedRenewalNeedle = 'enterprise renewal vector';");
+          assert.equal(duplicateVectorRows.line_count, 2);
+          assert.equal(duplicateVectorRows.vector_count, 1);
+        }
+      } finally {
+        db.close();
+      }
     }
   }
   assert.equal(graph.vector.engine, "sqlite-vec");
   assert.equal(graph.vector.dimensions, 1024);
   assert.equal(graph.vector.embedding_model, "bge-m3");
+  const semanticVectorProgress = vectorProgressEvents.filter((event) => event.phase === "semantic-vectors");
+  if (graph.vector.status === "available") {
+    assert.equal(semanticVectorProgress.length > 1, true);
+    assert.match(semanticVectorProgress[0].message, /building semantic vectors for \d+ files/);
+    assert.equal(semanticVectorProgress[0].files_embedded, 0);
+    assert.equal(
+      semanticVectorProgress.length <= graph.files.length + 2,
+      true,
+      "semantic vector progress must be per-file bounded, not per-line",
+    );
+    assert.equal(semanticVectorProgress.some((event) => event.files_embedded > 0), true);
+    const finalVectorProgress = semanticVectorProgress[semanticVectorProgress.length - 1];
+    assert.equal(finalVectorProgress.status, "done");
+    assert.match(finalVectorProgress.message, /semantic vectors built \(\d+ lines\)/);
+    assert.equal(finalVectorProgress.line_count, graph.vector.item_count);
+  }
   assert.equal(graph.files.some((file) => /(^|\/)(node_modules|\.expo|\.venv|venv|__pycache__|\.turbo|\.gradle)\//.test(file.path)), false);
   assert.equal(graph.files.some((file) => file.path.startsWith("ios/Pods/") || file.path.startsWith("android/build/")), false);
   assert.equal(graph.files.some((file) => file.path.startsWith(".aipi/runtime/") || file.path.startsWith(".aipi/state/")), false);
@@ -680,6 +730,18 @@ try {
   assert.equal(graph.run_outcomes.some((outcome) => outcome.step_id === "rule_gap" && outcome.verdict === "BLOCKED"), true);
 
   const graphPath = path.join(tempRoot, ".aipi", "state", "aipi-graph.json");
+  const cacheReuseCallsBefore = embeddingCalls.length;
+  const graphBeforeCacheReuse = JSON.parse(await fs.readFile(graphPath, "utf8"));
+  const cacheReuseGraph = await rebuildCodeGraph({
+    projectRoot: tempRoot,
+    previousGraph: graphBeforeCacheReuse,
+    now: () => new Date("2026-06-16T00:05:00.000Z"),
+    ...semanticOptions,
+  });
+  if (cacheReuseGraph.vector.status === "available") {
+    assert.equal(embeddingCalls.length, cacheReuseCallsBefore);
+    assert.equal(cacheReuseGraph.vector.unique_item_count, graph.vector.unique_item_count);
+  }
   const oldDimGraph = JSON.parse(await fs.readFile(graphPath, "utf8"));
   const legacyVectorDimensions = 1024 - 256;
   oldDimGraph.vector = { ...(oldDimGraph.vector ?? {}), dimensions: legacyVectorDimensions, embedding_model: "legacy-embed-text" };
@@ -714,17 +776,25 @@ try {
     path.join(tempRoot, "src", "billing.js"),
     "\nexport function staleFreshFunction() {\n  return 'fresh';\n}\n",
   );
+  const staleVectorProgressEvents = [];
   const staleRebuilt = await aipiCallers({
     projectRoot: tempRoot,
     symbol: "staleFreshFunction",
+    onProgress: (event) => staleVectorProgressEvents.push(event),
     ...semanticOptions,
   });
   assert.equal(staleRebuilt.graph.freshness.status, "fresh");
   assert.match(staleRebuilt.graph.rebuilt_from_stale.reason, /indexed file changed: src\/billing\.js/);
   assert.equal(staleRebuilt.refs.some((ref) => ref.path === "src/billing.js"), true);
   const staleEmbeddingInputs = embeddingCalls.slice(callsBeforeStaleRebuild).map((call) => call.input);
-  assert.equal(staleEmbeddingInputs.some((input) => input.includes("src/billing.js")), true);
-  assert.equal(staleEmbeddingInputs.some((input) => input.includes("tests/billing.test.js")), false);
+  assert.equal(staleEmbeddingInputs.some((input) => input.includes("staleFreshFunction")), true);
+  assert.equal(staleEmbeddingInputs.some((input) => input.includes("renewSubscription({ price: 10 })")), false);
+  const staleVectorProgress = staleVectorProgressEvents.filter((event) => event.phase === "semantic-vectors");
+  if (staleRebuilt.graph.vector.status === "available") {
+    assert.equal(staleVectorProgress.length > 1, true);
+    assert.equal(staleVectorProgress.length <= staleVectorProgress[0].file_count + 2, true);
+    assert.match(staleVectorProgress[staleVectorProgress.length - 1].message, /semantic vectors built/);
+  }
 
   const semantic = await aipiCallers({
     projectRoot: tempRoot,
@@ -779,6 +849,17 @@ try {
   if (graph.vector.status === "available") {
     assert.equal(semanticOnly.refs.some((ref) => ref.source === "sqlite-vec"), true);
   }
+  const semanticExact = await aipiSemanticSearch({
+    projectRoot: tempRoot,
+    query: "const sharedRenewalNeedle = 'enterprise renewal vector';",
+    ...semanticOptions,
+  });
+  if (graph.vector.status === "available") {
+    assert.equal(
+      semanticExact.refs.some((ref) => ref.path === "src/billing.js" && /enterprise renewal vector/.test(ref.excerpt)),
+      true,
+    );
+  }
   await assert.rejects(
     () =>
       aipiSemanticSearch({
@@ -792,16 +873,19 @@ try {
       }),
     /bge-m3|semantic memory is OFF|AIPI semantic search requires Ollama/,
   );
+  const lexicalProgressEvents = [];
   const lexicalFallback = await aipiImpact({
     projectRoot: tempRoot,
     query: "renewSubscription",
     rebuild: true,
     env: semanticOptions.env,
+    onProgress: (event) => lexicalProgressEvents.push(event),
     embeddingFetch: async () => {
       throw new Error("ollama down");
     },
   });
   assert.equal(lexicalFallback.refs.some((ref) => ref.path === "src/billing.js"), true);
+  assert.equal(lexicalProgressEvents.some((event) => event.phase === "semantic-vectors"), false);
 
   const legacyRoot = path.join(tempRoot, "legacy-semantic-project");
   await fs.mkdir(path.join(legacyRoot, "src"), { recursive: true });

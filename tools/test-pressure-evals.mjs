@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { initProject } from "../extensions/aipi/runtime/project-init.js";
 import { createAipiLifecycleHandlers } from "../extensions/aipi/runtime/lifecycle-hooks.js";
-import { aipiImpact } from "../extensions/aipi/runtime/aipi-tools.js";
+import { aipiImpact, rebuildCodeGraph } from "../extensions/aipi/runtime/aipi-tools.js";
 import { startWorkflowRun } from "../extensions/aipi/runtime/run-state.js";
 import { executeWorkflowRun } from "../extensions/aipi/runtime/workflow-executor.js";
 import { validateStepResult } from "../extensions/aipi/runtime/step-result.js";
@@ -17,6 +17,14 @@ const fixedRandom = () => Buffer.from((0xbad000 + randomCounter++).toString(16).
 
 try {
   await initProject({ sourceRoot, targetRoot: tempRoot });
+  await forceFastSemanticFallback(tempRoot);
+  await rebuildCodeGraph({
+    projectRoot: tempRoot,
+    now: () => fixedDate,
+    embeddingFetch: async () => {
+      throw new Error("ollama disabled for deterministic pressure-evals test");
+    },
+  });
   const handlers = createAipiLifecycleHandlers({ projectRootResolver: () => tempRoot });
 
   const sourceEditToolCall = await handlers.tool_call({
@@ -109,4 +117,13 @@ try {
   console.log("AIPI_PRESSURE_EVALS_TEST_OK runtime_gates=5");
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });
+}
+
+async function forceFastSemanticFallback(projectRoot) {
+  const configPath = path.join(projectRoot, ".aipi", "semantic-memory.json");
+  const config = JSON.parse(await fs.readFile(configPath, "utf8"));
+  await fs.writeFile(
+    configPath,
+    `${JSON.stringify({ ...config, ollama_host: "http://127.0.0.1:9" }, null, 2)}\n`,
+  );
 }

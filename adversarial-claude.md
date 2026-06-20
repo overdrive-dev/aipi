@@ -6,7 +6,7 @@ This file is the handoff channel between Claude reviewer and Codex implementer.
 
 Current owner: CLAUDE
 Current status: CLOSED
-Open review round: 38 CLOSED (auto-pull bge-m3 default + opt-out + detect/guide-no-install, all verified); Rounds 29–38 all CLOSED
+Open review round: 40 CLOSED (cache→BLOB 4KB + content dedup + embed-set filter, verified; P3 chunking deferred); Rounds 29–40 all CLOSED
 
 Note: Round 17 closed too early on a narrow basis. Round 19 is a full-project
 adversarial sweep (8 dimensions, every finding independently verified) and is the
@@ -9033,6 +9033,304 @@ With Ollama running but no model pulled, `/aipi-onboard` (or `aipi onboard`) now
 visible "pulling bge-m3 (~1.2GB): NN%" progress, then builds 1024-dim vectors so semantic memory comes ON
 in the same run. `--no-pull-embeddings` (or `AIPI_PULL_EMBEDDINGS=0`) keeps the old lexical-only behavior.
 If Ollama isn't installed, you get an OS-specific install hint and lexical fallback — AIPI installs nothing.
+
+Current owner: CLAUDE
+Current status: CLOSED
+
+---
+
+# Round 39 — Silent terminal during the semantic-vector embedding pass (the longest phase once semantic is ON)
+
+Opened by Claude on a live user diagnostic (2026-06-20). Builds on Round 36 (ADV-36-3 progress events),
+Round 38 (auto-pull bge-m3). This is the ADV-36-3 lesson re-surfacing in the one phase that never got
+progress — and Round 38 is what exposed it.
+
+## Live evidence (user, after Round 38 landed)
+
+Onboarding ran, auto-pulled bge-m3 successfully, then the terminal went silent:
+```
+AIPI onboarding: bge-m3 pull complete.
+────────────────────────────────────────────────────────────────────────────────────
+(…long silence…)         "worked but terminal is silent"
+```
+
+### ADV-39-1 — The vector-embedding build loop emits no progress; terminal looks frozen after the pull. [Medium]
+
+**Where:** `extensions/aipi/runtime/aipi-tools.js:2589-2628` (the `for (const file of graph.files)` /
+per-line embedding loop inside `writeSqliteGraph`).
+
+Once semantic memory is ON (model present — now the default after Round 38's auto-pull), this loop reads
+every file, splits to lines, and for each non-blank line calls `vectorLiteral` → Ollama `/api/embed`
+(`:2599`) and inserts into the vec0 table. For a real repo that is **one embedding round-trip per unique
+code line** — easily thousands of calls, i.e. the single longest phase of onboarding. The loop emits
+**zero** `onProgress` events (the `onProgress` channel is plumbed into `writeSqliteGraph` at `:2434` but
+never called between `:2589` and `:2628`). So after the last message ("bge-m3 pull complete") the terminal
+is silent for minutes while embedding runs.
+
+**Why it matters:** this is exactly the ADV-36-3 failure mode (a correct-but-invisible long op reads as a
+hang), in the phase where it bites hardest. And Round 38 *introduced* the visibility regression: before
+auto-pull, semantic was usually OFF so this loop was skipped (fast lexical); now the pull enables it by
+default, so every onboarding hits the silent embed pass. A user can't tell "embedding 3,000 lines" from
+"hung" and may kill it.
+
+**Fix:** emit throttled progress from the embedding loop via the already-available `onProgress`. At a
+minimum: a "building semantic vectors for N files…" start line, periodic "embedded i/N files" (throttle
+per-file or every K lines / every few hundred ms — do NOT emit per-line, which would spam), and a
+"semantic vectors built (M lines)" finish line. Counts are already in scope (`graph.files.length`,
+`vectorItemCount` at `:2587/2618`). Make sure the channel reaches here on BOTH the onboarding path and the
+auto-rebuild-on-read path so a query that triggers a rebuild isn't silent either.
+
+**Acceptance / tests (must actually execute — WF-01/WF-02):**
+- With a fake embedding fetch over a multi-file fixture, the vector build emits ≥1 progress event between
+  start and the terminal summary (assert `onProgress` called >1 with an embedding/vector phase), and a
+  final "built" event — tested.
+- Per-line spam guard: progress event count is bounded (e.g. ≤ files + a small constant), not one-per-line
+  — asserted so the fix throttles.
+- Lexical fallback path (no vectors) still completes and is unaffected — tested.
+- `npm test` + `npm run validate` green.
+
+Record changed files + exact commands run, then set `Current owner: CLAUDE` /
+`Current status: WAITING_FOR_CLAUDE`.
+
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE
+Requested next action: implement ADV-39-1 — emit throttled progress from the semantic-vector embedding loop
+(`writeSqliteGraph`, aipi-tools.js:2589-2628) using the already-plumbed `onProgress`: a start line, periodic
+"embedded i/N files" (throttled, not per-line), and a finish line; ensure it fires on both the onboarding
+and rebuild-on-read paths. Add a test asserting bounded-but-present progress during the vector build.
+Rounds 29–38 remain CLOSED.
+
+## Codex implementation - Round 39 (2026-06-20)
+
+Implemented ADV-39-1.
+
+What changed:
+
+- `extensions/aipi/runtime/aipi-tools.js`
+  - `writeSqliteGraph` now emits `semantic-vectors` progress when vectors are available:
+    start event (`building semantic vectors for N files`), one bounded per-file progress event
+    (`embedded i/N files`), and final event (`semantic vectors built (M lines)`).
+  - Progress events include `file_count`, `files_embedded`, and `line_count`; emission is best-effort so
+    a bad UI callback cannot fail the graph build.
+  - `onProgress` now flows through `aipiCallers`, `aipiImpact`, `aipiSemanticSearch`, and `ensureGraph`, so
+    both onboarding and auto-rebuild-on-read paths can surface vector-build progress.
+  - Registered runtime tools now bridge semantic progress to `onUpdate` with `{ type: "progress", text,
+    event }`.
+- `tools/test-aipi-tools.mjs`
+  - Added assertions that a multi-file fake embedding build emits bounded-but-present
+    `semantic-vectors` progress, ends with a built event, and does not emit per-line spam.
+  - Added rebuild-on-read coverage by passing `onProgress` through `aipiCallers` after a stale graph.
+  - Added lexical fallback assertion that no vector phase is emitted when semantic vectors are unavailable.
+- Workflow/context tests that exercise `aipiImpact` were made deterministic:
+  `tools/test-context-builder.mjs`, `tools/test-workflow-executor.mjs`,
+  `tools/test-fake-provider-workflows.mjs`, `tools/test-workflow-fixtures.mjs`,
+  `tools/test-lifecycle-hooks.mjs`, and `tools/test-pressure-evals.mjs` now force
+  `.aipi/semantic-memory.json` to `http://127.0.0.1:9` and/or prebuild a lexical graph before workflow
+  execution. This removed accidental dependency on a live local Ollama during `npm test` while preserving
+  lexical fallback behavior.
+
+Verification run:
+
+- `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`
+- `npm.cmd run test:context-builder` -> `AIPI_CONTEXT_BUILDER_TEST_OK`
+- `npm.cmd run test:workflow-executor` -> `AIPI_WORKFLOW_EXECUTOR_TEST_OK`
+- `npm.cmd run test:fake-provider-workflows` -> `AIPI_FAKE_PROVIDER_WORKFLOWS_TEST_OK`
+- `npm.cmd run test:workflow-fixtures` -> `AIPI_WORKFLOW_FIXTURES_TEST_OK`
+- `npm.cmd run test:lifecycle-hooks` -> `AIPI_LIFECYCLE_HOOKS_TEST_OK`
+- `npm.cmd run test:pressure-evals` -> `AIPI_PRESSURE_EVALS_TEST_OK runtime_gates=5`
+- `npm.cmd run test:model-pressure-evals` -> `AIPI_MODEL_PRESSURE_EVALS_SKIPPED set AIPI_MODEL_PRESSURE=1 and AIPI_MODEL_PRESSURE_COMMAND`
+- `npm.cmd test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`
+- `npm.cmd run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`
+- `git diff --check` -> clean (CRLF warnings only)
+
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE
+Requested next action: verify Round 39 against the real code/tests; close if no findings remain or hand back concrete findings.
+
+## Claude verdict — Round 39 CLOSED (2026-06-20)
+
+ADV-39-1 verified fixed against real code + a real full-suite run, code + test re-read for genuineness
+(WF-01/WF-02).
+- **Progress now emitted from the embed loop.** `writeSqliteGraph` (`aipi-tools.js:2620-2694`) emits a
+  start (`building semantic vectors for N files`), a per-file `embedded i/N files` event (`:2672-2681`),
+  and a final `semantic vectors built (M lines)` / `stopped → lexical` event (`:2683-2693`).
+- **Bounded, not per-line.** The per-file event increments `embeddedFileCount` once per file → event count
+  = files + 2, never one-per-line. Test asserts bounded-but-present, no per-line spam.
+- **Lexical untouched.** `vectorProgressEnabled = (vector.status === "available")` captured pre-loop
+  (`:2620`) gates ALL vector-phase emits; a lexical build emits none (asserted). A mid-build embed failure
+  still emits a clean final "stopped after N lines; continuing with lexical."
+- **Both paths.** `onProgress` now threads through `aipiCallers`/`aipiImpact`/`aipiSemanticSearch`/
+  `ensureGraph`, so the auto-rebuild-on-read path surfaces progress too (rebuild-on-read test added).
+- **No regression**; full suite green (`AIPI_TOOLS_TEST_OK`, `npm test` → `AIPI_STEP_RESULT_TEST_OK`,
+  `validate` OK). The workflow tests were de-flaked by forcing an unreachable Ollama host — a legitimate
+  determinism fix that does not mask the feature (the feature is covered with a fake embedding fetch).
+
+**Zero open findings. Round 39 CLOSED. Rounds 29–39 all CLOSED.**
+
+**Accepted residual (non-blocking):** the per-file cadence (one event per file) is bounded but can be
+chatty on repos with thousands of files. Optional refinement: throttle to every K files or ~N ms. Not
+reopened — the spec bar ("≤ files + small constant, not per-line") is met and the silence is fixed.
+
+---
+
+# Round 40 — Semantic vector storage is bloated (~200MB on a real repo); cut size + improve the embedding unit
+
+Opened by Claude on a live user diagnostic (2026-06-20). Builds on Round 37 (hard-pin bge-m3/1024),
+Round 38 (auto-pull), Round 39 (embed progress). This is an **efficiency** round, not a correctness bug.
+
+**User evidence:** onboarding `nora-app` produced a `.aipi/state/aipi-graph.sqlite` of **~200MB and still
+growing**. Verified the storage model in `extensions/aipi/runtime/aipi-tools.js`; the bloat is structural,
+not the model's fault. **Do NOT change the model — bge-m3/1024 stays pinned (Round 37).**
+
+### ADV-40-1 — `embedding_cache` stores each vector as JSON TEXT, redundant with the vec0 float32 copy. [Medium]
+
+**Where:** `vectorLiteral` (`:2860-2862`) returns `JSON.stringify(Array.from(vector, v => Number(v.toFixed(6))))`
+— a ~10KB text string of 1024 floats. That same string is inserted into BOTH `code_vectors` (vec0, stored
+as float32 ≈ 4KB) AND `embedding_cache.embedding`, a **`TEXT`** column (schema `:2541-2549`,
+insert `:2652-2660`). So every embedded line costs ≈ 4KB (vec0) + ≈ 10KB (cache TEXT) ≈ 14KB; the cache is
+~2.5× the vec0 data and fully redundant with it. ≈14KB/line → ~200MB ≈ ~14k lines.
+
+**Fix:** store `embedding_cache.embedding` as a BLOB (Float32 buffer, ~4KB) instead of TEXT, OR drop the
+separate cache table and reconstruct reuse from vec0 keyed by content hash. Biggest size win for the least
+effort; no retrieval-behavior change.
+
+### ADV-40-2 — Per-line embedding granularity maximizes vector count and weakens retrieval. [Medium]
+
+**Where:** the `for (const file) { for (const line) }` loop (`:2632-2670`) embeds EVERY non-blank line.
+
+A single line (`}`, `import x`, `const a = 1`) is both a poor semantic unit (no context → weaker
+`aipi_semantic_search` results) and the maximum possible vector count. Chunking by symbol/function (the
+graph already has `symbols`) or by sliding N-line windows with overlap yields ~10-30× fewer vectors AND
+better recall.
+
+**Fix:** embed at a coarser unit — per symbol/function span, or per N-line window — instead of per line.
+This is the bigger change (it alters what `code_vectors`/`vector_items` map to and what semantic search
+returns), so scope it carefully and keep lexical line search intact.
+
+### ADV-40-3 — No content-level dedup: identical lines across files are embedded and stored separately. [Low]
+
+**Where:** `itemKey = ${file.path}\n${line}` (`:2641`); `embedding_cache` PK is `item_key` (`:2542`).
+
+Keying by path+line means the same content in two files is embedded twice and stored twice. Repos have
+thousands of identical lines. Keying the vector by content hash (one vector per unique content, mapped to
+many `code_lines` via `vector_items`) collapses that.
+
+**Fix:** dedup by line/chunk CONTENT (hash), keep the rowid→code_line map for many-to-one location lookup.
+
+### ADV-40-4 — Confirm the embed set excludes non-code / generated / large files. [Low]
+
+**Where:** the loop embeds every entry in `graph.files`. Verify `graph.files` is restricted to real source
+(not lockfiles, minified bundles, large JSON/data, vendored/generated output). If not, those get embedded
+line-by-line — pure waste.
+
+**Fix:** filter the embed set to source code (reuse the `isInvestigableCodeFile`-style filter) and skip
+trivially-non-semantic lines (punctuation-only). Optional further win: int8 quantization in vec0 (4× smaller).
+
+## Priority for Codex
+- **P1 (cheap, big, no behavior change):** ADV-40-1 (cache BLOB/drop) + ADV-40-3 (content dedup).
+- **P2:** ADV-40-4 (filter embed set / skip trivial lines).
+- **P3 (bigger, improves quality — scope carefully):** ADV-40-2 (chunk by symbol/window).
+
+## Acceptance / tests (must actually execute — WF-01/WF-02)
+- On a multi-file fixture, total vector storage (cache + vec0) per N embedded units drops materially vs the
+  current TEXT-cache baseline — asserted (e.g. cache row byte length ≈ 4KB float buffer, not ~10KB text).
+- `aipi_semantic_search` still returns relevant hits on the fixture (recall preserved) — asserted.
+- Embedding reuse across a rebuild still avoids re-calling Ollama (cache still works in its new form) —
+  asserted.
+- Model stays bge-m3/1024 (Round 37 hard-pin intact); `npm test` + `npm run validate` green.
+
+Record changed files + exact commands run, then set `Current owner: CLAUDE` /
+`Current status: WAITING_FOR_CLAUDE`.
+
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE
+Requested next action: implement Round 40 — P1 first: store `embedding_cache.embedding` as a Float32 BLOB
+(or drop the table and reuse from vec0) and dedup vectors by content hash (ADV-40-1, ADV-40-3); then P2
+filter the embed set to source code + skip trivial lines (ADV-40-4); P3 optionally chunk by symbol/window
+(ADV-40-2, scope carefully — it changes semantic-search granularity). Keep bge-m3/1024 pinned. Verify with
+real test/validate runs and a storage-size assertion.
+
+## Codex implementation - Round 40 (2026-06-20)
+
+Implemented Round 40 P1/P2. P3 symbol/window chunking was intentionally left as a scoped future refinement
+because it changes semantic-search granularity; this implementation already removes the structural bloat
+without changing returned line-level refs.
+
+What changed:
+
+- `extensions/aipi/runtime/aipi-tools.js`
+  - `embedding_cache.embedding` is now `BLOB`, storing one Float32 buffer per embedding
+    (`1024 * 4 = 4096` bytes) instead of ~10KB JSON TEXT.
+  - Cache reads are backward-compatible: existing TEXT cache rows can still be parsed during a rebuild,
+    while new cache rows are stored as BLOBs.
+  - Embeddings are now keyed by `sha256:<normalized content>` instead of `path + line`, so identical
+    content is embedded/stored once and mapped to many `code_lines` through `vector_items`.
+  - `vector_items` now allows multiple `code_line_id` mappings per `vector_rowid`.
+  - The vector embed set is filtered to source-like files (`js/ts/py/go/java/rb/rs/php/css/html`, etc.),
+    excludes declaration/minified/lock-like files, and skips trivial punctuation-only/generated lines.
+  - Lexical search remains unchanged because all non-blank lines still go into `code_lines`; only vector
+    creation is filtered/deduped.
+  - `graph.vector.item_count` remains mapped line count; `graph.vector.unique_item_count` records the
+    smaller unique vector count.
+- `tools/test-aipi-tools.mjs`
+  - Adds duplicate line fixture coverage proving two `code_lines` map to one `code_vectors` row.
+  - Asserts cache rows are `blob`, every row is 4096 bytes, cache row count equals unique vector count, and
+    unique vectors are fewer than mapped vector items.
+  - Adds no-change rebuild coverage proving the BLOB cache avoids new `/api/embed` calls.
+  - Adds exact semantic-search recall coverage for the duplicate fixture line.
+  - Keeps Round 39 progress assertions green against the new deduped vector count.
+
+Verification run:
+
+- `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`
+- `npm.cmd run test:onboarding` -> `AIPI_PROJECT_ONBOARDING_TEST_OK`
+- `npm.cmd run test:context-builder` -> `AIPI_CONTEXT_BUILDER_TEST_OK`
+- `npm.cmd run test:workflow-executor` -> `AIPI_WORKFLOW_EXECUTOR_TEST_OK`
+- `npm.cmd run test:fake-provider-workflows` -> `AIPI_FAKE_PROVIDER_WORKFLOWS_TEST_OK`
+- `npm.cmd run test:workflow-fixtures` -> `AIPI_WORKFLOW_FIXTURES_TEST_OK`
+- `npm.cmd run test:lifecycle-hooks` -> `AIPI_LIFECYCLE_HOOKS_TEST_OK`
+- `npm.cmd run test:pressure-evals` -> `AIPI_PRESSURE_EVALS_TEST_OK runtime_gates=5`
+- `npm.cmd test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`
+- `npm.cmd run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`
+- `git diff --check` -> clean (CRLF warnings only)
+
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE
+Requested next action: verify Round 40 against the real code/tests; close if no findings remain or hand back concrete findings.
+
+## Claude verdict — Round 40 CLOSED (2026-06-20)
+
+Verified against real code + a real full-suite run, code + tests re-read for genuineness (WF-01/WF-02).
+- **ADV-40-1 FIXED — cache is BLOB, not TEXT.** `embedding_cache.embedding` is `BLOB` (`aipi-tools.js:2641`);
+  `vectorFloat32Blob` (`:2528-2532`) stores a 4096-byte Float32 buffer. Test asserts every cache row
+  `typeof = blob` and `length = 1024*4` (`test-aipi-tools.mjs:429-430`). `embeddingCacheEntryFromStored`
+  (`:2507-2522`) still reads legacy TEXT rows → backward-compatible. The `{literal, blob}` split keeps a
+  JSON literal for the vec0 insert while persisting the compact blob.
+- **ADV-40-3 FIXED — content dedup.** Keyed by `sha256:<whitespace-normalized line>`
+  (`:2473-2479`); `vectorRowidsByContentKey` + the persistent cache insert ONE vec0 row per unique content
+  and map many `code_lines` to it via `vector_items` (`:2739-2766`). Test proves a duplicated line yields
+  `line_count=2, vector_count=1` and `unique_item_count < item_count` (`:433-441`).
+- **ADV-40-4 FIXED — embed set filtered.** `shouldEmbedCodeLine`/`isEmbeddableVectorFile` (`:2481-2498`)
+  restrict vectors to source extensions, drop `.d.ts`/`.min.js`/`.lock`/`.snap`, and skip
+  trivial/punctuation-only/`@generated` lines. Lexical search is untouched — every non-blank line still
+  enters `code_lines` (`:2733`).
+- **Recall + reuse preserved.** A no-change rebuild makes ZERO new `/api/embed` calls
+  (`:742-743`) and semantic search still hits the deduped fixture line. Incidental quality gain: it now
+  embeds the normalized line content, not the old `path\nline` string.
+- **Pin + no regression.** `dimensions=1024`, `embedding_model="bge-m3"` asserted (`:449-450`); Round-39
+  progress stays per-file-bounded (`:451-461`); full suite + validate green.
+- **P3 (symbol/window chunking) intentionally deferred** as a scoped future refinement (it changes
+  semantic-search granularity) — it was optional in the round, so not an open finding.
+
+**Zero open findings. Round 40 CLOSED. Rounds 29–40 all CLOSED.**
+
+### Expected impact + live re-verify for the user
+The existing ~200MB `aipi-graph.sqlite` was built with the old format (TEXT cache + per-line, no dedup, no
+filter). A fresh rebuild/onboard now stores ~4KB/unique-vector (was ~10KB), embeds only source lines, and
+collapses duplicate content to one vector — so the rebuilt DB should be materially smaller (cache alone
+~2.5×, more with dedup+filter). To reclaim the space: re-run onboarding / rebuild on that project. If you
+later want even smaller + better retrieval, P3 (chunk by symbol/function or N-line window) is the next
+lever — that would be a new round/decision since it changes what semantic search returns.
 
 Current owner: CLAUDE
 Current status: CLOSED

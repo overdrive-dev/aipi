@@ -7,12 +7,14 @@ import {
   buildStepContext,
   ContextMaterializationError,
 } from "../extensions/aipi/runtime/context-builder.js";
+import { rebuildCodeGraph } from "../extensions/aipi/runtime/aipi-tools.js";
 
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-context-builder-"));
 const sourceRoot = path.resolve("templates/.aipi");
 
 try {
   await initProject({ sourceRoot, targetRoot: tempRoot });
+  await forceFastSemanticFallback(tempRoot);
   await fs.mkdir(path.join(tempRoot, "src"), { recursive: true });
   await fs.writeFile(
     path.join(tempRoot, "src", "billing.js"),
@@ -49,6 +51,13 @@ try {
     path.join(tempRoot, ".aipi", "memory", "project", "business-rules.md"),
     "\n## Billing renewal\n\nRenewal pricing must keep the accepted customer price.\n",
   );
+  await rebuildCodeGraph({
+    projectRoot: tempRoot,
+    now: () => new Date("2026-06-20T16:00:00.000Z"),
+    embeddingFetch: async () => {
+      throw new Error("ollama disabled for deterministic context-builder test");
+    },
+  });
 
   const state = {
     run_id: runId,
@@ -144,4 +153,13 @@ async function pathExists(filePath) {
   } catch {
     return false;
   }
+}
+
+async function forceFastSemanticFallback(projectRoot) {
+  const configPath = path.join(projectRoot, ".aipi", "semantic-memory.json");
+  const config = JSON.parse(await fs.readFile(configPath, "utf8"));
+  await fs.writeFile(
+    configPath,
+    `${JSON.stringify({ ...config, ollama_host: "http://127.0.0.1:9" }, null, 2)}\n`,
+  );
 }

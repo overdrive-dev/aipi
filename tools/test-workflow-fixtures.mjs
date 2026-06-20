@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { initProject } from "../extensions/aipi/runtime/project-init.js";
 import { runWorkflowCommand } from "../extensions/aipi/runtime/run-state.js";
+import { rebuildCodeGraph } from "../extensions/aipi/runtime/aipi-tools.js";
 import { writeControllerArtifact } from "../extensions/aipi/runtime/workflow-executor.js";
 
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-workflow-fixtures-"));
@@ -42,6 +43,13 @@ try {
     const projectRoot = path.join(tempRoot, fixture.workflow);
     await initProject({ sourceRoot, targetRoot: projectRoot });
     await seedFixtureProject(projectRoot, fixture.workflow);
+    await forceFastSemanticFallback(projectRoot);
+    await rebuildCodeGraph({
+      projectRoot,
+      embeddingFetch: async () => {
+        throw new Error("ollama disabled for deterministic workflow-fixtures test");
+      },
+    });
 
     const result = await runWorkflowCommand({
       args: `run ${fixture.workflow}`,
@@ -120,6 +128,15 @@ async function pathExists(filePath) {
   } catch {
     return false;
   }
+}
+
+async function forceFastSemanticFallback(projectRoot) {
+  const configPath = path.join(projectRoot, ".aipi", "semantic-memory.json");
+  const config = JSON.parse(await fs.readFile(configPath, "utf8"));
+  await fs.writeFile(
+    configPath,
+    `${JSON.stringify({ ...config, ollama_host: "http://127.0.0.1:9" }, null, 2)}\n`,
+  );
 }
 
 function createOpsApprovalRequiredWorkflowAdapter() {

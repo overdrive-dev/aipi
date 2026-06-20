@@ -10,6 +10,7 @@ import {
   writeControllerArtifact,
 } from "../extensions/aipi/runtime/workflow-executor.js";
 import { startWorkflowRun } from "../extensions/aipi/runtime/run-state.js";
+import { rebuildCodeGraph } from "../extensions/aipi/runtime/aipi-tools.js";
 
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-fake-provider-workflows-"));
 const sourceRoot = path.resolve("templates/.aipi");
@@ -19,6 +20,14 @@ const fixedRandom = () => Buffer.from((0xdef000 + randomCounter++).toString(16).
 
 try {
   await initProject({ sourceRoot, targetRoot: tempRoot });
+  await forceFastSemanticFallback(tempRoot);
+  await rebuildCodeGraph({
+    projectRoot: tempRoot,
+    now: () => fixedDate,
+    embeddingFetch: async () => {
+      throw new Error("ollama disabled for deterministic fake-provider workflow test");
+    },
+  });
 
   const branchRun = await startWorkflowRun({
     projectRoot: tempRoot,
@@ -223,6 +232,15 @@ function testSkipEvidence({ step, contract, skipCondition }) {
     result: `test fixture skip evidence ${token} for ${skipCondition}`,
     evidence_token: token,
   }));
+}
+
+async function forceFastSemanticFallback(projectRoot) {
+  const configPath = path.join(projectRoot, ".aipi", "semantic-memory.json");
+  const config = JSON.parse(await fs.readFile(configPath, "utf8"));
+  await fs.writeFile(
+    configPath,
+    `${JSON.stringify({ ...config, ollama_host: "http://127.0.0.1:9" }, null, 2)}\n`,
+  );
 }
 
 function createFakeProviderCoordinator(root) {

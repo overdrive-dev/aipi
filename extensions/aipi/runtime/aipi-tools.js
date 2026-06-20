@@ -70,6 +70,22 @@ const CODE_EXTENSIONS = new Set([
   ".yaml",
   ".yml",
 ]);
+const VECTOR_EMBED_EXTENSIONS = new Set([
+  ".cjs",
+  ".css",
+  ".go",
+  ".html",
+  ".java",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".php",
+  ".py",
+  ".rb",
+  ".rs",
+  ".ts",
+  ".tsx",
+]);
 
 const SKIP_DIRS = new Set([
   ".git",
@@ -331,8 +347,12 @@ export function registerAipiRuntimeTools(pi, { projectRootResolver = () => proce
         rebuild: { type: "boolean" },
       },
     },
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      return jsonResult(await aipiCallers({ projectRoot: projectRootResolver(ctx), ...params }));
+    async execute(_id, params, _signal, onUpdate, ctx) {
+      return jsonResult(await aipiCallers({
+        projectRoot: projectRootResolver(ctx),
+        ...params,
+        onProgress: runtimeToolProgress(onUpdate),
+      }));
     },
   });
 
@@ -349,8 +369,12 @@ export function registerAipiRuntimeTools(pi, { projectRootResolver = () => proce
         rebuild: { type: "boolean" },
       },
     },
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      return jsonResult(await aipiImpact({ projectRoot: projectRootResolver(ctx), ...params }));
+    async execute(_id, params, _signal, onUpdate, ctx) {
+      return jsonResult(await aipiImpact({
+        projectRoot: projectRootResolver(ctx),
+        ...params,
+        onProgress: runtimeToolProgress(onUpdate),
+      }));
     },
   });
 
@@ -367,8 +391,12 @@ export function registerAipiRuntimeTools(pi, { projectRootResolver = () => proce
         rebuild: { type: "boolean" },
       },
     },
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      return jsonResult(await aipiSemanticSearch({ projectRoot: projectRootResolver(ctx), ...params }));
+    async execute(_id, params, _signal, onUpdate, ctx) {
+      return jsonResult(await aipiSemanticSearch({
+        projectRoot: projectRootResolver(ctx),
+        ...params,
+        onProgress: runtimeToolProgress(onUpdate),
+      }));
     },
   });
 
@@ -443,6 +471,17 @@ export function registerAipiRuntimeTools(pi, { projectRootResolver = () => proce
       return jsonResult(await aipiPromoteMemory({ projectRoot: projectRootResolver(ctx), ...params }));
     },
   });
+}
+
+function runtimeToolProgress(onUpdate) {
+  if (typeof onUpdate !== "function") return null;
+  return (event) => {
+    onUpdate({
+      type: "progress",
+      text: event?.message ? `${event.message}\n` : "",
+      event,
+    });
+  };
 }
 
 export async function aipiMemoryQuery({
@@ -605,10 +644,11 @@ export async function aipiCallers({
   rebuild = false,
   env = process.env,
   embeddingFetch = globalThis.fetch,
+  onProgress = null,
 } = {}) {
   if (!symbol?.trim()) throw new Error("aipi_callers requires symbol");
   const root = assertRoot(projectRoot);
-  const graph = await ensureGraph(root, { rebuild, env, embeddingFetch });
+  const graph = await ensureGraph(root, { rebuild, env, embeddingFetch, onProgress });
   const refs = await graphRefs({ root, graph, query: symbol, limit, env, embeddingFetch });
   return {
     schema: "aipi.tool-result.v1",
@@ -628,9 +668,10 @@ export async function aipiImpact({
   rebuild = false,
   env = process.env,
   embeddingFetch = globalThis.fetch,
+  onProgress = null,
 } = {}) {
   const root = assertRoot(projectRoot);
-  const graph = await ensureGraph(root, { rebuild, env, embeddingFetch });
+  const graph = await ensureGraph(root, { rebuild, env, embeddingFetch, onProgress });
   const needle = symbol || query || targetPath;
   const refs = needle ? await graphRefs({ root, graph, query: needle, limit, env, embeddingFetch }) : [];
   const relatedTests = graph.files
@@ -658,10 +699,11 @@ export async function aipiSemanticSearch({
   rebuild = false,
   env = process.env,
   embeddingFetch = globalThis.fetch,
+  onProgress = null,
 } = {}) {
   if (!query?.trim()) throw new Error("aipi_semantic_search requires query");
   const root = assertRoot(projectRoot);
-  const graph = await ensureGraph(root, { rebuild, env, embeddingFetch });
+  const graph = await ensureGraph(root, { rebuild, env, embeddingFetch, onProgress });
   const refs = await graphRefs({ root, graph, query, limit, semanticOnly: true, env, embeddingFetch });
   return {
     schema: "aipi.tool-result.v1",
@@ -891,7 +933,12 @@ async function findRunContracts(root) {
     .map((entry) => path.join(runsDir, entry.name, "BDD-CONTRACT.md"));
 }
 
-async function ensureGraph(root, { rebuild = false, env = process.env, embeddingFetch = globalThis.fetch } = {}) {
+async function ensureGraph(root, {
+  rebuild = false,
+  env = process.env,
+  embeddingFetch = globalThis.fetch,
+  onProgress = null,
+} = {}) {
   if (!rebuild) {
     const existing = await readJson(path.join(root, GRAPH_REL_PATH));
     if (existing?.schema === "aipi.code-graph.v1" && !existing.stale && (await graphSidecarReady(root, existing))) {
@@ -899,12 +946,12 @@ async function ensureGraph(root, { rebuild = false, env = process.env, embedding
       if (!freshness.stale) {
         return { ...existing, stale: false, freshness };
       }
-      const rebuilt = await rebuildCodeGraph({ projectRoot: root, previousGraph: existing, env, embeddingFetch });
+      const rebuilt = await rebuildCodeGraph({ projectRoot: root, previousGraph: existing, env, embeddingFetch, onProgress });
       return { ...rebuilt, rebuilt_from_stale: freshness };
     }
   }
   const previousGraph = await readJson(path.join(root, GRAPH_REL_PATH)).catch(() => null);
-  return rebuildCodeGraph({ projectRoot: root, previousGraph, env, embeddingFetch });
+  return rebuildCodeGraph({ projectRoot: root, previousGraph, env, embeddingFetch, onProgress });
 }
 
 async function graphSidecarReady(root, graph) {
@@ -2423,6 +2470,78 @@ function contentHash(content) {
   return crypto.createHash("sha256").update(content).digest("hex");
 }
 
+function embeddingInputForCodeLine(line) {
+  return String(line ?? "").trim().replace(/\s+/g, " ");
+}
+
+function embeddingContentKey(input) {
+  return `sha256:${contentHash(input)}`;
+}
+
+function shouldEmbedCodeLine(relPath, line) {
+  if (!isEmbeddableVectorFile(relPath)) return false;
+  const text = embeddingInputForCodeLine(line);
+  if (text.length < 4) return false;
+  if (!/[A-Za-z0-9_]/.test(text)) return false;
+  if (/^[{}()[\];,.:+\-*/<>=!&|"'`\s]+$/.test(text)) return false;
+  if (/^\/\/\s*(generated|auto-generated|@generated)\b/i.test(text)) return false;
+  return true;
+}
+
+function isEmbeddableVectorFile(relPath) {
+  const normalized = String(relPath ?? "").replaceAll("\\", "/");
+  const base = path.posix.basename(normalized).toLowerCase();
+  if (base.endsWith(".d.ts")) return false;
+  if (/\.min\.[cm]?js$/.test(base)) return false;
+  if (/(^|\.)(lock|snap)$/.test(base)) return false;
+  return VECTOR_EMBED_EXTENSIONS.has(path.posix.extname(base));
+}
+
+function embeddingCacheEntryFromVector(vector) {
+  return {
+    literal: vectorLiteralFromArray(vector),
+    blob: vectorFloat32Blob(vector),
+  };
+}
+
+function embeddingCacheEntryFromStored(value, dimensions) {
+  if (value == null) return null;
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array || value instanceof ArrayBuffer) {
+    const vector = vectorFromFloat32Blob(value, dimensions);
+    return vector ? embeddingCacheEntryFromVector(vector) : null;
+  }
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? embeddingCacheEntryFromVector(parsed) : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function vectorLiteralFromArray(vector) {
+  return JSON.stringify(Array.from(vector, (value) => Number(Number(value).toFixed(6))));
+}
+
+function vectorFloat32Blob(vector) {
+  const floats = new Float32Array(vector.length);
+  for (const [index, value] of vector.entries()) floats[index] = Number(value);
+  return Buffer.from(floats.buffer);
+}
+
+function vectorFromFloat32Blob(value, dimensions) {
+  const buffer = Buffer.isBuffer(value)
+    ? value
+    : value instanceof ArrayBuffer
+      ? Buffer.from(value)
+      : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  if (buffer.byteLength !== dimensions * Float32Array.BYTES_PER_ELEMENT) return null;
+  const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+  return Array.from(new Float32Array(arrayBuffer));
+}
+
 async function writeSqliteGraph({
   root,
   graph,
@@ -2506,7 +2625,12 @@ async function writeSqliteGraph({
       CREATE INDEX relationships_source_idx ON relationships(source_kind, source_ref);
       CREATE INDEX relationships_target_idx ON relationships(target_kind, target_ref);
       CREATE INDEX relationships_relation_idx ON relationships(relation);
-      CREATE TABLE vector_items (vector_rowid INTEGER PRIMARY KEY, code_line_id INTEGER NOT NULL, source TEXT NOT NULL);
+      CREATE TABLE vector_items (
+        vector_rowid INTEGER NOT NULL,
+        code_line_id INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        PRIMARY KEY(vector_rowid, code_line_id)
+      );
       CREATE TABLE embedding_cache (
         item_key TEXT PRIMARY KEY,
         path TEXT NOT NULL,
@@ -2514,7 +2638,7 @@ async function writeSqliteGraph({
         dimensions INTEGER NOT NULL,
         model TEXT NOT NULL,
         host TEXT NOT NULL,
-        embedding TEXT NOT NULL
+        embedding BLOB NOT NULL
       );
     `);
 
@@ -2582,10 +2706,25 @@ async function writeSqliteGraph({
     const lastInsertId = db.prepare("SELECT last_insert_rowid() AS id");
     const cacheInsert =
       vector.status === "available"
-        ? db.prepare("INSERT OR REPLACE INTO embedding_cache(item_key, path, file_hash, dimensions, model, host, embedding) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        ? db.prepare("INSERT OR IGNORE INTO embedding_cache(item_key, path, file_hash, dimensions, model, host, embedding) VALUES (?, ?, ?, ?, ?, ?, ?)")
         : null;
     let vectorItemCount = 0;
+    let uniqueVectorCount = 0;
+    let embeddedFileCount = 0;
+    const vectorProgressEnabled = vector.status === "available";
+    if (vectorProgressEnabled) {
+      await emitSemanticProgress(onProgress, {
+        phase: "semantic-vectors",
+        status: "running",
+        file_count: graph.files.length,
+        files_embedded: 0,
+        line_count: 0,
+        message: `AIPI semantic memory: building semantic vectors for ${graph.files.length} files.`,
+      });
+    }
     const embeddingCache = new Map(reusableEmbeddingCache);
+    const embeddingRequestCache = new Map();
+    const vectorRowidsByContentKey = new Map();
     for (const file of graph.files) {
       const content = await fs.readFile(path.join(root, file.path), "utf8").catch(() => "");
       const lines = content.split(/\r?\n/);
@@ -2593,44 +2732,79 @@ async function writeSqliteGraph({
         if (!line.trim()) continue;
         lineInsert.run(file.path, index + 1, line);
         const codeLineId = lastInsertId.get().id;
-        if (vectorInsert && vectorMapInsert) {
+        if (vectorInsert && vectorMapInsert && shouldEmbedCodeLine(file.path, line)) {
           try {
-            const itemKey = `${file.path}\n${line}`;
-            const embedding = embeddingCache.get(itemKey) ?? await vectorLiteral(itemKey, {
-              root,
-              env,
-              fetchFn: embeddingFetch,
-              cache: embeddingCache,
-            });
-            embeddingCache.set(itemKey, embedding);
-            vectorInsert.run(embedding);
-            const vectorRowid = lastInsertId.get().id;
+            const embeddingInput = embeddingInputForCodeLine(line);
+            const itemKey = embeddingContentKey(embeddingInput);
+            let vectorRowid = vectorRowidsByContentKey.get(itemKey);
+            if (vectorRowid == null) {
+              let cachedEmbedding = embeddingCache.get(itemKey);
+              if (!cachedEmbedding) {
+                const vectorValues = await embedText(embeddingInput, {
+                  root,
+                  env,
+                  fetchFn: embeddingFetch,
+                  cache: embeddingRequestCache,
+                });
+                cachedEmbedding = embeddingCacheEntryFromVector(vectorValues);
+                embeddingCache.set(itemKey, cachedEmbedding);
+              }
+              vectorInsert.run(cachedEmbedding.literal);
+              vectorRowid = lastInsertId.get().id;
+              vectorRowidsByContentKey.set(itemKey, vectorRowid);
+              cacheInsert?.run(
+                itemKey,
+                file.path,
+                file.hash,
+                resolvedEmbeddingConfig.dimensions,
+                resolvedEmbeddingConfig.model,
+                resolvedEmbeddingConfig.host,
+                cachedEmbedding.blob,
+              );
+              uniqueVectorCount += 1;
+            }
             vectorMapInsert.run(vectorRowid, codeLineId, "code_line");
-            cacheInsert?.run(
-              itemKey,
-              file.path,
-              file.hash,
-              resolvedEmbeddingConfig.dimensions,
-              resolvedEmbeddingConfig.model,
-              resolvedEmbeddingConfig.host,
-              embedding,
-            );
             vectorItemCount += 1;
           } catch (error) {
             vector = semanticVectorUnavailable(error, resolvedEmbeddingConfig);
             vector.embedding_pull = embeddingPull;
             vector.item_count = vectorItemCount;
+            vector.unique_item_count = uniqueVectorCount;
             vectorInsert = null;
             vectorMapInsert = null;
           }
         }
       }
+      embeddedFileCount += 1;
+      if (vectorProgressEnabled && vector.status === "available") {
+        await emitSemanticProgress(onProgress, {
+          phase: "semantic-vectors",
+          status: "running",
+          file_count: graph.files.length,
+          files_embedded: embeddedFileCount,
+          line_count: vectorItemCount,
+          message: `AIPI semantic memory: embedded ${embeddedFileCount}/${graph.files.length} files.`,
+        });
+      }
+    }
+    if (vectorProgressEnabled) {
+      await emitSemanticProgress(onProgress, {
+        phase: "semantic-vectors",
+        status: vector.status === "available" ? "done" : "failed",
+        file_count: graph.files.length,
+        files_embedded: embeddedFileCount,
+        line_count: vectorItemCount,
+        message: vector.status === "available"
+          ? `AIPI semantic memory: semantic vectors built (${vectorItemCount} lines).`
+          : `AIPI semantic memory: semantic vector build stopped after ${vectorItemCount} lines; continuing with lexical memory.`,
+      });
     }
 
     const source = vector.status === "available" ? "sqlite+sqlite-vec+lexical" : "sqlite+lexical";
     metaInsert.run("source", source);
     if (vector.status === "available") {
       vector.item_count = vectorItemCount;
+      vector.unique_item_count = uniqueVectorCount;
     }
 
     db.exec("COMMIT");
@@ -2681,7 +2855,6 @@ async function readReusableEmbeddingCache({
   for (const [rel, hash] of currentHashes.entries()) {
     if (hash && previousHashes.get(rel) === hash) unchanged.add(rel);
   }
-  if (!unchanged.size) return new Map();
 
   let db;
   try {
@@ -2693,9 +2866,15 @@ async function readReusableEmbeddingCache({
     `).all(embeddingConfig.dimensions, embeddingConfig.model, embeddingConfig.host);
     const cache = new Map();
     for (const row of rows) {
+      const entry = embeddingCacheEntryFromStored(row.embedding, embeddingConfig.dimensions);
+      if (!entry) continue;
+      if (String(row.item_key ?? "").startsWith("sha256:")) {
+        cache.set(row.item_key, entry);
+        continue;
+      }
       if (!unchanged.has(row.path)) continue;
       if (currentHashes.get(row.path) !== row.file_hash) continue;
-      cache.set(row.item_key, row.embedding);
+      cache.set(row.item_key, entry);
     }
     return cache;
   } catch {
@@ -2793,7 +2972,7 @@ function escapeLike(value) {
 
 async function vectorLiteral(text, options = {}) {
   const vector = await embedText(text, options);
-  return JSON.stringify(Array.from(vector, (value) => Number(value.toFixed(6))));
+  return vectorLiteralFromArray(vector);
 }
 
 export async function embedText(text, {
@@ -3195,8 +3374,16 @@ async function readOllamaPullEvents(response, onEvent) {
 }
 
 async function emitSemanticPullProgress(onProgress, event) {
+  await emitSemanticProgress(onProgress, event);
+}
+
+async function emitSemanticProgress(onProgress, event) {
   if (typeof onProgress !== "function") return;
-  await Promise.resolve(onProgress(event));
+  try {
+    await Promise.resolve(onProgress(event));
+  } catch {
+    /* semantic progress is best-effort; the graph result remains authoritative */
+  }
 }
 
 function pullEmbeddingsDisabled(env = process.env) {

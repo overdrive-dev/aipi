@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { initProject } from "../extensions/aipi/runtime/project-init.js";
 import { readActiveRun, runWorkflowCommand, startWorkflowRun } from "../extensions/aipi/runtime/run-state.js";
+import { rebuildCodeGraph } from "../extensions/aipi/runtime/aipi-tools.js";
 import { SUBAGENT_STATE_ENTRY } from "../extensions/aipi/runtime/subagents.js";
 import {
   applyProviderPayloadPolicy,
@@ -24,6 +25,7 @@ const sourceRoot = path.resolve("templates/.aipi");
 
 try {
   await initProject({ sourceRoot, targetRoot: tempRoot });
+  await forceFastSemanticFallback(tempRoot);
   await fs.mkdir(path.join(tempRoot, "src"), { recursive: true });
   await fs.writeFile(
     path.join(tempRoot, "src", "billing.js"),
@@ -35,6 +37,12 @@ try {
       "",
     ].join("\n"),
   );
+  await rebuildCodeGraph({
+    projectRoot: tempRoot,
+    embeddingFetch: async () => {
+      throw new Error("ollama disabled for deterministic lifecycle-hooks test");
+    },
+  });
   const started = await startWorkflowRun({
     projectRoot: tempRoot,
     workflow: "feature",
@@ -245,6 +253,13 @@ try {
   const routerRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-router-suggest-"));
   try {
     await initProject({ sourceRoot, targetRoot: routerRoot });
+    await forceFastSemanticFallback(routerRoot);
+    await rebuildCodeGraph({
+      projectRoot: routerRoot,
+      embeddingFetch: async () => {
+        throw new Error("ollama disabled for deterministic lifecycle-hooks router test");
+      },
+    });
     const routerRunnerCalls = [];
     const routerNotifications = [];
     const routerEntries = [];
@@ -708,4 +723,13 @@ function assertWorkflowSuggestion(route, workflow) {
   assert.equal(route.workflowSuggestion, workflow);
   assert.equal(route.suggestedCommand, `/aipi-workflow run ${workflow}`);
   assert.equal(Object.hasOwn(route, "workflowArgs"), false);
+}
+
+async function forceFastSemanticFallback(projectRoot) {
+  const configPath = path.join(projectRoot, ".aipi", "semantic-memory.json");
+  const config = JSON.parse(await fs.readFile(configPath, "utf8"));
+  await fs.writeFile(
+    configPath,
+    `${JSON.stringify({ ...config, ollama_host: "http://127.0.0.1:9" }, null, 2)}\n`,
+  );
 }
