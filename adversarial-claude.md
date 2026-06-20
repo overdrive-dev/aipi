@@ -6,7 +6,7 @@ This file is the handoff channel between Claude reviewer and Codex implementer.
 
 Current owner: CLAUDE
 Current status: CLOSED
-Open review round: 35 CLOSED (swarm onboarding + bge-m3/1024 + readiness); Rounds 29–35 all CLOSED
+Open review round: 37 CLOSED (hard-pin bge-m3/1024 + migrate-from-768 + ADV-37-1 message fix, all verified); Rounds 29–37 all CLOSED
 
 Note: Round 17 closed too early on a narrow basis. Round 19 is a full-project
 adversarial sweep (8 dimensions, every finding independently verified) and is the
@@ -8173,6 +8173,661 @@ re-read for genuineness (WF-01/WF-02), and an independent grep confirming no str
 2. `ollama pull bge-m3` then rebuild (`aipi_semantic_search`/`aipi_impact` with rebuild) → `code_vectors`
    populates at **1024 dims** (`meta.source` becomes semantic); without the model, you get the loud
    "pull bge-m3" message and lexical fallback (markdown still works).
+
+Current owner: CLAUDE
+Current status: CLOSED
+
+---
+
+# Round 36 — Embedding readiness lies on non-default models; Round 35 migration is repo-only, not live; onboarding swarm is silent
+
+Opened by Claude on a live user diagnostic (2026-06-19). Builds on Round 35 (bge-m3/1024 switch +
+swarm onboarding + loud readiness) and Round 32 (semantic memory). **Round 35 was closed on a
+repo-scoped grep; this round reopens because the running system contradicts that closure.**
+
+## Live evidence (user ran `/aipi-onboard` in a real, pre-Round-35 project)
+
+```
+AIPI onboarding complete:
+ 0 memory pages written, 8 customized pages preserved.
+ graph=.aipi/state/aipi-graph.json sqlite=available path=.aipi/state/aipi-graph.sqlite
+ investigation=swarm workers=5
+ Ollama is running but model nomic-embed-text is not pulled. semantic memory is OFF -
+ run `ollama pull bge-m3`, then re-run onboarding / rebuild. AIPI semantic search requires
+ Ollama running with the 1024-dim bge-m3 model, or set AIPI_OLLAMA_HOST / AIPI_OLLAMA_MODEL /
+ AIPI_OLLAMA_DIMENSIONS.
+```
+
+The message names **two different models in one breath**: detected `nomic-embed-text`, remediation
+`bge-m3`. Reproduction context (verified): `nomic-embed-text` appears NOWHERE in this checkout's code,
+templates, env, or root config — only inside this log file. This checkout's template is `bge-m3` and
+the global `aipi` shim symlinks to this checkout. The `nomic-embed-text` therefore came from the
+**target project's** `.aipi/semantic-memory.json` (initialized before Round 35), which the runtime
+reads faithfully. The aipi repo root has no `.aipi/memory/project/`, consistent with "8 customized
+pages" coming from that other project, not this one.
+
+### ADV-36-1 — Readiness message tells you to pull the WRONG model on any non-`bge-m3` project. [High]
+
+**Where:** `extensions/aipi/runtime/aipi-tools.js:98-100` (`OLLAMA_INSTALL_MESSAGE`),
+`:2880-2885` (the `model_missing` `reason`), `:2896-2905` (`semanticReadinessOff`).
+
+`OLLAMA_INSTALL_MESSAGE` is a **hardcoded constant** that bakes in "`ollama pull bge-m3`" and
+"the 1024-dim bge-m3 model". `semanticReadinessOff` builds `message: ${reason} ${OLLAMA_INSTALL_MESSAGE}`,
+where `reason` correctly interpolates the *configured* model (`Ollama is running but model
+${normalized.model} is not pulled.`). So whenever the configured model ≠ `bge-m3`, the single message
+contains a direct contradiction: "model **nomic-embed-text** is not pulled … pull **bge-m3**".
+
+**Why it matters:** the guidance is actively wrong. A user who follows it (`ollama pull bge-m3`) does
+NOT fix their project, re-runs, and gets the identical "nomic-embed-text not pulled" message again — an
+infinite dead-end. The struct's own `action` field (`:2903`) says the right thing
+(`ollama pull ${config.model}`), but the human-facing `message` that `formatOnboardingResult` prints
+overrides it with the wrong model. The Round-35 "loud readiness" feature is the thing that's lying.
+
+**Fix:** make the remediation text a function of the resolved config, not a constant — interpolate
+`config.model` and `config.dimensions` (and reserve "bge-m3/1024" wording only when that's actually the
+configured model). Single source of truth: derive the whole sentence from `{host, model, dimensions}`.
+
+### ADV-36-2 — Round 35 migrated the template, not existing projects; no command upgrades a stale config. [Medium]
+
+**Where:** `extensions/aipi/runtime/aipi-tools.js:2818-2829` (`resolveSemanticEmbeddingConfig` reads
+the project's `.aipi/semantic-memory.json` verbatim); Round 35 changed only
+`templates/.aipi/semantic-memory.json` + repo defaults.
+
+Round 35's closure rested on a grep of THIS repo ("no stray `nomic-embed-text`/`768`"). But every
+project `aipi-init`'d before Round 35 carries its own `.aipi/semantic-memory.json` pinned to
+`nomic-embed-text`/`768` (verified via git: the pre-bge-m3 template was exactly
+`{"ollama_model":"nomic-embed-text","dimensions":768}`). `resolveSemanticEmbeddingConfig` reads that
+file first (`config.ollama_model ?? config.model`, `config.dimensions`), so the live model stays
+`nomic-embed-text`/`768` indefinitely. There is no version stamp, no detection, no upgrade path.
+
+**Accuracy note (correcting an earlier draft of this finding):** a stale config is *internally
+consistent* — model `nomic-embed-text` with `dimensions: 768` — and WOULD work if the user pulled
+`nomic-embed-text`. It is NOT a guaranteed dim mismatch (the old file carries `768`, so
+`resolveSemanticEmbeddingConfig` returns 768, not 1024). So this finding is divergence/staleness, not
+breakage. The active harm is ADV-36-1: the readiness message points the user at `bge-m3` while their
+project is pinned to `nomic-embed-text`, so following the message never resolves the "model not pulled"
+state. ADV-36-2 is why that misdirection is permanent (nothing migrates them off nomic).
+
+**Why it matters:** Round 35's intent (everyone on bge-m3/1024) does not reach already-initialized
+projects — exactly where real users are — and there is no supported path to move them. "Closed in repo"
+≠ "moved in the field."
+
+**Additional evidence (no migration path in ANY command).** The user ran `aipi update` before
+onboarding and it "went through", yet the project stayed on `nomic-embed-text`. Verified via
+`node bin/aipi.js update --dry-run`: `aipi update` does at most `pi update --self`, `git pull --ff-only`
+on the aipi checkout, and `npm install` on the checkout (`bin/aipi.js:476-501`). It never touches any
+target project's `.aipi/`. Combined with `init` (already run; won't re-pin) and `onboard` (reads the
+stale config), there is NO supported command that migrates a pre-bge-m3 project — the only escape is
+hand-editing `.aipi/semantic-memory.json`. The migration must live in onboard/rebuild (or a new
+`aipi migrate`/`update --projects` affordance), OR — if existing projects are intentionally left on
+their pinned model — ADV-36-1's fix alone makes the state self-consistent (correct message → pull nomic
+→ works), and migration becomes optional. Codex should pick one of those two coherent end-states.
+
+### ADV-36-4 — Vector-dimension defaults hardcode 1024, ignoring the configured model in two spots. [Low]
+
+**Where:** `extensions/aipi/runtime/aipi-tools.js:566-571` (sqlite-sidecar-unavailable fallback sets
+`graph.vector.dimensions = GRAPH_VECTOR_DIMENSIONS` = 1024); `:2831-2836` (`resolveEmbeddingDimensions`
+dead branch — both arms `return GRAPH_VECTOR_DIMENSIONS`).
+
+Two places assume 1024 regardless of the configured model:
+
+1. When sqlite-vec is unavailable, the fallback `graph.vector` reports `dimensions: 1024` even on a
+   project configured for 768. `inspectGraphFreshness` (`:2289-2295`) then compares
+   `graphVector.dimensions (1024) !== embeddingConfig.dimensions (768)` and declares a spurious
+   **"embedding dimension mismatch"** on a graph that has no vectors at all — noise that can drive a
+   pointless rebuild signal. The fallback should report `embeddingConfig.dimensions`, not the constant.
+2. `resolveEmbeddingDimensions` has a dead `if` — `if (model === DEFAULT_OLLAMA_MODEL) return 1024;`
+   then `return 1024;`. The `if` is meaningless; any model with no explicit `dimensions` gets 1024.
+   This only bites a config that omits `dimensions` (the realistic stale file includes it), so it is
+   Low — but it is latent wrong-by-construction and should derive width from the model (or the model's
+   returned vector length) and be stored back to `semantic-memory.json`.
+
+**Why it matters:** both are small now (the common stale path carries `768` and most users run with
+sqlite-vec available), but they are exactly the kind of constant-instead-of-config assumption that
+turns a future non-bge-m3 / non-1024 model into a silent mismatch. Cheap to fix while the area is open.
+
+**Fix:** detect a pre-bge-m3 `.aipi/semantic-memory.json` (model/dimensions mismatch vs current
+default OR missing schema/version) during onboarding/rebuild and MIGRATE it (rewrite model→`bge-m3`,
+dimensions→1024, drop+recreate the vec0 table — reuse Round 35's dim-mismatch rebuild path), or at
+minimum surface a distinct, correct "your project is pinned to <model>; update `.aipi/semantic-memory.json`
+or run <cmd>" message. Also collapse the dead `resolveEmbeddingDimensions` branch and derive width from
+the model (or the model's returned vector length), not a constant that ignores the model.
+
+### ADV-36-3 — Onboarding emits one line at the end; the in-session swarm runs silent for minutes. [Medium]
+
+**Where:** `extensions/aipi/index.js:96` (single terminal `ctx.ui.notify`); `bin/aipi.js:667`
+(single `console.log`); `extensions/aipi/runtime/onboarding.js:152-220` (no intermediate emit);
+`:476-499` + `:509-520` (`waitForCoordinatorDone`, serial, 180s timeout per worker).
+
+This is the user's original "no visual feedback." The CLI wrapper path is fast and forces
+`runWorker:false` (verified ~1s, prints a 5-line summary). But the slash command enables the swarm
+(`investigation=swarm workers=5`) and the runtime produces NO output between "start" and the final
+summary. Workers are awaited serially, each up to 180s — worst case ~15 min of a blank screen before a
+single line appears. A stalled worker is indistinguishable from a hang.
+
+**Why it matters:** users reasonably conclude the command did nothing and either kill it or re-run,
+corrupting their mental model of whether onboarding succeeded. A correct-but-invisible long operation
+is a UX failure for an interactive command.
+
+**Fix:** emit incremental progress per phase (inventory → graph built → `investigating N/5: <dimension>`
+as each worker resolves → memory seeded → readiness). Make the worker waits concurrent with one overall
+budget rather than serial 180s-each, and surface per-worker timeout/failure as a line, not silence.
+
+## Acceptance / tests (must actually execute — WF-01/WF-02)
+
+- A project fixture whose `.aipi/semantic-memory.json` pins `nomic-embed-text` and Ollama is up but
+  that model missing: the readiness `message` names ONE model consistently and the remediation command
+  matches the configured model (no "nomic … pull bge-m3" contradiction) — asserted on the exact string.
+- The same stale fixture is DETECTED (model/dim mismatch vs current default) and migrated to
+  `bge-m3`/1024 (or emits a correct, distinct upgrade message) — asserted, with the vec0 table rebuilt
+  to 1024 and no leftover 768.
+- `resolveEmbeddingDimensions` returns the configured/derived width for a non-default model (not a
+  hardcoded 1024); dead branch removed — unit asserted for model=`nomic-embed-text` (no explicit dim) →
+  768 (or model-derived), model=`bge-m3` → 1024. (ADV-36-4)
+- With sqlite-vec unavailable on a 768-configured project, the fallback `graph.vector.dimensions`
+  equals the configured dimensions and `inspectGraphFreshness` does NOT report a spurious
+  "embedding dimension mismatch" on a vectorless graph — asserted. (ADV-36-4)
+- Onboarding emits ≥1 progress signal before the terminal summary on the swarm path (assert the
+  emit/notify is called more than once, or a progress callback fires per worker) — tested with a fake
+  coordinator. (ADV-36-3)
+- `npm test` + `npm run validate` green; re-confirm no live path can print two different model names in
+  one readiness message.
+
+Record changed files + exact commands run, then set `Current owner: CLAUDE` /
+`Current status: WAITING_FOR_CLAUDE`.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX
+Requested next action: implement Round 36 — (1) ADV-36-1 [High] make the embedding-readiness
+remediation text a function of the resolved `{model, dimensions}` so it can never name two models;
+(2) ADV-36-2 [Medium] either migrate pre-bge-m3 `.aipi/semantic-memory.json` project configs
+(onboard/rebuild or a new affordance) OR rely on the 36-1 fix and leave projects on their pinned model —
+pick one coherent end-state; (3) ADV-36-3 [Medium] emit incremental onboarding progress and make the
+swarm waits concurrent under one budget instead of serial 180s-each; (4) ADV-36-4 [Low] stop hardcoding
+1024 in the sqlite-unavailable vector fallback and the dead `resolveEmbeddingDimensions` branch — derive
+width from config/model. Batch by severity: ADV-36-1 first, then ADV-36-2 / ADV-36-3, then ADV-36-4.
+
+## Codex implementation - Round 36 (2026-06-20)
+
+Implemented Round 36.
+
+What changed:
+
+- Embedding readiness text is now generated from the resolved semantic config. A project configured for
+  `nomic-embed-text`/768 now gets a single consistent message/action:
+  `ollama pull nomic-embed-text`; it cannot also tell the user to pull `bge-m3`.
+- Legacy pre-bge-m3 project configs are migrated during onboarding/rebuild when the project still has the
+  known old default `.aipi/semantic-memory.json` (`nomic-embed-text`/768) and no explicit model/dimension
+  env override. The file is rewritten to `bge-m3`/1024 before the graph/vector build, so the vec0 table is
+  created at 1024 when sqlite-vec is available.
+- `resolveEmbeddingDimensions` now derives known model widths (`bge-m3` -> 1024,
+  `nomic-embed-text` -> 768) instead of returning 1024 for every non-explicit model.
+- The sqlite-sidecar-unavailable graph fallback now reports the configured model/dimensions, so a 768
+  configured project without sqlite vectors no longer self-reports an embedding dimension mismatch.
+- `/aipi-onboard` and post-init onboarding now emit progress events to the Pi UI for inventory, graph,
+  swarm start, per-worker spawn/completion/failure, swarm finish, and memory seeding.
+- Onboarding swarm waits now run concurrently with one 180s overall worker budget rather than serial
+  180s waits per worker.
+
+Changed files:
+
+- `extensions/aipi/runtime/aipi-tools.js`
+- `extensions/aipi/runtime/onboarding.js`
+- `extensions/aipi/index.js`
+- `tools/test-aipi-tools.mjs`
+- `tools/test-project-onboarding.mjs`
+- `adversarial-claude.md`
+
+Validation run:
+
+- `node tools/test-project-onboarding.mjs` -> `AIPI_PROJECT_ONBOARDING_TEST_OK`
+- `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`
+- `npm.cmd test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`; existing
+  `AIPI_MODEL_PRESSURE_EVALS_SKIPPED` remains intentional unless `AIPI_MODEL_PRESSURE=1` and
+  `AIPI_MODEL_PRESSURE_COMMAND` are set.
+- `npm.cmd run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`
+- `git diff --check` -> no whitespace errors; Windows CRLF conversion warnings only.
+
+Acceptance evidence:
+
+- `tools/test-aipi-tools.mjs` asserts `nomic-embed-text` readiness names only `nomic-embed-text`, action is
+  `ollama pull nomic-embed-text`, message includes `768-dim nomic-embed-text`, and does not mention
+  `bge-m3`.
+- The same test creates a legacy `.aipi/semantic-memory.json` pinned to `nomic-embed-text`/768, rebuilds,
+  asserts the config file is rewritten to `bge-m3`/1024 with no leftover `nomic-embed-text` or `768`, and
+  asserts `code_vectors` is `float[1024]` when sqlite-vec is available.
+- The test asserts model-derived dimensions for `nomic-embed-text` -> 768 and `bge-m3` -> 1024.
+- The vectorless sqlite fallback fixture forces `.aipi/state/aipi-graph.sqlite` to be unavailable while
+  env config is `nomic-embed-text`/768; graph/vector dimensions remain 768 and `aipiCallers` freshness is
+  fresh with no `embedding dimension mismatch`.
+- `tools/test-project-onboarding.mjs` asserts the swarm path emits multiple progress events, including one
+  `spawned` and one completion event per onboarding worker.
+
+Residual risk:
+
+- Unknown Ollama models with no explicit dimensions still fall back to the current default width of 1024,
+  because Ollama model metadata does not provide embedding width before an embedding request. Known current
+  defaults are covered and env/config dimensions remain authoritative.
+
+## Claude verdict — Round 36 PARTIAL: 36-1/36-3/36-4 verified fixed; 36-2 fix introduced a regression (2026-06-20)
+
+Verified against real code + a real run of the tests (`node tools/test-project-onboarding.mjs` ->
+`AIPI_PROJECT_ONBOARDING_TEST_OK`; `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`), and the
+changed regions re-read for genuineness (WF-01/WF-02 — not trusting the handoff prose).
+
+- **ADV-36-1 [High] — FIXED.** The hardcoded `OLLAMA_INSTALL_MESSAGE` constant is gone. `ollamaInstallMessage`
+  (`aipi-tools.js:3022-3029`) derives `ollama pull <model>` and `<dimensions>-dim <model>` from the resolved
+  config; `semanticReadinessOff` (`:2956-2967`) builds `message`, `reason`, and `action` all from
+  `config.model`. A `nomic-embed-text` project can no longer be told to pull `bge-m3`. Test asserts it.
+- **ADV-36-3 [Medium] — FIXED.** `runOnboardingInvestigation` emits progress for inventory, graph, swarm
+  start, per-worker spawn (`onboarding.js:533`), per-worker completion/failure (`:555/:574`), swarm finish,
+  and seeding; each event carries `.message`, wired to `ctx.ui.notify` in both onboard entry points
+  (`index.js`). Worker waits are concurrent via `Promise.all` (`onboarding.js:543`), bounded ~180s overall
+  instead of serial 5×180s.
+- **ADV-36-4 [Low] — FIXED.** `resolveEmbeddingDimensions` (`:2844-2848`) derives width from
+  `OLLAMA_MODEL_DIMENSIONS` (bge-m3→1024, nomic→768); the sqlite-unavailable fallback now reports
+  `embeddingConfig.dimensions`/model/host (`:570-578`), so a 768 project no longer self-reports a spurious
+  dimension mismatch. Test covers both.
+- **ADV-36-2 [Medium] — addressed, but see ADV-36-5.** Legacy `nomic-embed-text`/768 configs are migrated to
+  `bge-m3`/1024. Mechanism is correct for the onboard/rebuild path; placement is too low in the stack.
+
+### ADV-36-5 — Migration mutates a tracked config file (and forces a rebuild) from READ-ONLY query paths. [Medium]
+
+**Where:** `extensions/aipi/runtime/aipi-tools.js:2830` (`maybeMigrateLegacySemanticConfig` is called inside
+`resolveSemanticEmbeddingConfig`, which `fs.writeFile`s `.aipi/semantic-memory.json` at `:2865`);
+read-only callers reach it via `ensureGraph` with `rebuild=false` -> `inspectGraphFreshness` (`:885` -> `:2295`).
+`ensureGraph` backs `aipiCallers` (`:588`), `aipiImpact` (`:609`), and `aipiSemanticSearch` (`:641`).
+
+The Round-36 spec for ADV-36-2 said migration "must live in onboard/rebuild." Codex instead put it in
+`resolveSemanticEmbeddingConfig`, which every config resolution funnels through — including pure read
+queries. Consequences on a legacy-default project, triggered by a *read*:
+
+1. **A tracked file is rewritten as a side effect of a query.** Running `aipi_callers`/`aipi_impact`/
+   `aipi_semantic_search` (or onboarding's own workers, which are told to call those tools at
+   `onboarding.js:521`) silently rewrites `.aipi/semantic-memory.json` nomic/768 → bge-m3/1024. A user who
+   only *read* the graph now has an unexpected dirty working tree / git diff. In CI or a "no uncommitted
+   changes" gate this is a failure caused by a read.
+2. **A read query escalates to a full rebuild.** After migration, the on-disk graph (indexed at 768/nomic)
+   mismatches the now-1024/bge-m3 config, so `inspectGraphFreshness` returns stale and `ensureGraph` runs
+   `rebuildCodeGraph` (`:889`) — a lightweight lookup becomes a full graph rebuild + (attempted) re-embed,
+   unprompted.
+3. **A working nomic setup is silently switched off.** If the user had `nomic-embed-text` pulled and working,
+   the read-triggered migration flips them to `bge-m3`; if bge-m3 isn't pulled, semantic memory degrades to
+   lexical with no explicit user action. (The readiness message is now correct — 36-1 — but the
+   *switch itself* happened behind a read.)
+
+**Why it matters:** least-astonishment + side-effect-free reads. Query tools must not mutate tracked project
+files or trigger rebuilds. This also escaped the tests because they exercise migration only on the
+rebuild/onboard path, never asserting that a read path leaves the file untouched.
+
+**Fix:** confine migration to explicit write entry points. Give `resolveSemanticEmbeddingConfig` a
+`migrate=false` default and pass `migrate:true` only from `rebuildCodeGraph`/onboarding; on read paths,
+resolve the legacy config in-memory (treat it as bge-m3 for comparison if desired) WITHOUT writing, or surface
+a "legacy embedding config detected — run onboarding/rebuild to migrate" note instead of writing. Add a test:
+a read-only `aipiCallers`/`aipiImpact` call on a legacy-default project leaves `.aipi/semantic-memory.json`
+byte-for-byte unchanged and does not trigger a rebuild.
+
+**Acceptance:** read-only query tools leave `.aipi/semantic-memory.json` unmodified on a legacy project
+(asserted by mtime/content); migration still occurs on onboard/rebuild; `npm test` + `npm run validate` green.
+
+Record changed files + exact commands run, then set `Current owner: CLAUDE` /
+`Current status: WAITING_FOR_CLAUDE`.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX
+Requested next action: implement ADV-36-5 — move the legacy-config migration out of the read path. Confine
+`maybeMigrateLegacySemanticConfig` to explicit onboard/rebuild entry points (e.g. a `migrate` flag on
+`resolveSemanticEmbeddingConfig`, default false; true only from `rebuildCodeGraph`/onboarding); read-only
+`aipiCallers`/`aipiImpact`/`aipiSemanticSearch` must not write `.aipi/semantic-memory.json` nor trigger a
+rebuild as a side effect. Add a regression test asserting a read leaves the config file unchanged.
+ADV-36-1, ADV-36-3, ADV-36-4 are verified fixed and need no further work.
+
+## Claude verdict — Round 36 CLOSED (2026-06-20)
+
+ADV-36-5 verified fixed against real code + a real full-suite run, tests re-read for genuineness
+(WF-01/WF-02).
+- `resolveSemanticEmbeddingConfig` now takes `migrate = false` (`aipi-tools.js:2827`) and only calls
+  `maybeMigrateLegacySemanticConfig` when `migrate` is true (`:2830`). The ONLY `migrate: true` call site
+  is `rebuildCodeGraph` (`:568`). Every read path — `inspectGraphFreshness` (`:2295`, behind
+  `aipiCallers`/`aipiImpact`), `aipiSemanticSearch` (`:2712`), and the embed resolve (`:2768`) — uses the
+  default `false`, so no read writes `.aipi/semantic-memory.json`.
+- Regression test (`test-aipi-tools.mjs:863-901`): builds a coherent legacy `nomic-embed-text`/768 graph,
+  snapshots config + `aipi-graph.json`, runs `aipiCallers`, and asserts BOTH files are byte-for-byte
+  unchanged, freshness stays `fresh`, and `rebuilt_from_stale` is absent. Genuinely proves a read leaves
+  the tree clean and triggers no rebuild.
+- Real runs: `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`; `node tools/test-project-onboarding.mjs`
+  -> `AIPI_PROJECT_ONBOARDING_TEST_OK`; `npm test` -> full suite through `AIPI_STEP_RESULT_TEST_OK`;
+  `node tools/validate-aipi-templates.mjs` -> `AIPI_TEMPLATE_VALIDATION_OK`.
+
+Round 36 findings ADV-36-1 [High], ADV-36-2 [Medium], ADV-36-3 [Medium], ADV-36-4 [Low], ADV-36-5 [Medium]
+are all resolved. **Zero open findings. Round 36 CLOSED. Rounds 29–36 all CLOSED.**
+
+**Accepted residual (documented, not a blocker):** if a legacy project's graph is *already stale* for an
+unrelated reason (source files changed), a read via `ensureGraph` still triggers `rebuildCodeGraph`
+(pre-existing auto-rebuild behavior) which migrates the config. This rides along with a rebuild that is
+already rewriting graph state, and is within the "migration confined to rebuild" intent, so it is not
+reopened. Superseded in part by Round 37 below (the 768-retirement decision revisits migration triggers).
+
+---
+
+## Codex implementation - ADV-36-5 (2026-06-20)
+
+Implemented ADV-36-5.
+
+What changed:
+
+- `resolveSemanticEmbeddingConfig` now defaults to `migrate: false`, so read-only paths resolve legacy
+  `.aipi/semantic-memory.json` without writing it.
+- `rebuildCodeGraph` passes `migrate: true`, keeping the legacy `nomic-embed-text`/768 -> `bge-m3`/1024
+  migration confined to explicit graph rebuild/onboarding write paths.
+- The existing migration test still proves rebuild migrates the legacy config to `bge-m3`/1024.
+- Added a read-only regression fixture: it builds a coherent legacy `nomic-embed-text`/768 graph, then runs
+  `aipiCallers` without explicit model/dimension overrides and asserts:
+  - `.aipi/semantic-memory.json` remains byte-for-byte unchanged,
+  - `.aipi/state/aipi-graph.json` remains byte-for-byte unchanged,
+  - graph freshness stays `fresh`,
+  - `rebuilt_from_stale` remains absent.
+
+Changed files:
+
+- `extensions/aipi/runtime/aipi-tools.js`
+- `tools/test-aipi-tools.mjs`
+- `adversarial-claude.md`
+
+Validation run:
+
+- `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`
+- `node tools/test-project-onboarding.mjs` -> `AIPI_PROJECT_ONBOARDING_TEST_OK`
+- `npm.cmd test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`; existing
+  `AIPI_MODEL_PRESSURE_EVALS_SKIPPED` remains intentional unless `AIPI_MODEL_PRESSURE=1` and
+  `AIPI_MODEL_PRESSURE_COMMAND` are set.
+- `npm.cmd run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`
+- `git diff --check` -> no whitespace errors; Windows CRLF conversion warnings only.
+
+Residual risk:
+
+- None known for ADV-36-5. Read paths no longer perform the tracked config migration; explicit
+  rebuild/onboarding still do.
+
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE
+Requested next action: verify ADV-36-5 against the real code/tests; close Round 36 if no findings remain or hand back concrete findings.
+
+(ADV-36-5 verified + Round 36 CLOSED — see "Claude verdict — Round 36 CLOSED" above.)
+
+---
+
+# Round 37 — Retire 768 entirely: bge-m3/1024 is the ONLY embedding config; always migrate FROM 768
+
+Opened by Claude on a binding user decision (2026-06-20). Builds on Round 35 (bge-m3/1024 switch),
+Round 36 (readiness-from-config + migration + ADV-36-5 read-path fix).
+
+**User decision (binding, 2026-06-20):** "Can we not use 768 anymore? Just the new one. Code must be
+able to migrate from 768." Clarified via recommendation pick → **Hard-pin to bge-m3/1024 only**: remove
+`nomic-embed-text`/768 as a usable target everywhere; bge-m3/1024 is the single embedding config; any
+768/nomic state — config file OR explicit `AIPI_OLLAMA_MODEL`/`AIPI_OLLAMA_DIMENSIONS` env requesting it —
+is migrated UP to bge-m3/1024 rather than honored. 768 survives ONLY as a migration *source* to detect.
+
+**Why:** Round 35 chose bge-m3 for robustness/multilingual (PT-BR). Today 768 is still first-class — the
+model map blesses it (`aipi-tools.js:98-101`), and an env override pins it while *skipping* migration
+(`:2852`). The user wants the dual-model surface gone: one model, one width, with a guaranteed upgrade
+path off 768.
+
+## What to build
+
+1. **Drop 768/nomic as a supported target.** Collapse `OLLAMA_MODEL_DIMENSIONS` so the only blessed
+   model/width is `bge-m3`/1024 (`:98-101`). `resolveEmbeddingDimensions` (`:2844-2848`) must resolve the
+   *target* width to 1024 — a `raw`/config/env value of 768 (or any non-1024) is NOT honored as a target;
+   it is treated as legacy-to-migrate. (Keep the ability to *read* a stored 768 off an old graph/config
+   for DETECTION only.)
+2. **Always migrate FROM 768 — remove the env-skip and broaden the trigger.** Delete the
+   `if (env.AIPI_OLLAMA_MODEL || env.AIPI_OLLAMA_DIMENSIONS) return null` skip (`:2852`) for the 768 case,
+   and broaden `isLegacyDefaultSemanticConfig` (`:2877-2882`) from the exact `{nomic,768}` fingerprint to
+   "any config whose model is `nomic-embed-text` OR whose dimensions are 768 (i.e. not bge-m3/1024)".
+   Migration target stays `bge-m3`/1024. An explicit env requesting nomic/768 must end up on bge-m3/1024,
+   not on 768.
+3. **Preserve ADV-36-5 (reads still don't write) — but reconcile with always-migrate.** A *bare read* must
+   not silently rewrite a CURRENT (bge-m3/1024) config. For a 768 config, the read resolves the target as
+   1024, so freshness sees the 768-indexed graph as a dimension mismatch (`:2289`) and `ensureGraph`
+   triggers `rebuildCodeGraph` — and THAT rebuild (migrate path) rewrites the config + re-embeds at 1024.
+   Net: encountering 768 triggers a one-time rebuild+migration (intended now that 768 is retired), while a
+   project already on bge-m3/1024 is never written by a read. State this invariant explicitly so the two
+   requirements don't contradict.
+4. **Graph re-embed at 1024.** A vec0 table / graph built at 768 is detected as stale and rebuilt to
+   `float[1024]` with bge-m3 (the dim-mismatch rebuild from Round 35 already does this — confirm it fires
+   for the broadened trigger). If bge-m3 isn't pulled, lexical fallback + the loud, now-correct
+   "pull bge-m3" readiness (Round 36) applies.
+5. **Update tests that depend on 768 being honored.** Several fixtures currently assert 768 is a valid
+   live config — notably the ADV-36-5 read-only regression (`test-aipi-tools.mjs:863-901`) builds a
+   "coherent legacy nomic/768 graph" and asserts a read leaves it UNCHANGED. Under Round 37 there is no
+   coherent 768 steady state; that test must be re-cast so its "read leaves config unchanged" invariant is
+   asserted on a **bge-m3/1024** project (the current standard), and a SEPARATE test asserts a 768 project
+   gets migrated to 1024 on rebuild/onboard. Also update `fakeEmbeddingFetchForModel(..., "nomic-embed-text",
+   768)` usages (`:886/:896`) and any 768/nomic assertions.
+
+## Acceptance / tests (must actually execute — WF-01/WF-02)
+
+- No supported path resolves a *target* width other than 1024: with `AIPI_OLLAMA_DIMENSIONS=768` (or a
+  768 config), the resolved target is 1024 and the project is migrated — asserted.
+- A project pinned to `nomic-embed-text`/768 via config AND one pinned via env are BOTH migrated to
+  `bge-m3`/1024 on rebuild/onboard (config rewritten, `code_vectors` rebuilt `float[1024]`, no leftover
+  768/nomic) — asserted on the real files.
+- ADV-36-5 invariant re-cast: a read-only `aipiCallers`/`aipiImpact` on a **bge-m3/1024** project leaves
+  `.aipi/semantic-memory.json` byte-for-byte unchanged and triggers no rebuild; a read on a 768 project
+  triggers exactly one rebuild that migrates it (no infinite re-migrate on the next read).
+- `rg` finds no `nomic-embed-text` / `768` as a *supported target* in `extensions`/`templates`/`tools`
+  (only as migration-source detection constants) — asserted.
+- `npm test` + `npm run validate` green.
+
+Record changed files + exact commands run, then set `Current owner: CLAUDE` /
+`Current status: WAITING_FOR_CLAUDE`.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX
+Requested next action: implement Round 37 — hard-pin embeddings to bge-m3/1024 only; retire 768/nomic as a
+usable target (model map, dimension resolution, env overrides); always migrate FROM 768 (remove the
+env-skip, broaden the legacy trigger to any nomic/768/non-1024 config, target bge-m3/1024); keep the
+ADV-36-5 no-write-on-current-read invariant while letting a 768 encounter trigger a one-time
+rebuild+migration; re-embed 768 graphs to float[1024]; and re-cast the 768-dependent tests. Verify with
+real test/validate runs.
+
+## Codex implementation - Round 37 (2026-06-20)
+
+Implemented Round 37.
+
+What changed:
+
+- Embedding target is now hard-pinned to `bge-m3`/1024. `resolveSemanticEmbeddingConfig` ignores
+  `AIPI_OLLAMA_MODEL=nomic-embed-text` and `AIPI_OLLAMA_DIMENSIONS=768` as target selection and returns
+  `model: "bge-m3"`, `dimensions: 1024`.
+- `resolveEmbeddingDimensions` no longer supports a live 768 target; it resolves target width to 1024.
+- `checkSemanticEmbeddingReadiness` is also hard-pinned, so even a direct config object containing
+  `nomic-embed-text`/768 produces a bge-m3/1024 readiness message/action.
+- Migration trigger was broadened from exact `nomic-embed-text`/768 to any non-current semantic config:
+  missing/non-bge model, missing/non-1024 dimensions, or old key variants.
+- The old env-skip was removed. Env overrides cannot block migration or force a 768 target.
+- Migration now runs before file inventory/hashing in `rebuildCodeGraph`, so the migrated
+  `.aipi/semantic-memory.json` hash is what gets stored in the rebuilt graph. This prevents a second
+  rebuild on the next read.
+- ADV-36-5 is preserved for current projects: a read on a current `bge-m3`/1024 project leaves
+  `.aipi/semantic-memory.json` and `.aipi/state/aipi-graph.json` byte-for-byte unchanged and does not
+  set `rebuilt_from_stale`.
+- A read that encounters legacy 768 state now triggers one rebuild/migration to `bge-m3`/1024; the next
+  read is fresh and does not rebuild again.
+
+Changed files:
+
+- `extensions/aipi/runtime/aipi-tools.js`
+- `tools/test-aipi-tools.mjs`
+- `adversarial-claude.md`
+
+Validation run:
+
+- `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`
+- `node tools/test-project-onboarding.mjs` -> `AIPI_PROJECT_ONBOARDING_TEST_OK`
+- `npm.cmd test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`; existing
+  `AIPI_MODEL_PRESSURE_EVALS_SKIPPED` remains intentional unless `AIPI_MODEL_PRESSURE=1` and
+  `AIPI_MODEL_PRESSURE_COMMAND` are set.
+- `npm.cmd run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`
+- `git diff --check` -> no whitespace errors; Windows CRLF conversion warnings only.
+- `rg -n "nomic-embed-text|768" extensions/aipi/runtime/aipi-tools.js templates/.aipi tools/test-aipi-tools.mjs docs README.md`
+  -> remaining hits are legacy-source constants and migration fixtures/asserts only; templates/docs/README
+  have no active `nomic`/`768` target references.
+
+Acceptance evidence:
+
+- `tools/test-aipi-tools.mjs` asserts `resolveEmbeddingDimensions({ model: "nomic-embed-text" }) === 1024`
+  and `resolveSemanticEmbeddingConfig` with env `AIPI_OLLAMA_MODEL=nomic-embed-text` +
+  `AIPI_OLLAMA_DIMENSIONS=768` resolves to `bge-m3`/1024.
+- The readiness test passes a direct `nomic-embed-text`/768 config and asserts the message/action are
+  `bge-m3`/1024 only, with no `nomic-embed-text` or `768-dim` wording.
+- The legacy config migration fixture now runs with both stale config and stale env override, then asserts
+  the file is rewritten to `bge-m3`/1024 with no leftover `nomic-embed-text` or `768`, and the graph/vector
+  target is bge-m3/1024.
+- The vectorless sqlite fallback fixture uses env requesting `nomic`/768 and asserts the fallback vector
+  metadata still reports `bge-m3`/1024.
+- The current-read fixture asserts a bge-m3/1024 read is byte-for-byte unchanged and does not rebuild.
+- The legacy-read fixture seeds a 768 graph/config, asserts first read rebuilds/migrates to bge-m3/1024,
+  then asserts the second read leaves graph/config byte-for-byte unchanged with fresh graph state.
+
+Residual risk:
+
+- None known for Round 37. 768 remains only as migration-source evidence in constants/tests, not as a
+  supported target.
+
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE
+Requested next action: verify Round 37 against the real code/tests; close if no findings remain or hand back concrete findings.
+
+## Claude verdict — Round 37 PARTIAL: hard-pin verified, but one new finding (ADV-37-1) (2026-06-20)
+
+Verified against real code + real runs (`node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`;
+`node tools/test-project-onboarding.mjs` -> `AIPI_PROJECT_ONBOARDING_TEST_OK`;
+`node tools/validate-aipi-templates.mjs` -> `AIPI_TEMPLATE_VALIDATION_OK`), changed regions + tests
+re-read for genuineness (WF-01/WF-02).
+
+The five Round-37 requirements are genuinely met:
+- **Hard-pin target.** `resolveSemanticEmbeddingConfig` (`aipi-tools.js:2831-2842`) returns `model:
+  "bge-m3"`, `dimensions: 1024` unconditionally; env `AIPI_OLLAMA_MODEL`/`AIPI_OLLAMA_DIMENSIONS` are no
+  longer read. `resolveEmbeddingDimensions` (`:2845-2847`) returns 1024. Host override still honored
+  (`:2837`) — not collateral damage.
+- **Always migrate FROM 768; env-skip removed; trigger broadened.** `semanticConfigNeedsMigration`
+  (`:2875-2883`) flags ANY non-bge-m3 / non-1024 config; `maybeMigrateLegacySemanticConfig` (`:2849`) no
+  longer early-returns on env presence. A config OR env requesting nomic/768 ends on bge-m3/1024.
+- **ADV-36-5 preserved + one-time 768 migration on read.** Verified by two genuine fixtures:
+  current-read (`test-aipi-tools.mjs:876-899`) — a bge-m3/1024 read leaves config+graph byte-for-byte
+  unchanged, no rebuild; legacy-read (`:901-960`) — first read migrates (rebuilt_from_stale, vector
+  dims 1024, model bge-m3, config rewritten with no nomic/768), and the SECOND read leaves config+graph
+  byte-for-byte unchanged + fresh + no rebuilt_from_stale. No infinite re-migrate.
+- **768 graph re-embeds to float[1024].** Dimension-mismatch freshness fires for the broadened trigger
+  and rebuilds at 1024/bge-m3 (asserted).
+- **No nomic/768 as a supported target** — only as migration-source detection constants/fixtures.
+
+### ADV-37-1 — Readiness message still tells users to set `AIPI_OLLAMA_MODEL` / `AIPI_OLLAMA_DIMENSIONS`, now dead knobs. [Medium]
+
+**Where:** `extensions/aipi/runtime/aipi-tools.js:3027` (`ollamaInstallMessage`).
+
+The OFF message ends: *"…requires Ollama running with the 1024-dim bge-m3 model, **or set AIPI_OLLAMA_HOST /
+AIPI_OLLAMA_MODEL / AIPI_OLLAMA_DIMENSIONS**."* But Round 37 made `AIPI_OLLAMA_MODEL` and
+`AIPI_OLLAMA_DIMENSIONS` no-ops — `resolveSemanticEmbeddingConfig` ignores them entirely; only
+`AIPI_OLLAMA_HOST` still has any effect.
+
+**Why it matters:** this is the exact failure mode this whole round-chain (35→36→37) exists to kill — a
+user-facing message instructing an action that the system silently ignores. A user who sees "semantic
+memory is OFF" and follows the hint by setting `AIPI_OLLAMA_MODEL=…` / `AIPI_OLLAMA_DIMENSIONS=…` gets no
+effect and no error — a dead-end identical in spirit to ADV-36-1, just inverted (now the message offers a
+knob that was removed instead of naming the wrong model).
+
+**Fix:** drop `AIPI_OLLAMA_MODEL` / `AIPI_OLLAMA_DIMENSIONS` from the message. Mention only
+`AIPI_OLLAMA_HOST` (the surviving override), e.g. *"…requires Ollama running with bge-m3 (1024-dim); run
+`ollama pull bge-m3`, or point AIPI at another Ollama host with `AIPI_OLLAMA_HOST`."* Add/adjust a test
+asserting the OFF message does NOT mention `AIPI_OLLAMA_MODEL`/`AIPI_OLLAMA_DIMENSIONS`.
+
+**Minor (non-blocking) cleanup while in there:** `resolveEmbeddingDimensions({ raw, model })` now ignores
+both parameters and always returns 1024; its call sites (e.g. `ollamaInstallMessage:3024`) pass
+`raw`/`model` that no longer matter. Optional: drop the dead params/callers. Not required for closure.
+
+**Acceptance:** OFF readiness message references only working overrides (no `AIPI_OLLAMA_MODEL`/
+`AIPI_OLLAMA_DIMENSIONS`); a test asserts their absence; `npm test` + `npm run validate` green.
+
+Record changed files + exact commands run, then set `Current owner: CLAUDE` /
+`Current status: WAITING_FOR_CLAUDE`.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX
+Requested next action: implement ADV-37-1 — remove the dead `AIPI_OLLAMA_MODEL` / `AIPI_OLLAMA_DIMENSIONS`
+references from the semantic-OFF readiness/install message (`ollamaInstallMessage`), keep only
+`AIPI_OLLAMA_HOST`, and add a test asserting the OFF message names no removed env knobs. Optionally drop
+the now-vestigial `resolveEmbeddingDimensions` params. Round 37's hard-pin + migration behavior is
+verified correct and needs no further change.
+
+## Codex implementation - ADV-37-1 (2026-06-20)
+
+Implemented ADV-37-1.
+
+What changed:
+
+- `ollamaInstallMessage` no longer mentions the removed `AIPI_OLLAMA_MODEL` or
+  `AIPI_OLLAMA_DIMENSIONS` knobs.
+- The semantic-OFF message now says to run `ollama pull bge-m3`, rerun onboarding/rebuild, and only set
+  `AIPI_OLLAMA_HOST` if Ollama runs on another host.
+- `tools/test-aipi-tools.mjs` asserts the OFF message includes `AIPI_OLLAMA_HOST` and does not include
+  `AIPI_OLLAMA_MODEL` or `AIPI_OLLAMA_DIMENSIONS`.
+
+Changed files:
+
+- `extensions/aipi/runtime/aipi-tools.js`
+- `tools/test-aipi-tools.mjs`
+- `adversarial-claude.md`
+
+Validation run:
+
+- `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`
+- `npm.cmd test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`; existing
+  `AIPI_MODEL_PRESSURE_EVALS_SKIPPED` remains intentional unless `AIPI_MODEL_PRESSURE=1` and
+  `AIPI_MODEL_PRESSURE_COMMAND` are set.
+- `npm.cmd run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`
+- `git diff --check` -> no whitespace errors; Windows CRLF conversion warnings only.
+- `rg -n "AIPI_OLLAMA_MODEL|AIPI_OLLAMA_DIMENSIONS|AIPI_OLLAMA_HOST" extensions/aipi/runtime/aipi-tools.js tools/test-aipi-tools.mjs`
+  -> runtime message only mentions `AIPI_OLLAMA_HOST`; removed env knobs remain only in tests proving they
+  are ignored/absent from the message.
+
+Residual risk:
+
+- None known for ADV-37-1.
+
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE
+Requested next action: verify ADV-37-1 against the real code/tests; close Round 37 if no findings remain or hand back concrete findings.
+
+## Claude verdict — Round 37 CLOSED (2026-06-20)
+
+ADV-37-1 verified fixed against real code + a real full-suite run, test re-read for genuineness
+(WF-01/WF-02).
+- `ollamaInstallMessage` (`aipi-tools.js:3022-3029`) now reads: *"semantic memory is OFF - run
+  `ollama pull bge-m3` … requires Ollama running with the 1024-dim bge-m3 model. Set AIPI_OLLAMA_HOST only
+  if Ollama runs on another host."* No `AIPI_OLLAMA_MODEL` / `AIPI_OLLAMA_DIMENSIONS` reference remains.
+- Independent grep: `AIPI_OLLAMA_MODEL` / `AIPI_OLLAMA_DIMENSIONS` are read NOWHERE in `extensions/` — they
+  are fully dead knobs, so the message no longer offers them. Only `AIPI_OLLAMA_HOST` is honored
+  (`resolveSemanticEmbeddingConfig:2837`).
+- Test (`test-aipi-tools.mjs:41,56-58`) sets env to the dead `nomic-embed-text`/`768` values and asserts the
+  readiness message matches `/AIPI_OLLAMA_HOST/` and does NOT match `/nomic-embed-text|768-dim/` nor
+  `/AIPI_OLLAMA_MODEL|AIPI_OLLAMA_DIMENSIONS/` — proving the hard-pin and the message fix together.
+- Real runs: `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`; `npm test` -> full suite through
+  `AIPI_STEP_RESULT_TEST_OK`; `node tools/validate-aipi-templates.mjs` -> `AIPI_TEMPLATE_VALIDATION_OK`.
+
+No regression to the Round-37 core (hard-pin bge-m3/1024, always-migrate-from-768, ADV-36-5 invariant,
+one-time migration on read) — those fixtures remain green in the same suite.
+
+Round 37 findings (hard-pin/migration verified + ADV-37-1) all resolved. **Zero open findings.
+Round 37 CLOSED. Rounds 29–37 all CLOSED.**
+
+### Live re-verify for the user
+- Any project still on `nomic-embed-text`/768 (config OR env) is now migrated to `bge-m3`/1024 on the next
+  rebuild/onboard — or on the first graph query, which triggers exactly one rebuild+migration and is fresh
+  thereafter. There is no supported way to run on 768 anymore.
+- With semantic memory OFF (bge-m3 not pulled), the message tells you to `ollama pull bge-m3` and only
+  mentions `AIPI_OLLAMA_HOST` for a remote Ollama — no dead knobs.
 
 Current owner: CLAUDE
 Current status: CLOSED

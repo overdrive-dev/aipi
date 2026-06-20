@@ -24,6 +24,7 @@ try {
   const coordinator = createDoneCoordinator();
   const selectCalls = [];
   const inputCalls = [];
+  const progressEvents = [];
   const onboarded = await runProjectOnboarding({
     projectRoot: tempRoot,
     ctx: {
@@ -44,6 +45,9 @@ try {
     askUser: true,
     runWorker: true,
     now: () => new Date("2026-06-19T12:00:00.000Z"),
+    onProgress: (event) => {
+      progressEvents.push(event);
+    },
     graphBuilder: async (input) => {
       graphBuilderCalled = true;
       return rebuildCodeGraph({ ...input, embeddingFetch: fakeMissingModelFetch() });
@@ -55,6 +59,15 @@ try {
   assert.equal(onboarded.investigation.mode, "swarm");
   assert.equal(onboarded.investigation.spawned_count > 1, true);
   assert.equal(coordinator.spawned.length > 1, true);
+  assert.equal(progressEvents.length > 1, true);
+  assert.equal(
+    progressEvents.filter((event) => event.phase === "investigation" && event.status === "spawned").length,
+    onboarded.investigation.spawned_count,
+  );
+  assert.equal(
+    progressEvents.filter((event) => event.phase === "investigation" && event.worker_id && event.status === "done").length,
+    onboarded.investigation.spawned_count,
+  );
   assert.equal(selectCalls.length, 0);
   assert.equal(inputCalls.length, 0);
   assert.equal(onboarded.memory.written.includes("project.md"), true);

@@ -121,6 +121,7 @@ export async function maybeRunPostInitOnboarding({
   skip = false,
   now = () => new Date(),
   log = null,
+  onProgress = null,
 } = {}) {
   if (skip) {
     return {
@@ -146,6 +147,7 @@ export async function maybeRunPostInitOnboarding({
     hostModel: hostModel.model,
     source: "auto",
     now,
+    onProgress,
   });
 }
 
@@ -161,12 +163,34 @@ export async function runProjectOnboarding({
   graphBuilder = rebuildCodeGraph,
   materializeGraph = true,
   runWorker = Boolean(coordinator && hostModel),
+  onProgress = null,
 } = {}) {
   const root = assertProjectRoot(projectRoot);
+  await emitOnboardingProgress(onProgress, {
+    phase: "start",
+    status: "running",
+    message: "AIPI onboarding: starting repository inventory.",
+  }, now);
   const inventory = await inventoryRepository(root);
-  const graph = materializeGraph
-    ? await graphBuilder({ projectRoot: root, now })
-    : null;
+  await emitOnboardingProgress(onProgress, {
+    phase: "inventory",
+    status: "done",
+    message: `AIPI onboarding: inventory collected (${inventory.files_sample.length} files sampled).`,
+  }, now);
+  let graph = null;
+  if (materializeGraph) {
+    await emitOnboardingProgress(onProgress, {
+      phase: "graph",
+      status: "running",
+      message: "AIPI onboarding: building code graph.",
+    }, now);
+    graph = await graphBuilder({ projectRoot: root, now });
+    await emitOnboardingProgress(onProgress, {
+      phase: "graph",
+      status: "done",
+      message: `AIPI onboarding: code graph built (${graph.files?.length ?? 0} files, semantic ${graph.vector?.status ?? "unknown"}).`,
+    }, now);
+  }
   const investigation = await runOnboardingInvestigation({
     coordinator,
     hostModel,
@@ -174,6 +198,7 @@ export async function runProjectOnboarding({
     graph,
     now,
     enabled: Boolean(runWorker),
+    onProgress,
   });
   const recommendations = askUser
     ? await askRecommendationQuestions({ ctx, inventory, investigation })
@@ -190,6 +215,11 @@ export async function runProjectOnboarding({
     now,
     force: false,
   });
+  await emitOnboardingProgress(onProgress, {
+    phase: "memory",
+    status: "done",
+    message: `AIPI onboarding: project memory seeded (${memory.written.length} written, ${memory.skipped_customized.length} preserved).`,
+  }, now);
 
   const result = {
     schema: "aipi.project-onboarding.v1",
@@ -335,6 +365,19 @@ function nudge(reason, log) {
   return result;
 }
 
+async function emitOnboardingProgress(onProgress, event, now = () => new Date()) {
+  if (typeof onProgress !== "function") return;
+  try {
+    await Promise.resolve(onProgress({
+      schema: "aipi.project-onboarding.progress.v1",
+      emitted_at: now().toISOString(),
+      ...event,
+    }));
+  } catch {
+    /* progress is best-effort; onboarding result remains authoritative */
+  }
+}
+
 async function recordOnboardingTrace(root, result) {
   const trace = {
     schema: "aipi.project-onboarding.trace.v1",
@@ -431,8 +474,13 @@ function buildRecommendationQuestion({ inventory }) {
   };
 }
 
-async function runOnboardingInvestigation({ coordinator, hostModel, inventory, graph, now, enabled }) {
+async function runOnboardingInvestigation({ coordinator, hostModel, inventory, graph, now, enabled, onProgress = null }) {
   if (!inventory.has_code) {
+    await emitOnboardingProgress(onProgress, {
+      phase: "investigation",
+      status: "skipped",
+      message: "AIPI onboarding: investigation skipped for empty repository.",
+    }, now);
     return {
       mode: "empty_repo",
       status: "skipped_empty_repo",
@@ -442,6 +490,11 @@ async function runOnboardingInvestigation({ coordinator, hostModel, inventory, g
     };
   }
   if (!enabled || !coordinator || !hostModel) {
+    await emitOnboardingProgress(onProgress, {
+      phase: "investigation",
+      status: "skipped",
+      message: "AIPI onboarding: using deterministic repository facts.",
+    }, now);
     return {
       mode: "deterministic",
       status: "worker_unavailable",
@@ -452,6 +505,11 @@ async function runOnboardingInvestigation({ coordinator, hostModel, inventory, g
   }
   const runId = `onboarding-${now().toISOString().replace(/[^0-9A-Za-z]+/g, "-")}`;
   const spawned = [];
+  await emitOnboardingProgress(onProgress, {
+    phase: "investigation",
+    status: "running",
+    message: `AIPI onboarding: starting investigation swarm (${ONBOARDING_SWARM_DIMENSIONS.length} workers).`,
+  }, now);
   for (const dimension of ONBOARDING_SWARM_DIMENSIONS) {
     const artifact = `.aipi/runtime/onboarding/${runId}/${dimension.id}.md`;
     const { agent_id: agentId } = coordinator.spawn({
@@ -472,31 +530,64 @@ async function runOnboardingInvestigation({ coordinator, hostModel, inventory, g
       budget: { timeout_ms: 120000, max_tool_calls: 20 },
     });
     spawned.push({ ...dimension, agent_id: agentId, artifact });
+    await emitOnboardingProgress(onProgress, {
+      phase: "investigation",
+      status: "spawned",
+      worker_id: dimension.id,
+      worker_title: dimension.title,
+      worker_index: spawned.length,
+      worker_count: ONBOARDING_SWARM_DIMENSIONS.length,
+      message: `AIPI onboarding: investigating ${spawned.length}/${ONBOARDING_SWARM_DIMENSIONS.length}: ${dimension.title}.`,
+    }, now);
   }
-  const dimensions = [];
-  for (const worker of spawned) {
+  const dimensions = await Promise.all(spawned.map(async (worker, index) => {
     try {
       await waitForCoordinatorDone(coordinator, worker.agent_id);
       const collected = coordinator.collect(worker.agent_id);
-      dimensions.push({
+      const result = {
         id: worker.id,
         title: worker.title,
         agent_id: worker.agent_id,
         status: collected.ready ? "done" : "not_ready",
         verdict: collected.step_result?.verdict ?? null,
         artifacts: collected.artifacts?.length ? collected.artifacts : [worker.artifact],
-      });
+      };
+      await emitOnboardingProgress(onProgress, {
+        phase: "investigation",
+        status: result.status,
+        worker_id: worker.id,
+        worker_title: worker.title,
+        worker_index: index + 1,
+        worker_count: spawned.length,
+        message: `AIPI onboarding: investigation ${index + 1}/${spawned.length} ${result.status}: ${worker.title}.`,
+      }, now);
+      return result;
     } catch (error) {
-      dimensions.push({
+      const result = {
         id: worker.id,
         title: worker.title,
         agent_id: worker.agent_id,
         status: "failed",
         error: String(error?.message ?? error),
         artifacts: [worker.artifact],
-      });
+      };
+      await emitOnboardingProgress(onProgress, {
+        phase: "investigation",
+        status: "failed",
+        worker_id: worker.id,
+        worker_title: worker.title,
+        worker_index: index + 1,
+        worker_count: spawned.length,
+        message: `AIPI onboarding: investigation ${index + 1}/${spawned.length} failed: ${worker.title}.`,
+      }, now);
+      return result;
     }
-  }
+  }));
+  await emitOnboardingProgress(onProgress, {
+    phase: "investigation",
+    status: dimensions.every((item) => item.status === "done") ? "done" : "partial",
+    message: `AIPI onboarding: investigation swarm finished (${dimensions.filter((item) => item.status === "done").length}/${dimensions.length} done).`,
+  }, now);
   return {
     mode: "swarm",
     status: dimensions.every((item) => item.status === "done") ? "done" : "partial",

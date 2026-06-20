@@ -12,8 +12,11 @@ import {
   aipiRuleGap,
   aipiRuleLookup,
   aipiSemanticSearch,
+  checkSemanticEmbeddingReadiness,
   rebuildCodeGraph,
   registerAipiRuntimeTools,
+  resolveEmbeddingDimensions,
+  resolveSemanticEmbeddingConfig,
 } from "../extensions/aipi/runtime/aipi-tools.js";
 import {
   formatMemoryCommandResult,
@@ -31,6 +34,29 @@ const semanticOptions = {
 
 try {
   await initProject({ sourceRoot, targetRoot: tempRoot });
+  assert.equal(resolveEmbeddingDimensions({ model: "nomic-embed-text" }), 1024);
+  assert.equal(resolveEmbeddingDimensions({ model: "bge-m3" }), 1024);
+  const envPinnedConfig = await resolveSemanticEmbeddingConfig({
+    root: tempRoot,
+    env: { AIPI_OLLAMA_MODEL: "nomic-embed-text", AIPI_OLLAMA_DIMENSIONS: "768" },
+  });
+  assert.equal(envPinnedConfig.model, "bge-m3");
+  assert.equal(envPinnedConfig.dimensions, 1024);
+  const missingLegacyReadiness = await checkSemanticEmbeddingReadiness({
+    config: { host: "http://ollama.test:11434", model: "nomic-embed-text", dimensions: 768 },
+    fetchFn: fakeMissingTagsFetch(),
+  });
+  assert.equal(missingLegacyReadiness.status, "model_missing");
+  assert.equal(missingLegacyReadiness.model, "bge-m3");
+  assert.equal(missingLegacyReadiness.dimensions, 1024);
+  assert.equal(missingLegacyReadiness.action, "ollama pull bge-m3");
+  assert.match(missingLegacyReadiness.message, /model bge-m3 is not pulled/);
+  assert.match(missingLegacyReadiness.message, /ollama pull bge-m3/);
+  assert.match(missingLegacyReadiness.message, /1024-dim bge-m3/);
+  assert.match(missingLegacyReadiness.message, /AIPI_OLLAMA_HOST/);
+  assert.doesNotMatch(missingLegacyReadiness.message, /nomic-embed-text|768-dim/);
+  assert.doesNotMatch(missingLegacyReadiness.message, /AIPI_OLLAMA_MODEL|AIPI_OLLAMA_DIMENSIONS/);
+
   const pristineGraph = await rebuildCodeGraph({
     projectRoot: tempRoot,
     now: () => new Date("2026-06-15T23:00:00.000Z"),
@@ -777,6 +803,164 @@ try {
   });
   assert.equal(lexicalFallback.refs.some((ref) => ref.path === "src/billing.js"), true);
 
+  const legacyRoot = path.join(tempRoot, "legacy-semantic-project");
+  await fs.mkdir(path.join(legacyRoot, "src"), { recursive: true });
+  await initProject({ sourceRoot, targetRoot: legacyRoot });
+  await fs.writeFile(path.join(legacyRoot, "src", "legacy.js"), "export function legacySemanticProject() {\n  return true;\n}\n");
+  await fs.writeFile(
+    path.join(legacyRoot, ".aipi", "semantic-memory.json"),
+    `${JSON.stringify({
+      schema: "aipi.semantic-memory.v1",
+      ollama_host: "http://localhost:11434",
+      ollama_model: "nomic-embed-text",
+      dimensions: 768,
+      rule: "old default",
+    }, null, 2)}\n`,
+  );
+  const legacyEmbeddingCalls = [];
+  const legacyGraph = await rebuildCodeGraph({
+    projectRoot: legacyRoot,
+    now: () => new Date("2026-06-19T15:00:00.000Z"),
+    env: {
+      AIPI_OLLAMA_HOST: "http://ollama.test:11434",
+      AIPI_OLLAMA_MODEL: "nomic-embed-text",
+      AIPI_OLLAMA_DIMENSIONS: "768",
+    },
+    embeddingFetch: fakeEmbeddingFetch(legacyEmbeddingCalls),
+  });
+  const migratedSemanticConfigText = await fs.readFile(path.join(legacyRoot, ".aipi", "semantic-memory.json"), "utf8");
+  const migratedSemanticConfig = JSON.parse(migratedSemanticConfigText);
+  assert.equal(migratedSemanticConfig.ollama_model, "bge-m3");
+  assert.equal(migratedSemanticConfig.dimensions, 1024);
+  assert.doesNotMatch(migratedSemanticConfigText, /nomic-embed-text|768/);
+  assert.equal(legacyGraph.vector.dimensions, 1024);
+  assert.equal(legacyGraph.vector.embedding_model, "bge-m3");
+  assert.equal(legacyGraph.vector.config_migration?.from_model, "nomic-embed-text");
+  if (legacyGraph.vector.status === "available") {
+    const sqlite = await import("node:sqlite").catch(() => null);
+    if (sqlite) {
+      const db = new sqlite.DatabaseSync(path.join(legacyRoot, ".aipi", "state", "aipi-graph.sqlite"), { readOnly: true });
+      const vectorTable = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'code_vectors'").get()?.sql ?? "";
+      db.close();
+      assert.match(vectorTable, /float\[1024\]/);
+    }
+  }
+
+  const vectorlessRoot = path.join(tempRoot, "vectorless-semantic-project");
+  const vectorlessEnv = {
+    AIPI_OLLAMA_HOST: "http://ollama.test:11434",
+    AIPI_OLLAMA_MODEL: "nomic-embed-text",
+    AIPI_OLLAMA_DIMENSIONS: "768",
+  };
+  await fs.mkdir(path.join(vectorlessRoot, "src"), { recursive: true });
+  await initProject({ sourceRoot, targetRoot: vectorlessRoot });
+  await fs.writeFile(path.join(vectorlessRoot, "src", "vectorless.js"), "export function vectorlessLookup() {\n  return 'ok';\n}\n");
+  await fs.mkdir(path.join(vectorlessRoot, ".aipi", "state", "aipi-graph.sqlite"), { recursive: true });
+  const vectorlessGraph = await rebuildCodeGraph({
+    projectRoot: vectorlessRoot,
+    now: () => new Date("2026-06-19T16:00:00.000Z"),
+    env: vectorlessEnv,
+    embeddingFetch: fakeAvailableTagsFetch("bge-m3"),
+  });
+  assert.equal(vectorlessGraph.sqlite.status, "unavailable");
+  assert.equal(vectorlessGraph.vector.dimensions, 1024);
+  assert.equal(vectorlessGraph.vector.embedding_model, "bge-m3");
+  assert.equal(vectorlessGraph.freshness.status, "fresh");
+  const vectorlessCallers = await aipiCallers({
+    projectRoot: vectorlessRoot,
+    symbol: "vectorlessLookup",
+    env: vectorlessEnv,
+    embeddingFetch: fakeAvailableTagsFetch("bge-m3"),
+  });
+  assert.equal(vectorlessCallers.graph.freshness.status, "fresh");
+  assert.doesNotMatch(vectorlessCallers.graph.freshness.reason ?? "", /embedding dimension mismatch/);
+
+  const currentReadRoot = path.join(tempRoot, "current-readonly-project");
+  await fs.mkdir(path.join(currentReadRoot, "src"), { recursive: true });
+  await initProject({ sourceRoot, targetRoot: currentReadRoot });
+  await fs.writeFile(path.join(currentReadRoot, "src", "readonly.js"), "export function currentReadOnlyLookup() {\n  return 'ok';\n}\n");
+  await rebuildCodeGraph({
+    projectRoot: currentReadRoot,
+    now: () => new Date("2026-06-19T17:00:00.000Z"),
+    env: { AIPI_OLLAMA_HOST: "http://ollama.test:11434" },
+    embeddingFetch: fakeEmbeddingFetch([]),
+  });
+  const currentConfigPath = path.join(currentReadRoot, ".aipi", "semantic-memory.json");
+  const currentGraphPath = path.join(currentReadRoot, ".aipi", "state", "aipi-graph.json");
+  const currentConfigBefore = await fs.readFile(currentConfigPath, "utf8");
+  const currentGraphBefore = await fs.readFile(currentGraphPath, "utf8");
+  const currentReadOnlyCallers = await aipiCallers({
+    projectRoot: currentReadRoot,
+    symbol: "currentReadOnlyLookup",
+    env: { AIPI_OLLAMA_HOST: "http://ollama.test:11434" },
+    embeddingFetch: fakeEmbeddingFetch([]),
+  });
+  assert.equal(await fs.readFile(currentConfigPath, "utf8"), currentConfigBefore);
+  assert.equal(await fs.readFile(currentGraphPath, "utf8"), currentGraphBefore);
+  assert.equal(currentReadOnlyCallers.graph.freshness.status, "fresh");
+  assert.equal(currentReadOnlyCallers.graph.rebuilt_from_stale ?? null, null);
+
+  const legacyReadRoot = path.join(tempRoot, "legacy-read-migrates-project");
+  await fs.mkdir(path.join(legacyReadRoot, "src"), { recursive: true });
+  await initProject({ sourceRoot, targetRoot: legacyReadRoot });
+  await fs.writeFile(path.join(legacyReadRoot, "src", "legacy-migrate.js"), "export function legacyReadMigratesLookup() {\n  return 'ok';\n}\n");
+  await fs.writeFile(
+    path.join(legacyReadRoot, ".aipi", "semantic-memory.json"),
+    `${JSON.stringify({
+      schema: "aipi.semantic-memory.v1",
+      ollama_host: "http://localhost:11434",
+      ollama_model: "nomic-embed-text",
+      dimensions: 768,
+      rule: "old default",
+    }, null, 2)}\n`,
+  );
+  const legacyReadGraphPath = path.join(legacyReadRoot, ".aipi", "state", "aipi-graph.json");
+  await fs.mkdir(path.dirname(legacyReadGraphPath), { recursive: true });
+  await fs.writeFile(
+    legacyReadGraphPath,
+    `${JSON.stringify({
+      schema: "aipi.code-graph.v1",
+      built_at: "2026-06-19T17:15:00.000Z",
+      source: "sqlite+lexical",
+      stale: false,
+      files: [{ path: "src/legacy-migrate.js", line_count: 3, size: 65, hash: "legacy" }],
+      symbols: [],
+      relationships: [],
+      run_outcomes: [],
+      sqlite: { path: ".aipi/state/aipi-graph.sqlite", status: "unavailable" },
+      vector: {
+        status: "unavailable",
+        engine: "sqlite-vec",
+        dimensions: 768,
+        embedding_model: "nomic-embed-text",
+      },
+      freshness: { status: "fresh" },
+    }, null, 2)}\n`,
+  );
+  const migratedFromRead = await aipiCallers({
+    projectRoot: legacyReadRoot,
+    symbol: "legacyReadMigratesLookup",
+    env: { AIPI_OLLAMA_HOST: "http://ollama.test:11434" },
+    embeddingFetch: fakeEmbeddingFetch([]),
+  });
+  assert.match(migratedFromRead.graph.rebuilt_from_stale.reason, /legacy embedding config migration required|embedding dimension mismatch/);
+  assert.equal(migratedFromRead.graph.vector.dimensions, 1024);
+  assert.equal(migratedFromRead.graph.vector.embedding_model, "bge-m3");
+  const migratedReadConfig = await fs.readFile(path.join(legacyReadRoot, ".aipi", "semantic-memory.json"), "utf8");
+  assert.doesNotMatch(migratedReadConfig, /nomic-embed-text|768/);
+  const migratedReadGraphAfterFirst = await fs.readFile(legacyReadGraphPath, "utf8");
+  const migratedReadConfigAfterFirst = await fs.readFile(path.join(legacyReadRoot, ".aipi", "semantic-memory.json"), "utf8");
+  const secondLegacyRead = await aipiCallers({
+    projectRoot: legacyReadRoot,
+    symbol: "legacyReadMigratesLookup",
+    env: { AIPI_OLLAMA_HOST: "http://ollama.test:11434" },
+    embeddingFetch: fakeEmbeddingFetch([]),
+  });
+  assert.equal(await fs.readFile(legacyReadGraphPath, "utf8"), migratedReadGraphAfterFirst);
+  assert.equal(await fs.readFile(path.join(legacyReadRoot, ".aipi", "semantic-memory.json"), "utf8"), migratedReadConfigAfterFirst);
+  assert.equal(secondLegacyRead.graph.freshness.status, "fresh");
+  assert.equal(secondLegacyRead.graph.rebuilt_from_stale ?? null, null);
+
   const kanban = await aipiKanbanUpdate({
     projectRoot: tempRoot,
     task: "billing renewal",
@@ -900,27 +1084,57 @@ async function pathExists(filePath) {
 }
 
 function fakeEmbeddingFetch(calls) {
+  return fakeEmbeddingFetchForModel(calls, "bge-m3", 1024);
+}
+
+function fakeEmbeddingFetchForModel(calls, expectedModel, dimensions) {
   return async (url, options = {}) => {
     if (String(url).endsWith("/api/tags")) {
       return {
         ok: true,
         status: 200,
         async json() {
-          return { models: [{ name: "bge-m3" }] };
+          return { models: [{ name: expectedModel }] };
         },
       };
     }
     const body = JSON.parse(options.body ?? "{}");
     const input = Array.isArray(body.input) ? String(body.input[0] ?? "") : String(body.input ?? "");
-    assert.equal(body.model, "bge-m3");
+    assert.equal(body.model, expectedModel);
     calls.push({ url: String(url), model: body.model, input });
-    const vector = new Array(1024).fill(0);
+    const vector = new Array(dimensions).fill(0);
     vector[Math.abs(hashText(input)) % vector.length] = 1;
     return {
       ok: true,
       status: 200,
       async json() {
         return { embeddings: [vector] };
+      },
+    };
+  };
+}
+
+function fakeMissingTagsFetch() {
+  return async (url) => {
+    assert.match(String(url), /\/api\/tags$/);
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return { models: [] };
+      },
+    };
+  };
+}
+
+function fakeAvailableTagsFetch(model) {
+  return async (url) => {
+    assert.match(String(url), /\/api\/tags$/);
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return { models: [{ name: model }] };
       },
     };
   };

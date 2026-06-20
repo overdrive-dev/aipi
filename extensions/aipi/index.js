@@ -70,6 +70,7 @@ export default function aipiExtension(pi) {
           ctx,
           coordinator,
           skip: options.noOnboard || options.dryRun,
+          onProgress: (event) => ctx.ui.notify(event.message, "info"),
         });
         ctx.ui.notify(formatOnboardingResult(onboarding), onboarding.action === "onboard" ? "info" : "warning");
       } catch (error) {
@@ -92,6 +93,7 @@ export default function aipiExtension(pi) {
           hostModel,
           askUser: !options.noQuestions,
           runWorker: Boolean(hostModel),
+          onProgress: (event) => ctx.ui.notify(event.message, "info"),
         });
         ctx.ui.notify(formatOnboardingResult(result), "info");
       } catch (error) {
