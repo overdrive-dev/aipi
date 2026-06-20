@@ -148,7 +148,10 @@ steps:
     name: Promote bug learnings
     prompt: >
       Propose durable root-cause lessons, gotchas, and rule/code links through
-      orchestrator-owned memory tools.
+      orchestrator-owned memory tools. Return PASS only when the step result
+      includes memory_promotions entries with kind, title, content, and
+      source_ref for each durable fact; otherwise return SKIPPED with
+      no_durable_memory_signal.
     requires: [review]
     context_from: [triage, rule_impact, verify, review]
     produces:

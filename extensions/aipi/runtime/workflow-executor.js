@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { awaitingUserInputFromStepResult } from "./blocker-input.js";
 import { buildStepContext, ContextMaterializationError } from "./context-builder.js";
+import { aipiPromoteMemory } from "./aipi-tools.js";
 import { resolveStepModel } from "./model-router.js";
 import { validateStepResult } from "./step-result.js";
 
@@ -119,9 +120,12 @@ export async function executeWorkflowRun({
     const missingArtifacts = validation.gatePassed
       ? await missingRequiredArtifacts({ root, state, step, result })
       : [];
+    const memoryPromotionGate = validation.gatePassed && missingArtifacts.length === 0
+      ? await materializeStepMemoryPromotions({ root, state, step, result, now })
+      : null;
     await writeStepResult({ root, state, step, result, validation, missingArtifacts });
 
-    if (validation.gatePassed && missingArtifacts.length === 0) {
+    if (validation.gatePassed && missingArtifacts.length === 0 && !memoryPromotionGate?.error) {
       const status = result.verdict === "SKIPPED" ? "skipped" : "passed";
       markStep(state, step.id, {
         status,
@@ -140,9 +144,13 @@ export async function executeWorkflowRun({
       continue;
     }
 
-    const target = missingArtifacts.length ? step.gate.on_verdict?.FAIL ?? null : branchTarget(step, validation);
+    const target = missingArtifacts.length || memoryPromotionGate?.error
+      ? step.gate.on_verdict?.FAIL ?? null
+      : branchTarget(step, validation);
     const error = missingArtifacts.length
       ? `missing required artifacts: ${missingArtifacts.join(", ")}`
+      : memoryPromotionGate?.error
+        ? memoryPromotionGate.error
       : validation.errors.length
         ? validation.errors.join("; ")
         : policyGateMessage(validation, target);
@@ -644,6 +652,124 @@ async function writeStepResult({ root, state, step, result, validation, missingA
   });
 }
 
+async function materializeStepMemoryPromotions({ root, state, step, result, now }) {
+  if (!isMemoryPromotionStep(step) || result?.verdict === "SKIPPED") return null;
+  if (result?.verdict !== "PASS") return null;
+
+  const promotions = Array.isArray(result.memory_promotions) ? result.memory_promotions : [];
+  const createdAt = now().toISOString();
+  const approvalRel = path.join(
+    ".aipi",
+    "runtime",
+    "approvals",
+    "approved",
+    `${safeArtifactName(state.run_id)}-${safeArtifactName(step.id)}-memory-promotion.json`,
+  ).replaceAll("\\", "/");
+  const resultRel = path.join(
+    runRelDir(state),
+    "steps",
+    step.id,
+    "MEMORY-PROMOTION-RESULT.json",
+  ).replaceAll("\\", "/");
+
+  const outputs = [];
+  const errors = [];
+  if (!promotions.length) {
+    errors.push("memory-promotion PASS requires memory_promotions; return SKIPPED with no_durable_memory_signal when there is no durable fact");
+  } else {
+    await writeControllerArtifact({
+      root,
+      state,
+      step,
+      relPath: approvalRel,
+      internal: true,
+      content: `${JSON.stringify({
+        schema: "aipi.memory-promotion-approval.v1",
+        decision: "APPROVED",
+        source: "aipi-workflow-executor",
+        run_id: state.run_id,
+        step_id: step.id,
+        created_at: createdAt,
+      }, null, 2)}\n`,
+    });
+
+    for (const [index, candidate] of promotions.entries()) {
+      const normalized = normalizeMemoryPromotion(candidate, { result, state, step });
+      if (!normalized.ok) {
+        errors.push(`memory_promotions[${index}]: ${normalized.error}`);
+        outputs.push({ index, status: "rejected", error: normalized.error });
+        continue;
+      }
+
+      try {
+        const toolResult = await aipiPromoteMemory({
+          projectRoot: root,
+          kind: normalized.value.kind,
+          title: normalized.value.title,
+          content: normalized.value.content,
+          source_ref: normalized.value.source_ref,
+          user_memory: normalized.value.user_memory,
+          approval_ref: approvalRel,
+          run_id: state.run_id,
+          now,
+        });
+        outputs.push({ index, input: normalized.value, result: toolResult });
+        if (toolResult.status !== "promoted") {
+          errors.push(`memory_promotions[${index}]: aipi_promote_memory returned ${toolResult.status}`);
+        }
+      } catch (error) {
+        errors.push(`memory_promotions[${index}]: ${error.message}`);
+        outputs.push({ index, input: normalized.value, status: "error", error: error.message });
+      }
+    }
+  }
+
+  const promotedCount = outputs.filter((item) => item.result?.status === "promoted").length;
+  const changedCount = outputs.filter((item) => item.result?.status === "promoted" && item.result.changed).length;
+  if (promotions.length && promotedCount === 0) {
+    errors.push("memory-promotion PASS produced no durable promotions through aipi_promote_memory");
+  }
+
+  const record = {
+    schema: "aipi.memory-promotion-result.v1",
+    run_id: state.run_id,
+    step_id: step.id,
+    approval_ref: approvalRel,
+    result_ref: resultRel,
+    created_at: createdAt,
+    promoted: promotedCount,
+    changed: changedCount,
+    errors,
+    promotions: outputs,
+  };
+  await writeControllerArtifact({
+    root,
+    state,
+    step,
+    relPath: resultRel,
+    internal: true,
+    content: `${JSON.stringify(record, null, 2)}\n`,
+  });
+
+  result.memory_promotion_result = {
+    schema: record.schema,
+    status: errors.length ? "failed" : "promoted",
+    approval_ref: approvalRel,
+    result_ref: resultRel,
+    promoted: promotedCount,
+    changed: changedCount,
+    errors,
+  };
+  if (!Array.isArray(result.artifacts)) result.artifacts = [];
+  if (!result.artifacts.includes(resultRel)) result.artifacts.push(resultRel);
+
+  return {
+    error: errors.length ? `memory promotion gate failed: ${errors.join("; ")}` : null,
+    record,
+    resultRel,
+  };
+}
+
 async function missingRequiredArtifacts({ root, state, step, result }) {
   if (result.verdict === "SKIPPED") return [];
   const missing = [];
@@ -700,7 +826,53 @@ function renderStepResultMarkdown({ step, result, validation, missingArtifacts }
     "",
     ...(result?.evidence ?? []).map((item) => `- ${item.rung} ${item.source} ${item.ref}: ${item.result}`),
     "",
+    ...(result?.memory_promotion_result
+      ? [
+          "## Memory Promotion",
+          "",
+          `- status: ${result.memory_promotion_result.status}`,
+          `- promoted: ${result.memory_promotion_result.promoted}`,
+          `- changed: ${result.memory_promotion_result.changed}`,
+          `- result_ref: ${result.memory_promotion_result.result_ref}`,
+          "",
+        ]
+      : []),
   ].join("\n");
+}
+
+function isMemoryPromotionStep(step) {
+  return step?.stage === "memory-promotion" || step?.id === "memory_promotion" || step?.id === "quick_memory";
+}
+
+function normalizeMemoryPromotion(candidate, { result, state, step }) {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return { ok: false, error: "entry must be an object" };
+  }
+  const kind = String(candidate.kind ?? candidate.type ?? "").trim();
+  const content = String(candidate.content ?? "").trim();
+  if (!kind) return { ok: false, error: "kind is required" };
+  if (!content) return { ok: false, error: "content is required" };
+  return {
+    ok: true,
+    value: {
+      kind,
+      title: String(candidate.title ?? "").trim(),
+      content,
+      source_ref: String(candidate.source_ref ?? firstEvidenceRef(result) ?? resultPathFor(state, step)).trim(),
+      user_memory: Boolean(candidate.user_memory),
+    },
+  };
+}
+
+function firstEvidenceRef(result) {
+  return (result?.evidence ?? []).find((item) => item?.ref)?.ref ?? null;
+}
+
+function safeArtifactName(value) {
+  return String(value ?? "")
+    .replace(/[^A-Za-z0-9_.-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    || "item";
 }
 
 function parseInlineList(value) {

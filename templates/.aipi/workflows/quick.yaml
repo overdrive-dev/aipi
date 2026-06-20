@@ -111,7 +111,10 @@ steps:
     name: Promote quick-lane learnings
     prompt: >
       Record no-signal unless the quick run produced a reusable rule, decision,
-      gotcha, procedure, or user workflow preference candidate.
+      gotcha, procedure, or user workflow preference candidate. Return PASS
+      only when the step result includes memory_promotions entries with kind,
+      title, content, and source_ref for each durable fact; otherwise return
+      SKIPPED with no_durable_memory_signal.
     requires: [quick_review]
     context_from: [quick_scope, quick_verify, quick_review]
     produces:

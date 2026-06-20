@@ -221,7 +221,10 @@ steps:
     name: Promote durable memory
     prompt: >
       Propose reusable facts through orchestrator-owned memory tools. Agents
-      never write durable shared memory directly.
+      never write durable shared memory directly. Return PASS only when the
+      step result includes memory_promotions entries with kind, title,
+      content, and source_ref for each durable fact; otherwise return SKIPPED
+      with no_durable_memory_signal.
     requires: [deployment_suggestion]
     context_from: [final_verification, deployment_suggestion]
     produces:

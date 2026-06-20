@@ -410,10 +410,11 @@ Claim evidence anchors for the live runtime surfaces are `test:workflow-executor
   rules. Related accepted/proposed rules that declare different values in the
   same currency now produce `implicit monetary mismatch conflict` graph edges,
   with BRL/USD fixture coverage in `npm run test:aipi-tools`.
-- Round 67: stabilized the SQLite/sqlite-vec graph writer with an explicit
-  `BEGIN IMMEDIATE`/`COMMIT` transaction and best-effort `ROLLBACK`. This keeps
-  vector/code-line indexing from doing thousands of synchronous autocommits and
-  is now guarded by template validation.
+- Round 67/Round 42: stabilized the SQLite/sqlite-vec graph writer with explicit
+  short `BEGIN IMMEDIATE`/`COMMIT` transactions. Static graph rows and code lines
+  commit separately from per-file vector/cache batches, so interrupted semantic
+  builds preserve completed `embedding_cache` progress and avoid one giant
+  rollback scope while still avoiding thousands of synchronous autocommits.
 - Round 68: added conservative threshold-direction conflict inference. Related
   business rules that declare the same numeric unit/value with opposite bounds,
   such as `at least 3 attempts` versus `at most 3 attempts`, now produce

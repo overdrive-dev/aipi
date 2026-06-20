@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { initProject } from "../extensions/aipi/runtime/project-init.js";
 import {
+  inventoryRepository,
   maybeRunPostInitOnboarding,
   runProjectOnboarding,
 } from "../extensions/aipi/runtime/onboarding.js";
@@ -60,6 +61,10 @@ try {
   assert.equal(onboarded.investigation.mode, "swarm");
   assert.equal(onboarded.investigation.spawned_count > 1, true);
   assert.equal(coordinator.spawned.length > 1, true);
+  const domainRulesSpawn = coordinator.spawned.find((item) => item.params.step_id === "project_onboarding_domain-rules");
+  assert.ok(domainRulesSpawn);
+  assert.match(domainRulesSpawn.params.context_packet, /validation guards/);
+  assert.match(domainRulesSpawn.params.context_packet, /CANDIDATE: <specific rule statement> \| source_ref:/);
   assert.equal(progressEvents.length > 1, true);
   assert.equal(
     progressEvents.filter((event) => event.phase === "investigation" && event.status === "spawned").length,
@@ -89,6 +94,8 @@ try {
 
   const seededProjectMemory = await fs.readFile(projectMemoryPath, "utf8");
   assert.doesNotMatch(seededProjectMemory, /Replace this section during/);
+  assert.match(seededProjectMemory, /onboarding_seeded: true/);
+  assert.match(seededProjectMemory, /onboarding_schema_version: 2/);
   assert.match(seededProjectMemory, /nora-app appears|React Native/);
   assert.match(seededProjectMemory, /React Native/);
   assert.match(seededProjectMemory, /Python/);
@@ -98,6 +105,69 @@ try {
   const businessRulesMemory = await fs.readFile(path.join(tempRoot, ".aipi", "memory", "project", "business-rules.md"), "utf8");
   assert.match(businessRulesMemory, /Candidate business\/domain context inferred from code/);
   assert.match(businessRulesMemory, /care workflows|patient|clinical|task/);
+
+  const docHeavyRoot = path.join(tempRoot, "doc-heavy-monorepo");
+  await writeDocHeavyMonorepo(docHeavyRoot);
+  const docHeavyInventory = await inventoryRepository(docHeavyRoot);
+  assert.equal(docHeavyInventory.file_count > 430, true);
+  assert.deepEqual(
+    docHeavyInventory.package_manifests.map((manifest) => manifest.path).sort(),
+    ["frontend/package.json", "package.json"],
+  );
+  assert.deepEqual(
+    docHeavyInventory.python.pyprojects.sort(),
+    ["backend/pyproject.toml", "pyproject.toml"],
+  );
+  assert.equal(docHeavyInventory.stack.includes("React Native"), true);
+  assert.equal(docHeavyInventory.stack.includes("Python"), true);
+  assert.equal(docHeavyInventory.stack.includes("frontend/backend monorepo"), true);
+  assert.equal(docHeavyInventory.entry_points.includes("frontend/src/App.tsx"), true);
+  assert.equal(docHeavyInventory.commands.some((command) => /frontend\/package\.json: npm run start/.test(command)), true);
+  const markdownCount = docHeavyInventory.languages.find((item) => item.language === "Markdown")?.count ?? 0;
+  const typescriptCount = docHeavyInventory.languages
+    .filter((item) => /TypeScript|React Native/.test(item.language))
+    .reduce((sum, item) => sum + item.count, 0);
+  const pythonCount = docHeavyInventory.languages.find((item) => item.language === "Python")?.count ?? 0;
+  assert.equal(markdownCount < 50, true);
+  assert.equal(typescriptCount >= 12, true);
+  assert.equal(pythonCount >= 10, true);
+
+  const freeTextRoot = path.join(tempRoot, "free-text-repo");
+  await writeFixtureRepo(freeTextRoot);
+  await initProject({ sourceRoot, targetRoot: freeTextRoot });
+  await runProjectOnboarding({
+    projectRoot: freeTextRoot,
+    answers: {
+      domain: "verificar no codigo, sao muitas. o principal e a gestao relatorios, troca de plantao, etc funcionar",
+    },
+    askUser: false,
+    runWorker: false,
+    materializeGraph: false,
+  });
+  const freeTextBusinessRules = await fs.readFile(path.join(freeTextRoot, ".aipi", "memory", "project", "business-rules.md"), "utf8");
+  const freeTextGlossary = await fs.readFile(path.join(freeTextRoot, ".aipi", "memory", "project", "glossary.md"), "utf8");
+  assert.doesNotMatch(freeTextBusinessRules, /etc funcionar|sao muitas\. o principal/i);
+  assert.doesNotMatch(freeTextGlossary, /etc funcionar|sao muitas\. o principal/i);
+
+  const concreteRuleRoot = path.join(tempRoot, "concrete-rule-repo");
+  await writeConcreteRuleRepo(concreteRuleRoot);
+  await initProject({ sourceRoot, targetRoot: concreteRuleRoot });
+  await runProjectOnboarding({
+    projectRoot: concreteRuleRoot,
+    askUser: false,
+    runWorker: false,
+    materializeGraph: false,
+  });
+  const concreteRuleMemory = await fs.readFile(path.join(concreteRuleRoot, ".aipi", "memory", "project", "business-rules.md"), "utf8");
+  assert.match(concreteRuleMemory, /Concrete candidate business rules were inferred from source evidence/);
+  assert.match(concreteRuleMemory, /CANDIDATE: price must be at least 0\. source_ref: backend\/services\/pricing\.py:2/);
+  assert.doesNotMatch(concreteRuleMemory, /Changes touching .* should preserve behavior inferred from related models, services, and tests/);
+  assert.doesNotMatch(concreteRuleMemory, /\*\*status:\*\* accepted|status:\s*accepted/i);
+  const concreteCandidateLines = concreteRuleMemory
+    .split(/\r?\n/)
+    .filter((line) => line.includes("CANDIDATE:"));
+  assert.equal(concreteCandidateLines.length >= 1, true);
+  assert.equal(concreteCandidateLines.every((line) => /source_ref:\s*\S+/.test(line)), true);
 
   const noPullRoot = path.join(tempRoot, "no-pull-repo");
   await writeFixtureRepo(noPullRoot);
@@ -181,6 +251,46 @@ try {
   assert.equal(recommendationCalls.length, 1);
   assert.equal(recommendationCalls[0].options.length, 4);
   assert.equal(recommendationCalls[0].options.at(-1), "Other / free text");
+
+  await fs.writeFile(
+    projectMemoryPath,
+    [
+      "---",
+      "type: project",
+      "owner: project",
+      "status: draft",
+      "last_reviewed: -",
+      "---",
+      "",
+      "# Project Context",
+      "",
+      "## Current truth",
+      "",
+      "Old inventory says this is Python only.",
+      "",
+      "## Open questions",
+      "",
+      "- Which commands exist?",
+      "",
+      "## Timeline",
+      "",
+      "- 2026-06-19: Seeded by /aipi-onboard.",
+      "",
+    ].join("\n"),
+  );
+  const refreshedAutoSeed = await runProjectOnboarding({
+    projectRoot: tempRoot,
+    answers: { purpose: "Refreshed inventory should replace stale auto-seeded memory." },
+    askUser: false,
+    runWorker: false,
+    materializeGraph: false,
+    now: () => new Date("2026-06-20T08:00:00.000Z"),
+  });
+  assert.equal(refreshedAutoSeed.memory.written.includes("project.md"), true);
+  const refreshedProjectMemory = await fs.readFile(projectMemoryPath, "utf8");
+  assert.match(refreshedProjectMemory, /Refreshed inventory should replace stale auto-seeded memory/);
+  assert.match(refreshedProjectMemory, /onboarding_schema_version: 2/);
+  assert.doesNotMatch(refreshedProjectMemory, /Old inventory says this is Python only|Open questions/);
 
   const customized = `${seededProjectMemory}\n<!-- user-customized -->\n`;
   await fs.writeFile(projectMemoryPath, customized);
@@ -443,4 +553,53 @@ async function writeFixtureRepo(root) {
   await fs.writeFile(path.join(root, "backend", "requirements.txt"), "fastapi\npytest\n");
   await fs.writeFile(path.join(root, ".github", "workflows", "ci.yml"), "name: ci\n");
   await fs.writeFile(path.join(root, "Dockerfile"), "FROM python:3.12-slim\n");
+}
+
+async function writeConcreteRuleRepo(root) {
+  await fs.mkdir(path.join(root, "backend", "services"), { recursive: true });
+  await fs.writeFile(
+    path.join(root, "backend", "services", "pricing.py"),
+    [
+      "def create_invoice(price):",
+      "    if price < 0:",
+      "        raise ValueError('price must be non-negative')",
+      "    return {'price': price}",
+      "",
+    ].join("\n"),
+  );
+  await fs.writeFile(
+    path.join(root, "package.json"),
+    `${JSON.stringify({ name: "pricing-service", scripts: { test: "pytest" } }, null, 2)}\n`,
+  );
+}
+
+async function writeDocHeavyMonorepo(root) {
+  await fs.mkdir(path.join(root, ".aihaus", "milestones"), { recursive: true });
+  for (let index = 0; index < 420; index += 1) {
+    await fs.writeFile(path.join(root, ".aihaus", "milestones", `story-${index}.md`), `# Story ${index}\n`);
+  }
+  await fs.mkdir(path.join(root, "frontend", "src", "screens"), { recursive: true });
+  await fs.mkdir(path.join(root, "backend", "app", "services"), { recursive: true });
+  await fs.writeFile(
+    path.join(root, "package.json"),
+    `${JSON.stringify({ name: "workspace-root", scripts: { test: "npm --prefix frontend test" } }, null, 2)}\n`,
+  );
+  await fs.writeFile(
+    path.join(root, "frontend", "package.json"),
+    `${JSON.stringify({
+      name: "nora-frontend",
+      scripts: { start: "expo start", test: "jest", typecheck: "tsc --noEmit" },
+      dependencies: { expo: "^50.0.0", "react-native": "^0.74.0" },
+      devDependencies: { typescript: "^5.0.0" },
+    }, null, 2)}\n`,
+  );
+  await fs.writeFile(path.join(root, "pyproject.toml"), "[project]\nname = \"workspace-root\"\n");
+  await fs.writeFile(path.join(root, "backend", "pyproject.toml"), "[project]\nname = \"nora-backend\"\n");
+  await fs.writeFile(path.join(root, "frontend", "src", "App.tsx"), "export default function App() { return null; }\n");
+  for (let index = 0; index < 12; index += 1) {
+    await fs.writeFile(path.join(root, "frontend", "src", "screens", `Screen${index}.tsx`), `export const Screen${index} = () => null;\n`);
+  }
+  for (let index = 0; index < 10; index += 1) {
+    await fs.writeFile(path.join(root, "backend", "app", "services", `service_${index}.py`), `def handler_${index}():\n    return True\n`);
+  }
 }

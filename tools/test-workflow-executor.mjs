@@ -125,6 +125,131 @@ try {
     ],
   );
 
+  await fs.appendFile(
+    path.join(tempRoot, ".aipi", "memory", "project", "business-rules.md"),
+    "\n## Human Notes\n\nManual business-rule context must survive promotion.\n",
+  );
+  const featureMemoryAdapter = createMemoryPromotionWorkflowAdapter({
+    memory_promotion: [
+      {
+        kind: "decision",
+        title: "Feature memory decision",
+        content: "Feature workflows promote accepted pricing decisions after final verification.",
+        source_ref: "memory://feature/accepted-pricing",
+      },
+      {
+        kind: "business-rule",
+        title: "Feature memory business rule",
+        content: "- **statement:** Feature workflows persist durable business rules after verification.",
+        source_ref: "memory://feature/business-rule",
+      },
+    ],
+  });
+  const featureMemoryRun = await runWorkflowCommand({
+    args: "run feature",
+    projectRoot: tempRoot,
+    adapter: featureMemoryAdapter,
+  });
+  assert.equal(featureMemoryRun.execution.status, "completed");
+  assert.equal(
+    featureMemoryRun.execution.state.steps.find((step) => step.id === "memory_promotion").status,
+    "passed",
+  );
+  const decisionsText = await fs.readFile(path.join(tempRoot, ".aipi", "memory", "project", "decisions.md"), "utf8");
+  assert.match(decisionsText, /memory_promoted: true/);
+  assert.match(decisionsText, /Feature workflows promote accepted pricing decisions after final verification\./);
+  assert.match(decisionsText, /## Timeline/);
+  assert.match(decisionsText, /Promoted decision from memory:\/\/feature\/accepted-pricing via aipi_promote_memory/);
+  assert.equal(
+    decisionsText.indexOf("Feature workflows promote accepted pricing decisions after final verification.") <
+      decisionsText.indexOf("## Timeline"),
+    true,
+  );
+  const businessRulesText = await fs.readFile(
+    path.join(tempRoot, ".aipi", "memory", "project", "business-rules.md"),
+    "utf8",
+  );
+  assert.match(businessRulesText, /memory_promoted: true/);
+  assert.match(businessRulesText, /Feature workflows persist durable business rules after verification\./);
+  assert.match(businessRulesText, /Manual business-rule context must survive promotion\./);
+  assert.match(businessRulesText, /Promoted business-rule from memory:\/\/feature\/business-rule via aipi_promote_memory/);
+
+  const featureDecisionHash = decisionsText.match(/\*\*promotion-hash:\*\* (sha256:[a-f0-9]+)/)?.[1];
+  assert.ok(featureDecisionHash);
+  const featureDecisionHashCount = countOccurrences(decisionsText, featureDecisionHash);
+  assert.equal(featureDecisionHashCount, 2);
+  const featureMemoryRunAgain = await runWorkflowCommand({
+    args: "run feature",
+    projectRoot: tempRoot,
+    adapter: featureMemoryAdapter,
+  });
+  assert.equal(featureMemoryRunAgain.execution.status, "completed");
+  const secondPromotionRecord = JSON.parse(await fs.readFile(
+    path.join(
+      tempRoot,
+      ".aipi",
+      "runtime",
+      "runs",
+      featureMemoryRunAgain.run.runId,
+      "steps",
+      "memory_promotion",
+      "MEMORY-PROMOTION-RESULT.json",
+    ),
+    "utf8",
+  ));
+  assert.equal(secondPromotionRecord.promoted, 2);
+  assert.equal(secondPromotionRecord.changed, 0);
+  const decisionsAfterRepeat = await fs.readFile(path.join(tempRoot, ".aipi", "memory", "project", "decisions.md"), "utf8");
+  assert.equal(countOccurrences(decisionsAfterRepeat, featureDecisionHash), featureDecisionHashCount);
+
+  const bugfixMemoryRun = await runWorkflowCommand({
+    args: "run bugfix",
+    projectRoot: tempRoot,
+    adapter: createMemoryPromotionWorkflowAdapter({
+      memory_promotion: [
+        {
+          kind: "knowledge",
+          title: "Bugfix root-cause memory",
+          content: "Bugfix workflows retain reusable root-cause lessons after adversarial review.",
+          source_ref: "memory://bugfix/root-cause",
+        },
+      ],
+    }),
+  });
+  assert.equal(bugfixMemoryRun.execution.status, "completed");
+  assert.equal(
+    bugfixMemoryRun.execution.state.steps.find((step) => step.id === "memory_promotion").status,
+    "passed",
+  );
+  const knowledgeText = await fs.readFile(path.join(tempRoot, ".aipi", "memory", "project", "knowledge.md"), "utf8");
+  assert.match(knowledgeText, /Bugfix workflows retain reusable root-cause lessons after adversarial review\./);
+  assert.match(knowledgeText, /Promoted knowledge from memory:\/\/bugfix\/root-cause via aipi_promote_memory/);
+
+  const emptyMemoryRun = await runWorkflowCommand({
+    args: "run quick",
+    projectRoot: tempRoot,
+    adapter: createMemoryPromotionWorkflowAdapter({ quick_memory: [] }),
+  });
+  assert.equal(emptyMemoryRun.execution.status, "failed");
+  const emptyMemoryStep = emptyMemoryRun.execution.state.steps.find((step) => step.id === "quick_memory");
+  assert.equal(emptyMemoryStep.status, "failed");
+  assert.match(emptyMemoryStep.error, /PASS requires memory_promotions/);
+  const emptyMemoryRecord = JSON.parse(await fs.readFile(
+    path.join(
+      tempRoot,
+      ".aipi",
+      "runtime",
+      "runs",
+      emptyMemoryRun.run.runId,
+      "steps",
+      "quick_memory",
+      "MEMORY-PROMOTION-RESULT.json",
+    ),
+    "utf8",
+  ));
+  assert.equal(emptyMemoryRecord.promoted, 0);
+  assert.match(emptyMemoryRecord.errors.join("\n"), /memory_promotions/);
+
   const opsRunStarted = await startWorkflowRun({
     projectRoot: tempRoot,
     workflow: "ops",
@@ -517,6 +642,10 @@ async function pathExists(filePath) {
   }
 }
 
+function countOccurrences(text, token) {
+  return String(text).split(token).length - 1;
+}
+
 function quickChangeLoopFailureAdapter() {
   const local = createTestPassWorkflowAdapter();
   return {
@@ -548,6 +677,51 @@ function policyGateFallbackAdapter() {
     async executeStep(args) {
       if (args.step.id === "classify_boundary") return pass.executeStep(args);
       return failClosed.executeStep(args);
+    },
+  };
+}
+
+function createMemoryPromotionWorkflowAdapter(promotionsByStep = {}) {
+  const pass = createTestPassWorkflowAdapter();
+  return {
+    async executeStep(args) {
+      const promotions = promotionsByStep[args.step.id];
+      if (!promotions) return pass.executeStep(args);
+
+      const artifacts = [];
+      for (const template of [...args.step.produces, ...args.step.controller_updates]) {
+        const relPath = renderTestTemplate(template, args.state, args.step);
+        await writeControllerArtifact({
+          root: args.root,
+          state: args.state,
+          step: args.step,
+          relPath,
+          content: [
+            `# test fixture artifact for ${args.step.id}`,
+            "",
+            "durable memory promotion candidates emitted by workflow adapter",
+            "",
+          ].join("\n"),
+        });
+        artifacts.push(relPath);
+      }
+
+      return {
+        schema: "aipi.step-result.v1",
+        step_id: args.step.id,
+        agent_ids: args.step.agents.length ? args.step.agents : ["test-memory-adapter"],
+        verdict: "PASS",
+        evidence: [
+          {
+            rung: "verified",
+            source: "test-memory-adapter",
+            ref: artifacts[0] ?? `.aipi/runtime/runs/${args.state.run_id}/steps/${args.step.id}/MEMORY-PROMOTION.md`,
+            result: "durable memory promotion candidates verified",
+          },
+        ],
+        artifacts,
+        memory_promotions: promotions,
+      };
     },
   };
 }

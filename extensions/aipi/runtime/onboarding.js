@@ -26,6 +26,7 @@ const STUB_MARKERS = [
   "No procedures have been confirmed yet.",
   "No glossary terms have been confirmed yet.",
 ];
+const ONBOARDING_MEMORY_SCHEMA_VERSION = 2;
 
 const SKIP_DIRS = new Set([
   ".git",
@@ -39,6 +40,13 @@ const SKIP_DIRS = new Set([
   ".venv",
   "venv",
   "__pycache__",
+]);
+const LOW_PRIORITY_INVENTORY_DIRS = new Set([
+  ".aihaus",
+  ".aipi",
+  "docs",
+  "doc",
+  "documentation",
 ]);
 
 const LANGUAGE_EXTENSIONS = new Map([
@@ -212,6 +220,7 @@ export async function runProjectOnboarding({
     }, now);
   }
   const investigation = await runOnboardingInvestigation({
+    root,
     coordinator,
     hostModel,
     inventory,
@@ -293,20 +302,29 @@ export function formatOnboardingResult(result) {
 export async function inventoryRepository(projectRoot) {
   const root = assertProjectRoot(projectRoot);
   const topLevel = await listTopLevel(root);
-  const files = await listRepoFiles(root, { maxFiles: 350 });
+  const files = await listRepoFiles(root);
+  const inferenceFiles = files.filter((file) => !isLowPriorityInventoryFile(file));
   const packageManifests = await readPackageManifests(root, files);
   const python = await readPythonManifests(root, files);
   const ci = files.filter((file) => file.startsWith(".github/workflows/") || /^\.gitlab-ci\.ya?ml$/i.test(file));
   const docker = files.filter((file) => /(^|\/)(Dockerfile|docker-compose\.ya?ml)$/i.test(file));
-  const languages = languageSummary(files);
-  const entryPoints = inferEntryPoints(files, packageManifests);
+  const languages = languageSummary(inferenceFiles);
+  const entryPoints = inferEntryPoints(inferenceFiles, packageManifests);
   const commands = inferCommands(packageManifests, python);
-  const codeFiles = files.filter(isInvestigableCodeFile).slice(0, 120);
+  const codeFiles = inferenceFiles.filter(isInvestigableCodeFile).slice(0, 120);
+  const candidateRules = await inferCodeCandidateRules(root, inferenceFiles);
   const configFiles = files.filter((file) => /(^|\/)(\.env\.example|\.env\.sample|docker-compose\.ya?ml|Dockerfile|package\.json|pyproject\.toml|requirements.*\.txt)$/i.test(file));
+  const manifestPaths = [
+    ...packageManifests.map((manifest) => manifest.path),
+    ...python.requirements,
+    ...python.pyprojects,
+  ];
 
   return {
     top_level: topLevel,
-    files_sample: files.slice(0, 80),
+    files_sample: representativeFileSample({ files, manifestPaths, limit: 80 }),
+    file_count: files.length,
+    inference_file_count: inferenceFiles.length,
     has_code: codeFiles.length > 0,
     code_files: codeFiles,
     config_files: configFiles,
@@ -317,14 +335,25 @@ export async function inventoryRepository(projectRoot) {
     docker,
     entry_points: entryPoints,
     commands,
-    stack: inferStack({ files, packageManifests, python }),
-    domains: inferDomains(files),
+    stack: inferStack({ files: inferenceFiles, packageManifests, python }),
+    domains: inferDomains(inferenceFiles),
+    candidate_rules: candidateRules,
   };
 }
 
 export function isStubMemoryPage(content) {
   const text = String(content ?? "");
   return STUB_MARKERS.some((marker) => text.includes(marker));
+}
+
+function isAutoSeededMemoryPage(content) {
+  const text = String(content ?? "");
+  return /Seeded (?:by|from).*\/aipi-onboard|Project memory seeded by \/aipi-onboard/i.test(text) ||
+    /onboarding_seeded:\s*true/i.test(text);
+}
+
+function hasHumanMemoryEditMarker(content) {
+  return /user-customized|human-customized|human-edited|manual edit|manual-edit|memory_promoted:\s*true/i.test(String(content ?? ""));
 }
 
 export async function seedProjectMemory({
@@ -353,18 +382,19 @@ export async function seedProjectMemory({
       summary.missing.push(file);
       continue;
     }
-    if (!force && !isStubMemoryPage(existing)) {
+    if (!force && !isStubMemoryPage(existing) && (!isAutoSeededMemoryPage(existing) || hasHumanMemoryEditMarker(existing))) {
       summary.skipped_customized.push(file);
       continue;
     }
-    const frontmatter = extractFrontmatter(existing);
+    const date = now().toISOString().slice(0, 10);
+    const frontmatter = onboardingFrontmatter({ existing, date });
     const content = renderMemoryPage({
       file,
       frontmatter,
       inventory,
       answers,
       investigation,
-      date: now().toISOString().slice(0, 10),
+      date,
     });
     await fs.writeFile(target, content);
     summary.written.push(file);
@@ -504,7 +534,7 @@ function buildRecommendationQuestion({ inventory }) {
   };
 }
 
-async function runOnboardingInvestigation({ coordinator, hostModel, inventory, graph, now, enabled, onProgress = null }) {
+async function runOnboardingInvestigation({ root, coordinator, hostModel, inventory, graph, now, enabled, onProgress = null }) {
   if (!inventory.has_code) {
     await emitOnboardingProgress(onProgress, {
       phase: "investigation",
@@ -550,10 +580,11 @@ async function runOnboardingInvestigation({ coordinator, hostModel, inventory, g
         `Investigate this repository for AIPI onboarding: ${dimension.title}.`,
         "Use repository-local evidence and AIPI graph tools when available: aipi_retrieve first, then aipi_impact, aipi_callers, aipi_semantic_search for narrower checks.",
         "Write a concise markdown artifact with facts and confidence. Do not ask the user and do not write durable memory.",
+        onboardingDimensionInstruction(dimension),
         `Memory pages this finding can inform: ${dimension.memory_files.join(", ")}`,
         `Graph source: ${graph?.source ?? "not-built"}; semantic readiness: ${graph?.vector?.readiness?.status ?? graph?.vector?.status ?? "unknown"}`,
         `Deterministic inventory: ${JSON.stringify(inventory).slice(0, 5000)}`,
-      ].join("\n"),
+      ].filter(Boolean).join("\n"),
       owned_files: [artifact],
       expected_artifacts: [artifact],
       artifact_target: path.posix.dirname(artifact),
@@ -574,6 +605,9 @@ async function runOnboardingInvestigation({ coordinator, hostModel, inventory, g
     try {
       await waitForCoordinatorDone(coordinator, worker.agent_id);
       const collected = coordinator.collect(worker.agent_id);
+      const candidateRules = worker.id === "domain-rules"
+        ? await readCandidateRulesFromArtifacts({ root, artifacts: collected.artifacts?.length ? collected.artifacts : [worker.artifact] })
+        : [];
       const result = {
         id: worker.id,
         title: worker.title,
@@ -582,6 +616,7 @@ async function runOnboardingInvestigation({ coordinator, hostModel, inventory, g
         verdict: collected.step_result?.verdict ?? null,
         artifacts: collected.artifacts?.length ? collected.artifacts : [worker.artifact],
       };
+      if (candidateRules.length) result.candidate_rules = candidateRules;
       await emitOnboardingProgress(onProgress, {
         phase: "investigation",
         status: result.status,
@@ -627,6 +662,63 @@ async function runOnboardingInvestigation({ coordinator, hostModel, inventory, g
   };
 }
 
+function onboardingDimensionInstruction(dimension) {
+  if (dimension?.id !== "domain-rules") return null;
+  return [
+    "For domain-rules, mine actual source code for concrete candidate rules.",
+    "Look for validation guards, schema constraints, model field constraints/enums, state transitions, authorization checks, price/quantity/date/quota invariants, uniqueness/required-field checks, and service conditionals.",
+    "Emit each rule as: - CANDIDATE: <specific rule statement> | source_ref: <path:line or symbol> | evidence: <short evidence>.",
+    "Keep rules CANDIDATE, not accepted; do not emit generic 'Changes touching <domain>' boilerplate when concrete evidence exists.",
+  ].join(" ");
+}
+
+async function readCandidateRulesFromArtifacts({ root, artifacts = [] } = {}) {
+  const rules = [];
+  for (const artifact of artifacts) {
+    const abs = safeArtifactPath(root, artifact);
+    if (!abs) continue;
+    const text = await fs.readFile(abs, "utf8").catch(() => "");
+    rules.push(...parseCandidateRulesFromText(text, artifact));
+  }
+  return mergeCandidateRules(rules);
+}
+
+function safeArtifactPath(root, artifact) {
+  const rel = String(artifact ?? "").replaceAll("\\", "/").replace(/^\.\/+/, "");
+  if (!rel || path.isAbsolute(rel)) return null;
+  const abs = path.resolve(root, rel);
+  const rootWithSep = root.endsWith(path.sep) ? root : `${root}${path.sep}`;
+  return abs === root || abs.startsWith(rootWithSep) ? abs : null;
+}
+
+function parseCandidateRulesFromText(text, artifact) {
+  const lines = String(text ?? "").split(/\r?\n/);
+  const rules = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (!/CANDIDATE:/i.test(line)) continue;
+    const statement = line
+      .replace(/^[-*]\s*/, "")
+      .replace(/^CANDIDATE:\s*/i, "")
+      .split(/\s+\|\s+source_ref:|\s+\(source_ref:/i)[0]
+      .trim();
+    const sourceRef = line.match(/source_ref:\s*([^|)]+)/i)?.[1]?.trim()
+      ?? lines[index + 1]?.match(/source_ref:\s*(.+)$/i)?.[1]?.trim()
+      ?? artifact;
+    const evidence = line.match(/evidence:\s*([^|)]+)/i)?.[1]?.trim() ?? "";
+    if (statement && sourceRef) {
+      rules.push({
+        statement: stripTrailingPunctuation(statement),
+        source_ref: sourceRef,
+        evidence,
+        status: "candidate",
+        source: "swarm-domain-rules",
+      });
+    }
+  }
+  return rules;
+}
+
 async function waitForCoordinatorDone(coordinator, agentId, { timeoutMs = 180000 } = {}) {
   const startedAt = Date.now();
   while (Date.now() - startedAt <= timeoutMs) {
@@ -648,27 +740,62 @@ async function listTopLevel(root) {
     .sort();
 }
 
-async function listRepoFiles(root, { maxFiles = 350 } = {}) {
+async function listRepoFiles(root, { maxFiles = null } = {}) {
   const out = [];
-  await walk(root, "", out, maxFiles);
+  await walkBreadthFirst(root, out, maxFiles);
   return out;
 }
 
-async function walk(root, relDir, out, maxFiles) {
-  if (out.length >= maxFiles) return;
-  const absDir = path.join(root, relDir);
-  const entries = await fs.readdir(absDir, { withFileTypes: true }).catch(() => []);
-  for (const entry of entries) {
-    if (out.length >= maxFiles) return;
-    const rel = path.posix.join(relDir.replaceAll("\\", "/"), entry.name);
-    if (entry.isDirectory()) {
-      if (SKIP_DIRS.has(entry.name)) continue;
-      await walk(root, rel, out, maxFiles);
-      continue;
+async function walkBreadthFirst(root, out, maxFiles) {
+  const queue = [""];
+  while (queue.length) {
+    if (maxFiles != null && out.length >= maxFiles) return;
+    const relDir = queue.shift();
+    const absDir = path.join(root, relDir);
+    const entries = (await fs.readdir(absDir, { withFileTypes: true }).catch(() => []))
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const rel = path.posix.join(relDir.replaceAll("\\", "/"), entry.name);
+      if (entry.isDirectory()) {
+        if (SKIP_DIRS.has(entry.name)) continue;
+        queue.push(rel);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      out.push(rel);
+      if (maxFiles != null && out.length >= maxFiles) return;
     }
-    if (!entry.isFile()) continue;
-    out.push(rel);
   }
+}
+
+function representativeFileSample({ files = [], manifestPaths = [], limit = 80 } = {}) {
+  const out = [];
+  const seen = new Set();
+  const add = (file) => {
+    if (!file || seen.has(file) || out.length >= limit) return;
+    seen.add(file);
+    out.push(file);
+  };
+  for (const file of manifestPaths) add(file);
+  const byTopLevel = new Map();
+  for (const file of files) {
+    const top = file.split("/")[0] || ".";
+    if (!byTopLevel.has(top)) byTopLevel.set(top, []);
+    byTopLevel.get(top).push(file);
+  }
+  const buckets = [...byTopLevel.entries()]
+    .sort(([left], [right]) => inventoryPriority(left) - inventoryPriority(right) || left.localeCompare(right))
+    .map(([, bucket]) => bucket);
+  let index = 0;
+  while (out.length < limit && buckets.some((bucket) => index < bucket.length)) {
+    for (const bucket of buckets) add(bucket[index]);
+    index += 1;
+  }
+  return out;
+}
+
+function inventoryPriority(topLevel) {
+  return LOW_PRIORITY_INVENTORY_DIRS.has(String(topLevel ?? "").toLowerCase()) ? 10 : 0;
 }
 
 async function readPackageManifests(root, files) {
@@ -689,10 +816,11 @@ async function readPackageManifests(root, files) {
 
 async function readPythonManifests(root, files) {
   const requirements = files.filter((file) => /(^|\/)requirements.*\.txt$/i.test(file));
-  const pyproject = files.find((file) => file.endsWith("pyproject.toml"));
+  const pyprojects = files.filter((file) => file.endsWith("pyproject.toml"));
   return {
     requirements,
-    pyproject: pyproject ?? null,
+    pyproject: pyprojects[0] ?? null,
+    pyprojects,
     has_pytest: files.some((file) => /(^|\/)tests?\//.test(file) || /(^|\/)pytest\.ini$/.test(file)),
     has_manage_py: files.includes("manage.py"),
   };
@@ -763,13 +891,18 @@ function inferStack({ files, packageManifests, python }) {
   if (deps.has("react-native") || deps.has("expo")) stack.push("React Native");
   else if (deps.has("react")) stack.push("React");
   if (deps.has("next")) stack.push("Next.js");
-  if (files.some((file) => file.endsWith(".py")) || python.pyproject || python.requirements.length) stack.push("Python");
+  if (files.some((file) => file.endsWith(".py")) || python.pyprojects?.length || python.requirements.length) stack.push("Python");
   if (deps.has("express")) stack.push("Express");
   if (deps.has("vite")) stack.push("Vite");
   if (files.some((file) => /^backend\//.test(file)) && files.some((file) => /^frontend\//.test(file))) {
     stack.push("frontend/backend monorepo");
   }
   return [...new Set(stack)];
+}
+
+function isLowPriorityInventoryFile(file) {
+  const firstSegment = String(file ?? "").replaceAll("\\", "/").split("/")[0]?.toLowerCase();
+  return LOW_PRIORITY_INVENTORY_DIRS.has(firstSegment);
 }
 
 function isInvestigableCodeFile(file) {
@@ -797,6 +930,25 @@ function inferDomains(files) {
 function extractFrontmatter(content) {
   const match = String(content ?? "").match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
   return match ? match[0] : "";
+}
+
+function onboardingFrontmatter({ existing, date }) {
+  const frontmatter = extractFrontmatter(existing);
+  const lines = frontmatter
+    ? frontmatter.replace(/^---\r?\n/, "").replace(/\r?\n---\r?\n?$/, "").split(/\r?\n/)
+    : [];
+  const fields = new Map();
+  for (const line of lines) {
+    const match = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+    if (match) fields.set(match[1], match[2]);
+  }
+  fields.set("onboarding_seeded", "true");
+  fields.set("onboarding_schema_version", String(ONBOARDING_MEMORY_SCHEMA_VERSION));
+  fields.set("onboarding_updated_at", date);
+  const out = ["---"];
+  for (const [key, value] of fields.entries()) out.push(`${key}: ${value}`);
+  out.push("---", "");
+  return out.join("\n");
 }
 
 function renderMemoryPage({ file, frontmatter, inventory, answers, investigation, date }) {
@@ -934,7 +1086,7 @@ function renderKnowledgePage({ inventory, insights, date }) {
     listOrNone([
       ...inventory.package_manifests.map((item) => item.path),
       ...inventory.python.requirements,
-      inventory.python.pyproject,
+      ...(inventory.python.pyprojects ?? [inventory.python.pyproject]),
     ].filter(Boolean)),
     "",
     "### High-signal files",
@@ -1069,11 +1221,15 @@ function renderGlossaryPage({ insights, date }) {
 function deriveProjectInsights({ inventory, answers = {}, investigation = null }) {
   const purpose = String(answers.purpose ?? "").trim() || inferProjectPurpose(inventory).text;
   const domains = [...new Set([
-    ...splitListish(answers.domain ?? ""),
+    ...structuredListTerms(answers.domain ?? ""),
     ...(inventory.domains ?? []),
     ...inferDomainTermsFromPaths(inventory.code_files ?? []),
   ])].slice(0, 12);
-  const candidateRules = inferCandidateRules({ inventory, domains });
+  const concreteCandidateRules = mergeCandidateRules([
+    ...(investigation?.dimensions ?? []).flatMap((dimension) => dimension.candidate_rules ?? []),
+    ...(inventory.candidate_rules ?? []),
+  ]);
+  const candidateRules = inferCandidateRules({ inventory, domains, concreteCandidateRules });
   const highSignalFiles = [
     ...(inventory.entry_points ?? []),
     ...(inventory.code_files ?? []).filter((file) => /(^|\/)(app|main|index|server|api|routes|models|services)\./i.test(file)),
@@ -1107,7 +1263,9 @@ function deriveProjectInsights({ inventory, answers = {}, investigation = null }
   return {
     purpose,
     domains,
-    businessSummary: domains.length
+    businessSummary: concreteCandidateRules.length
+      ? `Concrete candidate business rules were inferred from source evidence (${concreteCandidateRules.length}); review and accept before treating them as policy.`
+      : domains.length
       ? `Candidate business/domain context inferred from code: ${domains.join(", ")}.`
       : "No accepted business rules were found; onboarding recorded code-derived candidates only.",
     candidateRules,
@@ -1154,18 +1312,233 @@ function inferDomainTermsFromPaths(files = []) {
   return [...terms].slice(0, 12);
 }
 
-function inferCandidateRules({ inventory, domains }) {
+async function inferCodeCandidateRules(root, files = []) {
+  const targets = files
+    .filter(isInvestigableCodeFile)
+    .sort((left, right) => ruleScanPriority(left) - ruleScanPriority(right) || left.localeCompare(right))
+    .slice(0, 200);
   const rules = [];
-  if (inventory.commands.length) {
-    rules.push("Local changes should be validated with the detected repository commands before handoff.");
+  for (const rel of targets) {
+    const abs = path.join(root, rel);
+    const text = await fs.readFile(abs, "utf8").catch(() => "");
+    if (!text) continue;
+    rules.push(...extractCandidateRulesFromSource(rel, text.slice(0, 80_000)));
+    if (rules.length >= 20) break;
   }
-  if (inventory.ci.length) {
-    rules.push("CI workflow definitions are part of the delivery contract.");
-  }
-  for (const domain of domains.slice(0, 5)) {
-    rules.push(`Changes touching ${domain} should preserve behavior inferred from related models, services, and tests.`);
+  return mergeCandidateRules(rules).slice(0, 12);
+}
+
+function ruleScanPriority(file) {
+  if (/(^|\/)(models?|services?|schemas?|validators?|validation|rules?|polic(?:y|ies)|permissions?|auth|billing|payments?|orders?|subscriptions?|pricing|quota|state|status)(\/|\.|-|_)/i.test(file)) return 0;
+  if (/(^|\/)(api|routes|controllers?)(\/|\.|-|_)/i.test(file)) return 1;
+  if (/(^|\/)(src|app|backend|frontend)\//i.test(file)) return 2;
+  return 5;
+}
+
+function extractCandidateRulesFromSource(rel, text) {
+  const lines = String(text ?? "").split(/\r?\n/);
+  const rules = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const sourceRef = `${rel}:${index + 1}`;
+    const guard = line.match(/\bif\s*(?:\(\s*)?([A-Za-z_$][\w.$]*)\s*(<=|>=|<|>)\s*(-?\d+(?:\.\d+)?)/);
+    if (guard && isRejectingGuard(lines.slice(index, index + 4).join(" "))) {
+      rules.push({
+        statement: comparisonGuardStatement(guard[1], guard[2], guard[3]),
+        source_ref: sourceRef,
+        evidence: compactEvidence(line),
+        status: "candidate",
+        source: "static-guard-scan",
+      });
+    }
+
+    for (const rule of schemaConstraintRules(line, sourceRef)) rules.push(rule);
   }
   return rules;
+}
+
+function schemaConstraintRules(line, sourceRef) {
+  const rules = [];
+  const zod = line.match(/\b([A-Za-z_$][\w$]*)\s*:\s*z\.(number|string)\(\)([^,\n}]*)/);
+  if (zod) {
+    for (const constraint of zod[3].matchAll(/\.(min|max)\((-?\d+(?:\.\d+)?)/g)) {
+      rules.push({
+        statement: zodConstraintStatement(zod[1], zod[2], constraint[1], constraint[2]),
+        source_ref: sourceRef,
+        evidence: compactEvidence(line),
+        status: "candidate",
+        source: "static-schema-scan",
+      });
+    }
+  }
+
+  const field = line.match(/^\s*([A-Za-z_]\w*)\s*:\s*[^=]+=\s*Field\((.*)\)/);
+  if (field) {
+    for (const constraint of field[2].matchAll(/\b(ge|gt|le|lt)\s*=\s*(-?\d+(?:\.\d+)?)/g)) {
+      rules.push({
+        statement: fieldConstraintStatement(field[1], constraint[1], constraint[2]),
+        source_ref: sourceRef,
+        evidence: compactEvidence(line),
+        status: "candidate",
+        source: "static-schema-scan",
+      });
+    }
+  }
+
+  const literal = line.match(/\b([A-Za-z_]\w*)\s*:\s*Literal\[([^\]]+)\]/);
+  if (literal) {
+    const values = literal[2].match(/["'][^"']+["']/g)?.map((value) => value.replace(/^["']|["']$/g, "")) ?? [];
+    if (values.length) {
+      rules.push({
+        statement: `${humanizeIdentifier(literal[1])} must be one of ${values.join(", ")}`,
+        source_ref: sourceRef,
+        evidence: compactEvidence(line),
+        status: "candidate",
+        source: "static-schema-scan",
+      });
+    }
+  }
+  return rules;
+}
+
+function inferCandidateRules({ inventory, domains, concreteCandidateRules = [] }) {
+  const concrete = mergeCandidateRules(concreteCandidateRules);
+  if (concrete.length) return concrete.map(formatCandidateRule);
+
+  const rules = [];
+  if (inventory.commands.length) {
+    rules.push({
+      statement: "Local changes should be validated with the detected repository commands before handoff",
+      source_ref: commandSourceRef(inventory.commands[0]),
+      evidence: inventory.commands[0],
+      status: "candidate",
+      source: "deterministic-fallback",
+    });
+  }
+  if (inventory.ci.length) {
+    rules.push({
+      statement: "CI workflow definitions are part of the delivery contract",
+      source_ref: inventory.ci[0],
+      evidence: inventory.ci[0],
+      status: "candidate",
+      source: "deterministic-fallback",
+    });
+  }
+  for (const domain of domains.slice(0, 5)) {
+    rules.push({
+      statement: `Changes touching ${domain} should preserve behavior inferred from related models, services, and tests`,
+      source_ref: domainSourceRef(domain, inventory.code_files ?? []),
+      evidence: `domain inferred from repository inventory: ${domain}`,
+      status: "candidate",
+      source: "deterministic-fallback",
+    });
+  }
+  return mergeCandidateRules(rules).map(formatCandidateRule);
+}
+
+function isRejectingGuard(windowText) {
+  return /\b(throw|raise|abort|forbid|forbidden|unauthori[sz]ed|denied)\b/i.test(windowText) ||
+    /\breturn\s+(false|null|undefined)\b/i.test(windowText) ||
+    /\breturn\b[^;\n]*(error|invalid|reject)/i.test(windowText);
+}
+
+function comparisonGuardStatement(identifier, operator, value) {
+  const label = humanizeIdentifier(identifier);
+  if (operator === "<") return `${label} must be at least ${value}`;
+  if (operator === "<=") return `${label} must be greater than ${value}`;
+  if (operator === ">") return `${label} must be at most ${value}`;
+  if (operator === ">=") return `${label} must be less than ${value}`;
+  return `${label} must satisfy ${operator} ${value}`;
+}
+
+function zodConstraintStatement(identifier, type, method, value) {
+  const label = humanizeIdentifier(identifier);
+  if (type === "string") {
+    return method === "min" ? `${label} length must be at least ${value}` : `${label} length must be at most ${value}`;
+  }
+  return method === "min" ? `${label} must be at least ${value}` : `${label} must be at most ${value}`;
+}
+
+function fieldConstraintStatement(identifier, constraint, value) {
+  const label = humanizeIdentifier(identifier);
+  if (constraint === "ge") return `${label} must be at least ${value}`;
+  if (constraint === "gt") return `${label} must be greater than ${value}`;
+  if (constraint === "le") return `${label} must be at most ${value}`;
+  if (constraint === "lt") return `${label} must be less than ${value}`;
+  return `${label} must satisfy ${constraint} ${value}`;
+}
+
+function humanizeIdentifier(identifier) {
+  return String(identifier ?? "")
+    .split(".")
+    .at(-1)
+    .replace(/^[_$]+|[_$]+$/g, "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_$-]+/g, " ")
+    .trim()
+    .toLowerCase() || "value";
+}
+
+function compactEvidence(line) {
+  return String(line ?? "").trim().replace(/\s+/g, " ").slice(0, 160);
+}
+
+function commandSourceRef(command) {
+  const match = String(command ?? "").match(/^([^:]+):/);
+  return match?.[1] ?? "repository-commands";
+}
+
+function domainSourceRef(domain, codeFiles = []) {
+  const token = String(domain ?? "").split(/\s+/)[0]?.toLowerCase();
+  const matched = codeFiles.find((file) => token && file.toLowerCase().includes(token));
+  return matched ?? codeFiles[0] ?? "repository-inventory";
+}
+
+function formatCandidateRule(rule) {
+  const sourceRef = String(rule.source_ref ?? "").trim() || "repository-inventory";
+  const evidence = String(rule.evidence ?? "").trim();
+  return `CANDIDATE: ${stripTrailingPunctuation(rule.statement)}. source_ref: ${sourceRef}${evidence ? `; evidence: ${evidence}` : ""}`;
+}
+
+function mergeCandidateRules(rules = []) {
+  const out = [];
+  const seen = new Set();
+  for (const rule of rules) {
+    const normalized = normalizeCandidateRule(rule);
+    if (!normalized) continue;
+    const key = `${normalized.statement.toLowerCase()}|${normalized.source_ref.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function normalizeCandidateRule(rule) {
+  if (!rule) return null;
+  if (typeof rule === "string") {
+    return {
+      statement: stripTrailingPunctuation(rule),
+      source_ref: "repository-inventory",
+      evidence: "",
+      status: "candidate",
+      source: "unknown",
+    };
+  }
+  const statement = stripTrailingPunctuation(rule.statement ?? rule.title ?? rule.content ?? "");
+  const sourceRef = String(rule.source_ref ?? rule.sourceRef ?? "").trim();
+  if (!statement || !sourceRef) return null;
+  return {
+    statement,
+    source_ref: sourceRef,
+    evidence: String(rule.evidence ?? "").trim(),
+    status: "candidate",
+    source: String(rule.source ?? "unknown"),
+  };
+}
+
+function stripTrailingPunctuation(value) {
+  return String(value ?? "").trim().replace(/[.;:]+$/g, "");
 }
 
 function listOrNone(items) {
@@ -1173,9 +1546,29 @@ function listOrNone(items) {
   return clean.length ? clean.map((item) => `- ${item}`).join("\n") : "- none detected";
 }
 
-function splitListish(value) {
-  return String(value ?? "")
-    .split(/[,;\n]+/)
-    .map((item) => item.trim())
+function structuredListTerms(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return [];
+  const bulletLines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
     .filter(Boolean);
+  if (bulletLines.length > 1) {
+    const stripped = bulletLines
+      .map((line) => line.replace(/^[-*]\s+/, "").trim())
+      .filter((line) => isShortStructuredTerm(line));
+    return stripped.length === bulletLines.length ? stripped : [];
+  }
+  if (/[.?!]/.test(text)) return [];
+  const separator = text.includes(";") ? /;/ : text.includes(",") ? /,/ : null;
+  if (!separator) return isShortStructuredTerm(text) ? [text] : [];
+  const parts = text.split(separator).map((item) => item.trim()).filter(Boolean);
+  if (!parts.length || !parts.every(isShortStructuredTerm)) return [];
+  return parts;
+}
+
+function isShortStructuredTerm(value) {
+  const text = String(value ?? "").trim();
+  if (!text || text.length > 40) return false;
+  return text.split(/\s+/).length <= 4;
 }

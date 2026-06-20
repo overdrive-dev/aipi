@@ -107,6 +107,7 @@ const SKIP_REL_DIRS = new Set(["ios/Pods", "android/build"]);
 const GRAPH_REL_PATH = ".aipi/state/aipi-graph.json";
 const GRAPH_SQLITE_REL_PATH = ".aipi/state/aipi-graph.sqlite";
 const GRAPH_VECTOR_DIMENSIONS = 1024;
+const SQLITE_SIDECAR_SUFFIXES = ["-journal", "-wal", "-shm"];
 const VECTOR_CHUNK_WINDOW_LINES = 32;
 const VECTOR_CHUNK_WINDOW_OVERLAP_LINES = 8;
 const VECTOR_CHUNK_MAX_CHARS = 12_000;
@@ -885,7 +886,8 @@ export async function aipiPromoteMemory({
   const timestamp = now().toISOString();
   const approval = await inspectDurableMemoryApproval(root, approval_ref);
   const approvedForDurableWrite = approval.ok;
-  const entry = renderMemoryEntry({ kind, title, content, source_ref, approval_ref, timestamp });
+  const promotionHash = memoryPromotionHash({ kind, title, content, source_ref });
+  const entry = renderMemoryEntry({ kind, title, content, source_ref, approval_ref, timestamp, promotionHash });
 
   if (!approvedForDurableWrite) {
     const candidateRel = path.posix.join(
@@ -910,7 +912,15 @@ export async function aipiPromoteMemory({
   const targetRel = user_memory
     ? ".aipi/memory/user.local.md"
     : path.posix.join(".aipi", "memory", "project", projectMemoryFileForKind(kind));
-  await insertMemoryEntry({ root, targetRel, entry, kind, timestamp });
+  const insertion = await insertMemoryEntry({
+    root,
+    targetRel,
+    entry,
+    kind,
+    timestamp,
+    sourceRef: source_ref,
+    promotionHash,
+  });
   if (run_id) {
     await aipiKanbanUpdate({
       projectRoot: root,
@@ -925,7 +935,10 @@ export async function aipiPromoteMemory({
     schema: "aipi.tool-result.v1",
     tool: "aipi_promote_memory",
     status: "promoted",
+    changed: insertion.changed,
+    already_present: !insertion.changed,
     path: targetRel,
+    promotion_hash: promotionHash,
   };
 }
 
@@ -3080,6 +3093,7 @@ async function writeSqliteGraph({
   let db;
   let transactionOpen = false;
   try {
+    const sqliteRecovery = await recoverOrRemovePartialSqlite({ sqlite, sqlitePath });
     const resolvedEmbeddingConfig = embeddingConfig ?? await resolveSemanticEmbeddingConfig({ root, env });
     const readinessResult = await prepareSemanticReadiness({
       config: resolvedEmbeddingConfig,
@@ -3099,7 +3113,7 @@ async function writeSqliteGraph({
       graph,
       embeddingConfig: resolvedEmbeddingConfig,
     });
-    await fs.rm(sqlitePath, { force: true }).catch(() => {});
+    await removeSqliteSidecarFiles(sqlitePath);
     db = new sqlite.DatabaseSync(sqlitePath, { allowExtension: true });
     db.exec(`
       DROP TABLE IF EXISTS meta;
@@ -3183,8 +3197,16 @@ async function writeSqliteGraph({
       db.exec(`CREATE VIRTUAL TABLE code_vectors USING vec0(embedding float[${resolvedEmbeddingConfig.dimensions}])`);
     }
 
-    db.exec("BEGIN IMMEDIATE");
-    transactionOpen = true;
+    const beginWrite = () => {
+      db.exec("BEGIN IMMEDIATE");
+      transactionOpen = true;
+    };
+    const commitWrite = () => {
+      db.exec("COMMIT");
+      transactionOpen = false;
+    };
+
+    beginWrite();
 
     const metaInsert = db.prepare("INSERT INTO meta(key, value) VALUES (?, ?)");
     metaInsert.run("schema", graph.schema);
@@ -3275,11 +3297,13 @@ async function writeSqliteGraph({
       }
       codeLineIdsByPath.set(file.path, lineIds);
     }
+    commitWrite();
 
     for (const file of graph.files) {
       const lines = fileLinesByPath.get(file.path) ?? [];
       const lineIds = codeLineIdsByPath.get(file.path) ?? new Map();
       if (vectorInsert && vectorMapInsert && vectorChunkInsert) {
+        beginWrite();
         const chunks = buildVectorChunksForFile({ file, lines, symbols: graph.symbols ?? [] });
         for (const chunk of chunks) {
           try {
@@ -3345,6 +3369,7 @@ async function writeSqliteGraph({
             break;
           }
         }
+        commitWrite();
       }
       embeddedFileCount += 1;
       if (vectorProgressEnabled && vector.status === "available") {
@@ -3374,7 +3399,6 @@ async function writeSqliteGraph({
     }
 
     const source = vector.status === "available" ? "sqlite+sqlite-vec+lexical" : "sqlite+lexical";
-    metaInsert.run("source", source);
     if (vector.status === "available") {
       vector.item_count = vectorChunkCount;
       vector.unique_item_count = uniqueVectorCount;
@@ -3385,9 +3409,9 @@ async function writeSqliteGraph({
         overlap_lines: VECTOR_CHUNK_WINDOW_OVERLAP_LINES,
       };
     }
-
-    db.exec("COMMIT");
-    transactionOpen = false;
+    beginWrite();
+    metaInsert.run("source", source);
+    commitWrite();
 
     return {
       ...status,
@@ -3397,6 +3421,7 @@ async function writeSqliteGraph({
       relationship_count: graph.relationships?.length ?? 0,
       vector,
       embedding_pull: embeddingPull,
+      sqlite_recovery: sqliteRecovery,
     };
   } catch (error) {
     if (transactionOpen) {
@@ -3405,6 +3430,7 @@ async function writeSqliteGraph({
       } catch {
         /* best-effort rollback */
       }
+      transactionOpen = false;
     }
     return {
       ...status,
@@ -3420,6 +3446,40 @@ async function writeSqliteGraph({
   }
 }
 
+async function recoverOrRemovePartialSqlite({ sqlite, sqlitePath } = {}) {
+  if (!sqlite || !(await pathExists(sqlitePath))) return { status: "missing" };
+  const sidecars = SQLITE_SIDECAR_SUFFIXES.map((suffix) => `${sqlitePath}${suffix}`);
+  const hadSidecar = (await Promise.all(sidecars.map(pathExists))).some(Boolean);
+  let db;
+  try {
+    db = new sqlite.DatabaseSync(sqlitePath);
+    const integrity = db.prepare("PRAGMA integrity_check").get()?.integrity_check;
+    db.close();
+    db = null;
+    if (integrity !== "ok") throw new Error(`integrity_check=${integrity}`);
+    return { status: hadSidecar ? "recovered" : "ok", hot_journal: hadSidecar };
+  } catch (error) {
+    try {
+      db?.close();
+    } catch {
+      /* best-effort close */
+    }
+    await removeSqliteSidecarFiles(sqlitePath);
+    return {
+      status: "removed",
+      hot_journal: hadSidecar,
+      reason: String(error?.message ?? error),
+    };
+  }
+}
+
+async function removeSqliteSidecarFiles(sqlitePath) {
+  await fs.rm(sqlitePath, { force: true }).catch(() => {});
+  for (const suffix of SQLITE_SIDECAR_SUFFIXES) {
+    await fs.rm(`${sqlitePath}${suffix}`, { force: true }).catch(() => {});
+  }
+}
+
 async function readReusableEmbeddingCache({
   sqlite,
   sqlitePath,
@@ -3427,8 +3487,8 @@ async function readReusableEmbeddingCache({
   graph,
   embeddingConfig,
 } = {}) {
-  if (!sqlite || !previousGraph || !(await pathExists(sqlitePath))) return new Map();
-  const previousHashes = new Map((previousGraph.files ?? []).map((file) => [file.path, file.hash]));
+  if (!sqlite || !(await pathExists(sqlitePath))) return new Map();
+  const previousHashes = new Map((previousGraph?.files ?? []).map((file) => [file.path, file.hash]));
   const currentHashes = new Map((graph.files ?? []).map((file) => [file.path, file.hash]));
   const unchanged = new Set();
   for (const [rel, hash] of currentHashes.entries()) {
@@ -4210,13 +4270,22 @@ function projectMemoryFileForKind(kind) {
   return PROJECT_MEMORY_KIND_TO_FILE.get(normalized) ?? "knowledge.md";
 }
 
-function renderMemoryEntry({ kind, title, content, source_ref, approval_ref, timestamp }) {
+function memoryPromotionHash({ kind, title, content, source_ref } = {}) {
+  return `sha256:${contentHash([
+    slug(kind),
+    String(title ?? "").trim(),
+    String(content ?? "").trim(),
+    String(source_ref ?? "").trim(),
+  ].join("\n")).slice(0, 16)}`;
+}
+
+function renderMemoryEntry({ kind, title, content, source_ref, approval_ref, timestamp, promotionHash }) {
   const normalizedKind = slug(kind);
   if (normalizedKind === "business-rule" || normalizedKind === "business-rules") {
-    return renderBusinessRuleEntry({ title, content, source_ref, approval_ref, timestamp });
+    return renderBusinessRuleEntry({ title, content, source_ref, approval_ref, timestamp, promotionHash });
   }
   if (normalizedKind === "decision" || normalizedKind === "decisions") {
-    return renderDecisionEntry({ title, content, source_ref, approval_ref, timestamp });
+    return renderDecisionEntry({ title, content, source_ref, approval_ref, timestamp, promotionHash });
   }
   return [
     `## ${title?.trim() || kind}`,
@@ -4225,13 +4294,14 @@ function renderMemoryEntry({ kind, title, content, source_ref, approval_ref, tim
     `- kind: ${kind}`,
     `- source_ref: ${source_ref}`,
     `- approval_ref: ${approval_ref}`,
+    `- promotion_hash: ${promotionHash}`,
     "",
     content.trim(),
     "",
   ].join("\n");
 }
 
-function renderBusinessRuleEntry({ title, content, source_ref, approval_ref, timestamp }) {
+function renderBusinessRuleEntry({ title, content, source_ref, approval_ref, timestamp, promotionHash }) {
   const ruleId = extractBusinessRuleId(content) ?? generatedBusinessRuleId(timestamp);
   const ruleTitle = title?.trim() || firstContentLine(content) || "Promoted business rule";
   const statement = extractField(content, "statement") ?? stripMarkdownHeading(content).trim();
@@ -4246,12 +4316,13 @@ function renderBusinessRuleEntry({ title, content, source_ref, approval_ref, tim
     `- **rationale:** Promoted through aipi_promote_memory at ${timestamp}.`,
     "- **links:** implements:[], relates:[], decided-by:[]",
     `- **approval-ref:** ${approval_ref}`,
+    `- **promotion-hash:** ${promotionHash}`,
     `- **last-reviewed:** ${timestamp.slice(0, 10)}`,
     "",
   ].join("\n");
 }
 
-function renderDecisionEntry({ title, content, source_ref, approval_ref, timestamp }) {
+function renderDecisionEntry({ title, content, source_ref, approval_ref, timestamp, promotionHash }) {
   const decisionId = generatedDecisionId(timestamp);
   const decisionTitle = title?.trim() || firstContentLine(content) || "Promoted decision";
   return [
@@ -4262,6 +4333,7 @@ function renderDecisionEntry({ title, content, source_ref, approval_ref, timesta
     "- **consequences:** See source evidence and follow-up implementation artifacts.",
     "- **links:** rules:[], code:[], tests:[]",
     `- **approval-ref:** ${approval_ref}`,
+    `- **promotion-hash:** ${promotionHash}`,
     `- **date:** ${timestamp.slice(0, 10)}`,
     "",
   ].join("\n");
@@ -4289,28 +4361,48 @@ async function inspectDurableMemoryApproval(root, approvalRef) {
   return { ok: true, path: normalized };
 }
 
-async function insertMemoryEntry({ root, targetRel, entry, kind, timestamp }) {
+async function insertMemoryEntry({ root, targetRel, entry, kind, timestamp, sourceRef, promotionHash }) {
   const abs = path.join(root, targetRel);
   await fs.mkdir(path.dirname(abs), { recursive: true });
   const existing = await fs.readFile(abs, "utf8").catch((error) => {
     if (error.code === "ENOENT") return "";
     throw error;
   });
-  await writeProjectFile(root, targetRel, insertIntoCurrentTruth(existing, entry, { targetRel, kind, timestamp }));
+  const next = insertIntoCurrentTruth(existing, entry, {
+    targetRel,
+    kind,
+    timestamp,
+    sourceRef,
+    promotionHash,
+  });
+  const changed = next !== String(existing ?? "");
+  if (changed) await writeProjectFile(root, targetRel, next);
+  return { changed };
 }
 
-function insertIntoCurrentTruth(existing, entry, { targetRel = "", kind = "", timestamp = new Date().toISOString() } = {}) {
-  const text = ensureMemoryPageShape(String(existing ?? ""), { targetRel, kind, timestamp });
+function insertIntoCurrentTruth(existing, entry, {
+  targetRel = "",
+  kind = "",
+  timestamp = new Date().toISOString(),
+  sourceRef = "",
+  promotionHash = "",
+} = {}) {
+  const text = stampPromotedMemoryFrontmatter(
+    ensureMemoryPageShape(String(existing ?? ""), { targetRel, kind, timestamp }),
+    timestamp,
+  );
+  if (promotionHash && text.includes(promotionHash)) return text;
   const marker = "\n## Current truth";
   const markerIndex = text.indexOf(marker);
-  if (markerIndex === -1) return `${text.trimEnd()}\n\n${entry}`;
+  const timelineEntry = promotionTimelineEntry({ kind, timestamp, sourceRef, promotionHash });
+  if (markerIndex === -1) return insertPromotionTimeline(`${text.trimEnd()}\n\n${entry}`, timelineEntry);
 
   const headingEnd = text.indexOf("\n", markerIndex + 1);
   const afterHeading = headingEnd === -1 ? text.length : headingEnd + 1;
   const before = `${text.slice(0, afterHeading).trimEnd()}\n\n`;
   let after = text.slice(afterHeading).replace(/^\s+/, "");
   after = after.replace(/^No .*(?:recorded yet|have been recorded yet)\.\r?\n\r?\n?/i, "");
-  return `${before}${entry}\n${after}`;
+  return insertPromotionTimeline(`${before}${entry}\n${after}`, timelineEntry);
 }
 
 function ensureMemoryPageShape(existing, { targetRel = "", kind = "", timestamp = new Date().toISOString() } = {}) {
@@ -4333,6 +4425,48 @@ function ensureMemoryPageShape(existing, { targetRel = "", kind = "", timestamp 
   ].join("\n");
   if (!text.trim()) return header;
   return `${header}${text.trimStart()}`;
+}
+
+function stampPromotedMemoryFrontmatter(existing, timestamp) {
+  const text = String(existing ?? "");
+  const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
+  if (!match) return text;
+  const updates = new Map([
+    ["memory_promoted", "true"],
+    ["memory_promoted_at", timestamp.slice(0, 10)],
+  ]);
+  const seen = new Set();
+  const out = ["---"];
+  for (const line of match[1].split(/\r?\n/)) {
+    const field = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+    if (field && updates.has(field[1])) {
+      out.push(`${field[1]}: ${updates.get(field[1])}`);
+      seen.add(field[1]);
+      continue;
+    }
+    out.push(line);
+  }
+  for (const [key, value] of updates.entries()) {
+    if (!seen.has(key)) out.push(`${key}: ${value}`);
+  }
+  out.push("---");
+  return `${out.join("\n")}\n${text.slice(match[0].length)}`;
+}
+
+function promotionTimelineEntry({ kind, timestamp, sourceRef, promotionHash }) {
+  return `- ${timestamp.slice(0, 10)}: Promoted ${slug(kind)} from ${sourceRef} via aipi_promote_memory (${promotionHash}).`;
+}
+
+function insertPromotionTimeline(text, timelineEntry) {
+  if (!timelineEntry || text.includes(timelineEntry)) return text;
+  const marker = "\n## Timeline";
+  const markerIndex = text.indexOf(marker);
+  if (markerIndex === -1) {
+    return `${text.trimEnd()}\n\n## Timeline\n\n${timelineEntry}\n`;
+  }
+  const headingEnd = text.indexOf("\n", markerIndex + 1);
+  const insertAt = headingEnd === -1 ? text.length : headingEnd + 1;
+  return `${text.slice(0, insertAt).trimEnd()}\n\n${timelineEntry}\n${text.slice(insertAt).replace(/^\s+/, "")}`;
 }
 
 function memoryTypeForTarget(targetRel, kind) {

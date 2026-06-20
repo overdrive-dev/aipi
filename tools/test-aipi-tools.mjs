@@ -763,6 +763,68 @@ try {
     assert.equal(embeddingCalls.length, cacheReuseCallsBefore);
     assert.equal(cacheReuseGraph.vector.unique_item_count, graph.vector.unique_item_count);
   }
+
+  const interruptedRoot = path.join(tempRoot, "interrupted-semantic-project");
+  await fs.mkdir(path.join(interruptedRoot, "src"), { recursive: true });
+  await initProject({ sourceRoot, targetRoot: interruptedRoot });
+  for (let index = 0; index < 5; index += 1) {
+    await fs.writeFile(
+      path.join(interruptedRoot, "src", `chunk-${index}.js`),
+      `export function interruptedChunk${index}() {\n  return 'interrupted-${index}';\n}\n`,
+    );
+  }
+  const interruptedCalls = [];
+  const interruptedFetch = fakeEmbeddingFetchThatFailsAfter(interruptedCalls, 2);
+  const interruptedGraph = await rebuildCodeGraph({
+    projectRoot: interruptedRoot,
+    now: () => new Date("2026-06-16T00:10:00.000Z"),
+    env: semanticOptions.env,
+    embeddingFetch: interruptedFetch.fetch,
+  });
+  assert.equal(interruptedGraph.vector.status, "unavailable");
+  assert.equal(interruptedFetch.successfulInputs.length, 2);
+  const interruptedSqlitePath = path.join(interruptedRoot, ".aipi", "state", "aipi-graph.sqlite");
+  const sqliteForInterrupted = await import("node:sqlite").catch(() => null);
+  if (sqliteForInterrupted) {
+    const db = new sqliteForInterrupted.DatabaseSync(interruptedSqlitePath, { readOnly: true });
+    try {
+      const cachedRows = db.prepare("SELECT COUNT(*) AS count FROM embedding_cache").get()?.count ?? 0;
+      assert.equal(cachedRows >= 2, true);
+    } finally {
+      db.close();
+    }
+  }
+  await fs.rm(path.join(interruptedRoot, ".aipi", "state", "aipi-graph.json"), { force: true });
+  const resumedCalls = [];
+  const resumedGraph = await rebuildCodeGraph({
+    projectRoot: interruptedRoot,
+    now: () => new Date("2026-06-16T00:15:00.000Z"),
+    env: semanticOptions.env,
+    embeddingFetch: fakeEmbeddingFetch(resumedCalls),
+  });
+  if (resumedGraph.vector.status === "available") {
+    assert.equal(resumedCalls.length < resumedGraph.vector.unique_item_count, true);
+    for (const input of interruptedFetch.successfulInputs) {
+      assert.equal(resumedCalls.some((call) => call.input === input), false);
+    }
+  }
+
+  const brokenSqliteRoot = path.join(tempRoot, "broken-sqlite-project");
+  await fs.mkdir(path.join(brokenSqliteRoot, "src"), { recursive: true });
+  await initProject({ sourceRoot, targetRoot: brokenSqliteRoot });
+  await fs.writeFile(path.join(brokenSqliteRoot, "src", "healthy.js"), "export function healthyGraph() {\n  return true;\n}\n");
+  const brokenStateDir = path.join(brokenSqliteRoot, ".aipi", "state");
+  await fs.mkdir(brokenStateDir, { recursive: true });
+  await fs.writeFile(path.join(brokenStateDir, "aipi-graph.sqlite"), "not a sqlite database");
+  await fs.writeFile(path.join(brokenStateDir, "aipi-graph.sqlite-journal"), "hot journal");
+  const recoveredGraph = await rebuildCodeGraph({
+    projectRoot: brokenSqliteRoot,
+    now: () => new Date("2026-06-16T00:20:00.000Z"),
+    ...semanticOptions,
+  });
+  assert.equal(await pathExists(path.join(brokenStateDir, "aipi-graph.sqlite-journal")), false);
+  assert.equal(recoveredGraph.sqlite.sqlite_recovery.status, "removed");
+
   const oldDimGraph = JSON.parse(await fs.readFile(graphPath, "utf8"));
   const legacyVectorDimensions = 1024 - 256;
   oldDimGraph.vector = { ...(oldDimGraph.vector ?? {}), dimensions: legacyVectorDimensions, embedding_model: "legacy-embed-text" };
@@ -1168,10 +1230,30 @@ try {
     now: () => new Date("2026-06-16T03:00:00.000Z"),
   });
   assert.equal(promoted.status, "promoted");
+  assert.equal(promoted.changed, true);
+  assert.equal(promoted.already_present, false);
   const decisionsText = await fs.readFile(path.join(tempRoot, ".aipi", "memory", "project", "decisions.md"), "utf8");
   assert.match(decisionsText, /### ADR-20260616T030000Z - Keep renewal pricing tied to accepted contract\./);
   assert.match(decisionsText, /\*\*approval-ref:\*\* \.aipi\/runtime\/approvals\/approved\/memory-promotion\.json/);
+  assert.match(decisionsText, /memory_promoted: true/);
+  assert.match(decisionsText, /memory_promoted_at: 2026-06-16/);
+  assert.match(decisionsText, /## Timeline/);
+  assert.match(decisionsText, /Promoted decision from \.aipi\/runtime\/runs\/run-1\/steps\/final_verification\/VERIFICATION\.md via aipi_promote_memory/);
   assert.doesNotMatch(decisionsText, /No project-specific technical decisions have been recorded yet/);
+  assert.equal(decisionsText.indexOf("Keep renewal pricing tied to accepted contract.") < decisionsText.indexOf("## Timeline"), true);
+  const repeatedPromotion = await aipiPromoteMemory({
+    projectRoot: tempRoot,
+    kind: "decision",
+    content: "Keep renewal pricing tied to accepted contract.",
+    source_ref: ".aipi/runtime/runs/run-1/steps/final_verification/VERIFICATION.md",
+    approval_ref: approvalRel,
+    now: () => new Date("2026-06-16T03:10:00.000Z"),
+  });
+  assert.equal(repeatedPromotion.status, "promoted");
+  assert.equal(repeatedPromotion.changed, false);
+  assert.equal(repeatedPromotion.already_present, true);
+  const decisionsAfterRepeat = await fs.readFile(path.join(tempRoot, ".aipi", "memory", "project", "decisions.md"), "utf8");
+  assert.equal(countOccurrences(decisionsAfterRepeat, promoted.promotion_hash), 2);
 
   const promotedRule = await aipiPromoteMemory({
     projectRoot: tempRoot,
@@ -1183,9 +1265,12 @@ try {
     now: () => new Date("2026-06-16T03:30:00.000Z"),
   });
   assert.equal(promotedRule.status, "promoted");
+  assert.equal(promotedRule.changed, true);
   const businessRulesText = await fs.readFile(path.join(tempRoot, ".aipi", "memory", "project", "business-rules.md"), "utf8");
   assert.match(businessRulesText, /### BR-20260616T033000Z - Renewal source of truth/);
   assert.match(businessRulesText, /\*\*statement:\*\* Subscriptions renew at the accepted contract price\./);
+  assert.match(businessRulesText, /memory_promoted: true/);
+  assert.match(businessRulesText, /Promoted business-rule from \.aipi\/runtime\/runs\/run-1\/BDD-CONTRACT\.md via aipi_promote_memory/);
 
   const promotedUserMemory = await aipiPromoteMemory({
     projectRoot: tempRoot,
@@ -1198,7 +1283,7 @@ try {
   });
   assert.equal(promotedUserMemory.status, "promoted");
   const userMemoryText = await fs.readFile(path.join(tempRoot, ".aipi", "memory", "user.local.md"), "utf8");
-  assert.match(userMemoryText, /^---\ntype: knowledge\nowner: engineering\nstatus: active\nlast_reviewed: -\n---/);
+  assert.match(userMemoryText, /^---\ntype: knowledge\nowner: engineering\nstatus: active\nlast_reviewed: -\nmemory_promoted: true\nmemory_promoted_at: 2026-06-16\n---/);
 
   const registered = [];
   registerAipiRuntimeTools(
@@ -1241,6 +1326,24 @@ async function pathExists(filePath) {
 
 function fakeEmbeddingFetch(calls) {
   return fakeEmbeddingFetchForModel(calls, "bge-m3", 1024);
+}
+
+function fakeEmbeddingFetchThatFailsAfter(calls, successfulLimit) {
+  const successfulInputs = [];
+  const base = fakeEmbeddingFetch(calls);
+  return {
+    successfulInputs,
+    async fetch(url, options = {}) {
+      if (!String(url).endsWith("/api/embed")) return base(url, options);
+      if (successfulInputs.length >= successfulLimit) {
+        throw new Error("simulated interrupted embedding build");
+      }
+      const body = JSON.parse(options.body ?? "{}");
+      const input = Array.isArray(body.input) ? String(body.input[0] ?? "") : String(body.input ?? "");
+      successfulInputs.push(input);
+      return base(url, options);
+    },
+  };
 }
 
 function fakeEmbeddingFetchForModel(calls, expectedModel, dimensions) {
@@ -1302,4 +1405,8 @@ function hashText(text) {
     hash = Math.imul(hash ^ text.charCodeAt(index), 16777619);
   }
   return hash;
+}
+
+function countOccurrences(text, token) {
+  return String(text).split(token).length - 1;
 }

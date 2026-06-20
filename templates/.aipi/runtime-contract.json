@@ -146,7 +146,9 @@
       "model_fallback",
       "model_warning",
       "blocker_question",
-      "awaiting_user_input"
+      "awaiting_user_input",
+      "memory_promotions",
+      "memory_promotion_result"
     ],
     "verdictRule": "Only PASS satisfies a normal gate. FAIL, BLOCKED, and BLOCKED_TO_PLANNING never pass. SKIPPED passes only when the step declares allow_skip: true.",
     "evidenceRule": "A PASS result needs at least one evidence item with rung ran or verified unless the gate explicitly allows written evidence.",
