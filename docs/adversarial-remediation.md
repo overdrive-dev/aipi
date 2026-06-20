@@ -234,12 +234,14 @@ Claim evidence anchors for the live runtime surfaces are `test:workflow-executor
   `rpc_worker_process`, `per_worker_worktree`, or another unsupported isolation
   mode was rejected instead of silently downgrading to the shared in-process
   backend.
-- Round 33: added an optional `sqlite-vec` backend to the rebuildable code
-  graph. When the platform extension and local Ollama are available,
-  `rebuildCodeGraph` creates a `vec0` table with 1024-dimensional
-  `bge-m3` code-line embeddings; `aipi_callers` and `aipi_impact`
-  merge exact SQLite refs with vector refs and fall back to lexical search when
-  semantic embeddings are unavailable.
+- Round 33/Round 41: added and refined the optional `sqlite-vec` backend to the
+  rebuildable code graph. When the platform extension and local Ollama are
+  available, `rebuildCodeGraph` creates a `vec0` table with 1024-dimensional
+  `bge-m3` embeddings over symbol/window chunks while preserving line-level
+  `code_lines` for lexical fallback. `aipi_retrieve` fuses semantic chunks,
+  exact lexical lines, graph proximity, and governing rule/test links with RRF
+  provenance; `aipi_callers` and `aipi_impact` still merge SQLite/vector refs
+  and fall back to lexical search when semantic embeddings are unavailable.
 - Round 34: added rebuildable graph relationship edges. The JSON manifest and
   SQLite sidecar now record symbol definitions, test coverage candidates,
   memory mentions, and run-artifact path mentions; `aipi_impact` returns

@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { aipiImpact } from "./aipi-tools.js";
+import { aipiRetrieve } from "./aipi-tools.js";
 
 const DEFAULT_MAX_ARTIFACTS_PER_STEP = 4;
 const DEFAULT_MAX_EXCERPT_LINES = 80;
@@ -174,7 +174,7 @@ export async function materializeProjectMemory({
 async function materializeBlastRadius({ root, query = "", maxRefs = DEFAULT_MAX_BLAST_RADIUS_REFS } = {}) {
   if (!query?.trim()) {
     return {
-      source: "aipi_impact",
+      source: "aipi_retrieve",
       status: "skipped",
       reason: "empty query",
       refs: [],
@@ -182,17 +182,18 @@ async function materializeBlastRadius({ root, query = "", maxRefs = DEFAULT_MAX_
     };
   }
   try {
-    const impact = await aipiImpact({ projectRoot: root, query, limit: maxRefs });
+    const retrieval = await aipiRetrieve({ projectRoot: root, query, limit: maxRefs });
     return {
-      source: "aipi_impact",
+      source: "aipi_retrieve",
       status: "available",
-      graph: impact.graph,
-      refs: (impact.refs ?? []).slice(0, maxRefs),
-      relationships: (impact.relationships ?? []).slice(0, maxRefs),
+      graph: retrieval.graph,
+      fusion: retrieval.fusion,
+      refs: (retrieval.refs ?? []).slice(0, maxRefs),
+      relationships: (retrieval.relationships ?? []).slice(0, maxRefs),
     };
   } catch (error) {
     return {
-      source: "aipi_impact",
+      source: "aipi_retrieve",
       status: "unavailable",
       reason: String(error?.message ?? error),
       refs: [],
@@ -284,7 +285,7 @@ async function readGraphStatus(root) {
       sqlite_path: sqliteRel,
       status: "missing",
       stale: true,
-      note: "Run aipi_impact or aipi_callers to rebuild the JSON/SQLite graph index.",
+      note: "Run aipi_retrieve, aipi_impact, or aipi_callers to rebuild the JSON/SQLite graph index.",
     };
   }
   return {

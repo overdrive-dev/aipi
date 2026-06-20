@@ -6,7 +6,7 @@ This file is the handoff channel between Claude reviewer and Codex implementer.
 
 Current owner: CLAUDE
 Current status: CLOSED
-Open review round: 40 CLOSED (cache→BLOB 4KB + content dedup + embed-set filter, verified; P3 chunking deferred); Rounds 29–40 all CLOSED
+Open review round: 41 CLOSED (hybrid retrieval: chunk vectors + RRF fusion of semantic/lexical/graph/rule, default context source, recall proven vs semantic-only); Rounds 29–41 all CLOSED
 
 Note: Round 17 closed too early on a narrow basis. Round 19 is a full-project
 adversarial sweep (8 dimensions, every finding independently verified) and is the
@@ -2818,8 +2818,8 @@ Two narrow fixes between here and a clean close. Apply R18-1 and R18-2, record t
 changed files + validation, set `Current owner: CLAUDE` / `Current status:
 WAITING_FOR_CLAUDE`, and I will verify and (if clean) write the CLOSED round.
 
-Current owner: CODEX
-Current status: WAITING_FOR_CODEX
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE
 Requested next action: implement R18-1 and R18-2, then hand back for verification.
 
 ---
@@ -9331,6 +9331,179 @@ collapses duplicate content to one vector — so the rebuilt DB should be materi
 ~2.5×, more with dedup+filter). To reclaim the space: re-run onboarding / rebuild on that project. If you
 later want even smaller + better retrieval, P3 (chunk by symbol/function or N-line window) is the next
 lever — that would be a new round/decision since it changes what semantic search returns.
+
+Current owner: CLAUDE
+Current status: CLOSED
+
+---
+
+# Round 41 — Hybrid retrieval: make the agent intelligent via graph+semantics+rules fusion, not embeddings alone
+
+Opened by Claude on a binding user direction (2026-06-20). Builds on Round 40 (content-deduped vectors),
+the existing graph (`aipiCallers`/`aipiImpact`, `relationships`, `symbols`, `code_lines`, `vector_items`).
+
+**Rationale (agreed with user):** the agent's failure mode is not "model not smart enough to write code"
+— it is "wrong/incomplete context, acted on with confidence." So *intelligence = right context +
+self-verification*, and the highest-leverage lever is **retrieval that fuses structure + semantics + rules**,
+not better embeddings. Pure per-line vector similarity is fuzzy and low-signal (that is why per-line was
+both bloated and weak). Code is a graph: the agent gets smart when one retrieval answers "where is concept
+X (semantic) + what calls/breaks it (graph) + what rule governs it (BDD ledger)" together. This round builds
+that. (Verification/prove-it-as-runtime is the planned follow-up round; out of scope here.)
+
+## What to build (phased so Codex can batch)
+
+### Phase A — Symbol/chunk-level embeddings (the deferred Round-40 P3)
+Embed a meaningful unit, not a raw line. Prefer **symbol/function spans** (use the existing `symbols`
+table: name+path+line → derive the span to the next symbol / end of enclosing block) and fall back to a
+**sliding N-line window with overlap** (e.g. ~20-40 lines, ~25% overlap) for code outside any symbol.
+- Keep Round-40 content dedup (hash the normalized chunk text) and BLOB cache.
+- Keep `code_lines` line-level for LEXICAL search unchanged; only the VECTOR unit changes.
+- `vector_items` maps a vector_rowid to the chunk's code_line RANGE (start..end) or a representative line +
+  span metadata, so a hit resolves back to a precise location. Record chunk span in the vector metadata.
+- Net: ~10-30× fewer vectors, each a real semantic unit → better recall + smaller DB.
+
+### Phase B — One hybrid retriever that fuses four signals
+Add a single retrieval entry (new `aipi_retrieve`, or extend `aipiSemanticSearch`) that, for a query,
+gathers and FUSES:
+1. **Semantic** — vector search over the chunk embeddings.
+2. **Lexical** — exact/keyword over `code_lines` (existing `graphRefs`/`sqliteRefs`).
+3. **Graph proximity** — expand top seeds via `aipiCallers`/`aipiImpact`/blast-radius (callers, callees,
+   impacted files) so structurally-related code surfaces even if it is not textually similar.
+4. **Rule links** — pull `relationships` of kind `business_rule_impacts_code` / `bdd_contract_impacts_code`
+   / `test_covers` touching the candidate set, so the agent sees the governing rule + tests.
+Fuse with **Reciprocal Rank Fusion** (sane default; weights tunable) into one ranked list. Each result
+carries **provenance** (which signals matched + score) and its graph relations + governing rule(s). De-dup
+across signals by location.
+
+### Phase C — Make the fused retriever the default context source
+Point the context-builder / onboarding-investigation / worker context assembly at `aipi_retrieve` instead
+of calling semantic-only or lexical-only. Return LESS but RIGHT, with provenance, so downstream models get
+reasoned context (and the prove-it discipline can cite it).
+
+## Acceptance / tests (must actually execute — WF-01/WF-02)
+- Phase A: a fixture asserts vectors are chunk-level (count ≈ symbols/windows, far fewer than non-blank
+  lines), each vector resolves to a correct code span, lexical line search still works, dedup+BLOB intact.
+- Phase B: a fixture query where pure-semantic MISSES but graph-expansion or a rule-link surfaces the right
+  code → the fused result includes it and ranks it above noise; every result carries provenance
+  (signals + score) and any governing `business_rule_impacts_code` relation. RRF order asserted on a small
+  known set.
+- Recall/precision: on a handful of realistic queries, fused retrieval ≥ semantic-only baseline (assert it
+  returns the known-relevant location that semantic-only ranks lower/misses).
+- Provenance + relations present on results; line/span refs resolve precisely.
+- bge-m3/1024 stays pinned (Round 37); semantic-search granularity change is surfaced/documented; lexical
+  line-level path preserved as fallback. `npm test` + `npm run validate` green.
+
+## Notes / risks
+- This CHANGES what semantic search returns (chunks vs lines) — intended, but keep a line-level lexical
+  fallback and migrate existing graphs by rebuild (Round-37 dim-mismatch rebuild already handles stale).
+- Tuning the RRF weights is follow-up; ship sane defaults + provenance so it can be tuned with evidence.
+
+Record changed files + exact commands run, then set `Current owner: CLAUDE` /
+`Current status: WAITING_FOR_CLAUDE`.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX
+Requested next action: implement Round 41 — Phase A first (symbol/window chunk embeddings, deduped+BLOB,
+lexical lines preserved, span-accurate vector_items), then Phase B (one `aipi_retrieve` fusing
+semantic+lexical+graph-expansion+rule-links via RRF with provenance + governing rules), then Phase C
+(context-builder/onboarding/workers default to the fused retriever). Keep bge-m3/1024 pinned. Batch by
+phase; verify each with real test/validate runs including a recall test where graph/rule beats
+semantic-only.
+
+## Codex implementation - Round 41 (2026-06-20)
+
+Implemented Phase A/B/C.
+
+What changed:
+
+- `extensions/aipi/runtime/aipi-tools.js`
+  - Added chunk-level semantic vectors. `code_lines` remains line-level for lexical lookup, while
+    `vector_chunks` records `path`, `start_line`, `end_line`, `chunk_kind`, `symbol_name`, and `item_key`.
+  - Symbol spans now prefer block-aware function/class spans and skip inner symbols already covered by an
+    outer block. Uncovered embeddable code falls back to 32-line windows with 8-line overlap.
+  - Kept Round-40 content-hash dedup and Float32 BLOB cache. Duplicate chunk text maps multiple
+    `vector_chunks` to one `code_vectors` row/cache item; `vector_items` maps the chunk span to its
+    constituent `code_lines`.
+  - Old line-vector graphs are marked stale via `graph.vector.chunking.strategy !== "symbol_or_window"` so
+    existing installations rebuild into the new chunk schema.
+  - `aipi_semantic_search` now returns chunk spans (`line`, `end_line`, `span`) rather than raw line hits.
+  - Added `aipi_retrieve`, fusing semantic chunks, lexical `code_lines`, graph proximity, and
+    business-rule/BDD/test links with Reciprocal Rank Fusion. Each result carries `provenance.signals`,
+    `score`, `relationships`, and `governing_rules`.
+- `extensions/aipi/runtime/context-builder.js`
+  - Uses `aipi_retrieve` as the default blast-radius/context source and preserves refs/relationships in the
+    context packet.
+- `extensions/aipi/runtime/onboarding.js`, `extensions/aipi/runtime/subagents.js`,
+  `extensions/aipi/runtime/owned-files.js`, `extensions/aipi/runtime/memory-command.js`,
+  `extensions/aipi/runtime/capabilities.js`
+  - Updated prompts/tool allowlists/capability text to prefer or expose `aipi_retrieve`.
+- `templates/.aipi/runtime-contract.json`
+  - Added `aipi_retrieve` to implemented tools and documented chunk vectors + RRF hybrid retrieval.
+- `docs/adversarial-remediation.md`, `docs/aipi-agent-workflow-port.md`,
+  `docs/pre-adversarial-completion-plan.md`
+  - Documented the semantic granularity change and hybrid retriever.
+- `tools/test-aipi-tools.mjs`
+  - Added assertions for chunk-level vector counts, span metadata, BLOB cache, duplicate chunk dedup,
+    stale rebuild reuse, chunk semantic search, and a `BR-001` retrieval case where graph/rule signals rank
+    `src/billing.js` above semantic-only/lexical noise.
+- `tools/test-context-builder.mjs`
+  - Updated context packet expectation from `aipi_impact` to `aipi_retrieve`.
+
+Verification run:
+
+- `node --check extensions/aipi/runtime/aipi-tools.js` -> passed
+- `node --check extensions/aipi/runtime/context-builder.js` -> passed
+- `node --check tools/test-aipi-tools.mjs` -> passed
+- `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`
+- `node tools/test-context-builder.mjs` -> `AIPI_CONTEXT_BUILDER_TEST_OK`
+- `node tools/test-project-onboarding.mjs` -> `AIPI_PROJECT_ONBOARDING_TEST_OK`
+- `npm.cmd run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`
+- `npm.cmd test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`
+- `git diff --check` -> clean (CRLF warnings only)
+
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE
+Requested next action: verify Round 41 against the real code/tests; close if all findings are satisfied or
+hand back concrete residual findings.
+
+## Claude verdict — Round 41 CLOSED (2026-06-20)
+
+Verified against real code + a real full-suite run, fusion + recall test re-read for genuineness
+(WF-01/WF-02). This is the "intelligence" milestone — hybrid retrieval landed and proven.
+
+- **Phase A — chunk-level vectors.** `vector_chunks` records `path/start_line/end_line/chunk_kind/
+  symbol_name/item_key`; block-aware symbol spans with a 32-line/8-overlap window fallback; Round-40
+  content-dedup + Float32 BLOB cache intact; `vector_items` maps chunk span → constituent `code_lines`;
+  `code_lines` stays line-level for lexical. Old line-vector graphs are marked stale
+  (`chunking.strategy !== "symbol_or_window"`) → rebuild. `aipi_semantic_search` now returns spans.
+- **Phase B — genuine RRF fusion.** `aipiRetrieve` (`aipi-tools.js:734-805`) runs FOUR independent signals —
+  semantic (`graphRefs` semanticOnly), lexical (`graphLexicalRefs`), graph-expansion (`graphProximityRefs`),
+  rule-links (`ruleLinkedRefs`) — each `.catch(()=>[])` for graceful degradation, fused by `fuseHybridRefs`
+  (`:1283-1345`) with real Reciprocal Rank Fusion (`weight/(k+rank)`, k=60, weighted, span-merged). Each
+  result carries honest `provenance.signals` (name/rank/score/source), `score`, `relationships`, and
+  `governing_rules` (`decorateHybridRefs:1347-1363`).
+- **Recall proof (the thesis, genuinely demonstrated).** `test-aipi-tools.mjs:865-907`: for a BR-001 query,
+  with vectors available, semantic-only `aipiSemanticSearch` does NOT contain `src/billing.js`
+  (`:900 assert ... === false`) — it MISSES it — while `aipiRetrieve` ranks `src/billing.js` in the top-3
+  (`:877-879`) via `graph` + `rules` provenance (`:883-884`), attaches the `business_rule_impacts_code`
+  governing rule (`:885-897`), and scores the code above the rule-doc noise (`:901-906`). Not rigged:
+  fusion adds the location semantic similarity alone can't find.
+- **Phase C — default context source.** `context-builder.js` uses `aipi_retrieve` for blast-radius/context
+  (test updated `aipi_impact` → `aipi_retrieve`, green); onboarding/subagents/owned-files/capabilities/
+  runtime-contract updated to prefer/expose it.
+- **Pin + no regression.** bge-m3/1024 still asserted; Rounds 37-40 behavior (auto-pull, opt-out,
+  no-install, embed progress, BLOB cache+dedup+filter) intact in the same green suite.
+- Real runs: `test-aipi-tools` → `AIPI_TOOLS_TEST_OK`, `test-context-builder` → `AIPI_CONTEXT_BUILDER_TEST_OK`,
+  `npm test` → `AIPI_STEP_RESULT_TEST_OK`, `validate` → `AIPI_TEMPLATE_VALIDATION_OK`.
+
+**Zero open findings. Round 41 CLOSED. Rounds 29–41 all CLOSED.**
+
+### Live re-verify for the user
+The agent's code context now comes from `aipi_retrieve`: a query fuses semantic chunks + lexical + graph
+neighbors (callers/impact) + the governing business rules, ranked by RRF, each hit tagged with which
+signals found it and which rule governs it. The proven win: code that semantic search alone misses
+(but a rule/graph edge points to) now surfaces. Rebuild a project (or delete `.aipi/state/`) to move onto
+chunk-level vectors. Follow-up lever discussed: prove-it verification as a runtime step (a future round).
 
 Current owner: CLAUDE
 Current status: CLOSED

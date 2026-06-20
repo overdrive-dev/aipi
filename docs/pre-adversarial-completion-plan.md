@@ -346,14 +346,15 @@ Work:
   memory and require approval before promotion.
 - Implemented: build a rebuildable JSON manifest plus `node:sqlite` sidecar
   over code files, symbols, searchable code lines, and optional `sqlite-vec`
-  1024-dimensional Ollama `bge-m3` code-line vectors. The graph also stores rebuildable
+  1024-dimensional Ollama `bge-m3` symbol/window chunk vectors. The graph also stores rebuildable
   relationship edges for symbol definitions, test coverage candidates, memory
   mentions, run-artifact path mentions, accepted business rules, BDD contracts,
   explicit rule conflicts, deployment surfaces, and verification artifacts.
   Historical run artifacts now produce `run_outcomes` plus `run_verifies_rule`,
   `run_fails_rule`, `run_blocks_rule`, `run_skips_rule`, and
   `run_outcome_impacts_code` relationships.
-  `aipi_callers` and `aipi_impact` query SQLite/vector first and fall back to
+  `aipi_retrieve` fuses semantic chunks, lexical lines, graph proximity, and
+  rule/test links; `aipi_callers` and `aipi_impact` query SQLite/vector first and fall back to
   lexical scans plus manifest relationships. SQLite/code-line/vector writes run
   inside one explicit transaction to avoid slow autocommit behavior during graph
   refresh.

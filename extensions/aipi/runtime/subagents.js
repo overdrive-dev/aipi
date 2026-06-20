@@ -1047,7 +1047,7 @@ function buildWorkerContextAugmentation({ descriptor = {}, root = process.cwd() 
     "- memory_refs: .aipi/memory/project/business-rules.md, .aipi/memory/project/decisions.md, .aipi/memory/project/project.md",
     `- blast_radius_seeds: ${blastSeeds.length ? blastSeeds.join(", ") : "(none)"}`,
     `- code_graph: ${graph.status}; source=${graph.source ?? "unknown"}; built_at=${graph.built_at ?? "unknown"}`,
-    "- use aipi_impact/aipi_callers for detailed semantic+lexical blast-radius materialization before editing.",
+    "- use aipi_retrieve for fused semantic/lexical/graph/rule context before editing; use aipi_impact/aipi_callers for narrower follow-up.",
   ].join("\n");
 }
 

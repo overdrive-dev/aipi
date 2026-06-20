@@ -102,7 +102,7 @@ try {
   assert.equal(context.prior_steps[0].step_id, "scope");
   assert.match(context.prior_steps[0].artifacts[0].excerpt, /Renewal pricing touches billing/);
   assert.equal(context.memory.refs.some((ref) => ref.path.endsWith("business-rules.md")), true);
-  assert.equal(context.blast_radius.source, "aipi_impact");
+  assert.equal(context.blast_radius.source, "aipi_retrieve");
   assert.equal(Array.isArray(context.blast_radius.refs), true);
   assert.equal(context.blast_radius.refs.length > 0, true);
   assert.equal(context.blast_radius.refs.some((ref) => ref.path === "src/billing.js"), true);

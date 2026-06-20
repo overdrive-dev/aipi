@@ -9,6 +9,7 @@ import {
   aipiKanbanUpdate,
   aipiMemoryQuery,
   aipiPromoteMemory,
+  aipiRetrieve,
   aipiRuleGap,
   aipiRuleLookup,
   aipiSemanticSearch,
@@ -281,6 +282,10 @@ try {
     "export function renewSubscription(account) {\n  const sharedRenewalNeedle = 'enterprise renewal vector';\n  const sharedRenewalNeedle = 'enterprise renewal vector';\n  return account.price;\n}\n",
   );
   await fs.writeFile(
+    path.join(tempRoot, "src", "billing-copy.js"),
+    "export function renewSubscription(account) {\n  const sharedRenewalNeedle = 'enterprise renewal vector';\n  const sharedRenewalNeedle = 'enterprise renewal vector';\n  return account.price;\n}\n",
+  );
+  await fs.writeFile(
     path.join(tempRoot, "tests", "billing.test.js"),
     "import { renewSubscription } from '../src/billing.js';\nrenewSubscription({ price: 10 });\n",
   );
@@ -424,21 +429,37 @@ try {
           `).all();
           const vectorRowCount = db.prepare("SELECT COUNT(*) AS count FROM code_vectors").get()?.count ?? 0;
           const vectorMapCount = db.prepare("SELECT COUNT(*) AS count FROM vector_items").get()?.count ?? 0;
+          const vectorChunkCount = db.prepare("SELECT COUNT(*) AS count FROM vector_chunks").get()?.count ?? 0;
+          const codeLineCount = db.prepare("SELECT COUNT(*) AS count FROM code_lines").get()?.count ?? 0;
           assert.equal(cacheRows.length, vectorRowCount);
           assert.equal(cacheRows.every((row) => String(row.item_key).startsWith("sha256:")), true);
           assert.equal(cacheRows.every((row) => row.storage_type === "blob"), true);
           assert.equal(cacheRows.every((row) => row.bytes === 1024 * 4), true);
           assert.equal(vectorRowCount, graph.vector.unique_item_count);
-          assert.equal(vectorMapCount, graph.vector.item_count);
-          assert.equal(vectorRowCount < vectorMapCount, true);
-          const duplicateVectorRows = db.prepare(`
-            SELECT COUNT(*) AS line_count, COUNT(DISTINCT items.vector_rowid) AS vector_count
-            FROM code_lines AS lines
-            JOIN vector_items AS items ON items.code_line_id = lines.id
-            WHERE lines.text = ?
-          `).get("  const sharedRenewalNeedle = 'enterprise renewal vector';");
-          assert.equal(duplicateVectorRows.line_count, 2);
-          assert.equal(duplicateVectorRows.vector_count, 1);
+          assert.equal(vectorChunkCount, graph.vector.item_count);
+          assert.equal(vectorMapCount, graph.vector.line_mapping_count);
+          assert.equal(vectorChunkCount < codeLineCount, true);
+          assert.equal(vectorMapCount > vectorChunkCount, true);
+          const renewalChunk = db.prepare(`
+            SELECT start_line, end_line, text, chunk_kind, symbol_name
+            FROM vector_chunks
+            WHERE path = ? AND chunk_kind = 'symbol' AND symbol_name = 'renewSubscription'
+            ORDER BY start_line ASC
+            LIMIT 1
+          `).get("src/billing.js");
+          assert.equal(renewalChunk.start_line, 1);
+          assert.equal(renewalChunk.end_line >= 5, true);
+          assert.match(renewalChunk.text, /enterprise renewal vector/);
+          const duplicateChunkRows = db.prepare(`
+            SELECT COUNT(*) AS chunk_count, COUNT(DISTINCT vector_rowid) AS vector_count
+            FROM vector_chunks
+            GROUP BY item_key
+            HAVING chunk_count >= 2
+            ORDER BY chunk_count DESC
+            LIMIT 1
+          `).get();
+          assert.equal(duplicateChunkRows.chunk_count >= 2, true);
+          assert.equal(duplicateChunkRows.vector_count, 1);
         }
       } finally {
         db.close();
@@ -461,7 +482,7 @@ try {
     assert.equal(semanticVectorProgress.some((event) => event.files_embedded > 0), true);
     const finalVectorProgress = semanticVectorProgress[semanticVectorProgress.length - 1];
     assert.equal(finalVectorProgress.status, "done");
-    assert.match(finalVectorProgress.message, /semantic vectors built \(\d+ lines\)/);
+    assert.match(finalVectorProgress.message, /semantic vectors built \(\d+ chunks\)/);
     assert.equal(finalVectorProgress.line_count, graph.vector.item_count);
   }
   assert.equal(graph.files.some((file) => /(^|\/)(node_modules|\.expo|\.venv|venv|__pycache__|\.turbo|\.gradle)\//.test(file.path)), false);
@@ -841,6 +862,50 @@ try {
   assert.equal(failedImpact.graph.run_outcome_count >= 2, true);
   assert.equal(failedImpact.relationships.some((edge) => edge.relation === "run_fails_rule"), true);
 
+  const semanticRuleBaseline = await aipiSemanticSearch({
+    projectRoot: tempRoot,
+    query: ".aipi/memory/project/business-rules.md#BR-001",
+    limit: 1,
+    ...semanticOptions,
+  });
+  const hybridRuleRetrieval = await aipiRetrieve({
+    projectRoot: tempRoot,
+    query: ".aipi/memory/project/business-rules.md#BR-001",
+    limit: 5,
+    ...semanticOptions,
+  });
+  const hybridBillingIndex = hybridRuleRetrieval.refs.findIndex((ref) => ref.path === "src/billing.js");
+  assert.equal(hybridBillingIndex >= 0, true);
+  assert.equal(hybridBillingIndex < 3, true);
+  const hybridBillingRef = hybridRuleRetrieval.refs[hybridBillingIndex];
+  assert.equal(hybridBillingRef.source, "hybrid");
+  assert.equal(hybridBillingRef.provenance.method, "reciprocal_rank_fusion");
+  assert.equal(hybridBillingRef.provenance.signals.some((signal) => signal.name === "graph"), true);
+  assert.equal(hybridBillingRef.provenance.signals.some((signal) => signal.name === "rules"), true);
+  assert.equal(
+    hybridBillingRef.governing_rules.some((edge) => edge.relation === "business_rule_impacts_code"),
+    true,
+  );
+  assert.equal(
+    hybridRuleRetrieval.relationships.some(
+      (edge) =>
+        edge.relation === "business_rule_impacts_code" &&
+        edge.source_ref.endsWith("business-rules.md#BR-001") &&
+        edge.target_ref === "src/billing.js",
+    ),
+    true,
+  );
+  assert.equal(hybridRuleRetrieval.fusion.method, "reciprocal_rank_fusion");
+  if (graph.vector.status === "available") {
+    assert.equal(semanticRuleBaseline.refs.some((ref) => ref.path === "src/billing.js"), false);
+    assert.equal(
+      hybridBillingRef.score > Math.max(...hybridRuleRetrieval.refs
+        .filter((ref) => ref.path.endsWith("business-rules.md"))
+        .map((ref) => ref.score), 0),
+      true,
+    );
+  }
+
   const semanticOnly = await aipiSemanticSearch({
     projectRoot: tempRoot,
     query: "subscription renewal price",
@@ -851,12 +916,18 @@ try {
   }
   const semanticExact = await aipiSemanticSearch({
     projectRoot: tempRoot,
-    query: "const sharedRenewalNeedle = 'enterprise renewal vector';",
+    query: "export function renewSubscription(account) {\n  const sharedRenewalNeedle = 'enterprise renewal vector';\n  const sharedRenewalNeedle = 'enterprise renewal vector';\n  return account.price;\n}",
     ...semanticOptions,
   });
   if (graph.vector.status === "available") {
     assert.equal(
-      semanticExact.refs.some((ref) => ref.path === "src/billing.js" && /enterprise renewal vector/.test(ref.excerpt)),
+      semanticExact.refs.some(
+        (ref) =>
+          ref.path === "src/billing.js" &&
+          ref.span?.start_line === 1 &&
+          ref.end_line >= 5 &&
+          /enterprise renewal vector/.test(ref.excerpt),
+      ),
       true,
     );
   }
@@ -1146,6 +1217,7 @@ try {
       "aipi_rule_gap",
       "aipi_callers",
       "aipi_impact",
+      "aipi_retrieve",
       "aipi_semantic_search",
       "aipi_guarded_bash",
       "aipi_kanban_update",

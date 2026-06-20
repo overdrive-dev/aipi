@@ -90,6 +90,7 @@ provides:
 - `aipi_rule_lookup`
 - `aipi_rule_gap`
 - `aipi_impact`
+- `aipi_retrieve`
 - `aipi_callers`
 - `aipi_kanban_update`
 - `aipi_promote_memory`

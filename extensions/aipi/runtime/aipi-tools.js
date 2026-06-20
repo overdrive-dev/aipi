@@ -9,6 +9,7 @@ export const AIPI_RUNTIME_TOOL_NAMES = [
   "aipi_rule_gap",
   "aipi_callers",
   "aipi_impact",
+  "aipi_retrieve",
   "aipi_semantic_search",
   "aipi_guarded_bash",
   "aipi_kanban_update",
@@ -106,6 +107,9 @@ const SKIP_REL_DIRS = new Set(["ios/Pods", "android/build"]);
 const GRAPH_REL_PATH = ".aipi/state/aipi-graph.json";
 const GRAPH_SQLITE_REL_PATH = ".aipi/state/aipi-graph.sqlite";
 const GRAPH_VECTOR_DIMENSIONS = 1024;
+const VECTOR_CHUNK_WINDOW_LINES = 32;
+const VECTOR_CHUNK_WINDOW_OVERLAP_LINES = 8;
+const VECTOR_CHUNK_MAX_CHARS = 12_000;
 const SEMANTIC_CONFIG_REL_PATH = ".aipi/semantic-memory.json";
 const DEFAULT_OLLAMA_HOST = "http://localhost:11434";
 const DEFAULT_OLLAMA_MODEL = "bge-m3";
@@ -136,6 +140,19 @@ const RELATIONSHIP_PRIORITY = new Map([
   ["mentions_file", 70],
   ["mentions_symbol", 80],
   ["defines", 90],
+]);
+const HYBRID_RRF_K = 60;
+const HYBRID_SIGNAL_WEIGHTS = {
+  semantic: 1.0,
+  lexical: 1.15,
+  graph: 0.85,
+  rules: 1.05,
+};
+const RULE_LINK_RELATIONS = new Set([
+  "business_rule_impacts_code",
+  "business_rule_implements_code",
+  "bdd_contract_impacts_code",
+  "test_covers",
 ]);
 const DOMAIN_TOKEN_ALIASES = new Map([
   ["assinatura", "subscription"],
@@ -379,9 +396,31 @@ export function registerAipiRuntimeTools(pi, { projectRootResolver = () => proce
   });
 
   pi.registerTool({
+    name: "aipi_retrieve",
+    description:
+      "Return fused code context from semantic chunks, lexical matches, graph proximity, and governing rules.",
+    parameters: {
+      type: "object",
+      required: ["query"],
+      properties: {
+        query: { type: "string" },
+        limit: { type: "number" },
+        rebuild: { type: "boolean" },
+      },
+    },
+    async execute(_id, params, _signal, onUpdate, ctx) {
+      return jsonResult(await aipiRetrieve({
+        projectRoot: projectRootResolver(ctx),
+        ...params,
+        onProgress: runtimeToolProgress(onUpdate),
+      }));
+    },
+  });
+
+  pi.registerTool({
     name: "aipi_semantic_search",
     description:
-      "Run semantic-only code search through Ollama bge-m3. Fails loudly if semantic embeddings are unavailable.",
+      "Run semantic-only code search through Ollama bge-m3 chunk embeddings. Fails loudly if semantic embeddings are unavailable.",
     parameters: {
       type: "object",
       required: ["query"],
@@ -692,6 +731,82 @@ export async function aipiImpact({
   };
 }
 
+export async function aipiRetrieve({
+  projectRoot,
+  query = "",
+  limit = 12,
+  rebuild = false,
+  env = process.env,
+  embeddingFetch = globalThis.fetch,
+  onProgress = null,
+} = {}) {
+  if (!query?.trim()) throw new Error("aipi_retrieve requires query");
+  const root = assertRoot(projectRoot);
+  const graph = await ensureGraph(root, { rebuild, env, embeddingFetch, onProgress });
+  const needle = query.trim();
+  const resultLimit = Math.max(1, limit);
+  const signalLimit = Math.max(16, Math.min(64, resultLimit * 4));
+
+  const semanticRefs = await graphRefs({
+    root,
+    graph,
+    query: needle,
+    limit: signalLimit,
+    semanticOnly: true,
+    env,
+    embeddingFetch,
+  }).catch(() => []);
+  const lexicalRefs = await graphLexicalRefs({ root, graph, query: needle, limit: signalLimit }).catch(() => []);
+  const matchingRelationships = await graphRelationships({ root, graph, query: needle, limit: signalLimit }).catch(() => []);
+  const seedRefs = mergeRefs([...semanticRefs, ...lexicalRefs], signalLimit);
+  const graphExpansionRefs = graphProximityRefs({
+    graph,
+    query: needle,
+    seedRefs,
+    seedRelationships: matchingRelationships,
+    limit: signalLimit,
+  });
+  const ruleRefs = ruleLinkedRefs({
+    graph,
+    query: needle,
+    seedRefs,
+    seedRelationships: matchingRelationships,
+    limit: signalLimit,
+  });
+  const refs = decorateHybridRefs({
+    graph,
+    query: needle,
+    seedRelationships: matchingRelationships,
+    refs: fuseHybridRefs({
+      signals: [
+        { name: "semantic", refs: semanticRefs },
+        { name: "lexical", refs: lexicalRefs },
+        { name: "graph", refs: graphExpansionRefs },
+        { name: "rules", refs: ruleRefs },
+      ],
+      limit: resultLimit,
+    }),
+  });
+
+  return {
+    schema: "aipi.tool-result.v1",
+    tool: "aipi_retrieve",
+    query: needle,
+    graph: graphSummary(graph),
+    refs,
+    relationships: uniqueRelationships([
+      ...matchingRelationships,
+      ...refs.flatMap((ref) => ref.relationships ?? []),
+      ...refs.flatMap((ref) => ref.governing_rules ?? []),
+    ]).slice(0, signalLimit),
+    fusion: {
+      method: "reciprocal_rank_fusion",
+      k: HYBRID_RRF_K,
+      weights: HYBRID_SIGNAL_WEIGHTS,
+    },
+  };
+}
+
 export async function aipiSemanticSearch({
   projectRoot,
   query = "",
@@ -968,6 +1083,12 @@ async function graphRefs({ root, graph, query, limit, semanticOnly = false, env 
   return lexicalRefs({ root, files: graph.files.map((file) => file.path), query, limit });
 }
 
+async function graphLexicalRefs({ root, graph, query, limit }) {
+  const sqlite = await sqliteLexicalRefs({ root, query, limit });
+  if (sqlite) return sqlite;
+  return lexicalRefs({ root, files: graph.files.map((file) => file.path), query, limit });
+}
+
 async function graphRelationships({ root, graph, query = "", targetPath = "", limit = 16 } = {}) {
   const sqlite = await sqliteRelationshipRefs({ root, query, targetPath, limit });
   if (sqlite) return sqlite;
@@ -993,19 +1114,7 @@ async function sqliteRefs({ root, query, limit, semanticOnly = false, env = proc
     db = new sqlite.DatabaseSync(sqlitePath, { readOnly: true, allowExtension: true });
     const source = db.prepare("SELECT value FROM meta WHERE key = 'source'").get()?.value ?? "";
     const vectorEnabled = String(source).includes("sqlite-vec");
-    const exactRows = db.prepare(`
-      SELECT path, line, text
-      FROM code_lines
-      WHERE text LIKE ? ESCAPE '\\'
-      ORDER BY path ASC, line ASC
-      LIMIT ?
-    `).all(`%${escapeLike(needle)}%`, Math.max(1, limit));
-    const exact = exactRows.map((row) => ({
-      path: row.path,
-      line: row.line,
-      excerpt: String(row.text ?? "").trim(),
-      source: "sqlite",
-    }));
+    const exact = sqliteLexicalRows(db, needle, limit);
     if (!vectorEnabled && semanticOnly) {
       throw semanticUnavailableError("semantic-only search requires a built sqlite-vec index.");
     }
@@ -1023,6 +1132,45 @@ async function sqliteRefs({ root, query, limit, semanticOnly = false, env = proc
       /* best-effort close */
     }
   }
+}
+
+async function sqliteLexicalRefs({ root, query, limit }) {
+  const needle = String(query ?? "").trim();
+  if (!needle) return [];
+  const sqlite = await loadSqlite();
+  if (!sqlite) return null;
+  const sqlitePath = path.join(root, GRAPH_SQLITE_REL_PATH);
+  if (!(await pathExists(sqlitePath))) return null;
+
+  let db;
+  try {
+    db = new sqlite.DatabaseSync(sqlitePath, { readOnly: true });
+    return sqliteLexicalRows(db, needle, limit);
+  } catch {
+    return null;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      /* best-effort close */
+    }
+  }
+}
+
+function sqliteLexicalRows(db, needle, limit) {
+  const exactRows = db.prepare(`
+    SELECT path, line, text
+    FROM code_lines
+    WHERE text LIKE ? ESCAPE '\\'
+    ORDER BY path ASC, line ASC
+    LIMIT ?
+  `).all(`%${escapeLike(needle)}%`, Math.max(1, limit));
+  return exactRows.map((row) => ({
+    path: row.path,
+    line: row.line,
+    excerpt: String(row.text ?? "").trim(),
+    source: "sqlite",
+  }));
 }
 
 async function sqliteRelationshipRefs({ root, query, targetPath, limit }) {
@@ -1089,6 +1237,239 @@ async function lexicalRefs({ root, files, query, limit }) {
     }
   }
   return refs;
+}
+
+function graphProximityRefs({ graph, query = "", seedRefs = [], seedRelationships = [], limit = 16 } = {}) {
+  const out = [];
+  const seedPaths = new Set(seedRefs.map((ref) => ref.path).filter(Boolean));
+  const relevantRelationships = uniqueRelationships([
+    ...seedRelationships,
+    ...(graph.relationships ?? []).filter((edge) =>
+      relationshipMatches(edge, String(query ?? "").toLowerCase()) ||
+      relationshipTouchesAnyPath(edge, seedPaths, graph),
+    ),
+  ]);
+
+  for (const edge of relevantRelationships) {
+    for (const ref of codeRefsFromRelationship({ edge, graph, source: "graph" })) {
+      out.push(ref);
+      if (out.length >= Math.max(1, limit)) return mergeRefs(out, limit);
+    }
+  }
+  return mergeRefs(out, limit);
+}
+
+function ruleLinkedRefs({ graph, query = "", seedRefs = [], seedRelationships = [], limit = 16 } = {}) {
+  const seedPaths = new Set(seedRefs.map((ref) => ref.path).filter(Boolean));
+  const ruleRelationships = uniqueRelationships([
+    ...seedRelationships,
+    ...(graph.relationships ?? []),
+  ])
+    .filter((edge) => RULE_LINK_RELATIONS.has(edge.relation))
+    .filter((edge) =>
+      relationshipMatches(edge, String(query ?? "").toLowerCase()) ||
+      relationshipTouchesAnyPath(edge, seedPaths, graph),
+    );
+  const out = [];
+  for (const edge of ruleRelationships) {
+    for (const ref of codeRefsFromRelationship({ edge, graph, source: "rules" })) {
+      out.push(ref);
+      if (out.length >= Math.max(1, limit)) return mergeRefs(out, limit);
+    }
+  }
+  return mergeRefs(out, limit);
+}
+
+function fuseHybridRefs({ signals = [], limit = 12 } = {}) {
+  const candidates = [];
+  for (const signal of signals) {
+    const name = signal.name;
+    const weight = HYBRID_SIGNAL_WEIGHTS[name] ?? 1;
+    for (const [index, ref] of (signal.refs ?? []).entries()) {
+      if (!ref?.path) continue;
+      const rank = index + 1;
+      const contribution = weight / (HYBRID_RRF_K + rank);
+      let candidate = candidates.find((existing) => hybridRefsOverlap(existing, ref));
+      if (!candidate) {
+        const span = normalizedRefSpan(ref);
+        candidate = {
+          path: ref.path,
+          line: span.line,
+          end_line: span.end_line,
+          span,
+          excerpt: ref.excerpt ?? ref.text ?? "",
+          source: "hybrid",
+          score: 0,
+          provenance: {
+            method: "reciprocal_rank_fusion",
+            k: HYBRID_RRF_K,
+            signals: [],
+          },
+        };
+        candidates.push(candidate);
+      } else {
+        const existingSpan = normalizedRefSpan(candidate);
+        const refSpan = normalizedRefSpan(ref);
+        candidate.line = Math.min(existingSpan.line, refSpan.line);
+        candidate.end_line = Math.max(existingSpan.end_line, refSpan.end_line);
+        candidate.span = { start_line: candidate.line, end_line: candidate.end_line };
+        if (!candidate.excerpt && (ref.excerpt || ref.text)) candidate.excerpt = ref.excerpt ?? ref.text;
+      }
+      candidate.score += contribution;
+      candidate.provenance.signals.push({
+        name,
+        rank,
+        score: Number(contribution.toFixed(6)),
+        source: ref.source ?? name,
+        distance: Number.isFinite(ref.distance) ? Number(ref.distance) : undefined,
+      });
+    }
+  }
+
+  return candidates
+    .map((candidate) => ({
+      ...candidate,
+      score: Number(candidate.score.toFixed(6)),
+      provenance: {
+        ...candidate.provenance,
+        score: Number(candidate.score.toFixed(6)),
+      },
+    }))
+    .sort((left, right) =>
+      right.score - left.score ||
+      left.path.localeCompare(right.path) ||
+      left.line - right.line ||
+      left.end_line - right.end_line,
+    )
+    .slice(0, Math.max(1, limit));
+}
+
+function decorateHybridRefs({ graph, query = "", seedRelationships = [], refs = [] } = {}) {
+  const allRelationships = uniqueRelationships([...seedRelationships, ...(graph.relationships ?? [])]);
+  return refs.map((ref) => {
+    const relationships = allRelationships
+      .filter((edge) => relationshipTouchesRef(edge, ref, graph) || relationshipMatches(edge, String(query ?? "").toLowerCase()))
+      .sort((left, right) => compareRelationshipRefs(left, right, query))
+      .slice(0, 12)
+      .map((edge) => ({ ...edge, source: edge.source ?? "manifest" }));
+    const governingRules = relationships
+      .filter((edge) => RULE_LINK_RELATIONS.has(edge.relation))
+      .slice(0, 8);
+    return {
+      ...ref,
+      relationships,
+      governing_rules: governingRules,
+    };
+  });
+}
+
+function codeRefsFromRelationship({ edge, graph, source = "graph" } = {}) {
+  const refs = [];
+  refs.push(...codeRefsFromRelationshipEndpoint({ edge, graph, side: "source", source }));
+  refs.push(...codeRefsFromRelationshipEndpoint({ edge, graph, side: "target", source }));
+  return mergeRefs(refs, refs.length || 1);
+}
+
+function codeRefsFromRelationshipEndpoint({ edge, graph, side, source }) {
+  const kind = edge?.[`${side}_kind`];
+  const ref = edge?.[`${side}_ref`];
+  if (!kind || !ref) return [];
+  const excerpt = relationshipExcerpt(edge);
+  if ((kind === "file" || kind === "test") && isGraphCodePath(graph, ref)) {
+    return [{
+      path: ref,
+      line: 1,
+      excerpt,
+      source,
+      relationship: edge,
+    }];
+  }
+  if (kind === "symbol") {
+    return (graph.symbols ?? [])
+      .filter((symbol) => symbol.name === ref && isGraphCodePath(graph, symbol.path))
+      .map((symbol) => ({
+        path: symbol.path,
+        line: symbol.line ?? 1,
+        excerpt,
+        source,
+        relationship: edge,
+      }));
+  }
+  return [];
+}
+
+function relationshipExcerpt(edge) {
+  const evidence = edge.evidence ? ` (${edge.evidence})` : "";
+  return `${edge.relation}: ${edge.source_ref} -> ${edge.target_ref}${evidence}`;
+}
+
+function relationshipTouchesAnyPath(edge, paths, graph) {
+  if (!paths?.size) return false;
+  for (const rel of paths) {
+    if (relationshipTouchesPath(edge, rel, graph)) return true;
+  }
+  return false;
+}
+
+function relationshipTouchesRef(edge, ref, graph) {
+  if (!ref?.path) return false;
+  if (relationshipTouchesPath(edge, ref.path, graph)) return true;
+  return codeRefsFromRelationship({ edge, graph }).some((edgeRef) => hybridRefsOverlap(edgeRef, ref));
+}
+
+function relationshipTouchesPath(edge, rel, graph) {
+  const normalized = String(rel ?? "").replaceAll("\\", "/");
+  if (!normalized) return false;
+  for (const side of ["source", "target"]) {
+    const kind = edge?.[`${side}_kind`];
+    const ref = String(edge?.[`${side}_ref`] ?? "").replaceAll("\\", "/");
+    if (ref === normalized || ref.startsWith(`${normalized}#`)) return true;
+    if (kind === "symbol" && (graph.symbols ?? []).some((symbol) => symbol.name === ref && symbol.path === normalized)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isGraphCodePath(graph, rel) {
+  const normalized = String(rel ?? "").replaceAll("\\", "/");
+  if (!normalized || isMemoryFile(normalized) || normalized.startsWith(".aipi/runtime/")) return false;
+  return (graph.files ?? []).some((file) => file.path === normalized);
+}
+
+function hybridRefsOverlap(left, right) {
+  if (!left?.path || !right?.path || left.path !== right.path) return false;
+  const leftSpan = normalizedRefSpan(left);
+  const rightSpan = normalizedRefSpan(right);
+  return leftSpan.line <= rightSpan.end_line && rightSpan.line <= leftSpan.end_line;
+}
+
+function normalizedRefSpan(ref) {
+  const line = Number(ref?.span?.start_line ?? ref?.start_line ?? ref?.line ?? 1);
+  const endLine = Number(ref?.span?.end_line ?? ref?.end_line ?? ref?.line ?? line);
+  const start = Number.isFinite(line) && line > 0 ? line : 1;
+  const end = Number.isFinite(endLine) && endLine >= start ? endLine : start;
+  return { start_line: start, line: start, end_line: end };
+}
+
+function uniqueRelationships(edges = []) {
+  const out = [];
+  const seen = new Set();
+  for (const edge of edges) {
+    if (!edge) continue;
+    const key = [
+      edge.source_kind,
+      edge.source_ref,
+      edge.relation,
+      edge.target_kind,
+      edge.target_ref,
+      edge.evidence,
+    ].join("\u0000");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(edge);
+  }
+  return out;
 }
 
 async function listProjectFiles(root) {
@@ -2378,6 +2759,14 @@ async function inspectGraphFreshness(root, graph, { env = process.env } = {}) {
       actualCount: graph.files?.length ?? 0,
     });
   }
+  if (graphVector?.status === "available" && graphVector?.chunking?.strategy !== "symbol_or_window") {
+    return graphFreshnessStale({
+      checkedAt,
+      reason: "semantic vector chunking strategy changed: rebuild required for symbol/window chunks",
+      expectedCount: graph.files?.length ?? 0,
+      actualCount: graph.files?.length ?? 0,
+    });
+  }
   if (!Array.isArray(graph.files)) {
     return graphFreshnessStale({
       checkedAt,
@@ -2474,6 +2863,10 @@ function embeddingInputForCodeLine(line) {
   return String(line ?? "").trim().replace(/\s+/g, " ");
 }
 
+function embeddingInputForCodeChunk(text) {
+  return String(text ?? "").trim().replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n");
+}
+
 function embeddingContentKey(input) {
   return `sha256:${contentHash(input)}`;
 }
@@ -2495,6 +2888,126 @@ function isEmbeddableVectorFile(relPath) {
   if (/\.min\.[cm]?js$/.test(base)) return false;
   if (/(^|\.)(lock|snap)$/.test(base)) return false;
   return VECTOR_EMBED_EXTENSIONS.has(path.posix.extname(base));
+}
+
+function buildVectorChunksForFile({ file, lines, symbols = [] } = {}) {
+  if (!file?.path || !isEmbeddableVectorFile(file.path)) return [];
+  const fileSymbols = symbols
+    .filter((symbol) => symbol.path === file.path && Number.isFinite(Number(symbol.line)) && Number(symbol.line) > 0)
+    .map((symbol) => ({
+      ...symbol,
+      line: Math.min(lines.length, Math.max(1, Number(symbol.line))),
+    }))
+    .sort((left, right) => left.line - right.line || left.name.localeCompare(right.name));
+  const chunks = [];
+  const coveredLines = new Set();
+
+  for (const [index, symbol] of fileSymbols.entries()) {
+    if (coveredLines.has(symbol.line)) continue;
+    const nextSymbol = fileSymbols.slice(index + 1).find((candidate) => candidate.line > symbol.line);
+    const startLine = symbol.line;
+    const fallbackEndLine = Math.max(startLine, Math.min(lines.length, (nextSymbol?.line ?? (lines.length + 1)) - 1));
+    const endLine = symbolSpanEndLine(lines, startLine, fallbackEndLine);
+    const text = vectorChunkTextForSpan({ relPath: file.path, lines, startLine, endLine });
+    if (!text) continue;
+    chunks.push({
+      path: file.path,
+      start_line: startLine,
+      end_line: endLine,
+      text,
+      chunk_kind: "symbol",
+      symbol_name: symbol.name,
+    });
+    for (let line = startLine; line <= endLine; line += 1) coveredLines.add(line);
+  }
+
+  const uncoveredEmbeddableLines = [];
+  for (const [index, line] of lines.entries()) {
+    const lineNumber = index + 1;
+    if (coveredLines.has(lineNumber)) continue;
+    if (shouldEmbedCodeLine(file.path, line)) uncoveredEmbeddableLines.push(lineNumber);
+  }
+  for (const [startLine, endLine] of contiguousLineRanges(uncoveredEmbeddableLines)) {
+    chunks.push(...windowChunksForSpan({ relPath: file.path, lines, startLine, endLine }));
+  }
+
+  return chunks;
+}
+
+function symbolSpanEndLine(lines, startLine, fallbackEndLine) {
+  let depth = 0;
+  let sawBlock = false;
+  for (let index = startLine - 1; index < lines.length; index += 1) {
+    const line = stripQuotedTextForBraceScan(lines[index] ?? "");
+    for (const char of line) {
+      if (char === "{") {
+        depth += 1;
+        sawBlock = true;
+      } else if (char === "}") {
+        depth -= 1;
+      }
+    }
+    if (sawBlock && depth <= 0) return index + 1;
+  }
+  return fallbackEndLine;
+}
+
+function stripQuotedTextForBraceScan(line) {
+  return String(line ?? "")
+    .replace(/'[^']*'/g, "''")
+    .replace(/"[^"]*"/g, '""')
+    .replace(/`[^`]*`/g, "``");
+}
+
+function vectorChunkTextForSpan({ relPath, lines, startLine, endLine } = {}) {
+  const spanLines = lines.slice(startLine - 1, endLine);
+  if (!spanLines.some((line) => shouldEmbedCodeLine(relPath, line))) return "";
+  const text = spanLines.join("\n").trim();
+  if (!text) return "";
+  return text.length > VECTOR_CHUNK_MAX_CHARS ? text.slice(0, VECTOR_CHUNK_MAX_CHARS) : text;
+}
+
+function contiguousLineRanges(lineNumbers = []) {
+  const ranges = [];
+  let start = null;
+  let previous = null;
+  for (const line of lineNumbers) {
+    if (start == null) {
+      start = line;
+      previous = line;
+      continue;
+    }
+    if (line === previous + 1) {
+      previous = line;
+      continue;
+    }
+    ranges.push([start, previous]);
+    start = line;
+    previous = line;
+  }
+  if (start != null) ranges.push([start, previous]);
+  return ranges;
+}
+
+function windowChunksForSpan({ relPath, lines, startLine, endLine } = {}) {
+  const chunks = [];
+  const step = Math.max(1, VECTOR_CHUNK_WINDOW_LINES - VECTOR_CHUNK_WINDOW_OVERLAP_LINES);
+  for (let windowStart = startLine; windowStart <= endLine; windowStart += step) {
+    const windowEnd = Math.min(endLine, windowStart + VECTOR_CHUNK_WINDOW_LINES - 1);
+    const text = vectorChunkTextForSpan({ relPath, lines, startLine: windowStart, endLine: windowEnd });
+    if (text) {
+      chunks.push({
+        path: relPath,
+        start_line: windowStart,
+        end_line: windowEnd,
+        text,
+        chunk_kind: "window",
+        symbol_name: null,
+      });
+    }
+    if (windowEnd >= endLine) break;
+  }
+  return chunks;
 }
 
 function embeddingCacheEntryFromVector(vector) {
@@ -2595,6 +3108,7 @@ async function writeSqliteGraph({
       DROP TABLE IF EXISTS code_lines;
       DROP TABLE IF EXISTS relationships;
       DROP TABLE IF EXISTS vector_items;
+      DROP TABLE IF EXISTS vector_chunks;
       DROP TABLE IF EXISTS embedding_cache;
       DROP TABLE IF EXISTS code_vectors;
       CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -2631,6 +3145,19 @@ async function writeSqliteGraph({
         source TEXT NOT NULL,
         PRIMARY KEY(vector_rowid, code_line_id)
       );
+      CREATE TABLE vector_chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        vector_rowid INTEGER NOT NULL,
+        path TEXT NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        chunk_kind TEXT NOT NULL,
+        symbol_name TEXT,
+        item_key TEXT NOT NULL
+      );
+      CREATE INDEX vector_chunks_vector_idx ON vector_chunks(vector_rowid);
+      CREATE INDEX vector_chunks_path_span_idx ON vector_chunks(path, start_line, end_line);
       CREATE TABLE embedding_cache (
         item_key TEXT PRIMARY KEY,
         path TEXT NOT NULL,
@@ -2703,12 +3230,20 @@ async function writeSqliteGraph({
       vector.status === "available"
         ? db.prepare("INSERT INTO vector_items(vector_rowid, code_line_id, source) VALUES (?, ?, ?)")
         : null;
+    let vectorChunkInsert =
+      vector.status === "available"
+        ? db.prepare(`
+          INSERT INTO vector_chunks(vector_rowid, path, start_line, end_line, text, chunk_kind, symbol_name, item_key)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        : null;
     const lastInsertId = db.prepare("SELECT last_insert_rowid() AS id");
     const cacheInsert =
       vector.status === "available"
         ? db.prepare("INSERT OR IGNORE INTO embedding_cache(item_key, path, file_hash, dimensions, model, host, embedding) VALUES (?, ?, ?, ?, ?, ?, ?)")
         : null;
-    let vectorItemCount = 0;
+    let vectorChunkCount = 0;
+    let vectorLineMapCount = 0;
     let uniqueVectorCount = 0;
     let embeddedFileCount = 0;
     const vectorProgressEnabled = vector.status === "available";
@@ -2725,16 +3260,36 @@ async function writeSqliteGraph({
     const embeddingCache = new Map(reusableEmbeddingCache);
     const embeddingRequestCache = new Map();
     const vectorRowidsByContentKey = new Map();
+    const codeLineIdsByPath = new Map();
+    const fileLinesByPath = new Map();
     for (const file of graph.files) {
       const content = await fs.readFile(path.join(root, file.path), "utf8").catch(() => "");
       const lines = content.split(/\r?\n/);
+      fileLinesByPath.set(file.path, lines);
+      const lineIds = new Map();
       for (const [index, line] of lines.entries()) {
         if (!line.trim()) continue;
         lineInsert.run(file.path, index + 1, line);
         const codeLineId = lastInsertId.get().id;
-        if (vectorInsert && vectorMapInsert && shouldEmbedCodeLine(file.path, line)) {
+        lineIds.set(index + 1, codeLineId);
+      }
+      codeLineIdsByPath.set(file.path, lineIds);
+    }
+
+    for (const file of graph.files) {
+      const lines = fileLinesByPath.get(file.path) ?? [];
+      const lineIds = codeLineIdsByPath.get(file.path) ?? new Map();
+      if (vectorInsert && vectorMapInsert && vectorChunkInsert) {
+        const chunks = buildVectorChunksForFile({ file, lines, symbols: graph.symbols ?? [] });
+        for (const chunk of chunks) {
           try {
-            const embeddingInput = embeddingInputForCodeLine(line);
+            const mappedLineIds = [];
+            for (let lineNumber = chunk.start_line; lineNumber <= chunk.end_line; lineNumber += 1) {
+              const codeLineId = lineIds.get(lineNumber);
+              if (codeLineId != null) mappedLineIds.push(codeLineId);
+            }
+            if (!mappedLineIds.length) continue;
+            const embeddingInput = embeddingInputForCodeChunk(chunk.text);
             const itemKey = embeddingContentKey(embeddingInput);
             let vectorRowid = vectorRowidsByContentKey.get(itemKey);
             if (vectorRowid == null) {
@@ -2763,15 +3318,31 @@ async function writeSqliteGraph({
               );
               uniqueVectorCount += 1;
             }
-            vectorMapInsert.run(vectorRowid, codeLineId, "code_line");
-            vectorItemCount += 1;
+            vectorChunkInsert.run(
+              vectorRowid,
+              chunk.path,
+              chunk.start_line,
+              chunk.end_line,
+              chunk.text,
+              chunk.chunk_kind,
+              chunk.symbol_name ?? null,
+              itemKey,
+            );
+            for (const codeLineId of mappedLineIds) {
+              vectorMapInsert.run(vectorRowid, codeLineId, "code_chunk");
+              vectorLineMapCount += 1;
+            }
+            vectorChunkCount += 1;
           } catch (error) {
             vector = semanticVectorUnavailable(error, resolvedEmbeddingConfig);
             vector.embedding_pull = embeddingPull;
-            vector.item_count = vectorItemCount;
+            vector.item_count = vectorChunkCount;
             vector.unique_item_count = uniqueVectorCount;
+            vector.line_mapping_count = vectorLineMapCount;
             vectorInsert = null;
             vectorMapInsert = null;
+            vectorChunkInsert = null;
+            break;
           }
         }
       }
@@ -2782,7 +3353,8 @@ async function writeSqliteGraph({
           status: "running",
           file_count: graph.files.length,
           files_embedded: embeddedFileCount,
-          line_count: vectorItemCount,
+          line_count: vectorChunkCount,
+          chunk_count: vectorChunkCount,
           message: `AIPI semantic memory: embedded ${embeddedFileCount}/${graph.files.length} files.`,
         });
       }
@@ -2793,18 +3365,25 @@ async function writeSqliteGraph({
         status: vector.status === "available" ? "done" : "failed",
         file_count: graph.files.length,
         files_embedded: embeddedFileCount,
-        line_count: vectorItemCount,
+        line_count: vectorChunkCount,
+        chunk_count: vectorChunkCount,
         message: vector.status === "available"
-          ? `AIPI semantic memory: semantic vectors built (${vectorItemCount} lines).`
-          : `AIPI semantic memory: semantic vector build stopped after ${vectorItemCount} lines; continuing with lexical memory.`,
+          ? `AIPI semantic memory: semantic vectors built (${vectorChunkCount} chunks).`
+          : `AIPI semantic memory: semantic vector build stopped after ${vectorChunkCount} chunks; continuing with lexical memory.`,
       });
     }
 
     const source = vector.status === "available" ? "sqlite+sqlite-vec+lexical" : "sqlite+lexical";
     metaInsert.run("source", source);
     if (vector.status === "available") {
-      vector.item_count = vectorItemCount;
+      vector.item_count = vectorChunkCount;
       vector.unique_item_count = uniqueVectorCount;
+      vector.line_mapping_count = vectorLineMapCount;
+      vector.chunking = {
+        strategy: "symbol_or_window",
+        window_lines: VECTOR_CHUNK_WINDOW_LINES,
+        overlap_lines: VECTOR_CHUNK_WINDOW_OVERLAP_LINES,
+      };
     }
 
     db.exec("COMMIT");
@@ -2932,19 +3511,29 @@ async function sqliteVectorRefs({ db, root, query, limit, semanticOnly = false, 
   try {
     const embedding = await vectorLiteral(query, { root, env, fetchFn: embeddingFetch });
     const rows = db.prepare(`
-      SELECT cl.path AS path, cl.line AS line, cl.text AS text, vectors.distance AS distance
+      SELECT
+        chunks.path AS path,
+        chunks.start_line AS start_line,
+        chunks.end_line AS end_line,
+        chunks.text AS text,
+        chunks.chunk_kind AS chunk_kind,
+        chunks.symbol_name AS symbol_name,
+        vectors.distance AS distance
       FROM code_vectors AS vectors
-      JOIN vector_items AS items ON items.vector_rowid = vectors.rowid
-      JOIN code_lines AS cl ON cl.id = items.code_line_id
+      JOIN vector_chunks AS chunks ON chunks.vector_rowid = vectors.rowid
       WHERE vectors.embedding MATCH ? AND k = ?
       ORDER BY vectors.distance ASC
       LIMIT ?
     `).all(embedding, Math.max(1, limit), Math.max(1, limit));
     return rows.map((row) => ({
       path: row.path,
-      line: row.line,
+      line: row.start_line,
+      end_line: row.end_line,
+      span: { start_line: row.start_line, end_line: row.end_line },
       excerpt: String(row.text ?? "").trim(),
       source: "sqlite-vec",
+      chunk_kind: row.chunk_kind,
+      symbol: row.symbol_name ?? null,
       distance: Number(row.distance),
     }));
   } catch (error) {
@@ -3101,7 +3690,7 @@ function normalizeOllamaModelName(model) {
 }
 
 function defaultSemanticMemoryRule({ model, dimensions }) {
-  return `Semantic code search uses local Ollama embeddings. Run \`ollama pull ${model}\` before semantic-only search or onboarding rebuild; aipi_callers and aipi_impact continue with exact/lexical fallback when embeddings are unavailable, but onboarding must report semantic memory is OFF loudly instead of silently degrading. Expected vector width: ${dimensions}.`;
+  return `Semantic code search uses local Ollama embeddings. Run \`ollama pull ${model}\` before semantic-only search or onboarding rebuild; aipi_retrieve, aipi_callers, and aipi_impact continue with exact/lexical fallback when embeddings are unavailable, but onboarding must report semantic memory is OFF loudly instead of silently degrading. Expected vector width: ${dimensions}.`;
 }
 
 function normalizeOllamaHost(value) {

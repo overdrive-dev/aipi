@@ -548,7 +548,7 @@ async function runOnboardingInvestigation({ coordinator, hostModel, inventory, g
       model: hostModel,
       context_packet: [
         `Investigate this repository for AIPI onboarding: ${dimension.title}.`,
-        "Use repository-local evidence and AIPI graph tools when available: aipi_impact, aipi_callers, aipi_semantic_search.",
+        "Use repository-local evidence and AIPI graph tools when available: aipi_retrieve first, then aipi_impact, aipi_callers, aipi_semantic_search for narrower checks.",
         "Write a concise markdown artifact with facts and confidence. Do not ask the user and do not write durable memory.",
         `Memory pages this finding can inform: ${dimension.memory_files.join(", ")}`,
         `Graph source: ${graph?.source ?? "not-built"}; semantic readiness: ${graph?.vector?.readiness?.status ?? graph?.vector?.status ?? "unknown"}`,

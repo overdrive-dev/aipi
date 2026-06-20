@@ -19,7 +19,7 @@ export function buildRuntimeCapabilityReport({ contract = {} } = {}) {
       id: "context.builder",
       state: "verified",
       evidence: ["test:context-builder"],
-      summary: "context packet regression covers prior results, artifact excerpts, Markdown memory refs, graph status, and provenance fields",
+      summary: "context packet regression covers prior results, artifact excerpts, Markdown memory refs, graph status, fused retrieval refs, and provenance fields",
     },
     {
       id: "aipi.tool.surface",
@@ -61,7 +61,7 @@ export function buildRuntimeCapabilityReport({ contract = {} } = {}) {
       id: "memory.graph.vector",
       state: "verified",
       evidence: ["test:aipi-tools"],
-      summary: "sqlite-vec vec0 is loaded when available and stores 1024-dimensional Ollama bge-m3 code-line embeddings by default, with loud readiness warnings and lexical fallback when semantic embeddings are unavailable",
+      summary: "sqlite-vec vec0 is loaded when available and stores 1024-dimensional Ollama bge-m3 symbol/window chunk embeddings by default, with loud readiness warnings, lexical fallback, and fused aipi_retrieve context",
     },
   ];
 

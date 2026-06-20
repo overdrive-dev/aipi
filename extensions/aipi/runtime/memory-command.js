@@ -205,7 +205,7 @@ async function readCodeGraphStatus(root) {
       path: GRAPH_REL_PATH,
       sqlite: { path: GRAPH_SQLITE_REL_PATH, status: "missing" },
       vector: { status: "unknown", engine: "sqlite-vec" },
-      note: "Run aipi_impact or aipi_callers to rebuild the JSON/SQLite graph index.",
+      note: "Run aipi_retrieve, aipi_impact, or aipi_callers to rebuild the JSON/SQLite graph index.",
     };
   }
   return {

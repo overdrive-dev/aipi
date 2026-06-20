@@ -19,6 +19,7 @@ const READ_ONLY_TOOLS = new Set([
   "aipi_rule_gap",
   "aipi_callers",
   "aipi_impact",
+  "aipi_retrieve",
 ]);
 
 const PATH_MUTATING_TOOLS = new Set(["write", "edit", "multi_edit", "apply_patch"]);
