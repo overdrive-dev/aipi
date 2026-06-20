@@ -142,6 +142,7 @@ assert.deepEqual(parseAipiOnboardArgs(["--target", "project", "--json", "--no-qu
   target: path.resolve(path.join("C:", "repo"), "project"),
   json: true,
   noQuestions: true,
+  noPullEmbeddings: false,
   onboardArgs: ["--target", "project", "--no-questions"],
 });
 assert.deepEqual(parseAipiDiagnoseArgs(["--target", "project", "--json", "--share", "run-1"], { cwd: path.join("C:", "repo") }), {
@@ -162,8 +163,8 @@ assert.equal(formatAipiVersion({ aipiVersion: "0.1.0", piVersion: { ok: true, ve
 assert.equal(formatAipiVersion({ aipiVersion: "0.1.0", piVersion: { ok: false } }), "aipi 0.1.0 (pi: not found)");
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi 0\.1\.0 - BDD-contract agent harness on Pi/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi with no arguments starts an interactive Pi session/);
-assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-init \[--dry-run\] \[--force\] \[--reset-memory\]/);
-assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-onboard \[--target <dir>\] \[--no-questions\]/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-init \[--dry-run\] \[--force\] \[--reset-memory\].*\[--no-pull-embeddings\]/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-onboard \[--target <dir>\] \[--no-questions\] \[--no-pull-embeddings\]/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-workflow \[list \| status \| start <name> \| run <name> \| execute\]/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-memory \[status \| refs \| query <terms>\]/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-diagnose \[<run_id>\] \[--share\] \[--json\]/);
@@ -173,7 +174,7 @@ assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /--pi-help/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi status \[--target <dir>\] \[--json\] \[--strict\]/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi workflow \[--target <dir>\] \[--json\]/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi memory \[--target <dir>\] \[--json\]/);
-assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi onboard \[--target <dir>\] \[--json\] \[--no-questions\]/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi onboard \[--target <dir>\] \[--json\] \[--no-questions\] \[--no-pull-embeddings\]/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi diagnose \[<run_id>\] \[--target <dir>\] \[--share\] \[--json\]/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi update \[--dry-run\]/);
 
@@ -375,13 +376,14 @@ const onboardResult = {
 };
 const returnedOnboard = await runAipiOnboard({
   cwd: path.join("C:", "repo"),
-  userArgs: ["--target", "project", "--no-questions"],
+  userArgs: ["--target", "project", "--no-questions", "--no-pull-embeddings"],
   log: (line) => onboardOutput.push(line),
   onboardingFns: {
-    async runProjectOnboarding({ projectRoot, askUser, runWorker }) {
+    async runProjectOnboarding({ projectRoot, askUser, runWorker, pullEmbeddings }) {
       assert.equal(projectRoot, path.resolve(path.join("C:", "repo"), "project"));
       assert.equal(askUser, false);
       assert.equal(runWorker, false);
+      assert.equal(pullEmbeddings, false);
       return onboardResult;
     },
     formatOnboardingResult: () => "AIPI onboarding complete",

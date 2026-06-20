@@ -97,6 +97,8 @@ const LEGACY_DEFAULT_OLLAMA_MODEL = "nomic-embed-text";
 const LEGACY_DEFAULT_VECTOR_DIMENSIONS = 768;
 const OLLAMA_EMBED_PATH = "/api/embed";
 const OLLAMA_TAGS_PATH = "/api/tags";
+const OLLAMA_PULL_PATH = "/api/pull";
+const DEFAULT_OLLAMA_PULL_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_GRAPH_RELATIONSHIPS = 2500;
 const RELATIONSHIP_PRIORITY = new Map([
   ["test_covers", 0],
@@ -527,6 +529,10 @@ export async function rebuildCodeGraph({
   env = process.env,
   embeddingFetch = globalThis.fetch,
   previousGraph = null,
+  pullEmbeddings = false,
+  onProgress = null,
+  platform = process.platform,
+  pullTimeoutMs = DEFAULT_OLLAMA_PULL_TIMEOUT_MS,
 } = {}) {
   const root = assertRoot(projectRoot);
   const embeddingConfig = await resolveSemanticEmbeddingConfig({ root, env, migrate: true });
@@ -562,7 +568,18 @@ export async function rebuildCodeGraph({
     run_outcomes: runOutcomes,
     relationships: await buildRelationships({ root, files: graphFiles, symbols, runReferenceFiles, runOutcomes }),
   };
-  graph.sqlite = await writeSqliteGraph({ root, graph, previousGraph, env, embeddingFetch, embeddingConfig });
+  graph.sqlite = await writeSqliteGraph({
+    root,
+    graph,
+    previousGraph,
+    env,
+    embeddingFetch,
+    embeddingConfig,
+    pullEmbeddings,
+    onProgress,
+    platform,
+    pullTimeoutMs,
+  });
   graph.vector = graph.sqlite.vector ?? {
     status: "unavailable",
     engine: "sqlite-vec",
@@ -2413,6 +2430,10 @@ async function writeSqliteGraph({
   env = process.env,
   embeddingFetch = globalThis.fetch,
   embeddingConfig = null,
+  pullEmbeddings = false,
+  onProgress = null,
+  platform = process.platform,
+  pullTimeoutMs = DEFAULT_OLLAMA_PULL_TIMEOUT_MS,
 }) {
   const sqlite = await loadSqlite();
   const status = {
@@ -2428,7 +2449,17 @@ async function writeSqliteGraph({
   let transactionOpen = false;
   try {
     const resolvedEmbeddingConfig = embeddingConfig ?? await resolveSemanticEmbeddingConfig({ root, env });
-    const semanticReadiness = await checkSemanticEmbeddingReadiness({ config: resolvedEmbeddingConfig, fetchFn: embeddingFetch });
+    const readinessResult = await prepareSemanticReadiness({
+      config: resolvedEmbeddingConfig,
+      fetchFn: embeddingFetch,
+      pullEmbeddings,
+      onProgress,
+      platform,
+      pullTimeoutMs,
+      env,
+    });
+    const semanticReadiness = readinessResult.readiness;
+    const embeddingPull = readinessResult.pull;
     const reusableEmbeddingCache = await readReusableEmbeddingCache({
       sqlite,
       sqlitePath,
@@ -2496,6 +2527,7 @@ async function writeSqliteGraph({
         sqlite_vec_reason: sqliteVecStatus.reason ?? null,
       };
     }
+    vector.embedding_pull = embeddingPull;
     if (vector.status === "available") {
       db.exec(`CREATE VIRTUAL TABLE code_vectors USING vec0(embedding float[${resolvedEmbeddingConfig.dimensions}])`);
     }
@@ -2586,6 +2618,7 @@ async function writeSqliteGraph({
             vectorItemCount += 1;
           } catch (error) {
             vector = semanticVectorUnavailable(error, resolvedEmbeddingConfig);
+            vector.embedding_pull = embeddingPull;
             vector.item_count = vectorItemCount;
             vectorInsert = null;
             vectorMapInsert = null;
@@ -2610,6 +2643,7 @@ async function writeSqliteGraph({
       symbol_count: graph.symbols.length,
       relationship_count: graph.relationships?.length ?? 0,
       vector,
+      embedding_pull: embeddingPull,
     };
   } catch (error) {
     if (transactionOpen) {
@@ -2904,7 +2938,86 @@ function ollamaTagsUrl(host) {
   return `${normalizeOllamaHost(host)}${OLLAMA_TAGS_PATH}`;
 }
 
-export async function checkSemanticEmbeddingReadiness({ config, fetchFn = globalThis.fetch } = {}) {
+function ollamaPullUrl(host) {
+  return `${normalizeOllamaHost(host)}${OLLAMA_PULL_PATH}`;
+}
+
+async function prepareSemanticReadiness({
+  config,
+  fetchFn = globalThis.fetch,
+  pullEmbeddings = false,
+  onProgress = null,
+  platform = process.platform,
+  pullTimeoutMs = DEFAULT_OLLAMA_PULL_TIMEOUT_MS,
+  env = process.env,
+} = {}) {
+  let readiness = await checkSemanticEmbeddingReadiness({ config, fetchFn, platform });
+  if (readiness.status !== "model_missing") return { readiness, pull: null };
+
+  if (!pullEmbeddings || pullEmbeddingsDisabled(env)) {
+    return {
+      readiness,
+      pull: {
+        status: "skipped",
+        reason: pullEmbeddings ? "env_disabled" : "disabled",
+        host: readiness.host,
+        model: readiness.model,
+      },
+    };
+  }
+
+  const startedAt = new Date().toISOString();
+  try {
+    await emitSemanticPullProgress(onProgress, {
+      phase: "semantic-pull",
+      status: "running",
+      model: readiness.model,
+      message: `AIPI onboarding: pulling ${readiness.model} (~1.2GB) for semantic memory.`,
+    });
+    const pull = await pullOllamaModel({
+      host: readiness.host,
+      model: readiness.model,
+      fetchFn,
+      onProgress,
+      timeoutMs: pullTimeoutMs,
+    });
+    readiness = await checkSemanticEmbeddingReadiness({ config, fetchFn, platform });
+    return {
+      readiness,
+      pull: {
+        ...pull,
+        started_at: startedAt,
+        finished_at: new Date().toISOString(),
+        readiness_after: readiness.status,
+      },
+    };
+  } catch (error) {
+    const pull = {
+      status: "failed",
+      host: readiness.host,
+      model: readiness.model,
+      started_at: startedAt,
+      finished_at: new Date().toISOString(),
+      error: String(error?.message ?? error),
+    };
+    await emitSemanticPullProgress(onProgress, {
+      phase: "semantic-pull",
+      status: "failed",
+      model: readiness.model,
+      message: `AIPI onboarding: ${readiness.model} pull failed; continuing with lexical memory.`,
+    });
+    return {
+      readiness: {
+        ...readiness,
+        message: `${readiness.message} Auto-pull failed: ${pull.error}`,
+        pull,
+      },
+      pull,
+    };
+  }
+}
+
+export async function checkSemanticEmbeddingReadiness({ config, fetchFn = globalThis.fetch, platform = process.platform } = {}) {
   const normalized = {
     host: normalizeOllamaHost(config?.host ?? DEFAULT_OLLAMA_HOST),
     model: DEFAULT_OLLAMA_MODEL,
@@ -2912,23 +3025,23 @@ export async function checkSemanticEmbeddingReadiness({ config, fetchFn = global
     config_migration: config?.config_migration ?? null,
   };
   if (typeof fetchFn !== "function") {
-    return semanticReadinessOff("ollama_unreachable", normalized, "Ollama fetch API is unavailable.");
+    return semanticReadinessOff("ollama_unreachable", normalized, "Ollama fetch API is unavailable.", { platform });
   }
   let response;
   try {
     response = await fetchFn(ollamaTagsUrl(normalized.host), { method: "GET" });
   } catch (error) {
-    return semanticReadinessOff("ollama_unreachable", normalized, `Ollama is unreachable: ${String(error?.message ?? error)}`);
+    return semanticReadinessOff("ollama_unreachable", normalized, `Ollama is unreachable: ${String(error?.message ?? error)}`, { platform });
   }
   if (!response?.ok) {
     const status = response?.status ? `HTTP ${response.status}` : "unknown HTTP status";
-    return semanticReadinessOff("ollama_unreachable", normalized, `Ollama /api/tags failed with ${status}.`);
+    return semanticReadinessOff("ollama_unreachable", normalized, `Ollama /api/tags failed with ${status}.`, { platform });
   }
   let body;
   try {
     body = await response.json();
   } catch (error) {
-    return semanticReadinessOff("ollama_unreachable", normalized, `Ollama /api/tags returned invalid JSON: ${String(error?.message ?? error)}`);
+    return semanticReadinessOff("ollama_unreachable", normalized, `Ollama /api/tags returned invalid JSON: ${String(error?.message ?? error)}`, { platform });
   }
   const names = new Set((body?.models ?? []).map((item) => {
     if (typeof item === "string") return item;
@@ -2953,7 +3066,145 @@ export async function checkSemanticEmbeddingReadiness({ config, fetchFn = global
   };
 }
 
-function semanticReadinessOff(status, config, reason) {
+export async function pullOllamaModel({
+  host = DEFAULT_OLLAMA_HOST,
+  model = DEFAULT_OLLAMA_MODEL,
+  fetchFn = globalThis.fetch,
+  onProgress = null,
+  timeoutMs = DEFAULT_OLLAMA_PULL_TIMEOUT_MS,
+} = {}) {
+  if (typeof fetchFn !== "function") {
+    throw new Error("Ollama pull fetch API is unavailable.");
+  }
+  const normalizedHost = normalizeOllamaHost(host);
+  const startedAt = new Date().toISOString();
+  const first = await postOllamaPull({ host: normalizedHost, body: { model, stream: true }, fetchFn, timeoutMs });
+  const response = first.ok
+    ? first
+    : await postOllamaPull({ host: normalizedHost, body: { name: model, stream: true }, fetchFn, timeoutMs });
+  if (!response.ok) {
+    const status = response.status ? `HTTP ${response.status}` : "unknown HTTP status";
+    throw new Error(`Ollama /api/pull failed with ${status}.`);
+  }
+  const events = await readOllamaPullEvents(response, async (event) => {
+    const total = Number(event.total);
+    const completed = Number(event.completed);
+    const percent = Number.isFinite(total) && total > 0 && Number.isFinite(completed)
+      ? Math.max(0, Math.min(100, Math.round((completed / total) * 100)))
+      : null;
+    await emitSemanticPullProgress(onProgress, {
+      phase: "semantic-pull",
+      status: "running",
+      model,
+      percent,
+      message: percent == null
+        ? `AIPI onboarding: pulling ${model}: ${String(event.status ?? "in progress")}.`
+        : `AIPI onboarding: pulling ${model}: ${percent}%.`,
+    });
+  });
+  await emitSemanticPullProgress(onProgress, {
+    phase: "semantic-pull",
+    status: "done",
+    model,
+    percent: 100,
+    message: `AIPI onboarding: ${model} pull complete.`,
+  });
+  return {
+    status: "success",
+    host: normalizedHost,
+    model,
+    started_at: startedAt,
+    finished_at: new Date().toISOString(),
+    events,
+  };
+}
+
+async function postOllamaPull({ host, body, fetchFn, timeoutMs }) {
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  const timeout = controller && Number.isFinite(timeoutMs) && timeoutMs > 0
+    ? setTimeout(() => controller.abort(), timeoutMs)
+    : null;
+  try {
+    return await fetchFn(ollamaPullUrl(host), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller?.signal,
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error(`Ollama /api/pull timed out after ${timeoutMs}ms.`);
+    throw error;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+async function readOllamaPullEvents(response, onEvent) {
+  const events = [];
+  const handleLine = async (line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let event;
+    try {
+      event = JSON.parse(trimmed);
+    } catch {
+      if (/^\s*\{/.test(trimmed)) throw new Error(`Ollama /api/pull returned invalid JSON: ${trimmed}`);
+      events.push({ status: trimmed });
+      await onEvent?.({ status: trimmed });
+      return;
+    }
+    events.push(event);
+    await onEvent?.(event);
+    if (event.error) throw new Error(`Ollama /api/pull failed: ${String(event.error)}`);
+  };
+
+  if (response.body?.getReader) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffered = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffered += decoder.decode(value, { stream: true });
+      const lines = buffered.split(/\r?\n/);
+      buffered = lines.pop() ?? "";
+      for (const line of lines) await handleLine(line);
+    }
+    buffered += decoder.decode();
+    if (buffered) await handleLine(buffered);
+    return events;
+  }
+
+  if (response.body?.[Symbol.asyncIterator]) {
+    const decoder = new TextDecoder();
+    let buffered = "";
+    for await (const chunk of response.body) {
+      buffered += typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
+      const lines = buffered.split(/\r?\n/);
+      buffered = lines.pop() ?? "";
+      for (const line of lines) await handleLine(line);
+    }
+    buffered += decoder.decode();
+    if (buffered) await handleLine(buffered);
+    return events;
+  }
+
+  const text = typeof response.text === "function" ? await response.text() : "";
+  for (const line of text.split(/\r?\n/)) await handleLine(line);
+  return events;
+}
+
+async function emitSemanticPullProgress(onProgress, event) {
+  if (typeof onProgress !== "function") return;
+  await Promise.resolve(onProgress(event));
+}
+
+function pullEmbeddingsDisabled(env = process.env) {
+  return /^(0|false|no|off)$/i.test(String(env.AIPI_PULL_EMBEDDINGS ?? "").trim());
+}
+
+function semanticReadinessOff(status, config, reason, { platform = process.platform } = {}) {
+  const installHint = status === "ollama_unreachable" ? ollamaInstallHint(platform) : null;
   return {
     status,
     host: config.host,
@@ -2961,8 +3212,9 @@ function semanticReadinessOff(status, config, reason) {
     dimensions: config.dimensions,
     config_migration: config.config_migration ?? null,
     reason,
-    message: `${reason} ${ollamaInstallMessage(config)}`,
+    message: `${reason} ${ollamaInstallMessage(config, { installHint })}`,
     action: `ollama pull ${config.model}`,
+    install_hint: installHint,
   };
 }
 
@@ -2988,10 +3240,12 @@ function semanticVectorUnavailable(error, config = {}, readiness = null) {
     config_migration: config.config_migration ?? null,
     reason: semanticUnavailableReason(error, config),
     readiness: readiness
-      ? {
+        ? {
           status: readiness.status,
           message: readiness.message,
           action: readiness.action ?? null,
+          install_hint: readiness.install_hint ?? null,
+          pull: readiness.pull ?? null,
         }
       : null,
   };
@@ -3019,18 +3273,49 @@ function asSemanticUnavailable(error) {
   return semanticUnavailableError(error);
 }
 
-function ollamaInstallMessage(config = {}) {
+function ollamaInstallMessage(config = {}, { installHint = null } = {}) {
   const model = String(config.model ?? DEFAULT_OLLAMA_MODEL).trim() || DEFAULT_OLLAMA_MODEL;
   const dimensions = resolveEmbeddingDimensions({ raw: config.dimensions, model });
-  return (
+  const message = (
     `semantic memory is OFF - run \`ollama pull ${model}\`, then re-run onboarding / rebuild. ` +
     `AIPI semantic search requires Ollama running with the ${dimensions}-dim ${model} model. ` +
     "Set AIPI_OLLAMA_HOST only if Ollama runs on another host."
   );
+  return installHint?.message ? `${message} ${installHint.message}` : message;
 }
 
 function hasOllamaInstallGuidance(message) {
   return /semantic memory is OFF - run `ollama pull [^`]+`/.test(String(message ?? ""));
+}
+
+function ollamaInstallHint(platform = process.platform) {
+  const normalized = String(platform ?? "").toLowerCase();
+  if (normalized === "win32") {
+    return {
+      platform: "win32",
+      command: "winget install Ollama.Ollama",
+      message: "Ollama does not appear reachable; install it on Windows with `winget install Ollama.Ollama` or visit https://ollama.com/download. AIPI will not install system software.",
+    };
+  }
+  if (normalized === "darwin") {
+    return {
+      platform: "darwin",
+      command: "brew install ollama",
+      message: "Ollama does not appear reachable; install it on macOS with `brew install ollama` or visit https://ollama.com/download. AIPI will not install system software.",
+    };
+  }
+  if (normalized === "linux") {
+    return {
+      platform: "linux",
+      command: "curl -fsSL https://ollama.com/install.sh | sh",
+      message: "Ollama does not appear reachable; install it on Linux with `curl -fsSL https://ollama.com/install.sh | sh` or visit https://ollama.com/download. AIPI will not install system software.",
+    };
+  }
+  return {
+    platform: normalized || "unknown",
+    command: null,
+    message: "Ollama does not appear reachable; install it from https://ollama.com/download. AIPI will not install system software.",
+  };
 }
 
 function lineNumberForIndex(content, index) {

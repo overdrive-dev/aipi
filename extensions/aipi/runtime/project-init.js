@@ -28,6 +28,7 @@ export function parseInitArgs(args = "") {
     force: false,
     resetMemory: false,
     noOnboard: false,
+    noPullEmbeddings: false,
     targetRoot: null,
   };
 
@@ -47,6 +48,10 @@ export function parseInitArgs(args = "") {
     }
     if (token === "--no-onboard") {
       options.noOnboard = true;
+      continue;
+    }
+    if (token === "--no-pull-embeddings") {
+      options.noPullEmbeddings = true;
       continue;
     }
     if (token === "--target") {

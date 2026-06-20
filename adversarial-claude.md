@@ -6,7 +6,7 @@ This file is the handoff channel between Claude reviewer and Codex implementer.
 
 Current owner: CLAUDE
 Current status: CLOSED
-Open review round: 37 CLOSED (hard-pin bge-m3/1024 + migrate-from-768 + ADV-37-1 message fix, all verified); Rounds 29–37 all CLOSED
+Open review round: 38 CLOSED (auto-pull bge-m3 default + opt-out + detect/guide-no-install, all verified); Rounds 29–38 all CLOSED
 
 Note: Round 17 closed too early on a narrow basis. Round 19 is a full-project
 adversarial sweep (8 dimensions, every finding independently verified) and is the
@@ -8828,6 +8828,211 @@ Round 37 CLOSED. Rounds 29–37 all CLOSED.**
   thereafter. There is no supported way to run on 768 anymore.
 - With semantic memory OFF (bge-m3 not pulled), the message tells you to `ollama pull bge-m3` and only
   mentions `AIPI_OLLAMA_HOST` for a remote Ollama — no dead knobs.
+
+Current owner: CLAUDE
+Current status: CLOSED
+
+---
+
+# Round 38 — Onboarding auto-provisions semantic memory: auto-pull bge-m3 (default), detect+guide if Ollama absent
+
+Opened by Claude on a binding user decision (2026-06-20). Builds on Round 35 (onboarding swarm +
+readiness), Round 36 (progress events + readiness-from-config), Round 37 (hard-pin bge-m3/1024).
+
+**User decisions (binding, 2026-06-20):**
+- **Auto-pull bge-m3 by default.** When onboarding/init runs and Ollama is reachable but `bge-m3` is
+  missing, pull it automatically and bring semantic memory ON in the same flow — opt-out via
+  `--no-pull-embeddings` (clarified via recommendation pick → "Auto-pull by default").
+- **Ollama not installed → detect + guide, do NOT install.** If Ollama isn't installed/reachable, surface
+  a clear OS-specific install hint and continue in lexical mode; perform NO system install (clarified →
+  "Detect + guide"). Deliberate security/portability boundary: AIPI never installs system software silently.
+
+**Grounding:** the runtime already speaks to Ollama over HTTP via an injected `fetchFn`
+(`aipi-tools.js` — `/api/tags` in `checkSemanticEmbeddingReadiness:2906`, `/api/embed` in the embed path).
+Ollama exposes `POST /api/pull` which streams NDJSON progress (`{status, total, completed}`). So the pull
+is a `fetch` to `/api/pull`, NOT a shell-out to an `ollama` binary that may be off PATH.
+
+## What to build
+
+1. **Auto-pull on `model_missing` (default ON).** In the onboarding/graph-build path, after readiness
+   detects Ollama *reachable* but `bge-m3` absent (the existing `model_missing` state), call a new
+   `pullOllamaModel({ host, model: "bge-m3", fetchFn, onProgress })` that streams `POST {host}/api/pull`
+   (`{"model":"bge-m3","stream":true}`; fall back to `{"name":...}` if a server rejects `model`). Emit
+   progress through the Round-36 `emitOnboardingProgress` channel ("pulling bge-m3: NN%") so it is never
+   silent (do not repeat ADV-36-3). Inject `fetchFn` so tests fake it.
+2. **Bring semantic ON in the same run.** After a successful pull, re-check readiness and build the vector
+   graph at 1024 so `code_vectors` populates and `meta.source` becomes semantic — no second manual rebuild.
+3. **Opt-out + non-interactive safety.** Add `--no-pull-embeddings` to `/aipi-onboard`, `aipi onboard`
+   (and the init flow), plus an env opt-out (`AIPI_PULL_EMBEDDINGS=0`). The natural CI/offline guard: the
+   pull only fires when `/api/tags` actually responds, so a box without Ollama running never pulls. Document
+   this; recommend CI set the opt-out explicitly anyway.
+4. **Failure is non-fatal.** A pull that errors (network/stream/non-OK/disk) must NOT crash onboarding —
+   fall back to the current loud OFF message + lexical, and record the attempt+outcome in the onboarding
+   trace (`onboarding.jsonl`). A stalled pull needs a sensible timeout with a clear surfaced message, not a
+   silent hang.
+5. **Ollama-absent → detect + guide (no install).** When Ollama is unreachable/not installed, keep lexical
+   mode and emit an OS-aware actionable hint, e.g. Windows `winget install Ollama.Ollama`, macOS
+   `brew install ollama`, Linux `curl -fsSL https://ollama.com/install.sh | sh`, plus https://ollama.com —
+   detection only; AIPI performs no system install. Reuse `process.platform` for the OS-specific line.
+6. **Idempotent.** `bge-m3` already present → no pull. Already-installed Ollama → no install hint.
+7. **Loud, not silent (security boundary).** Auto-pull is a network egress + ~1.2GB disk write triggered by
+   default; it must be announced (progress + a "pulling bge-m3 (~1.2GB)…" line) and opt-out-able, never
+   silent. No auto system install, ever.
+
+## Acceptance / tests (must actually execute — WF-01/WF-02)
+
+- Fake Ollama: `/api/tags` lacks bge-m3, `/api/pull` streams progress then success → onboarding calls
+  `/api/pull` with model `bge-m3`, emits ≥1 pull-progress event, then builds vectors at 1024 (semantic ON)
+  — asserted with injected `fetchFn`.
+- `--no-pull-embeddings` (and `AIPI_PULL_EMBEDDINGS=0`) → no `/api/pull` call; loud OFF message + lexical —
+  asserted.
+- Ollama unreachable (`/api/tags` fails) → no pull attempt, lexical mode, and the message includes an
+  OS-specific install hint (assert the `process.platform` branch) — asserted; no system-install command is
+  ever executed (assert no child-process spawn).
+- `bge-m3` already present → no `/api/pull` call — asserted.
+- Pull failure (stream/non-OK) → onboarding completes in lexical mode, no throw, trace records the failed
+  attempt — asserted.
+- `npm test` + `npm run validate` green.
+
+## Likely touch points (for the implementer)
+- `extensions/aipi/runtime/aipi-tools.js` — new `pullOllamaModel`; wire pull into the build path between
+  readiness `model_missing` and the vector build; OS-hint helper.
+- `extensions/aipi/runtime/onboarding.js` — thread `pullEmbeddings` option + pull/guide progress events.
+- `extensions/aipi/index.js` + `bin/aipi.js` — parse `--no-pull-embeddings`, env opt-out, thread through
+  (CLI wrapper too).
+- `tools/test-aipi-tools.mjs`, `tools/test-project-onboarding.mjs` — the fixtures above.
+
+Record changed files + exact commands run, then set `Current owner: CLAUDE` /
+`Current status: WAITING_FOR_CLAUDE`.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX
+Requested next action: implement Round 38 — auto-pull `bge-m3` (default ON, `--no-pull-embeddings` /
+`AIPI_PULL_EMBEDDINGS=0` opt-out) via streamed `POST /api/pull` with progress, bringing semantic memory ON
+in the same onboarding run; non-fatal on failure; idempotent; and when Ollama is absent, detect + emit an
+OS-specific install hint WITHOUT performing any system install. Verify with real test/validate runs.
+
+## Codex implementation - Round 38 (2026-06-20)
+
+Implemented Round 38.
+
+What changed:
+
+- Added `pullOllamaModel` in `extensions/aipi/runtime/aipi-tools.js`, using streamed `POST /api/pull`
+  against the configured Ollama host. It sends `{"model":"bge-m3","stream":true}` first and falls back to
+  `{"name":"bge-m3","stream":true}` if the first response is not OK.
+- `rebuildCodeGraph` can now receive `pullEmbeddings`, `onProgress`, `platform`, and `pullTimeoutMs`.
+  Onboarding passes `pullEmbeddings=true` by default; generic graph/query paths remain non-pulling unless
+  explicitly asked.
+- When readiness is `model_missing` and pull is enabled, AIPI announces the pull (`~1.2GB`), streams
+  progress events, re-checks readiness after success, and then builds the 1024-dim vector graph in the same
+  onboarding run.
+- Pull failures are non-fatal. Stream errors, non-OK responses, fetch errors, and timeouts leave onboarding
+  in lexical mode with the loud OFF message plus the pull failure reason.
+- Pull attempt outcome is attached to `graph.vector.embedding_pull`, `graph.sqlite.embedding_pull`,
+  onboarding result `embedding_pull`, and the `.aipi/runtime/onboarding/onboarding.jsonl` trace.
+- Ollama unreachable now includes an OS-specific install hint and explicitly states that AIPI does not
+  install system software. Windows uses `winget install Ollama.Ollama`; macOS uses `brew install ollama`;
+  Linux uses `curl -fsSL https://ollama.com/install.sh | sh`.
+- Added opt-out support:
+  - `/aipi-onboard --no-pull-embeddings`
+  - `/aipi-init --no-pull-embeddings`
+  - `aipi onboard --no-pull-embeddings`
+  - env `AIPI_PULL_EMBEDDINGS=0` / `false` / `no` / `off`
+- CLI non-JSON onboarding now forwards progress messages to stdout; `--json` remains clean.
+
+Changed files:
+
+- `extensions/aipi/runtime/aipi-tools.js`
+- `extensions/aipi/runtime/onboarding.js`
+- `extensions/aipi/index.js`
+- `extensions/aipi/runtime/project-init.js`
+- `bin/aipi.js`
+- `tools/test-project-onboarding.mjs`
+- `tools/test-aipi-bin.mjs`
+- `tools/test-project-init.mjs`
+- `adversarial-claude.md`
+
+Validation run:
+
+- `node tools/test-project-onboarding.mjs` -> `AIPI_PROJECT_ONBOARDING_TEST_OK`
+- `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`
+- `node tools/test-aipi-bin.mjs` -> `AIPI_BIN_TEST_OK`
+- `node tools/test-project-init.mjs` -> `AIPI_PROJECT_INIT_TEST_OK`
+- `npm.cmd test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`; existing
+  `AIPI_MODEL_PRESSURE_EVALS_SKIPPED` remains intentional unless `AIPI_MODEL_PRESSURE=1` and
+  `AIPI_MODEL_PRESSURE_COMMAND` are set.
+- `npm.cmd run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`
+- `git diff --check` -> no whitespace errors; Windows CRLF conversion warnings only.
+
+Acceptance evidence:
+
+- `tools/test-project-onboarding.mjs` uses a fake Ollama server where first `/api/tags` lacks `bge-m3`,
+  `/api/pull` streams NDJSON progress, second `/api/tags` has `bge-m3`, and `/api/embed` returns 1024-dim
+  vectors. The test asserts one pull call, pull progress events, `embedding_pull.status === "success"`,
+  semantic readiness cleared, vector status `available`, and embed calls occurred in the same onboarding run.
+- Opt-out is asserted both by explicit `pullEmbeddings: false` (the runtime path used by
+  `--no-pull-embeddings`) and env `AIPI_PULL_EMBEDDINGS=0`; both assert zero `/api/pull` calls and lexical
+  OFF fallback.
+- Ollama unreachable is asserted with `platform: "win32"`; the message includes
+  `winget install Ollama.Ollama` and "AIPI will not install system software", with zero pull calls.
+- Pull failure is asserted with a streamed `{ "error": "disk full" }`; onboarding completes, lexical fallback
+  remains loud, `embedding_pull.status === "failed"`, and the JSONL trace records the failed attempt.
+- Idempotence is covered by the existing `test-aipi-tools.mjs` fake where `/api/tags` already includes
+  `bge-m3`; no `/api/pull` path is exercised and semantic vectors remain green.
+- `tools/test-aipi-bin.mjs` verifies wrapper help and `aipi onboard --no-pull-embeddings` passes
+  `pullEmbeddings: false`; `tools/test-project-init.mjs` verifies `/aipi-init --no-pull-embeddings` parsing.
+
+Residual risk:
+
+- CLI `--json` intentionally suppresses progress lines to keep JSON output valid; the pull attempt is still
+  recorded in the returned JSON/trace.
+
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE
+Requested next action: verify Round 38 against the real code/tests; close if no findings remain or hand back concrete findings.
+
+## Claude verdict — Round 38 CLOSED (2026-06-20)
+
+Verified against real code + real runs (`test-project-onboarding` -> `AIPI_PROJECT_ONBOARDING_TEST_OK`,
+`test-aipi-tools` -> `AIPI_TOOLS_TEST_OK`, `test-aipi-bin` -> `AIPI_BIN_TEST_OK`, `test-project-init` ->
+`AIPI_PROJECT_INIT_TEST_OK`, `npm test` -> `AIPI_STEP_RESULT_TEST_OK`, `validate` ->
+`AIPI_TEMPLATE_VALIDATION_OK`), changed regions + tests re-read for genuineness (WF-01/WF-02).
+
+- **Auto-pull gated correctly.** `prepareSemanticReadiness` (`aipi-tools.js:2945-2967`) pulls ONLY when
+  readiness is `model_missing` (Ollama reachable + bge-m3 absent) AND pull is enabled; unreachable/present
+  short-circuit with no pull. Default ON (`onboarding.js:130,176` `pullEmbeddings = true`).
+- **Streamed pull, never silent.** `pullOllamaModel` (`:3069-3120`) streams `POST /api/pull`, tries
+  `{model}` then falls back to `{name}` on non-OK, emits a per-event progress with percent
+  (`emitSemanticPullProgress`), and a final "pull complete" — addresses the ADV-36-3 silent-long-op lesson.
+- **Failure is non-fatal AND detected.** A streamed `{"error":...}` line throws (`:3158`), as does non-OK
+  (`:3085-3088`) and an `AbortController` timeout (`:3122-3140`); all are caught upstream
+  (`:2994-3002`) → onboarding finishes in lexical mode with the loud OFF message. Test asserts a
+  `{"error":"disk full"}` stream yields `embedding_pull.status === "failed"` and a JSONL trace entry.
+- **Opt-out works.** `--no-pull-embeddings` (onboard/init/CLI wrapper) → `pullEmbeddings:false`; env
+  `AIPI_PULL_EMBEDDINGS=0/false/no/off` via `pullEmbeddingsDisabled`. Tests assert zero `/api/pull` calls
+  on both paths.
+- **Ollama-absent → guide, NO install.** Independent grep confirms ZERO `child_process`/`spawn`/`exec`
+  (only SQLite `db.exec` and coordinator agent-`spawn`). The unreachable hint
+  (`:3296-3317`) branches win32 `winget` / darwin `brew` / linux `curl` / generic, each ending "AIPI will
+  not install system software." Test asserts the win32 branch + no pull.
+- **Idempotent.** bge-m3 already present (`/api/tags` has it) → no `/api/pull` (existing tools test green).
+- **No regression** to Round 37 hard-pin/migration — those fixtures remain green in the same suite.
+
+**Zero open findings. Round 38 CLOSED. Rounds 29–38 all CLOSED.**
+
+**Accepted residual (non-blocking, documented):** the pull timeout (`DEFAULT_OLLAMA_PULL_TIMEOUT_MS = 15
+min`, `:101`) is a *total-duration* cap via one `AbortController`, not a stall/idle timeout. 15 min is
+generous for ~1.2GB (needs ~11 Mbps sustained) and abort is non-fatal + re-runnable, so it is not
+reopened — but on a very slow link a still-progressing download could be aborted at 15 min and fall back
+to lexical. Optional future refinement: abort only on a progress STALL (no NDJSON event for N seconds)
+rather than total elapsed time. Recorded here so it is a known boundary, not a surprise.
+
+### Live re-verify for the user
+With Ollama running but no model pulled, `/aipi-onboard` (or `aipi onboard`) now auto-pulls bge-m3 with a
+visible "pulling bge-m3 (~1.2GB): NN%" progress, then builds 1024-dim vectors so semantic memory comes ON
+in the same run. `--no-pull-embeddings` (or `AIPI_PULL_EMBEDDINGS=0`) keeps the old lexical-only behavior.
+If Ollama isn't installed, you get an OS-specific install hint and lexical fallback — AIPI installs nothing.
 
 Current owner: CLAUDE
 Current status: CLOSED

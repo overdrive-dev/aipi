@@ -143,7 +143,7 @@ export function parseAipiMemoryArgs(userArgs = [], { cwd = process.cwd() } = {})
 }
 
 export function parseAipiOnboardArgs(userArgs = [], { cwd = process.cwd() } = {}) {
-  const options = { json: false, target: cwd, noQuestions: false, onboardArgs: [] };
+  const options = { json: false, target: cwd, noQuestions: false, noPullEmbeddings: false, onboardArgs: [] };
   for (let index = 0; index < userArgs.length; index += 1) {
     const arg = userArgs[index];
     if (arg === "--json") {
@@ -160,6 +160,11 @@ export function parseAipiOnboardArgs(userArgs = [], { cwd = process.cwd() } = {}
     }
     if (arg === "--no-questions") {
       options.noQuestions = true;
+      options.onboardArgs.push(arg);
+      continue;
+    }
+    if (arg === "--no-pull-embeddings") {
+      options.noPullEmbeddings = true;
       options.onboardArgs.push(arg);
       continue;
     }
@@ -663,6 +668,8 @@ export async function runAipiOnboard({
       projectRoot: options.target,
       askUser: false,
       runWorker: false,
+      pullEmbeddings: !options.noPullEmbeddings,
+      onProgress: options.json ? null : (event) => log(event.message),
     });
     log(options.json ? JSON.stringify(result, null, 2) : fns.formatOnboardingResult(result));
     return result;
@@ -719,8 +726,8 @@ export function formatAipiHelp({ aipiVersion }) {
     "  aipi with arguments runs pi with the AIPI extensions preloaded; all other Pi flags pass through.",
     "",
     "AIPI commands inside a session:",
-    "  /aipi-init [--dry-run] [--force] [--reset-memory] [--target <dir>]",
-    "  /aipi-onboard [--target <dir>] [--no-questions]",
+    "  /aipi-init [--dry-run] [--force] [--reset-memory] [--target <dir>] [--no-pull-embeddings]",
+    "  /aipi-onboard [--target <dir>] [--no-questions] [--no-pull-embeddings]",
     "  /aipi-status",
     "  /aipi-workflow [list | status | start <name> | run <name> | execute]",
     "  /aipi-memory [status | refs | query <terms>]",
@@ -738,7 +745,7 @@ export function formatAipiHelp({ aipiVersion }) {
     "                  Inspect or drive AIPI workflow state outside a Pi session",
     "  aipi memory [--target <dir>] [--json] [status|refs|query <terms>]",
     "                  Inspect AIPI Markdown memory and code graph state outside a Pi session",
-    "  aipi onboard [--target <dir>] [--json] [--no-questions]",
+    "  aipi onboard [--target <dir>] [--json] [--no-questions] [--no-pull-embeddings]",
     "                  Inventory a project and seed AIPI project memory outside a Pi session",
     "  aipi diagnose [<run_id>] [--target <dir>] [--share] [--json]",
     "                  Explain the most recent failed/blocked AIPI run and write a redacted report",

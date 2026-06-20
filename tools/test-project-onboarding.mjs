@@ -25,6 +25,7 @@ try {
   const selectCalls = [];
   const inputCalls = [];
   const progressEvents = [];
+  const autoPullFetch = fakeAutoPullEmbeddingFetch();
   const onboarded = await runProjectOnboarding({
     projectRoot: tempRoot,
     ctx: {
@@ -50,7 +51,7 @@ try {
     },
     graphBuilder: async (input) => {
       graphBuilderCalled = true;
-      return rebuildCodeGraph({ ...input, embeddingFetch: fakeMissingModelFetch() });
+      return rebuildCodeGraph({ ...input, embeddingFetch: autoPullFetch.fetch });
     },
   });
 
@@ -74,9 +75,14 @@ try {
   assert.equal(onboarded.graph.sqlite_path, ".aipi/state/aipi-graph.sqlite");
   assert.ok(onboarded.graph.file_count > 0);
   assert.equal(onboarded.graph.embedding_model, "bge-m3");
-  assert.match(onboarded.semantic_readiness.message, /ollama pull bge-m3/);
+  assert.equal(autoPullFetch.pullCalls, 1);
+  assert.equal(autoPullFetch.embedCalls > 0, true);
+  assert.equal(onboarded.embedding_pull.status, "success");
+  assert.equal(onboarded.semantic_readiness, null);
+  assert.equal(onboarded.graph.vector_status, "available");
+  assert.equal(progressEvents.some((event) => event.phase === "semantic-pull" && event.status === "running"), true);
   await fs.access(path.join(tempRoot, ".aipi", "state", "aipi-graph.json"));
-  assert.match(await fs.readFile(path.join(tempRoot, ".aipi", "runtime", "onboarding", "onboarding.jsonl"), "utf8"), /model_missing|bge-m3/);
+  assert.match(await fs.readFile(path.join(tempRoot, ".aipi", "runtime", "onboarding", "onboarding.jsonl"), "utf8"), /"embedding_pull":\{"status":"success"|bge-m3/);
   if (onboarded.graph.sqlite_status === "available") {
     await fs.access(path.join(tempRoot, ".aipi", "state", "aipi-graph.sqlite"));
   }
@@ -92,6 +98,65 @@ try {
   const businessRulesMemory = await fs.readFile(path.join(tempRoot, ".aipi", "memory", "project", "business-rules.md"), "utf8");
   assert.match(businessRulesMemory, /Candidate business\/domain context inferred from code/);
   assert.match(businessRulesMemory, /care workflows|patient|clinical|task/);
+
+  const noPullRoot = path.join(tempRoot, "no-pull-repo");
+  await writeFixtureRepo(noPullRoot);
+  await initProject({ sourceRoot, targetRoot: noPullRoot });
+  const noPullFetch = fakeNoPullMissingModelFetch();
+  const noPullRun = await runProjectOnboarding({
+    projectRoot: noPullRoot,
+    askUser: false,
+    runWorker: false,
+    pullEmbeddings: false,
+    graphBuilder: async (input) => rebuildCodeGraph({ ...input, embeddingFetch: noPullFetch.fetch }),
+  });
+  assert.equal(noPullFetch.pullCalls, 0);
+  assert.equal(noPullRun.embedding_pull.status, "skipped");
+  assert.match(noPullRun.semantic_readiness.message, /ollama pull bge-m3/);
+
+  const envNoPullRoot = path.join(tempRoot, "env-no-pull-repo");
+  await writeFixtureRepo(envNoPullRoot);
+  await initProject({ sourceRoot, targetRoot: envNoPullRoot });
+  const envNoPullFetch = fakeNoPullMissingModelFetch();
+  const envNoPullRun = await runProjectOnboarding({
+    projectRoot: envNoPullRoot,
+    askUser: false,
+    runWorker: false,
+    env: { AIPI_PULL_EMBEDDINGS: "0" },
+    graphBuilder: async (input) => rebuildCodeGraph({ ...input, embeddingFetch: envNoPullFetch.fetch }),
+  });
+  assert.equal(envNoPullFetch.pullCalls, 0);
+  assert.equal(envNoPullRun.embedding_pull.status, "skipped");
+
+  const unreachableRoot = path.join(tempRoot, "ollama-unreachable-repo");
+  await writeFixtureRepo(unreachableRoot);
+  await initProject({ sourceRoot, targetRoot: unreachableRoot });
+  const unreachableFetch = fakeUnreachableOllamaFetch();
+  const unreachableRun = await runProjectOnboarding({
+    projectRoot: unreachableRoot,
+    askUser: false,
+    runWorker: false,
+    platform: "win32",
+    graphBuilder: async (input) => rebuildCodeGraph({ ...input, embeddingFetch: unreachableFetch.fetch, platform: "win32" }),
+  });
+  assert.equal(unreachableFetch.pullCalls, 0);
+  assert.match(unreachableRun.semantic_readiness.message, /winget install Ollama\.Ollama/);
+  assert.match(unreachableRun.semantic_readiness.message, /AIPI will not install system software/);
+
+  const pullFailureRoot = path.join(tempRoot, "pull-failure-repo");
+  await writeFixtureRepo(pullFailureRoot);
+  await initProject({ sourceRoot, targetRoot: pullFailureRoot });
+  const pullFailureFetch = fakePullFailureFetch();
+  const pullFailureRun = await runProjectOnboarding({
+    projectRoot: pullFailureRoot,
+    askUser: false,
+    runWorker: false,
+    graphBuilder: async (input) => rebuildCodeGraph({ ...input, embeddingFetch: pullFailureFetch.fetch }),
+  });
+  assert.equal(pullFailureFetch.pullCalls, 1);
+  assert.equal(pullFailureRun.embedding_pull.status, "failed");
+  assert.match(pullFailureRun.semantic_readiness.message, /Auto-pull failed/);
+  assert.match(await fs.readFile(path.join(pullFailureRoot, ".aipi", "runtime", "onboarding", "onboarding.jsonl"), "utf8"), /"embedding_pull":\{"status":"failed"/);
 
   const emptyRoot = path.join(tempRoot, "empty-repo");
   await fs.mkdir(emptyRoot, { recursive: true });
@@ -197,6 +262,142 @@ function createDoneCoordinator() {
     },
   };
   return coordinator;
+}
+
+function fakeAutoPullEmbeddingFetch() {
+  let modelAvailable = false;
+  let pullCalls = 0;
+  let embedCalls = 0;
+  return {
+    get pullCalls() {
+      return pullCalls;
+    },
+    get embedCalls() {
+      return embedCalls;
+    },
+    async fetch(url, options = {}) {
+      if (String(url).endsWith("/api/tags")) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { models: modelAvailable ? [{ name: "bge-m3" }] : [] };
+          },
+        };
+      }
+      if (String(url).endsWith("/api/pull")) {
+        pullCalls += 1;
+        const body = JSON.parse(options.body ?? "{}");
+        assert.equal(body.model ?? body.name, "bge-m3");
+        modelAvailable = true;
+        return pullStreamResponse([
+          { status: "pulling manifest" },
+          { status: "downloading", total: 100, completed: 40 },
+          { status: "success", total: 100, completed: 100 },
+        ]);
+      }
+      if (String(url).endsWith("/api/embed")) {
+        embedCalls += 1;
+        const body = JSON.parse(options.body ?? "{}");
+        assert.equal(body.model, "bge-m3");
+        const vector = new Array(1024).fill(0);
+        vector[embedCalls % vector.length] = 1;
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { embeddings: [vector] };
+          },
+        };
+      }
+      throw new Error(`unexpected Ollama URL ${url}`);
+    },
+  };
+}
+
+function fakeNoPullMissingModelFetch() {
+  let pullCalls = 0;
+  return {
+    get pullCalls() {
+      return pullCalls;
+    },
+    async fetch(url) {
+      if (String(url).endsWith("/api/tags")) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { models: [] };
+          },
+        };
+      }
+      if (String(url).endsWith("/api/pull")) {
+        pullCalls += 1;
+        throw new Error("pull should not be called");
+      }
+      throw new Error(`unexpected Ollama URL ${url}`);
+    },
+  };
+}
+
+function fakeUnreachableOllamaFetch() {
+  let pullCalls = 0;
+  return {
+    get pullCalls() {
+      return pullCalls;
+    },
+    async fetch(url) {
+      if (String(url).endsWith("/api/pull")) pullCalls += 1;
+      throw new Error("connect ECONNREFUSED");
+    },
+  };
+}
+
+function fakePullFailureFetch() {
+  let pullCalls = 0;
+  return {
+    get pullCalls() {
+      return pullCalls;
+    },
+    async fetch(url) {
+      if (String(url).endsWith("/api/tags")) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { models: [] };
+          },
+        };
+      }
+      if (String(url).endsWith("/api/pull")) {
+        pullCalls += 1;
+        return pullStreamResponse([{ status: "pulling manifest" }, { error: "disk full" }]);
+      }
+      throw new Error(`unexpected Ollama URL ${url}`);
+    },
+  };
+}
+
+function pullStreamResponse(events) {
+  const encoder = new TextEncoder();
+  const chunks = events.map((event) => encoder.encode(`${JSON.stringify(event)}\n`));
+  let index = 0;
+  return {
+    ok: true,
+    status: 200,
+    body: {
+      getReader() {
+        return {
+          async read() {
+            if (index >= chunks.length) return { done: true, value: undefined };
+            const value = chunks[index];
+            index += 1;
+            return { done: false, value };
+          },
+        };
+      },
+    },
+  };
 }
 
 function fakeMissingModelFetch() {

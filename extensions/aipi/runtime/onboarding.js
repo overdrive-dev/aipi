@@ -93,6 +93,7 @@ export function parseOnboardArgs(args = "") {
   const options = {
     targetRoot: null,
     noQuestions: false,
+    noPullEmbeddings: false,
   };
 
   for (let index = 0; index < tokens.length; index += 1) {
@@ -106,6 +107,10 @@ export function parseOnboardArgs(args = "") {
     }
     if (token === "--no-questions") {
       options.noQuestions = true;
+      continue;
+    }
+    if (token === "--no-pull-embeddings") {
+      options.noPullEmbeddings = true;
       continue;
     }
     throw new Error(`Unknown /aipi-onboard option: ${token}`);
@@ -122,6 +127,8 @@ export async function maybeRunPostInitOnboarding({
   now = () => new Date(),
   log = null,
   onProgress = null,
+  pullEmbeddings = true,
+  env = process.env,
 } = {}) {
   if (skip) {
     return {
@@ -148,6 +155,8 @@ export async function maybeRunPostInitOnboarding({
     source: "auto",
     now,
     onProgress,
+    pullEmbeddings,
+    env,
   });
 }
 
@@ -164,8 +173,12 @@ export async function runProjectOnboarding({
   materializeGraph = true,
   runWorker = Boolean(coordinator && hostModel),
   onProgress = null,
+  pullEmbeddings = true,
+  env = process.env,
+  platform = process.platform,
 } = {}) {
   const root = assertProjectRoot(projectRoot);
+  const shouldPullEmbeddings = resolvePullEmbeddings({ pullEmbeddings, env });
   await emitOnboardingProgress(onProgress, {
     phase: "start",
     status: "running",
@@ -184,7 +197,14 @@ export async function runProjectOnboarding({
       status: "running",
       message: "AIPI onboarding: building code graph.",
     }, now);
-    graph = await graphBuilder({ projectRoot: root, now });
+    graph = await graphBuilder({
+      projectRoot: root,
+      now,
+      env,
+      pullEmbeddings: shouldPullEmbeddings,
+      platform,
+      onProgress: (event) => emitOnboardingProgress(onProgress, event, now),
+    });
     await emitOnboardingProgress(onProgress, {
       phase: "graph",
       status: "done",
@@ -238,10 +258,13 @@ export async function runProjectOnboarding({
           vector_dimensions: graph.vector?.dimensions ?? graph.sqlite?.vector?.dimensions ?? null,
           embedding_model: graph.vector?.embedding_model ?? graph.sqlite?.vector?.embedding_model ?? null,
           semantic_readiness: graph.vector?.readiness ?? null,
+          embedding_pull: graph.vector?.embedding_pull ?? graph.sqlite?.embedding_pull ?? null,
           file_count: graph.files?.length ?? 0,
         }
       : null,
     semantic_readiness: graph?.vector?.readiness ?? null,
+    embedding_pull: graph?.vector?.embedding_pull ?? graph?.sqlite?.embedding_pull ?? null,
+    pull_embeddings: shouldPullEmbeddings,
     investigation,
     recommendations,
   };
@@ -365,6 +388,11 @@ function nudge(reason, log) {
   return result;
 }
 
+function resolvePullEmbeddings({ pullEmbeddings = true, env = process.env } = {}) {
+  if (pullEmbeddings === false) return false;
+  return !/^(0|false|no|off)$/i.test(String(env.AIPI_PULL_EMBEDDINGS ?? "").trim());
+}
+
 async function emitOnboardingProgress(onProgress, event, now = () => new Date()) {
   if (typeof onProgress !== "function") return;
   try {
@@ -387,6 +415,8 @@ async function recordOnboardingTrace(root, result) {
     memory: result.memory,
     graph: result.graph,
     semantic_readiness: result.semantic_readiness,
+    embedding_pull: result.embedding_pull ?? null,
+    pull_embeddings: result.pull_embeddings ?? null,
     investigation: {
       mode: result.investigation?.mode ?? null,
       status: result.investigation?.status ?? null,

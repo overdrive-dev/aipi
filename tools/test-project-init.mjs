@@ -18,13 +18,15 @@ try {
     force: true,
     resetMemory: false,
     noOnboard: false,
+    noPullEmbeddings: false,
     targetRoot: "C:\\repo",
   });
-  assert.deepEqual(parseInitArgs("--force --reset-memory --no-onboard"), {
+  assert.deepEqual(parseInitArgs("--force --reset-memory --no-onboard --no-pull-embeddings"), {
     dryRun: false,
     force: true,
     resetMemory: true,
     noOnboard: true,
+    noPullEmbeddings: true,
     targetRoot: null,
   });
   assert.throws(() => parseInitArgs("--reset-memory"), /requires --force/);
