@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { runGuardedCommand } from "./command-watchdog.js";
 
 export const AIPI_RUNTIME_TOOL_NAMES = [
@@ -145,6 +146,16 @@ const RELATIONSHIP_PRIORITY = new Map([
   ["mentions_file", 70],
   ["mentions_symbol", 80],
   ["defines", 90],
+]);
+const GENERIC_TEST_COVER_STEMS = new Set([
+  "__init__",
+  "__main__",
+  "conftest",
+  "index",
+  "main",
+  "mod",
+  "setup",
+  "types",
 ]);
 const HYBRID_RRF_K = 60;
 const HYBRID_SIGNAL_WEIGHTS = {
@@ -1627,14 +1638,15 @@ async function buildRelationships({ root, files, symbols, runReferenceFiles = []
     const content = await readProjectText(root, testRel);
     const normalizedContent = content.toLowerCase();
     for (const sourceRel of sourceFiles) {
-      if (!testRelatesToSource({ testRel, sourceRel, normalizedContent })) continue;
+      const evidence = testCoverageEvidence({ testRel, sourceRel, normalizedContent });
+      if (!evidence) continue;
       add({
         source_kind: "test",
         source_ref: testRel,
         relation: "test_covers",
         target_kind: "file",
         target_ref: sourceRel,
-        evidence: sharesStem(testRel, sourceRel) ? "shared stem" : "source import/reference",
+        evidence,
       });
     }
   }
@@ -1745,9 +1757,36 @@ async function addCallRelationships({ root, sourceFiles, symbols, add }) {
 
 function capGraphRelationships(edges) {
   if (edges.length <= MAX_GRAPH_RELATIONSHIPS) return edges;
-  return [...edges]
-    .sort(compareGraphRelationshipPriority)
-    .slice(0, MAX_GRAPH_RELATIONSHIPS);
+  const byRelation = new Map();
+  for (const edge of edges) {
+    const relation = String(edge.relation ?? "");
+    const group = byRelation.get(relation) ?? [];
+    group.push(edge);
+    byRelation.set(relation, group);
+  }
+  const relationOrder = [...byRelation.keys()].sort((left, right) =>
+    (RELATIONSHIP_PRIORITY.get(left) ?? 100) - (RELATIONSHIP_PRIORITY.get(right) ?? 100) ||
+    left.localeCompare(right)
+  );
+  for (const group of byRelation.values()) group.sort(compareGraphRelationshipPriority);
+
+  const selected = [];
+  const relationOffsets = new Map(relationOrder.map((relation) => [relation, 0]));
+  while (selected.length < MAX_GRAPH_RELATIONSHIPS) {
+    let addedThisPass = false;
+    for (const relation of relationOrder) {
+      const group = byRelation.get(relation);
+      const offset = relationOffsets.get(relation) ?? 0;
+      if (!group || offset >= group.length) continue;
+      const edge = group[offset];
+      relationOffsets.set(relation, offset + 1);
+      selected.push(edge);
+      addedThisPass = true;
+      if (selected.length >= MAX_GRAPH_RELATIONSHIPS) break;
+    }
+    if (!addedThisPass) break;
+  }
+  return selected.sort(compareGraphRelationshipPriority);
 }
 
 function compareGraphRelationshipPriority(left, right) {
@@ -3391,7 +3430,7 @@ async function writeSqliteGraph({
         message: `AIPI semantic memory: building semantic vectors for ${graph.files.length} files.`,
       });
     }
-    const embeddingCache = new Map(reusableEmbeddingCache);
+    const embeddingCache = new Map(reusableEmbeddingCache.cache);
     const embeddingRequestCache = new Map();
     const vectorRowidsByContentKey = new Map();
     const codeLineIdsByPath = new Map();
@@ -3552,6 +3591,7 @@ async function writeSqliteGraph({
       vector.file_count = filesWithVectors;
       vector.scanned_file_count = scannedFileCount;
       vector.skipped_file_count = scannedFileCount - filesWithVectors;
+      vector.embedding_cache_reuse = reusableEmbeddingCache.status;
       vector.chunking = {
         strategy: "symbol_or_window",
         window_lines: VECTOR_CHUNK_WINDOW_LINES,
@@ -3636,7 +3676,18 @@ async function readReusableEmbeddingCache({
   graph,
   embeddingConfig,
 } = {}) {
-  if (!sqlite || !(await pathExists(sqlitePath))) return new Map();
+  if (!sqlite) {
+    return {
+      cache: new Map(),
+      status: { status: "unavailable", reused_item_count: 0, reason: "node:sqlite unavailable" },
+    };
+  }
+  if (!(await pathExists(sqlitePath))) {
+    return {
+      cache: new Map(),
+      status: { status: "missing", reused_item_count: 0, reason: "previous sqlite graph missing" },
+    };
+  }
   const previousHashes = new Map((previousGraph?.files ?? []).map((file) => [file.path, file.hash]));
   const currentHashes = new Map((graph.files ?? []).map((file) => [file.path, file.hash]));
   const unchanged = new Set();
@@ -3644,9 +3695,55 @@ async function readReusableEmbeddingCache({
     if (hash && previousHashes.get(rel) === hash) unchanged.add(rel);
   }
 
+  const failures = [];
+  for (const openMode of ["read_only", "immutable"]) {
+    try {
+      const result = await readReusableEmbeddingCacheWithOpenMode({
+        sqlite,
+        sqlitePath,
+        unchanged,
+        currentHashes,
+        embeddingConfig,
+        openMode,
+      });
+      if (failures.length > 0) {
+        result.status.recovered_from_reason = failures.map((failure) => `${failure.open_mode}: ${failure.reason}`).join("; ");
+      }
+      return result;
+    } catch (error) {
+      failures.push({
+        open_mode: openMode,
+        reason: String(error?.message ?? error),
+      });
+    }
+  }
+
+  return {
+    cache: new Map(),
+    status: {
+      status: "unavailable",
+      reused_item_count: 0,
+      reason: failures.map((failure) => `${failure.open_mode}: ${failure.reason}`).join("; "),
+    },
+  };
+}
+
+async function readReusableEmbeddingCacheWithOpenMode({
+  sqlite,
+  sqlitePath,
+  unchanged,
+  currentHashes,
+  embeddingConfig,
+  openMode,
+} = {}) {
   let db;
+  const location = openMode === "immutable" ? sqliteImmutableUri(sqlitePath) : sqlitePath;
   try {
-    db = new sqlite.DatabaseSync(sqlitePath, { readOnly: true });
+    db = new sqlite.DatabaseSync(location, { readOnly: true, allowExtension: true, timeout: 1 });
+    const vecStatus = await prepareSqliteVec(db, embeddingConfig);
+    if (vecStatus.status !== "available") {
+      throw new Error(`sqlite-vec unavailable while reading embedding cache: ${vecStatus.reason ?? "unknown"}`);
+    }
     const rows = db.prepare(`
       SELECT item_key, path, file_hash, dimensions, model, host, embedding
       FROM embedding_cache
@@ -3664,9 +3761,15 @@ async function readReusableEmbeddingCache({
       if (currentHashes.get(row.path) !== row.file_hash) continue;
       cache.set(row.item_key, entry);
     }
-    return cache;
-  } catch {
-    return new Map();
+    return {
+      cache,
+      status: {
+        status: "available",
+        open_mode: openMode,
+        reused_item_count: cache.size,
+        row_count: rows.length,
+      },
+    };
   } finally {
     try {
       db?.close();
@@ -3674,6 +3777,10 @@ async function readReusableEmbeddingCache({
       /* best-effort close */
     }
   }
+}
+
+function sqliteImmutableUri(sqlitePath) {
+  return `${pathToFileURL(sqlitePath).href}?immutable=1`;
 }
 
 async function loadSqlite() {
@@ -4338,6 +4445,7 @@ function relationshipEvidenceRank(edge) {
   const evidence = String(edge?.evidence ?? "").toLowerCase();
   if (/structured .*link/.test(evidence)) return 0;
   if (evidence.includes("explicit source path")) return 1;
+  if (evidence.includes("source import/reference")) return 2;
   return 5;
 }
 
@@ -4366,14 +4474,16 @@ function isMemoryFile(rel) {
   return rel.startsWith(".aipi/memory/project/") && rel.endsWith(".md");
 }
 
-function testRelatesToSource({ testRel, sourceRel, normalizedContent }) {
-  if (sharesStem(testRel, sourceRel)) return true;
+function testCoverageEvidence({ testRel, sourceRel, normalizedContent }) {
   const withoutExt = sourceRel.replace(/\.[^.]+$/, "").toLowerCase();
   const basename = path.basename(withoutExt).toLowerCase();
-  return normalizedContent.includes(sourceRel.toLowerCase()) ||
+  if (normalizedContent.includes(sourceRel.toLowerCase()) ||
     normalizedContent.includes(withoutExt) ||
     normalizedContent.includes(`/${basename}`) ||
-    normalizedContent.includes(`..\/${basename}`);
+    normalizedContent.includes(`..\/${basename}`)) {
+    return "source import/reference";
+  }
+  return sharesStem(testRel, sourceRel) ? "shared stem" : null;
 }
 
 function mentionsPath(normalizedContent, rel) {
@@ -4405,9 +4515,19 @@ function escapeRegex(value) {
 }
 
 function sharesStem(a, b) {
-  const left = path.basename(a).replace(/\.(test|spec)\./i, ".").split(".")[0];
-  const right = path.basename(b).split(".")[0];
+  const left = coverageStem(a);
+  const right = coverageStem(b);
+  if (GENERIC_TEST_COVER_STEMS.has(left) || GENERIC_TEST_COVER_STEMS.has(right)) return false;
   return left && right && (left.includes(right) || right.includes(left));
+}
+
+function coverageStem(rel) {
+  return path.basename(rel)
+    .replace(/\.(test|spec)\./i, ".")
+    .split(".")[0]
+    .toLowerCase()
+    .replace(/^test[_-]/, "")
+    .replace(/[_-]test$/, "");
 }
 
 async function listMarkdownFiles(dir) {
@@ -4763,3 +4883,7 @@ function assertRoot(projectRoot) {
 function jsonResult(value) {
   return { content: [{ type: "text", text: JSON.stringify(value, null, 2) }] };
 }
+
+export const __aipiTestInternals = Object.freeze({
+  readReusableEmbeddingCache,
+});

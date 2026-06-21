@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { initProject } from "../extensions/aipi/runtime/project-init.js";
 import {
+  __aipiTestInternals,
   aipiCallers,
   aipiImpact,
   aipiKanbanUpdate,
@@ -896,6 +897,28 @@ try {
   const graphPath = path.join(tempRoot, ".aipi", "state", "aipi-graph.json");
   const cacheReuseCallsBefore = embeddingCalls.length;
   const graphBeforeCacheReuse = JSON.parse(await fs.readFile(graphPath, "utf8"));
+  const sqliteForLockedCache = await import("node:sqlite").catch(() => null);
+  if (sqliteForLockedCache && graph.vector.status === "available") {
+    const lockedCacheSqlitePath = path.join(tempRoot, ".aipi", "state", "aipi-graph.sqlite");
+    const lockedCacheDb = new sqliteForLockedCache.DatabaseSync(lockedCacheSqlitePath, { allowExtension: true });
+    try {
+      lockedCacheDb.exec("BEGIN EXCLUSIVE");
+      const lockedCache = await __aipiTestInternals.readReusableEmbeddingCache({
+        sqlite: sqliteForLockedCache,
+        sqlitePath: lockedCacheSqlitePath,
+        previousGraph: graphBeforeCacheReuse,
+        graph: graphBeforeCacheReuse,
+        embeddingConfig: await resolveSemanticEmbeddingConfig({ root: tempRoot, env: semanticOptions.env }),
+      });
+      assert.equal(lockedCache.status.status, "available");
+      assert.equal(lockedCache.status.open_mode, "immutable");
+      assert.match(lockedCache.status.recovered_from_reason, /read_only: .*lock/i);
+      assert.equal(lockedCache.cache.size > 0, true);
+    } finally {
+      lockedCacheDb.exec("ROLLBACK");
+      lockedCacheDb.close();
+    }
+  }
   const cacheReuseGraph = await rebuildCodeGraph({
     projectRoot: tempRoot,
     previousGraph: graphBeforeCacheReuse,
@@ -905,6 +928,13 @@ try {
   if (cacheReuseGraph.vector.status === "available") {
     assert.equal(embeddingCalls.length, cacheReuseCallsBefore);
     assert.equal(cacheReuseGraph.vector.unique_item_count, graph.vector.unique_item_count);
+    assert.equal(cacheReuseGraph.vector.embedding_cache_reuse.status, "available");
+    assert.equal(cacheReuseGraph.vector.embedding_cache_reuse.reused_item_count > 0, true);
+    assert.equal(
+      cacheReuseGraph.vector.embedding_cache_reuse.row_count >=
+        cacheReuseGraph.vector.embedding_cache_reuse.reused_item_count,
+      true,
+    );
   }
 
   const interruptedRoot = path.join(tempRoot, "interrupted-semantic-project");
@@ -947,6 +977,8 @@ try {
   });
   if (resumedGraph.vector.status === "available") {
     assert.equal(resumedCalls.length < resumedGraph.vector.unique_item_count, true);
+    assert.equal(resumedGraph.vector.embedding_cache_reuse.status, "available");
+    assert.equal(resumedGraph.vector.embedding_cache_reuse.reused_item_count >= 2, true);
     for (const input of interruptedFetch.successfulInputs) {
       assert.equal(resumedCalls.some((call) => call.input === input), false);
     }
@@ -967,6 +999,48 @@ try {
   });
   assert.equal(await pathExists(path.join(brokenStateDir, "aipi-graph.sqlite-journal")), false);
   assert.equal(recoveredGraph.sqlite.sqlite_recovery.status, "removed");
+
+  const cacheFailureRoot = path.join(tempRoot, "cache-failure-project");
+  await fs.mkdir(path.join(cacheFailureRoot, "src"), { recursive: true });
+  await initProject({ sourceRoot, targetRoot: cacheFailureRoot });
+  await fs.writeFile(
+    path.join(cacheFailureRoot, "src", "cache-failure.js"),
+    "export function cacheFailureProbe() {\n  return true;\n}\n",
+  );
+  const cacheFailureStateDir = path.join(cacheFailureRoot, ".aipi", "state");
+  await fs.mkdir(cacheFailureStateDir, { recursive: true });
+  const sqliteForCacheFailure = await import("node:sqlite").catch(() => null);
+  if (sqliteForCacheFailure) {
+    const cacheFailureSqlitePath = path.join(cacheFailureStateDir, "aipi-graph.sqlite");
+    const cacheFailureDb = new sqliteForCacheFailure.DatabaseSync(cacheFailureSqlitePath);
+    try {
+      cacheFailureDb.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    } finally {
+      cacheFailureDb.close();
+    }
+    const cacheFailureGraph = await rebuildCodeGraph({
+      projectRoot: cacheFailureRoot,
+      previousGraph: {
+        schema: "aipi.code-graph.v1",
+        source: "sqlite+sqlite-vec+lexical",
+        files: [{ path: "src/cache-failure.js", hash: "previous-hash" }],
+        vector: {
+          status: "available",
+          engine: "sqlite-vec",
+          dimensions: 1024,
+          embedding_model: "bge-m3",
+        },
+        sqlite: { path: ".aipi/state/aipi-graph.sqlite", status: "available" },
+      },
+      now: () => new Date("2026-06-16T00:25:00.000Z"),
+      ...semanticOptions,
+    });
+    if (cacheFailureGraph.vector.status === "available") {
+      assert.equal(cacheFailureGraph.vector.embedding_cache_reuse.status, "unavailable");
+      assert.equal(cacheFailureGraph.vector.embedding_cache_reuse.reused_item_count, 0);
+      assert.match(cacheFailureGraph.vector.embedding_cache_reuse.reason, /embedding_cache|no such table/i);
+    }
+  }
 
   const oldDimGraph = JSON.parse(await fs.readFile(graphPath, "utf8"));
   const legacyVectorDimensions = 1024 - 256;
@@ -1178,10 +1252,63 @@ try {
   assert.equal(lexicalFallback.refs.some((ref) => ref.path === "src/billing.js"), true);
   assert.equal(lexicalProgressEvents.some((event) => event.phase === "semantic-vectors"), false);
 
+  const genericStemRoot = path.join(tempRoot, "generic-test-cover-project");
+  await initProject({ sourceRoot, targetRoot: genericStemRoot });
+  await fs.mkdir(path.join(genericStemRoot, "src", "app", "api"), { recursive: true });
+  await fs.mkdir(path.join(genericStemRoot, "tests"), { recursive: true });
+  await fs.writeFile(path.join(genericStemRoot, "src", "app", "__init__.py"), "# app package\n");
+  await fs.writeFile(path.join(genericStemRoot, "src", "app", "api", "__init__.py"), "# api package\n");
+  await fs.writeFile(path.join(genericStemRoot, "src", "index.js"), "export const indexValue = 1;\n");
+  await fs.writeFile(path.join(genericStemRoot, "src", "user_service.py"), "def load_user_service():\n    return True\n");
+  await fs.writeFile(path.join(genericStemRoot, "tests", "__init__.py"), "# test package only\n");
+  await fs.writeFile(path.join(genericStemRoot, "tests", "index.test.js"), "test('index package marker', () => {});\n");
+  await fs.writeFile(path.join(genericStemRoot, "tests", "test_user_service.py"), "def test_user_service():\n    assert True\n");
+  const genericStemGraph = await rebuildCodeGraph({
+    projectRoot: genericStemRoot,
+    now: () => new Date("2026-06-21T09:00:00.000Z"),
+    env: semanticOptions.env,
+    embeddingFetch: fakeMissingTagsFetch(),
+  });
+  const genericStemTestCovers = genericStemGraph.relationships.filter((edge) => edge.relation === "test_covers");
+  assert.equal(
+    genericStemTestCovers.some(
+      (edge) => edge.source_ref === "tests/__init__.py" && path.basename(edge.target_ref) === "__init__.py",
+    ),
+    false,
+  );
+  assert.equal(
+    genericStemTestCovers.some(
+      (edge) => edge.source_ref === "tests/index.test.js" && edge.target_ref === "src/index.js",
+    ),
+    false,
+  );
+  assert.equal(
+    genericStemTestCovers.some(
+      (edge) =>
+        edge.source_ref === "tests/test_user_service.py" &&
+        edge.target_ref === "src/user_service.py" &&
+        edge.evidence === "shared stem",
+    ),
+    true,
+  );
+
   const cappedGraphRoot = path.join(tempRoot, "relationship-cap-project");
   await initProject({ sourceRoot, targetRoot: cappedGraphRoot });
   await fs.mkdir(path.join(cappedGraphRoot, "src"), { recursive: true });
   await fs.mkdir(path.join(cappedGraphRoot, "tests"), { recursive: true });
+  const testCoverOverflowPairs = 51;
+  for (let index = 0; index < testCoverOverflowPairs; index += 1) {
+    await fs.mkdir(path.join(cappedGraphRoot, "src", `cap-area-${index}`), { recursive: true });
+    await fs.mkdir(path.join(cappedGraphRoot, "tests", `cap-area-${index}`), { recursive: true });
+    await fs.writeFile(
+      path.join(cappedGraphRoot, "src", `cap-area-${index}`, "cap.js"),
+      `export const capOverflowSource${index} = ${index};\n`,
+    );
+    await fs.writeFile(
+      path.join(cappedGraphRoot, "tests", `cap-area-${index}`, "cap.test.js"),
+      `test('cap overflow ${index}', () => {});\n`,
+    );
+  }
   await fs.writeFile(
     path.join(cappedGraphRoot, "src", "aaa-overflow.js"),
     Array.from({ length: 2605 }, (_, index) => `export const overflowSymbol${index} = ${index};\n`).join(""),
@@ -1217,7 +1344,15 @@ try {
     embeddingFetch: fakeMissingTagsFetch(),
   });
   assert.equal(cappedGraph.relationships.length, 2500);
+  const cappedRelationCounts = new Map();
+  for (const edge of cappedGraph.relationships) {
+    cappedRelationCounts.set(edge.relation, (cappedRelationCounts.get(edge.relation) ?? 0) + 1);
+  }
+  assert.equal(testCoverOverflowPairs * testCoverOverflowPairs > 2500, true);
+  assert.equal(cappedRelationCounts.get("test_covers") > 0, true);
+  assert.equal(cappedRelationCounts.get("test_covers") < cappedGraph.relationships.length, true);
   const cappedDefinesCount = cappedGraph.relationships.filter((edge) => edge.relation === "defines").length;
+  assert.equal(cappedDefinesCount > 0, true);
   assert.equal(cappedDefinesCount < cappedGraph.relationships.length, true);
   assert.equal(
     cappedGraph.relationships.some(
@@ -1253,6 +1388,15 @@ try {
     embeddingFetch: fakeMissingTagsFetch(),
   });
   assert.equal(cappedImpact.related_tests.includes("tests/critical.test.js"), true);
+  assert.equal(cappedImpact.relationships.some((edge) => edge.relation === "calls"), true);
+  assert.equal(cappedImpact.relationships.some((edge) => edge.relation === "business_rule_impacts_code"), true);
+  const cappedCallers = await aipiCallers({
+    projectRoot: cappedGraphRoot,
+    symbol: "cappedCallTarget",
+    env: semanticOptions.env,
+    embeddingFetch: fakeMissingTagsFetch(),
+  });
+  assert.equal(cappedCallers.refs.some((ref) => ref.path === "src/critical.js"), true);
   const cappedRetrieval = await aipiRetrieve({
     projectRoot: cappedGraphRoot,
     query: "src/critical.js",
