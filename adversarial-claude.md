@@ -6,7 +6,7 @@ This file is the handoff channel between Claude reviewer and Codex implementer.
 
 Current owner: CLAUDE
 Current status: WAITING_FOR_CLAUDE
-Open review round: 44 CLOSED (real business-rule extraction: static scan of guards/Zod/Pydantic/Literal → concrete source-cited CANDIDATE rules, boilerplate demoted, swarm path too, proven on disk); Rounds 29–44 all CLOSED
+Open review round: 47 CLOSED (business-rule acceptance: approval-gated candidate→accepted BR-### in Markdown + business_rule_impacts_code edge re-derived on rebuild → governing_rules in hybrid retrieval; lifecycle end-to-end); Rounds 29–47 all CLOSED
 
 Note: Round 17 closed too early on a narrow basis. Round 19 is a full-project
 adversarial sweep (8 dimensions, every finding independently verified) and is the
@@ -10018,6 +10018,373 @@ Zod/Pydantic/Literal); deeper/idiomatic rules rely on the swarm worker. In scope
 Re-onboard `nora-app` (after deleting `.aipi/state`): `business-rules.md` should now carry CONCRETE,
 source-cited `CANDIDATE: …` rules pulled from the backend's validation/constraint code (not the old
 boilerplate or your free-text answer), each linkable to its source for acceptance → `business_rule_impacts_code`.
+
+Current owner: CLAUDE
+Current status: CLOSED
+
+---
+
+# Round 45 — Stop embedding low-signal files: exclude tests/css/html/generated from the semantic vector set
+
+Opened by Claude on a user direction (2026-06-20) after a live analysis of `nora-app`. Scope = P1 ONLY
+(the safe, high-confidence cut). P2 (high-signal-only / lazy embedding) is explicitly deferred.
+
+**Problem (verified, with live numbers):** the semantic vector index embeds low-signal files. For `nora-app`,
+of **1537 embeddable files, ~743 (~48%) are tests** (`backend/tests`, `frontend/__tests__`, …), plus 18
+`.html`. The embed filter `isEmbeddableVectorFile` (`aipi-tools.js:2897`) is EXTENSION-based — it excludes
+`.d.ts`/`.min.js`/`.lock`/`.snap` but NOT tests, css, html, or generated/migrations. The system already has
+`isTestFile()` (`:4205`, used for `test_covers` edges) — it just isn't wired into the embed filter. Effect:
+the vector index is ~2× bigger than needed AND retrieval is polluted (a semantic query returns piles of test
+files instead of the implementation).
+
+## What to build (P1 only)
+Exclude these from the VECTOR/embed set (NOT from anything else):
+- **Test/spec files** — wire `isTestFile(rel)` into `isEmbeddableVectorFile` (and the chunk builder).
+- **`.css` / `.html`** — low signal for code semantic search.
+- **Generated / migrations** — `migrations/` dirs, `*.generated.*`, `@generated`-marked, `__generated__/`.
+
+Crucially, KEEP them everywhere else so nothing is lost:
+- Tests stay in `code_lines` → lexical/Ctrl-F still finds them.
+- Tests stay in the graph as `test_covers` edges → blast-radius "which tests cover this" still works
+  (`aipi_impact` related_tests unaffected).
+Only the SEMANTIC VECTORS are skipped for these files.
+
+## Acceptance / tests (must actually execute — WF-01/WF-02)
+- A fixture with a source service + a matching `*.test.*` (or `tests/…`) file: after build, the SERVICE has a
+  `vector_chunks`/`code_vectors` entry but the TEST file has NONE (assert no vector rows for the test path),
+  while the test IS present in `code_lines` (lexical) AND a `test_covers` edge to the service still exists.
+- `.css`/`.html` files produce no vectors but remain in `code_lines`.
+- The embedded-unique-vector count for a mixed fixture drops materially vs embedding everything (assert
+  vectors come only from non-test source).
+- `aipi_retrieve`/`aipi_semantic_search` still return the real implementation for a concept query, and no
+  test file outranks it; lexical + graph + hybrid retrieval unaffected; bge-m3/1024 pinned.
+- `npm test` + `npm run validate` green.
+
+## Note
+Pure cut — no behavior change beyond what's embedded. Expect the `nora-app` index to roughly halve on a fresh
+rebuild. P2 (embed only high-signal / lazy on-demand) remains available as a future round if more is wanted.
+
+Record changed files + exact commands run, then set `Current owner: CLAUDE` /
+`Current status: WAITING_FOR_CLAUDE`.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX
+Requested next action: implement Round 45 P1 — exclude test/spec files (wire the existing `isTestFile` into
+`isEmbeddableVectorFile`), `.css`/`.html`, and generated/migrations from the SEMANTIC VECTOR set only. Keep
+them in `code_lines` (lexical) and keep `test_covers` graph edges intact (blast-radius unaffected). Prove
+with a fixture: service is embedded, its test is NOT (no vector rows) but is still lexically indexed + still
+linked via `test_covers`; vector count drops; hybrid retrieval still surfaces the real implementation. Keep
+bge-m3/1024 pinned. Do NOT do P2.
+
+## Codex implementation - Round 45 (2026-06-20)
+
+Implemented P1 only: low-signal files are excluded from the semantic vector/chunk set while remaining in the
+SQLite lexical index and graph relationships.
+
+Changed files:
+
+- `extensions/aipi/runtime/aipi-tools.js`
+  - Wired existing `isTestFile(rel)` into `isEmbeddableVectorFile`.
+  - Excluded `.css` and `.html` from semantic vectors only.
+  - Added generated/migration vector exclusions for `migrations/`/`migration/` dirs, `*.generated.*`,
+    `__generated__/`, and content-level `@generated` markers in `buildVectorChunksForFile`.
+  - Left `CODE_EXTENSIONS`, `code_lines`, relationship building, and graph impact behavior unchanged.
+- `tools/test-aipi-tools.mjs`
+  - Extended the existing billing fixture with `tests/billing.test.js`, CSS, HTML, generated, `__generated__`,
+    migration, and `@generated` marker files.
+  - Asserted `src/billing.js` produces vector chunks while every low-signal fixture file produces zero
+    `vector_chunks`.
+  - Asserted those low-signal files still have `code_lines`, and the billing test still has a SQL
+    `test_covers` relationship to `src/billing.js`.
+  - Asserted the mixed fixture's vectorized path set is smaller than the pre-P1 candidate set and contains
+    only non-low-signal source paths.
+  - Asserted `aipi_semantic_search` for a concept query returns the implementation and does not return the
+    test file, while `aipi_retrieve` keeps the implementation ahead of any test result.
+- `adversarial-claude.md`
+  - Recorded this handoff and changed Round 45 ownership back to Claude for verification.
+
+Verification run:
+
+- `node --check extensions/aipi/runtime/aipi-tools.js` -> passed
+- `node --check tools/test-aipi-tools.mjs` -> passed
+- `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`
+- `npm.cmd run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`
+- `npm.cmd test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`
+- `git diff --check` -> clean (CRLF warnings only)
+
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE
+Requested next action: verify Round 45 P1 against the implementation above; close if no findings remain or
+hand back concrete residual findings. P2 remains deferred.
+
+## Claude verdict — Round 45 CLOSED (2026-06-20)
+
+Verified against real code + a real full-suite run, filter + test re-read for genuineness (WF-01/WF-02).
+- **Filter excludes low-signal from vectors only.** `isEmbeddableVectorFile` (`aipi-tools.js`) now returns
+  false for `isTestFile(normalized)`, `isGeneratedOrMigrationFile(normalized)`, and `.css`/`.html` (on top of
+  the existing `.d.ts`/`.min.js`/`.lock`/`.snap`). `code_lines`, relationships, and impact behavior unchanged.
+- **Proven on disk (the crux).** `test-aipi-tools.mjs:478-522`: with a fixture containing a service + a
+  `tests/billing.test.js` + css/html/3×generated/migration files — `src/billing.js` has `vector_chunks` (`:499`)
+  while EVERY low-signal path has **zero `vector_chunks`** (`:502`) yet **>0 `code_lines`** (`:501`, still
+  lexical), no vector path is in the excluded set (`:504`), the vectorized set is strictly SMALLER than the
+  lexically-indexed set (`:510-514`), and the `test_covers` edge `tests/billing.test.js → src/billing.js`
+  STILL exists (`:515-522`) — blast-radius / `aipi_impact` related_tests intact.
+- **Retrieval improved, not broken.** `aipi_semantic_search` returns the implementation and not the test;
+  `aipi_retrieve` keeps the implementation ahead of any test result; bge-m3/1024 pinned.
+- **P2 NOT done** (only exclusions added; no high-signal-only/lazy logic) — as instructed.
+- No regression; `AIPI_TOOLS_TEST_OK`, `npm test` → `AIPI_STEP_RESULT_TEST_OK`, validate OK.
+
+**Zero open findings. Round 45 CLOSED. Rounds 29–45 all CLOSED.**
+
+### Live re-verify for the user
+Delete `.aipi/state` on `nora-app` and re-onboard: the semantic index should roughly halve (the ~743 test
+files + css/html/generated no longer get vectors), semantic search stops returning test files, and
+"which tests cover this" (blast-radius) is unchanged because tests stay in the graph as `test_covers`.
+P2 (embed only high-signal / lazy on-demand) remains available as a future round if you want it leaner still.
+
+Current owner: CLAUDE
+Current status: CLOSED
+
+---
+
+# Round 46 — P2: embed ONLY high-signal source (semantics for high-value files only)
+
+Opened by Claude on a user decision (2026-06-20: "semântica só pra alto valor"). Builds on Round 45 (P1
+excluded tests/css/html/generated from vectors). P1 was a denylist; P2 adds a positive HIGH-SIGNAL gate.
+
+**Goal:** a file gets semantic vectors only if it is genuinely high-signal (real logic/behavior). Everything
+else stays in lexical (`code_lines`) + graph (relationships) as before — only the SEMANTIC door narrows.
+
+**High-signal definition (objective, reuse existing infra; conservative — when unsure, INCLUDE):**
+A file is embeddable for vectors only if it passes P1 AND is "live code":
+- it has ≥1 extracted **symbol** (defines a function/class/exported member — the graph already builds the
+  `symbols` table), OR
+- it participates in the **graph** (has ≥1 relationship edge — imported/called/covered).
+Skip files with NO symbols AND NO edges: pure data/constants/config blobs, empty/scaffold files, orphan
+scripts. These are low-value for find-by-meaning and just add vectors + noise.
+(Optional refinement Codex MAY add if cheap: down-rank very large generated-looking data files; prefer
+files under recognized source roots. Keep it conservative — do NOT drop real logic to chase size.)
+
+**Honest scope note:** the big win was P1 (tests ≈ 48%). P2's incremental cut is smaller and riskier, so the
+bar is "never drop a file that defines or participates in real logic." Err toward inclusion.
+
+## What to build
+- Extend the vector-embed gate (`isEmbeddableVectorFile` / `buildVectorChunksForFile` /
+  `shouldEmbedCodeLine` path in `aipi-tools.js`) with the high-signal check above, using the already-built
+  `symbols` + `relationships` for the file. Keep P1 exclusions.
+- `code_lines` + relationships + impact unchanged (lexical + graph still cover everything).
+- bge-m3/1024 pinned.
+
+## Acceptance / tests (must actually execute — WF-01/WF-02)
+- Fixture with: (a) a service with exported functions/symbols → embedded (has `vector_chunks`); (b) a
+  pure-data/config file with NO symbols and NO edges → NOT embedded (zero `vector_chunks`) but STILL in
+  `code_lines` and unaffected in the graph; (c) a small util that IS imported/called (has edges) but few
+  symbols → still embedded (don't drop live code).
+- Assert the high-signal file has vectors, the no-symbol/no-edge file has none, and the live-but-small file
+  is NOT dropped.
+- Unique vector count drops further vs P1 on a mixed fixture; `aipi_semantic_search`/`aipi_retrieve` still
+  return the real implementation; lexical + graph + blast-radius unaffected.
+- `npm test` + `npm run validate` green.
+
+Record changed files + exact commands run, then set `Current owner: CLAUDE` /
+`Current status: WAITING_FOR_CLAUDE`.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX
+Requested next action: implement Round 46 P2 — gate semantic vectors to HIGH-SIGNAL source only: in addition
+to the P1 denylist, embed a file only if it has ≥1 symbol OR ≥1 graph relationship; skip no-symbol+no-edge
+data/config/orphan files. Conservative — never drop a file that defines or participates in real logic. Keep
+everything in `code_lines` + graph; bge-m3/1024 pinned. Prove with a fixture: service embedded, no-symbol
+config NOT embedded (but still lexical+graph), small-but-imported util NOT dropped; vector count drops;
+retrieval still surfaces the implementation.
+
+---
+
+# Round 47 — QUEUED (DO NOT START until Round 46 is CLOSED) — Business-rule acceptance: candidates → accepted BR-### with graph edges
+
+NOTE TO CODEX: DRAFT/QUEUED. No active handoff pair — the live handoff is Round 46 above. Do not start until
+Claude activates it after Round 46 closes.
+
+Opened-as-draft by Claude on user interest (2026-06-20: "esse fluxo de regra de negócio tb é legal").
+
+**Context:** Round 44 makes onboarding emit CONCRETE candidate business rules with `source_ref`, but they
+stay CANDIDATE. There's no flow to ACCEPT them into the authoritative ledger. Accepted rules should become
+`BR-###` entries that the graph links to code via `business_rule_impacts_code` — which feeds Round-41 hybrid
+retrieval (governing_rules) and blast-radius.
+
+**What to build (for the active round later):**
+1. An acceptance flow (CLI/tool, approval-gated) that turns a chosen candidate rule into an ACCEPTED rule:
+   assigns a stable `BR-###` id, writes it to `business-rules.md` as accepted (via the Round-43 approval-gated
+   `aipi_promote_memory`, current-truth + Timeline), and stamps it accepted (not candidate).
+2. Create the `business_rule_impacts_code` relationship from the accepted `BR-###` to its `source_ref`
+   target(s) so the rule shows up in `aipi_retrieve` `governing_rules` for that code and in blast-radius.
+3. Idempotent (re-accepting doesn't duplicate); human-authored accepted rules preserved; acceptance is a
+   deliberate user/agent action, never automatic.
+4. Tie the BR id + edges into the rebuildable graph so a rebuild re-derives the edge from the accepted rule's
+   links (Markdown stays source of truth).
+
+**Acceptance (must actually execute — WF-01/WF-02):**
+- Accepting a candidate produces an accepted `BR-###` in `business-rules.md` (not "candidate") AND a
+  `business_rule_impacts_code` edge from that BR to the cited source path in the graph — asserted by reading
+  the file + querying the graph.
+- `aipi_retrieve` for the cited code returns that BR in `governing_rules`.
+- Idempotent; candidate-not-accepted stays candidate; `npm test` + `npm run validate` green.
+
+## Codex implementation - Round 46 (2026-06-20)
+
+Implemented P2 only: semantic vectors now require the Round 45/P1 denylist AND a positive high-signal signal.
+A file is vectorized only when it has at least one extracted symbol or at least one graph relationship touching
+its path. Files that fail this gate still remain in `code_lines`, `files`, and graph processing.
+
+Changed files:
+
+- `extensions/aipi/runtime/aipi-tools.js`
+  - `buildVectorChunksForFile` now receives `relationships` alongside `symbols`.
+  - Added `isHighSignalVectorFile`: include files with at least one symbol or with a relationship whose
+    `source_ref`/`target_ref` matches the file path, `path#...`, or `path:line`.
+  - The P1 denylist remains first: tests/specs, `.css`, `.html`, generated, migrations, and `@generated`
+    marked files still produce no semantic chunks.
+  - `code_lines` insertion still runs for every indexed file before vector chunking, so lexical/graph behavior
+    is unchanged.
+- `tools/test-aipi-tools.mjs`
+  - Added `src/static-palette.js` as a P1-allowed but no-symbol/no-edge config/data fixture; asserted it stays
+    in `files` and `code_lines`, has no symbols/relationships, and produces zero `vector_chunks`.
+  - Added `src/live-hook.js` with no extracted symbol plus `tests/live-hook.test.js` referencing it; asserted
+    the `test_covers` edge keeps the util high-signal and it still produces vector chunks.
+  - Kept Round 45 assertions for tests/css/html/generated/migrations excluded from vectors only.
+  - Asserted the P1-allowed candidate set drops further under P2, while semantic/hybrid retrieval still
+    surfaces `src/billing.js` and no test file outranks it.
+- `adversarial-claude.md`
+  - Recorded this handoff. Round 47 remains queued and was not started.
+
+Verification run:
+
+- `node --check extensions/aipi/runtime/aipi-tools.js` -> passed
+- `node --check tools/test-aipi-tools.mjs` -> passed
+- `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`
+- `npm.cmd run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`
+- `npm.cmd test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`
+- `git diff --check` -> clean (CRLF warnings only)
+
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE
+Requested next action: verify Round 46 P2 against the implementation above; close if no findings remain or
+hand back concrete residual findings. Round 47 remains queued until Round 46 is closed.
+
+## Claude verdict — Round 46 CLOSED (2026-06-20)
+
+Verified against real code + a real full-suite run, gate + fixtures re-read for genuineness (WF-01/WF-02).
+- **High-signal gate is correct + conservative.** `buildVectorChunksForFile` applies P1
+  (`isEmbeddableVectorFile`, `aipi-tools.js:2910`) THEN P2 (`isHighSignalVectorFile`, `:2912`).
+  `isHighSignalVectorFile` (`:2966`) returns true if the file has ≥1 symbol OR any relationship whose
+  source/target matches the path (`graphRefMatchesFile` handles `path` / `path#…` / `path:line`). No-symbol +
+  no-edge → no vectors. `code_lines`/files/graph processing unchanged.
+- **Proven on disk (both crux cases).** `test-aipi-tools.mjs`: `src/static-palette.js` (no symbol, no edge)
+  is in `files` (`:536`) + `code_lines` (`:537`) but has **zero `vector_chunks`** (`:538`), with no symbol
+  (`:539`) and no edge (`:542`). `src/live-hook.js` (NO symbol) has a `test_covers` edge from
+  `tests/live-hook.test.js` (`:549-553`) and therefore **still produces vector chunks** (`:556`) — the
+  conservative "never drop live code" guarantee. P2 candidate set drops further; Round-45 exclusions kept.
+- **Retrieval intact.** `aipi_semantic_search`/`aipi_retrieve` still surface `src/billing.js` and no test
+  outranks it; lexical + graph + blast-radius unaffected; bge-m3/1024 pinned. P2 only (Round 47 untouched).
+- No regression; `AIPI_TOOLS_TEST_OK`, `npm test` → `AIPI_STEP_RESULT_TEST_OK`, validate OK.
+
+**Zero open findings. Round 46 CLOSED. Rounds 29–46 all CLOSED.** Semantic vectors are now "high-value only":
+P1 (no tests/css/html/generated) + P2 (must define or participate in real code).
+
+---
+
+## Round 47 ACTIVATED (2026-06-20)
+
+The Round 47 draft above ("Business-rule acceptance: candidates → accepted BR-### with graph edges") is now
+the active handoff. Spec + acceptance = that drafted section. (NOTE: the draft's "DO NOT START" header is
+superseded by this activation.)
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX
+Requested next action: implement Round 47 per the drafted spec above — an approval-gated acceptance flow that
+turns a CONCRETE candidate rule (Round 44) into an ACCEPTED `BR-###`: write it to `business-rules.md` as
+accepted via the Round-43 `aipi_promote_memory` (current-truth + Timeline, idempotent), AND create a
+`business_rule_impacts_code` edge from the BR to its `source_ref` so it appears in `aipi_retrieve`
+`governing_rules` for that code + in blast-radius. Markdown stays source of truth (rebuild re-derives the
+edge). Acceptance is a deliberate action, never automatic; idempotent; human-authored rules preserved. Prove
+by reading `business-rules.md` + querying the graph for the edge + asserting `aipi_retrieve` surfaces the BR.
+Stay strictly: Codex implements; Claude reviews.
+
+## Codex implementation - Round 47 (2026-06-20)
+
+Implemented the approval-gated business-rule acceptance path through the existing `aipi_promote_memory`
+tool. A chosen candidate rule promoted with a durable `approval_ref` now becomes an accepted `BR-###` in
+`business-rules.md`, links to its cited source path, and rebuilds into graph edges that feed retrieval.
+
+Changed files:
+
+- `extensions/aipi/runtime/aipi-tools.js`
+  - `aipi_promote_memory` now passes the durable approval result into memory rendering.
+  - Approved business-rule promotions render with `- **status:** accepted`; deferred/non-approved business-rule
+    promotions render as `candidate` in `.aipi/runtime/memory-candidates` only.
+  - Business-rule rendering extracts a code path from `source_ref` such as `src/billing.js:2` and writes
+    `links: implements:[src/billing.js]`, keeping Markdown as source of truth.
+  - Rebuild now derives both `business_rule_implements_code` and `business_rule_impacts_code` from structured
+    `implements:[path]` links, so accepted BRs show up in blast-radius and retrieval.
+  - Relationship sorting now ranks structured/explicit links ahead of fuzzy domain matches so accepted source
+    links are visible in `governing_rules` for cited code.
+- `tools/test-aipi-tools.mjs`
+  - Added an approved candidate promotion that creates `BR-20260616T034000Z` with `status: accepted`,
+    `source: src/billing.js:2`, and `links: implements:[src/billing.js]`.
+  - Asserted re-accepting the same candidate is idempotent and does not duplicate the BR.
+  - Asserted a business-rule promotion without approval is deferred, remains `candidate`, and is not written to
+    durable `business-rules.md`.
+  - Rebuilt the graph and asserted a `business_rule_impacts_code` edge from the accepted BR to `src/billing.js`.
+  - Asserted `aipi_retrieve` for `src/billing.js` returns a ref whose `governing_rules` include that accepted BR.
+- `adversarial-claude.md`
+  - Recorded this handoff.
+
+Verification run:
+
+- `node --check extensions/aipi/runtime/aipi-tools.js` -> passed
+- `node --check tools/test-aipi-tools.mjs` -> passed
+- `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`
+- `npm.cmd run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`
+- `npm.cmd test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`
+- `git diff --check` -> clean (CRLF warnings only)
+
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE
+Requested next action: verify Round 47 against the implementation above; close if no findings remain or
+hand back concrete residual findings.
+
+## Claude verdict — Round 47 CLOSED (2026-06-20)
+
+Verified against real code + a real full-suite run, rendering + edge-derivation + tests re-read for
+genuineness (WF-01/WF-02).
+- **Approval-gated acceptance.** `aipiPromoteMemory` writes durable memory only with a real approval artifact;
+  no approval / self-approval → `deferred` + a `.aipi/runtime/memory-candidates/` file (test `:1318-1341,
+  1446-1460`: the unapproved rule stays `status: candidate` and never reaches `business-rules.md`).
+- **Accepted BR rendered to Markdown.** `renderBusinessRuleEntry` writes `### BR-<id> - <title>` with
+  `**status:** accepted`, `**source:** src/billing.js:2`, and `**links:** implements:[src/billing.js], …`
+  (path extracted from `source_ref`). Test reads `business-rules.md` and asserts all of it (`:1420-1424`).
+- **Edge re-derived from Markdown (source of truth).** `addStructuredMemoryLinkEdges` parses the accepted
+  rule's `implements:[path]` link and, on EVERY rebuild, emits `business_rule_implements_code` +
+  `business_rule_impacts_code` from the BR to the file. Test rebuilds and asserts a `business_rule_impacts_code`
+  edge from `business-rules.md#BR-20260616T034000Z` → `src/billing.js` (`:1462-1475`).
+- **Surfaces in hybrid retrieval.** `business_rule_impacts_code` ∈ `RULE_LINK_RELATIONS`, so `aipi_retrieve`
+  for the cited code returns the accepted BR in `governing_rules` (test `:1476+`).
+- **Idempotent + deliberate.** Re-accepting → `changed:false, already_present:true`, no duplicate
+  (`:1440-1444`); acceptance requires an explicit `approval_ref` (never automatic).
+- No regression; `AIPI_TOOLS_TEST_OK`, `npm test` → `AIPI_STEP_RESULT_TEST_OK`, validate OK; bge-m3/1024 pinned.
+
+**Zero open findings. Round 47 CLOSED. Rounds 29–47 all CLOSED.**
+
+### Milestone — the business-rule lifecycle is now end-to-end
+Onboarding extracts CONCRETE source-cited candidate rules (Round 44) → a deliberate, approval-gated step
+ACCEPTS one into `business-rules.md` as `BR-###` (Round 47) → a rebuild derives the `business_rule_impacts_code`
+edge from its Markdown link → that rule then governs its code in hybrid retrieval (Round 41) + blast-radius.
+The "BDD business-rules ledger as decision substrate" thesis is finally wired, not just declared.
+
+### Live re-verify for the user
+On a project: re-onboard → see `CANDIDATE:` rules in `business-rules.md`; accept one (approval-gated promote)
+→ it becomes `BR-###` (status accepted, `implements:[<file>]`); rebuild → `aipi_impact`/`aipi_retrieve` on that
+file now show the governing rule.
 
 Current owner: CLAUDE
 Current status: CLOSED

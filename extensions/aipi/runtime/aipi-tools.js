@@ -887,7 +887,16 @@ export async function aipiPromoteMemory({
   const approval = await inspectDurableMemoryApproval(root, approval_ref);
   const approvedForDurableWrite = approval.ok;
   const promotionHash = memoryPromotionHash({ kind, title, content, source_ref });
-  const entry = renderMemoryEntry({ kind, title, content, source_ref, approval_ref, timestamp, promotionHash });
+  const entry = renderMemoryEntry({
+    kind,
+    title,
+    content,
+    source_ref,
+    approval_ref,
+    timestamp,
+    promotionHash,
+    accepted: approvedForDurableWrite,
+  });
 
   if (!approvedForDurableWrite) {
     const candidateRel = path.posix.join(
@@ -1827,11 +1836,20 @@ function addStructuredMemoryLinkEdges({ add, businessRules, decisions, fileSet }
   for (const rule of businessRules) {
     for (const targetPath of rule.links.implements ?? []) {
       if (!fileSet.has(targetPath)) continue;
+      const targetKind = isTestFile(targetPath) ? "test" : "file";
       add({
         source_kind: "business_rule",
         source_ref: rule.ref,
         relation: "business_rule_implements_code",
-        target_kind: isTestFile(targetPath) ? "test" : "file",
+        target_kind: targetKind,
+        target_ref: targetPath,
+        evidence: `structured implements link ${targetPath}`,
+      });
+      add({
+        source_kind: "business_rule",
+        source_ref: rule.ref,
+        relation: "business_rule_impacts_code",
+        target_kind: targetKind,
         target_ref: targetPath,
         evidence: `structured implements link ${targetPath}`,
       });
@@ -2897,14 +2915,19 @@ function shouldEmbedCodeLine(relPath, line) {
 function isEmbeddableVectorFile(relPath) {
   const normalized = String(relPath ?? "").replaceAll("\\", "/");
   const base = path.posix.basename(normalized).toLowerCase();
+  if (isTestFile(normalized)) return false;
+  if (isGeneratedOrMigrationFile(normalized)) return false;
+  if ([".css", ".html"].includes(path.posix.extname(base))) return false;
   if (base.endsWith(".d.ts")) return false;
   if (/\.min\.[cm]?js$/.test(base)) return false;
   if (/(^|\.)(lock|snap)$/.test(base)) return false;
   return VECTOR_EMBED_EXTENSIONS.has(path.posix.extname(base));
 }
 
-function buildVectorChunksForFile({ file, lines, symbols = [] } = {}) {
+function buildVectorChunksForFile({ file, lines, symbols = [], relationships = [] } = {}) {
   if (!file?.path || !isEmbeddableVectorFile(file.path)) return [];
+  if (hasGeneratedMarker(lines)) return [];
+  if (!isHighSignalVectorFile(file.path, { symbols, relationships })) return [];
   const fileSymbols = symbols
     .filter((symbol) => symbol.path === file.path && Number.isFinite(Number(symbol.line)) && Number(symbol.line) > 0)
     .map((symbol) => ({
@@ -2945,6 +2968,37 @@ function buildVectorChunksForFile({ file, lines, symbols = [] } = {}) {
   }
 
   return chunks;
+}
+
+function isGeneratedOrMigrationFile(relPath) {
+  const normalized = String(relPath ?? "").replaceAll("\\", "/").toLowerCase();
+  if (/(^|\/)__generated__(\/|$)/.test(normalized)) return true;
+  if (/(^|\/)migrations?(\/|$)/.test(normalized)) return true;
+  return /\.generated\.[^/]+$/.test(normalized);
+}
+
+function hasGeneratedMarker(lines = []) {
+  return lines.some((line) => /@generated\b/i.test(String(line ?? "")));
+}
+
+function isHighSignalVectorFile(relPath, { symbols = [], relationships = [] } = {}) {
+  const normalized = normalizeGraphRefPath(relPath);
+  if (!normalized) return false;
+  if (symbols.some((symbol) => normalizeGraphRefPath(symbol.path) === normalized)) return true;
+  return relationships.some((edge) =>
+    graphRefMatchesFile(edge.source_ref, normalized) || graphRefMatchesFile(edge.target_ref, normalized),
+  );
+}
+
+function graphRefMatchesFile(ref, normalizedRelPath) {
+  const normalizedRef = normalizeGraphRefPath(ref);
+  return normalizedRef === normalizedRelPath ||
+    normalizedRef.startsWith(`${normalizedRelPath}#`) ||
+    normalizedRef.startsWith(`${normalizedRelPath}:`);
+}
+
+function normalizeGraphRefPath(value) {
+  return String(value ?? "").replaceAll("\\", "/").replace(/^\.\/+/, "");
 }
 
 function symbolSpanEndLine(lines, startLine, fallbackEndLine) {
@@ -3304,7 +3358,12 @@ async function writeSqliteGraph({
       const lineIds = codeLineIdsByPath.get(file.path) ?? new Map();
       if (vectorInsert && vectorMapInsert && vectorChunkInsert) {
         beginWrite();
-        const chunks = buildVectorChunksForFile({ file, lines, symbols: graph.symbols ?? [] });
+        const chunks = buildVectorChunksForFile({
+          file,
+          lines,
+          symbols: graph.symbols ?? [],
+          relationships: graph.relationships ?? [],
+        });
         for (const chunk of chunks) {
           try {
             const mappedLineIds = [];
@@ -4182,7 +4241,14 @@ function relationshipRank(edge, needle = "") {
   const sourceRef = String(edge.source_ref ?? "").toLowerCase();
   const targetRef = String(edge.target_ref ?? "").toLowerCase();
   const exactPathMatch = normalizedNeedle && (sourceRef === normalizedNeedle || targetRef === normalizedNeedle) ? 0 : 5;
-  return exactPathMatch + (RELATIONSHIP_PRIORITY.get(edge.relation) ?? 100);
+  return exactPathMatch + (RELATIONSHIP_PRIORITY.get(edge.relation) ?? 100) + relationshipEvidenceRank(edge);
+}
+
+function relationshipEvidenceRank(edge) {
+  const evidence = String(edge?.evidence ?? "").toLowerCase();
+  if (/structured .*link/.test(evidence)) return 0;
+  if (evidence.includes("explicit source path")) return 1;
+  return 5;
 }
 
 function relationshipMatches(edge, needle) {
@@ -4279,10 +4345,10 @@ function memoryPromotionHash({ kind, title, content, source_ref } = {}) {
   ].join("\n")).slice(0, 16)}`;
 }
 
-function renderMemoryEntry({ kind, title, content, source_ref, approval_ref, timestamp, promotionHash }) {
+function renderMemoryEntry({ kind, title, content, source_ref, approval_ref, timestamp, promotionHash, accepted = false }) {
   const normalizedKind = slug(kind);
   if (normalizedKind === "business-rule" || normalizedKind === "business-rules") {
-    return renderBusinessRuleEntry({ title, content, source_ref, approval_ref, timestamp, promotionHash });
+    return renderBusinessRuleEntry({ title, content, source_ref, approval_ref, timestamp, promotionHash, accepted });
   }
   if (normalizedKind === "decision" || normalizedKind === "decisions") {
     return renderDecisionEntry({ title, content, source_ref, approval_ref, timestamp, promotionHash });
@@ -4301,25 +4367,37 @@ function renderMemoryEntry({ kind, title, content, source_ref, approval_ref, tim
   ].join("\n");
 }
 
-function renderBusinessRuleEntry({ title, content, source_ref, approval_ref, timestamp, promotionHash }) {
+function renderBusinessRuleEntry({ title, content, source_ref, approval_ref, timestamp, promotionHash, accepted = false }) {
   const ruleId = extractBusinessRuleId(content) ?? generatedBusinessRuleId(timestamp);
   const ruleTitle = title?.trim() || firstContentLine(content) || "Promoted business rule";
   const statement = extractField(content, "statement") ?? stripMarkdownHeading(content).trim();
+  const sourcePath = codePathFromSourceRef(source_ref);
+  const links = sourcePath ? `implements:[${sourcePath}], relates:[], decided-by:[]` : "implements:[], relates:[], decided-by:[]";
   return [
     `### ${ruleId} - ${ruleTitle}`,
     "- **domain:** project",
     `- **statement:** ${singleLine(statement)}`,
     "- **scenarios:**",
     "  - Given the accepted project context, When this rule applies, Then the statement above remains true.",
-    "- **status:** proposed",
+    `- **status:** ${accepted ? "accepted" : "candidate"}`,
     `- **source:** ${source_ref}`,
     `- **rationale:** Promoted through aipi_promote_memory at ${timestamp}.`,
-    "- **links:** implements:[], relates:[], decided-by:[]",
+    `- **links:** ${links}`,
     `- **approval-ref:** ${approval_ref}`,
     `- **promotion-hash:** ${promotionHash}`,
     `- **last-reviewed:** ${timestamp.slice(0, 10)}`,
     "",
   ].join("\n");
+}
+
+function codePathFromSourceRef(sourceRef) {
+  const normalized = String(sourceRef ?? "").trim().replaceAll("\\", "/").replace(/^\.\/+/, "");
+  if (!normalized || normalized.startsWith(".aipi/")) return "";
+  const withoutFragment = normalized.split("#")[0];
+  const withoutLine = withoutFragment.replace(/:\d+(?::\d+)?$/, "");
+  const ext = path.posix.extname(withoutLine).toLowerCase();
+  if (!ext || ext === ".md" || !CODE_EXTENSIONS.has(ext)) return "";
+  return withoutLine;
 }
 
 function renderDecisionEntry({ title, content, source_ref, approval_ref, timestamp, promotionHash }) {
