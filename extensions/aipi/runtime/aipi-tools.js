@@ -121,11 +121,15 @@ const OLLAMA_TAGS_PATH = "/api/tags";
 const OLLAMA_PULL_PATH = "/api/pull";
 const DEFAULT_OLLAMA_PULL_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_GRAPH_RELATIONSHIPS = 2500;
+const MAX_CALL_RELATIONSHIPS_PER_FILE = 25;
+const VECTOR_FILE_SUBPROGRESS_CHUNK_THRESHOLD = 25;
+const VECTOR_FILE_SUBPROGRESS_CHUNK_INTERVAL = 10;
 const RELATIONSHIP_PRIORITY = new Map([
   ["test_covers", 0],
   ["business_rule_impacts_code", 10],
   ["bdd_contract_impacts_code", 20],
   ["deployment_impacts_code", 30],
+  ["calls", 35],
   ["run_outcome_impacts_code", 40],
   ["run_verifies_rule", 50],
   ["run_fails_rule", 50],
@@ -1587,7 +1591,6 @@ async function buildRelationships({ root, files, symbols, runReferenceFiles = []
   const seen = new Set();
 
   const add = (edge) => {
-    if (edges.length >= MAX_GRAPH_RELATIONSHIPS) return;
     const normalized = {
       source_kind: edge.source_kind,
       source_ref: edge.source_ref,
@@ -1635,6 +1638,8 @@ async function buildRelationships({ root, files, symbols, runReferenceFiles = []
       });
     }
   }
+
+  await addCallRelationships({ root, sourceFiles, symbols, add });
 
   for (const memoryRel of memoryFilesInGraph) {
     const content = await readProjectText(root, memoryRel);
@@ -1700,7 +1705,56 @@ async function buildRelationships({ root, files, symbols, runReferenceFiles = []
     add,
   });
 
-  return edges;
+  return capGraphRelationships(edges);
+}
+
+async function addCallRelationships({ root, sourceFiles, symbols, add }) {
+  const symbolsByName = new Map();
+  for (const symbol of symbols) {
+    const key = String(symbol.name ?? "").toLowerCase();
+    if (!key || key.length < 3) continue;
+    const existing = symbolsByName.get(key) ?? [];
+    existing.push(symbol);
+    symbolsByName.set(key, existing);
+  }
+  if (!symbolsByName.size) return;
+
+  for (const sourceRel of sourceFiles.filter((candidate) => !candidate.startsWith(".aipi/"))) {
+    const content = await readProjectText(root, sourceRel);
+    const identifiers = new Set(content.match(/\b[A-Za-z_$][\w$]{2,}\b/g) ?? []);
+    let addedForFile = 0;
+    for (const identifier of [...identifiers].sort((left, right) => left.localeCompare(right))) {
+      const definitions = symbolsByName.get(identifier.toLowerCase()) ?? [];
+      for (const symbol of definitions) {
+        if (symbol.path === sourceRel) continue;
+        add({
+          source_kind: "file",
+          source_ref: sourceRel,
+          relation: "calls",
+          target_kind: "symbol",
+          target_ref: symbol.name,
+          evidence: `references symbol defined in ${symbol.path}`,
+        });
+        addedForFile += 1;
+        if (addedForFile >= MAX_CALL_RELATIONSHIPS_PER_FILE) break;
+      }
+      if (addedForFile >= MAX_CALL_RELATIONSHIPS_PER_FILE) break;
+    }
+  }
+}
+
+function capGraphRelationships(edges) {
+  if (edges.length <= MAX_GRAPH_RELATIONSHIPS) return edges;
+  return [...edges]
+    .sort(compareGraphRelationshipPriority)
+    .slice(0, MAX_GRAPH_RELATIONSHIPS);
+}
+
+function compareGraphRelationshipPriority(left, right) {
+  return relationshipRank(left) - relationshipRank(right) ||
+    String(left.relation ?? "").localeCompare(String(right.relation ?? "")) ||
+    String(left.source_ref ?? "").localeCompare(String(right.source_ref ?? "")) ||
+    String(left.target_ref ?? "").localeCompare(String(right.target_ref ?? ""));
 }
 
 async function addDomainRelationships({ root, files, sourceFiles, memoryFilesInGraph, runReferenceFiles, add }) {
@@ -3321,15 +3375,19 @@ async function writeSqliteGraph({
     let vectorChunkCount = 0;
     let vectorLineMapCount = 0;
     let uniqueVectorCount = 0;
-    let embeddedFileCount = 0;
+    let scannedFileCount = 0;
+    let filesWithVectors = 0;
     const vectorProgressEnabled = vector.status === "available";
     if (vectorProgressEnabled) {
       await emitSemanticProgress(onProgress, {
         phase: "semantic-vectors",
         status: "running",
         file_count: graph.files.length,
+        files_scanned: 0,
         files_embedded: 0,
+        files_with_vectors: 0,
         line_count: 0,
+        chunk_count: 0,
         message: `AIPI semantic memory: building semantic vectors for ${graph.files.length} files.`,
       });
     }
@@ -3364,6 +3422,7 @@ async function writeSqliteGraph({
           symbols: graph.symbols ?? [],
           relationships: graph.relationships ?? [],
         });
+        let fileChunkCount = 0;
         for (const chunk of chunks) {
           try {
             const mappedLineIds = [];
@@ -3416,6 +3475,27 @@ async function writeSqliteGraph({
               vectorLineMapCount += 1;
             }
             vectorChunkCount += 1;
+            fileChunkCount += 1;
+            if (
+              vectorProgressEnabled &&
+              chunks.length > VECTOR_FILE_SUBPROGRESS_CHUNK_THRESHOLD &&
+              (fileChunkCount % VECTOR_FILE_SUBPROGRESS_CHUNK_INTERVAL === 0 || fileChunkCount === chunks.length)
+            ) {
+              await emitSemanticProgress(onProgress, {
+                phase: "semantic-vectors",
+                status: "running",
+                file_count: graph.files.length,
+                files_scanned: scannedFileCount,
+                files_embedded: filesWithVectors,
+                files_with_vectors: filesWithVectors,
+                line_count: vectorChunkCount,
+                chunk_count: vectorChunkCount,
+                file_path: file.path,
+                file_chunks_embedded: fileChunkCount,
+                file_chunk_count: chunks.length,
+                message: `AIPI semantic memory: embedding ${file.path}: ${fileChunkCount}/${chunks.length} chunks...`,
+              });
+            }
           } catch (error) {
             vector = semanticVectorUnavailable(error, resolvedEmbeddingConfig);
             vector.embedding_pull = embeddingPull;
@@ -3428,18 +3508,22 @@ async function writeSqliteGraph({
             break;
           }
         }
+        if (fileChunkCount > 0) filesWithVectors += 1;
         commitWrite();
       }
-      embeddedFileCount += 1;
+      scannedFileCount += 1;
       if (vectorProgressEnabled && vector.status === "available") {
         await emitSemanticProgress(onProgress, {
           phase: "semantic-vectors",
           status: "running",
           file_count: graph.files.length,
-          files_embedded: embeddedFileCount,
+          files_scanned: scannedFileCount,
+          files_embedded: filesWithVectors,
+          files_with_vectors: filesWithVectors,
           line_count: vectorChunkCount,
           chunk_count: vectorChunkCount,
-          message: `AIPI semantic memory: embedded ${embeddedFileCount}/${graph.files.length} files.`,
+          files_skipped: scannedFileCount - filesWithVectors,
+          message: `AIPI semantic memory: embedded ${filesWithVectors} high-signal files (${vectorChunkCount} chunks); ${scannedFileCount}/${graph.files.length} scanned, ${scannedFileCount - filesWithVectors} low-signal skipped.`,
         });
       }
     }
@@ -3448,12 +3532,15 @@ async function writeSqliteGraph({
         phase: "semantic-vectors",
         status: vector.status === "available" ? "done" : "failed",
         file_count: graph.files.length,
-        files_embedded: embeddedFileCount,
+        files_scanned: scannedFileCount,
+        files_embedded: filesWithVectors,
+        files_with_vectors: filesWithVectors,
         line_count: vectorChunkCount,
         chunk_count: vectorChunkCount,
+        files_skipped: scannedFileCount - filesWithVectors,
         message: vector.status === "available"
-          ? `AIPI semantic memory: semantic vectors built (${vectorChunkCount} chunks).`
-          : `AIPI semantic memory: semantic vector build stopped after ${vectorChunkCount} chunks; continuing with lexical memory.`,
+          ? `AIPI semantic memory: semantic vectors built: embedded ${filesWithVectors} high-signal files (${vectorChunkCount} chunks); scanned ${scannedFileCount} files, skipped ${scannedFileCount - filesWithVectors} low-signal/no-vector files.`
+          : `AIPI semantic memory: semantic vector build stopped after ${vectorChunkCount} chunks; scanned ${scannedFileCount} files, embedded ${filesWithVectors} high-signal files; continuing with lexical memory.`,
       });
     }
 
@@ -3462,6 +3549,9 @@ async function writeSqliteGraph({
       vector.item_count = vectorChunkCount;
       vector.unique_item_count = uniqueVectorCount;
       vector.line_mapping_count = vectorLineMapCount;
+      vector.file_count = filesWithVectors;
+      vector.scanned_file_count = scannedFileCount;
+      vector.skipped_file_count = scannedFileCount - filesWithVectors;
       vector.chunking = {
         strategy: "symbol_or_window",
         window_lines: VECTOR_CHUNK_WINDOW_LINES,

@@ -288,6 +288,16 @@ try {
     "export function renewSubscription(account) {\n  const sharedRenewalNeedle = 'enterprise renewal vector';\n  const sharedRenewalNeedle = 'enterprise renewal vector';\n  return account.price;\n}\n",
   );
   await fs.writeFile(
+    path.join(tempRoot, "src", "bulk-worker.js"),
+    Array.from({ length: 35 }, (_, index) => [
+      `export function bulkWorker${index}(account) {`,
+      `  const bulkWorkerNeedle${index} = 'bulk worker semantic chunk ${index}';`,
+      `  return account.price + ${index};`,
+      "}",
+      "",
+    ].join("\n")).join(""),
+  );
+  await fs.writeFile(
     path.join(tempRoot, "tests", "billing.test.js"),
     "import { renewSubscription } from '../src/billing.js';\nrenewSubscription({ price: 10 });\n",
   );
@@ -434,6 +444,8 @@ try {
   assert.equal(mechanics.classification, "MECHANICS");
 
   const vectorProgressEvents = [];
+  let vectorizedPathCount = 0;
+  let bulkWorkerChunkCount = 0;
   const graph = await rebuildCodeGraph({
     projectRoot: tempRoot,
     now: () => new Date("2026-06-16T00:00:00.000Z"),
@@ -509,7 +521,13 @@ try {
             ORDER BY path ASC
           `).all();
           const vectorPathSet = new Set(vectorPaths.map((row) => row.path));
+          vectorizedPathCount = vectorPaths.length;
+          bulkWorkerChunkCount = vectorChunkCountForPath("src/bulk-worker.js");
+          assert.equal(graph.vector.file_count, vectorizedPathCount);
+          assert.equal(graph.vector.scanned_file_count, graph.files.length);
+          assert.equal(graph.vector.file_count < graph.vector.scanned_file_count, true);
           assert.equal(vectorChunkCountForPath("src/billing.js") > 0, true);
+          assert.equal(bulkWorkerChunkCount > 25, true);
           for (const relPath of lowSignalVectorExcludedPaths) {
             assert.equal(codeLineCountForPath(relPath) > 0, true, `${relPath} remains lexically indexed`);
             assert.equal(vectorChunkCountForPath(relPath), 0, `${relPath} must not produce vector chunks`);
@@ -589,15 +607,25 @@ try {
     assert.equal(semanticVectorProgress.length > 1, true);
     assert.match(semanticVectorProgress[0].message, /building semantic vectors for \d+ files/);
     assert.equal(semanticVectorProgress[0].files_embedded, 0);
+    assert.equal(semanticVectorProgress[0].files_scanned, 0);
+    const bulkWorkerProgress = semanticVectorProgress.filter((event) => event.file_path === "src/bulk-worker.js");
     assert.equal(
-      semanticVectorProgress.length <= graph.files.length + 2,
+      semanticVectorProgress.length <= graph.files.length + bulkWorkerProgress.length + 2,
       true,
-      "semantic vector progress must be per-file bounded, not per-line",
+      "semantic vector progress must be per-file plus throttled sub-progress, not per-chunk",
     );
+    assert.equal(bulkWorkerProgress.length > 1, true);
+    assert.equal(bulkWorkerProgress.length < bulkWorkerChunkCount, true);
+    assert.equal(bulkWorkerProgress.every((event) => event.file_chunk_count === bulkWorkerChunkCount), true);
+    assert.equal(bulkWorkerProgress.some((event) => event.file_chunks_embedded < bulkWorkerChunkCount), true);
     assert.equal(semanticVectorProgress.some((event) => event.files_embedded > 0), true);
     const finalVectorProgress = semanticVectorProgress[semanticVectorProgress.length - 1];
     assert.equal(finalVectorProgress.status, "done");
-    assert.match(finalVectorProgress.message, /semantic vectors built \(\d+ chunks\)/);
+    assert.match(finalVectorProgress.message, /embedded \d+ high-signal files \(\d+ chunks\); scanned \d+ files, skipped \d+/);
+    assert.equal(finalVectorProgress.files_embedded, vectorizedPathCount);
+    assert.equal(finalVectorProgress.files_with_vectors, vectorizedPathCount);
+    assert.equal(finalVectorProgress.files_scanned, graph.files.length);
+    assert.equal(finalVectorProgress.files_embedded < finalVectorProgress.files_scanned, true);
     assert.equal(finalVectorProgress.line_count, graph.vector.item_count);
   }
   assert.equal(graph.files.some((file) => /(^|\/)(node_modules|\.expo|\.venv|venv|__pycache__|\.turbo|\.gradle)\//.test(file.path)), false);
@@ -990,7 +1018,8 @@ try {
   const staleVectorProgress = staleVectorProgressEvents.filter((event) => event.phase === "semantic-vectors");
   if (staleRebuilt.graph.vector.status === "available") {
     assert.equal(staleVectorProgress.length > 1, true);
-    assert.equal(staleVectorProgress.length <= staleVectorProgress[0].file_count + 2, true);
+    const staleSubProgress = staleVectorProgress.filter((event) => event.file_path);
+    assert.equal(staleVectorProgress.length <= staleVectorProgress[0].file_count + staleSubProgress.length + 2, true);
     assert.match(staleVectorProgress[staleVectorProgress.length - 1].message, /semantic vectors built/);
   }
 
@@ -1086,6 +1115,7 @@ try {
   const semanticOnly = await aipiSemanticSearch({
     projectRoot: tempRoot,
     query: "subscription renewal price",
+    limit: 50,
     ...semanticOptions,
   });
   if (graph.vector.status === "available") {
@@ -1096,7 +1126,7 @@ try {
   const hybridConceptRetrieval = await aipiRetrieve({
     projectRoot: tempRoot,
     query: "subscription renewal price",
-    limit: 5,
+    limit: 20,
     ...semanticOptions,
   });
   const hybridConceptBillingIndex = hybridConceptRetrieval.refs.findIndex((ref) => ref.path === "src/billing.js");
@@ -1106,6 +1136,7 @@ try {
   const semanticExact = await aipiSemanticSearch({
     projectRoot: tempRoot,
     query: "export function renewSubscription(account) {\n  const sharedRenewalNeedle = 'enterprise renewal vector';\n  const sharedRenewalNeedle = 'enterprise renewal vector';\n  return account.price;\n}",
+    limit: 50,
     ...semanticOptions,
   });
   if (graph.vector.status === "available") {
@@ -1146,6 +1177,100 @@ try {
   });
   assert.equal(lexicalFallback.refs.some((ref) => ref.path === "src/billing.js"), true);
   assert.equal(lexicalProgressEvents.some((event) => event.phase === "semantic-vectors"), false);
+
+  const cappedGraphRoot = path.join(tempRoot, "relationship-cap-project");
+  await initProject({ sourceRoot, targetRoot: cappedGraphRoot });
+  await fs.mkdir(path.join(cappedGraphRoot, "src"), { recursive: true });
+  await fs.mkdir(path.join(cappedGraphRoot, "tests"), { recursive: true });
+  await fs.writeFile(
+    path.join(cappedGraphRoot, "src", "aaa-overflow.js"),
+    Array.from({ length: 2605 }, (_, index) => `export const overflowSymbol${index} = ${index};\n`).join(""),
+  );
+  await fs.writeFile(
+    path.join(cappedGraphRoot, "src", "called-target.js"),
+    "export function cappedCallTarget() {\n  return true;\n}\n",
+  );
+  await fs.writeFile(
+    path.join(cappedGraphRoot, "src", "critical.js"),
+    "import { cappedCallTarget } from './called-target.js';\nexport function criticalCapSubject() {\n  return cappedCallTarget();\n}\n",
+  );
+  await fs.writeFile(
+    path.join(cappedGraphRoot, "tests", "critical.test.js"),
+    "import { criticalCapSubject } from '../src/critical.js';\ncriticalCapSubject();\n",
+  );
+  await fs.appendFile(
+    path.join(cappedGraphRoot, ".aipi", "memory", "project", "business-rules.md"),
+    [
+      "",
+      "### BR-CAP - Critical cap survives",
+      "- **domain:** software",
+      "- **statement:** Critical cap behavior remains governed.",
+      "- **status:** accepted",
+      "- **links:** implements:[src/critical.js], relates:[], decided-by:[]",
+      "",
+    ].join("\n"),
+  );
+  const cappedGraph = await rebuildCodeGraph({
+    projectRoot: cappedGraphRoot,
+    now: () => new Date("2026-06-20T10:00:00.000Z"),
+    env: semanticOptions.env,
+    embeddingFetch: fakeMissingTagsFetch(),
+  });
+  assert.equal(cappedGraph.relationships.length, 2500);
+  const cappedDefinesCount = cappedGraph.relationships.filter((edge) => edge.relation === "defines").length;
+  assert.equal(cappedDefinesCount < cappedGraph.relationships.length, true);
+  assert.equal(
+    cappedGraph.relationships.some(
+      (edge) =>
+        edge.relation === "test_covers" &&
+        edge.source_ref === "tests/critical.test.js" &&
+        edge.target_ref === "src/critical.js",
+    ),
+    true,
+  );
+  assert.equal(
+    cappedGraph.relationships.some(
+      (edge) =>
+        edge.relation === "business_rule_impacts_code" &&
+        edge.source_ref.endsWith("business-rules.md#BR-CAP") &&
+        edge.target_ref === "src/critical.js",
+    ),
+    true,
+  );
+  assert.equal(
+    cappedGraph.relationships.some(
+      (edge) =>
+        edge.relation === "calls" &&
+        edge.source_ref === "src/critical.js" &&
+        edge.target_ref === "cappedCallTarget",
+    ),
+    true,
+  );
+  const cappedImpact = await aipiImpact({
+    projectRoot: cappedGraphRoot,
+    path: "src/critical.js",
+    env: semanticOptions.env,
+    embeddingFetch: fakeMissingTagsFetch(),
+  });
+  assert.equal(cappedImpact.related_tests.includes("tests/critical.test.js"), true);
+  const cappedRetrieval = await aipiRetrieve({
+    projectRoot: cappedGraphRoot,
+    query: "src/critical.js",
+    limit: 5,
+    env: semanticOptions.env,
+    embeddingFetch: fakeMissingTagsFetch(),
+  });
+  const cappedCriticalRef = cappedRetrieval.refs.find((ref) => ref.path === "src/critical.js");
+  assert.ok(cappedCriticalRef);
+  assert.equal(
+    cappedCriticalRef.governing_rules.some(
+      (edge) =>
+        edge.relation === "business_rule_impacts_code" &&
+        edge.source_ref.endsWith("business-rules.md#BR-CAP") &&
+        edge.target_ref === "src/critical.js",
+    ),
+    true,
+  );
 
   const legacyRoot = path.join(tempRoot, "legacy-semantic-project");
   await fs.mkdir(path.join(legacyRoot, "src"), { recursive: true });

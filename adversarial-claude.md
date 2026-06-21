@@ -6,7 +6,7 @@ This file is the handoff channel between Claude reviewer and Codex implementer.
 
 Current owner: CLAUDE
 Current status: WAITING_FOR_CLAUDE
-Open review round: 47 CLOSED (business-rule acceptance: approval-gated candidate→accepted BR-### in Markdown + business_rule_impacts_code edge re-derived on rebuild → governing_rules in hybrid retrieval; lifecycle end-to-end); Rounds 29–47 all CLOSED
+Open review round: 48 CLOSED (honest embed progress embedded-vs-scanned + large-file sub-progress; AND [HIGH] priority-aware relationship cap so defines stop starving test_covers/business_rule/calls/impact at scale — proven with a 2605-symbol fixture); Rounds 29–48 all CLOSED
 
 Note: Round 17 closed too early on a narrow basis. Round 19 is a full-project
 adversarial sweep (8 dimensions, every finding independently verified) and is the
@@ -10385,6 +10385,200 @@ The "BDD business-rules ledger as decision substrate" thesis is finally wired, n
 On a project: re-onboard → see `CANDIDATE:` rules in `business-rules.md`; accept one (approval-gated promote)
 → it becomes `BR-###` (status accepted, `implements:[<file>]`); rebuild → `aipi_impact`/`aipi_retrieve` on that
 file now show the governing rule.
+
+Current owner: CLAUDE
+Current status: CLOSED
+
+---
+
+# Round 48 — Embed progress reports SCANNED files as "embedded" (misleading) + no sub-progress on large files (looks stuck)
+
+Opened by Claude on a live user observation (2026-06-20): onboarding shows "embedding 1608 files" on a repo
+where P1+P2 should skip most of them, and "some files take much longer" (the counter sits still → looks
+stuck). Verified both in code; the filtering IS working (correct build), but the PROGRESS lies.
+
+### ADV-48-1 — The counter counts files SCANNED, not files EMBEDDED. [Medium]
+
+**Where:** `aipi-tools.js` — the per-file vector loop. `embeddedFileCount += 1` (`:3433`) runs for EVERY
+file in `graph.files`, OUTSIDE the vector-producing block, then the message is
+`embedded ${embeddedFileCount}/${graph.files.length} files` (`:3442`). Low-signal files (tests/css/html/
+generated via P1; no-symbol+no-edge via P2) still increment the counter even though they produce ZERO
+`vector_chunks`.
+
+**Why it matters:** on a real repo (`nora-app`: 1608 files, ~743 tests) the user sees "embedded 1608/1608"
+and concludes AIPI is embedding everything / running the wrong build — when in fact the filters are working
+and only the high-signal subset is vectorized. The progress message actively hides that P1/P2 are doing
+their job.
+
+**Fix:** report EMBEDDED vs SCANNED distinctly. Track `filesWithVectors` (files that produced ≥1 chunk)
+separately from the scanned count, and surface chunk count, e.g.:
+`"AIPI semantic memory: embedded N high-signal files (M chunks); K/1608 scanned, low-signal skipped."`
+The terminal summary should likewise show vectored-file-count + chunk-count, not the raw file total.
+
+### ADV-48-2 — No sub-progress on large files → a slow file looks like a hang. [Low]
+
+**Where:** progress is emitted once per file (`:3434-3443`). A file with many UNIQUE chunks = many Ollama
+`/api/embed` round-trips (each ~tens–hundreds of ms), so the per-file counter freezes for seconds–minutes on
+a big file. Indistinguishable from stuck (the ADV-36-3 lesson, recurring at chunk granularity).
+
+**Why it matters:** the user reported exactly this ("some files take longer", "parece stuck"). A long silent
+file undermines trust that it's progressing.
+
+**Fix:** for a file whose chunk count exceeds a threshold (e.g. > 25), emit periodic sub-progress (every K
+chunks or every ~N ms): `"embedding <file>: 18/40 chunks…"`. Throttle (not per-chunk) to avoid spam.
+
+## Acceptance / tests (must actually execute — WF-01/WF-02)
+- A mixed fixture (high-signal source + tests/css/no-symbol files): progress/summary reports
+  `filesWithVectors` < `scanned`, and the embedded count equals the number of files that actually produced
+  `vector_chunks` (assert, by reading the events + the DB) — i.e. low-signal files are NOT counted as embedded.
+- A fixture with a many-chunk file emits >1 `semantic-vectors` progress event DURING that single file
+  (sub-progress), bounded/throttled (not one-per-chunk).
+- Lexical/graph/blast-radius unaffected; bge-m3/1024 pinned; `npm test` + `npm run validate` green.
+
+Record changed files + exact commands run, then set `Current owner: CLAUDE` /
+`Current status: WAITING_FOR_CLAUDE`.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX
+Requested next action: implement Round 48 — (ADV-48-1) make embed progress + the final summary report
+EMBEDDED (files that produced ≥1 vector chunk) vs SCANNED distinctly, with chunk count, so P1/P2 filtering is
+visible instead of "embedded 1608/1608"; (ADV-48-2) emit throttled sub-progress within a large file (many
+chunks) so a slow file shows movement instead of looking stuck. No behavior change to what's embedded; just
+honest progress. Verify with a mixed fixture (embedded < scanned) and a many-chunk fixture (>1 event during
+one file). ALSO implement ADV-48-3 [High] (folded in below): make the relationship cap PRIORITY-AWARE so
+`defines` edges stop starving blast-radius edges (test_covers / business_rule_impacts_code / calls / impact)
+on repos with >2500 symbols — this is the HIGH-priority part of Round 48. See its full spec + acceptance in
+the ADV-48-3 section immediately below.
+
+---
+
+### ADV-48-3 [High] — Relationship cap is order-based: `defines` starve blast-radius edges at scale
+
+FOLDED INTO ROUND 48 (user request 2026-06-20: "junta os dois no 48"). This is part of the ACTIVE Round 48
+handoff above — implement it together with ADV-48-1/48-2. It is the HIGH-priority item; do not let the
+cosmetic progress fix overshadow it.
+
+Found on a live inspection of `nora-app` (2026-06-20) while building a graph visualization. **It exposed that
+the graph's blast-radius is empty at scale.**
+
+## Live evidence (nora-app, a real ~1600-file repo)
+`aipi-graph.json`: `relationships: 2500`, and **100% of them are `defines`** (file→symbol). ZERO
+`test_covers`, ZERO `business_rule_impacts_code`, ZERO call/impact/run-outcome edges — despite 743 test
+files and the Round-44/47 business-rule machinery. So `aipi_impact`/`aipi_callers` blast-radius and the
+Round-41 graph+rule retrieval signals return essentially nothing on this repo.
+
+## Root cause (verified in `extensions/aipi/runtime/aipi-tools.js`)
+`buildRelationships`:
+- `const add = (edge) => { if (edges.length >= MAX_GRAPH_RELATIONSHIPS) return; … }` (`:1589-1590`) — the
+  cap (2500) stops adding **by insertion order, with NO priority**.
+- The FIRST loop adds a `defines` edge per symbol (`:1612-1621`). nora-app has **10312 symbols**, so this
+  loop alone fills all 2500 slots with `defines`.
+- `test_covers` (`:1623+`), `business_rule_impacts_code`, run-outcome, conflict, etc. are added AFTER — the
+  cap is already full, so `add()` returns immediately and **none are ever included**.
+- `RELATIONSHIP_PRIORITY` (`:124`, `defines`=90 lowest, `test_covers`=0 highest) EXISTS but is only used for
+  RETRIEVAL ranking (`:4244`), NOT for the cap.
+
+**Why it matters [HIGH/Critical]:** the graph is the load-bearing "blast radius" leg (cheaper than vectors,
+supposed to always work). On ANY repo with >2500 symbols it degenerates to defines-only — blast radius,
+`test_covers`, and `business_rule_impacts_code` (Round 47) all vanish, and Round-41 hybrid retrieval loses
+its graph+rule signals. This passed all fixture tests because fixtures have <2500 symbols — a
+"green in tests, broken at scale" gap.
+
+## What to build (for the active round later)
+- Make the cap PRIORITY-AWARE. Collect candidate edges, then keep the top `MAX_GRAPH_RELATIONSHIPS` BY
+  `RELATIONSHIP_PRIORITY` (high-value first: test_covers, business_rule_impacts_code, bdd/deploy/run edges,
+  calls; `defines` last) — OR add high-value edges FIRST and let `defines` fill only the remainder — OR cap
+  `defines` to a separate budget so they can never starve relationship edges.
+- Consider raising `MAX_GRAPH_RELATIONSHIPS` and/or a separate cap per relation class; ensure `defines`
+  doesn't crowd out everything on large repos. Keep determinism.
+- (Optional, ties to the user's request) add a graph EXPORT (`aipi graph export --obsidian|--mermaid|--json`)
+  so the relationships are visualizable — only meaningful once non-`defines` edges actually exist.
+
+## Acceptance / tests (must actually execute — WF-01/WF-02)
+- A fixture with MORE than `MAX_GRAPH_RELATIONSHIPS` symbols (defines would overflow) PLUS real test_covers +
+  business_rule_impacts_code + call edges: assert the built graph CONTAINS the test_covers / business-rule /
+  call edges (they are NOT starved by defines), and `aipi_impact` returns related tests, and `aipi_retrieve`
+  surfaces governing_rules — i.e. reproduce the nora-app condition and prove blast-radius survives the cap.
+- Assert `defines` no longer occupies 100% of the cap when higher-priority edges exist.
+- bge-m3/1024 pinned; lexical/vector behavior unchanged; `npm test` + `npm run validate` green.
+
+## Codex implementation - Round 48 (2026-06-20)
+
+Implemented ADV-48-1/2/3 together. Embedding behavior is unchanged; progress is now honest, large files emit
+bounded sub-progress, and the relationship cap is priority-aware so `defines` cannot starve blast-radius
+edges at scale.
+
+Changed files:
+
+- `extensions/aipi/runtime/aipi-tools.js`
+  - Removed the insertion-order relationship cap from `add()` and now caps after all candidate edges are
+    collected, sorted deterministically by `RELATIONSHIP_PRIORITY`/evidence/source/target.
+  - Added `calls` relationship candidates from source-file identifier references to extracted symbols, with a
+    per-file cap to keep graph growth bounded.
+  - Added `calls` to relationship priority above lower-value `defines`.
+  - Split vector progress into `files_scanned` and `files_embedded`/`files_with_vectors`; `files_embedded`
+    now counts only files that produced at least one `vector_chunk`.
+  - Progress and final summary now report embedded high-signal files, chunks, scanned files, and skipped
+    low-signal/no-vector files.
+  - Files with more than 25 chunks emit throttled per-file sub-progress every 10 chunks and at file completion.
+  - Added vector summary fields: `file_count`, `scanned_file_count`, and `skipped_file_count`.
+- `tools/test-aipi-tools.mjs`
+  - Added `src/bulk-worker.js` with 35 symbol chunks to prove >1 throttled sub-progress events inside one file,
+    while still bounded and not per-chunk.
+  - Asserted progress final `files_embedded` equals distinct vectorized paths from SQLite `vector_chunks`, and
+    `files_embedded < files_scanned` in the mixed fixture.
+  - Added a separate relationship-cap fixture with 2605 symbols plus `test_covers`, `business_rule_impacts_code`,
+    and `calls`; asserted those high-value edges survive the 2500 cap and `defines` is no longer 100%.
+  - Asserted `aipi_impact` still returns related tests and `aipi_retrieve` still surfaces governing rules under
+    the capped-relationship condition.
+- `adversarial-claude.md`
+  - Recorded this handoff.
+
+Verification run:
+
+- `node --check extensions/aipi/runtime/aipi-tools.js` -> passed
+- `node --check tools/test-aipi-tools.mjs` -> passed
+- `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`
+- `npm.cmd run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`
+- `npm.cmd test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`
+- `git diff --check` -> clean (CRLF warnings only)
+
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE
+Requested next action: verify Round 48 ADV-48-1/2/3 against the implementation above; close if no findings
+remain or hand back concrete residual findings.
+
+## Claude verdict — Round 48 CLOSED (2026-06-20)
+
+Verified against real code + a real full-suite run, the cap logic + the >2500-symbol fixture re-read for
+genuineness (WF-01/WF-02).
+- **ADV-48-3 [HIGH] FIXED — blast-radius survives at scale.** The insertion-order cap is gone from `add()`
+  (`aipi-tools.js:1593-1613`, all edges collected); `capGraphRelationships` (`:1746-1751`) now sorts ALL
+  edges by `compareGraphRelationshipPriority` (→ `relationshipRank` = `RELATIONSHIP_PRIORITY`: test_covers 0,
+  business_rule 10, calls/…, defines 90 last) and keeps the top 2500. A new `calls` edge type was added.
+  Proven by a fixture with **2605 export symbols** (defines alone overflow the cap) plus real edges
+  (`test-aipi-tools.mjs:1181-1259`): the graph caps at 2500, `defines` is NOT 100% (`:1220-1221`), and the
+  `test_covers`, `business_rule_impacts_code`, and `calls` edges all SURVIVE (`:1222-1248`), `aipiImpact`
+  returns the related test (`:1255`), `aipiRetrieve` surfaces governing rules. Under the old code this test
+  would fail — it reproduces the nora-app condition and proves the fix.
+- **ADV-48-1 [Med] FIXED.** Progress/summary now split `files_scanned` vs `files_embedded`/`files_with_vectors`;
+  `files_embedded` counts only files that produced ≥1 `vector_chunk`. Test asserts
+  `files_embedded === distinct vectorized paths` and `files_embedded < files_scanned` (`:625-628`). No more
+  "1608/1608" — embedded vs scanned is honest.
+- **ADV-48-2 [Low] FIXED.** A 35-chunk file (`bulk-worker.js`) emits >1 throttled per-file sub-progress event
+  (every 10 chunks), not per-chunk (`:611-615`).
+- No change to WHAT is embedded; lexical/vector behavior unchanged; bge-m3/1024 pinned; full suite + validate
+  green (`AIPI_TOOLS_TEST_OK`, `npm test` → `AIPI_STEP_RESULT_TEST_OK`).
+
+**Zero open findings. Round 48 CLOSED. Rounds 29–48 all CLOSED.** The graph's blast-radius is no longer
+starved by `defines` at scale — `aipi_impact`/`aipi_callers`/`aipi_retrieve` get real test/rule/call edges on
+big repos.
+
+### Live re-verify for the user (nora-app)
+Run `/aipi-onboard` OVER the existing project (no need to delete `.aipi/state` — rebuild auto-resets the
+sqlite and REUSES the embedding cache, so it's fast and only recomputes relationships). The new graph will
+have real `calls`/`test_covers`/`business_rule_impacts_code` edges (not 100% `defines`), so blast-radius
+works — and a graph visualization (Obsidian/Mermaid/HTML) finally becomes worthwhile.
 
 Current owner: CLAUDE
 Current status: CLOSED
