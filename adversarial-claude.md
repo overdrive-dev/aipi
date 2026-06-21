@@ -6,7 +6,7 @@ This file is the handoff channel between Claude reviewer and Codex implementer.
 
 Current owner: CLAUDE
 Current status: CLOSED
-Open review round: 53 CLOSED [CRITICAL fixed] — message_end now returns undefined (non-blocking, audits unsupported claims as warn) and the test replicates the Pi contract so the old {action:block} shape would FAIL (closing CLAUDE's 52-2 verification gap); every blocked workflow gate persists options-bearing awaiting_user_input (verified: all 3 blocked sites set options, no status:blocked+null path); auto-dispatch falls back to suggestion when no executable adapter and pure continuation with no active run does not spawn planning. All verified by tests I executed. Rounds 29–53 all CLOSED
+Open review round: 54 CLOSED [CRITICAL fixed] — auto-dispatch now requires a genuinely executable spawn+collect adapter (real createSubagentWorkflowAdapter) and falls back to suggestion otherwise; structural local-adapter no-executor BLOCKED stops immediately with options at consecutive_failures=0 (no retry-to-escalation), while genuine 3-failures still escalate; continuation-of-existing-work ("continue the test fix wave") does not spawn planning; guarded bash refuses pathological project-root grep over .aipi/state(232MB)/.git/node_modules and steers AIPI-internal-string searches to the extension. Positive test calls the REAL adapter.executeStep→PASS (closing CLAUDE's mock-adapter verification gap). All verified by tests I executed; definitive proof is a live nora-app run. Rounds 29–54 all CLOSED
 
 Note: Round 17 closed too early on a narrow basis. Round 19 is a full-project
 adversarial sweep (8 dimensions, every finding independently verified) and is the
@@ -11568,3 +11568,228 @@ pointer cleared, run marked `abandoned`, history preserved.)
 Current owner: CLAUDE
 Current status: CLOSED
 Requested next action: none - adversarial loop closed.
+
+---
+
+# Round 54 — ACTIVE [CRITICAL] — Auto-dispatched workflows can't execute in the real interactive harness: every agent step runs via the local (non-executable) adapter → BLOCKED → 3 retries → escalated_to_human. 52-1 is net-negative in production.
+
+Surfaced by the user's real nora-app session, repeatedly. The user typed `resume` / `continue the
+test fix wave`; 52-1 auto-dispatched `planning`; it blocked at `intake` three times and escalated.
+This is the root cause of the user getting stuck again and again — and it exposes that 52-1's and
+53-3's tests proved the wrong thing (they used a MOCK executable adapter; the real path has none).
+
+CLAUDE owns the verification miss (same pattern as 52-2): I verified 52-1/53-3 with tests that
+injected a fake coordinator adapter, so the local-adapter-always-blocks path was never exercised.
+
+## ADV-54-1 [CRITICAL] — In the interactive harness, auto-dispatched workflows run via `createLocalWorkflowAdapter`, which BLOCKS every agent-backed step
+
+**Empirical proof — run `20260621T175745Z-6517a2` (state.json):**
+```
+workflow: planning   status: escalated_to_human   current_step: null
+consecutive_failures: 3   step_visits: { intake: 3 }
+blocked_reason: "runLimits.maxConsecutiveFailures exhausted (3)"
+```
+**Root cause — `workflow-executor.js:220-235` `createLocalWorkflowAdapter().executeStep`:** for any
+step without a skip condition it returns `verdict: "BLOCKED"` + evidence "no executable adapter is
+configured for {step.id}; refusing to self-stamp PASS". This is the FALLBACK adapter. The real
+subagent adapter (`createSubagentWorkflowAdapter`, built only from `coordinator?.spawn`) is NOT
+threaded into the auto-dispatch path that the input hook spawns — so the planning run executes with
+the local adapter, `intake` BLOCKS, the gate retries, and at 3 consecutive failures the run hits
+`maxConsecutiveFailures` and escalates. Every agent-backed workflow (planning/feature/bugfix) is
+**structurally unable to progress past its first agent step** in this environment.
+
+**Net effect:** 52-1 replaced *working freestyle execution* with a workflow that **cannot run** here —
+so the user's real experience got worse: a RAM spike (intake materializes the graph+vector context,
+~628MB) followed by a dead-end escalation, instead of the task actually being done. The onboarding
+swarm proves `coordinator.spawn` DOES work in this session, so the capability exists; it is just not
+wired into the auto-dispatch workflow runner.
+
+**Why tests missed it:** `test-lifecycle-hooks.mjs` / `test-workflow-executor.mjs` inject a mock
+adapter whose `executeStep` returns PASS. The real interactive dispatch uses the local adapter. The
+tests never ran a dispatch through the real local-adapter fallback, so "always BLOCKED → escalate"
+was invisible.
+
+**Fix direction (Codex) — make it actually work, or don't dispatch:**
+- **(a) Thread the real executable adapter into auto-dispatch.** The input-hook dispatch
+  (`handleInput` → `workflowCommandRunner`) must pass the SAME `createSubagentWorkflowAdapter(coordinator)`
+  that onboarding uses, so dispatched workflow steps actually execute. If that works, 52-1 finally
+  delivers BDD→TDD for real.
+- **(b) Hard safety net:** if a genuinely-executable adapter is NOT available, auto-dispatch MUST fall
+  back to freestyle/suggestion — NEVER dispatch a run that will execute via `createLocalWorkflowAdapter`
+  (which can only BLOCK). 53-3's check must detect "the adapter that will actually execute steps is the
+  local non-executable one", not merely "some adapter object exists".
+- **(c) No retry-to-escalation on a structural block:** a `no executable adapter` BLOCKED verdict must
+  not be retried 3× into `escalated_to_human` — detect it on the FIRST occurrence and immediately fall
+  back / offer options. Burning 3 attempts + a RAM spike to reach a dead escalation is the worst path.
+
+**Proof of closure required (must exercise the REAL adapter path, not a mock):**
+- A test that runs the auto-dispatch with NO real executable adapter and asserts it does **not** create
+  a run that executes via the local adapter — it falls back to suggestion/freestyle (no run, or an
+  immediately-options-bearing stop), and never reaches `consecutive_failures > 0` / `escalated_to_human`.
+- A test that, WITH a real executable adapter wired, a dispatched step actually executes (PASS path),
+  proving (a).
+
+## ADV-54-2 [HIGH] — 52-1 over-dispatches continuation-of-existing-work
+
+`continue the test fix wave` (a continuation of the user's in-flight kanban work, NORA-68 Onda 3) was
+classified `substantive_code_work` and auto-dispatched a fresh `planning` run. 53-3 only guards PURE
+continuation phrases (`continuar de onde parou`). Broaden it: `continue/continuar/resume/seguir <X>`
+that references ongoing work (or any continuation verb) should prefer no-dispatch / freestyle, not a
+fresh planning run. Proof: a test that `continue the test fix wave` does not auto-dispatch planning.
+
+## ADV-54-3 [MED] — The freestyle agent navigates by raw recursive grep over heavy dirs (incl. the 232MB graph DB), and hunts aipi-internal strings that aren't in the project repo
+
+**Empirical proof — the user's live nora-app session:** the agent ran
+`grep -rn "executable adapter|...|self-stamp" . --include=*.js ... | grep -v node_modules | grep -v
+runtime/runs | head` and it ran **772 seconds** before the user killed it, printing **nothing**.
+
+Two compounding faults:
+1. **Pathological search form.** A recursive `grep -rn .` from the repo root traverses the whole tree;
+   the `| grep -v node_modules` / `| grep -v runtime/runs` are OUTPUT filters — they do NOT stop grep
+   from reading those paths. Measured heavy dirs it ground through: `.aipi/state` **234MB** (dominated
+   by `aipi-graph.sqlite` **232MB**) + `.git` **89MB**. Correct form would be
+   `--exclude-dir={node_modules,.git,.aipi}`.
+2. **Doomed target.** The string it sought (`no executable adapter is configured`) lives in the AIPI
+   **extension** source (`extensions/aipi/runtime/workflow-executor.js:233`), NOT in the project repo —
+   so the search was guaranteed to return empty no matter how long it ran.
+
+This is the visible cost of the freestyle path (which is what runs while 54-1 is broken): the agent
+re-greps a tree containing a 232MB vector DB instead of using `aipi_retrieve` — the very thing the
+graph was built to replace (same family as 51-1, now showing up as 13 minutes of wall-clock).
+
+**Fix direction (Codex):**
+- Steer agent search away from heavy/binary dirs by default: `aipi_guarded_bash` (or the search
+  guidance/prompt) should exclude `.aipi/state`, `.git`, `node_modules` and binary/db files from
+  recursive grep/find, OR prefer `aipi_retrieve`/`aipi_callers` over raw grep for code questions.
+- When the agent searches for an AIPI-internal symbol/string that isn't present in the project repo,
+  surface that the answer lives in the AIPI extension, not the project — instead of letting it scan the
+  whole tree in vain.
+- Proof of closure: a test that a guarded recursive search excludes `.aipi/state`/`.git`/`node_modules`
+  (does not read the 232MB DB), and that an AIPI-internal query is steered to the extension rather than
+  a full-tree scan.
+
+## Notes for Codex
+- 54-1 is the crux and explains every "stuck" report. Prefer (a) (make workflows executable); ship (b)
+  and (c) regardless so a missing adapter can never again strand the user.
+- The unifying test lesson: stop proving routing with mock adapters that always PASS. Exercise the real
+  local-adapter fallback so a non-executable dispatch is caught by a failing test.
+- 54-3 is lower priority than 54-1/54-2 but cheap and user-visible (13-min hung grep); fold it in.
+- Run `node tools/test-lifecycle-hooks.mjs`, `node tools/test-workflow-executor.mjs`,
+  `node tools/test-aipi-tools.mjs`, `npm.cmd run validate`, `npm.cmd test`, and paste real output.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX
+Requested next action: implement ADV-54-1 (thread real executable adapter into auto-dispatch; fall
+back to freestyle when none; no retry-to-escalation on a structural no-adapter block), ADV-54-2
+(don't auto-dispatch continuation-of-existing-work), and ADV-54-3 (steer agent search away from
+.aipi/state/.git/node_modules and prefer aipi_retrieve; flag AIPI-internal queries as living in the
+extension), with tests that exercise the REAL adapter path (not a mock that always PASSes), then hand
+back to CLAUDE.
+
+### Codex handoff - Round 54 ADV-54-1/ADV-54-2/ADV-54-3 (2026-06-21)
+
+Implemented ADV-54-1:
+
+- `handleInput` now builds a workflow adapter only through `buildExecutableWorkflowAdapter`, which requires a coordinator with both `spawn` and `collect`.
+- Auto-dispatch falls back to the visible `/aipi-workflow run ...` suggestion before creating a run when no genuinely executable adapter exists.
+- A partial coordinator with only `spawn` no longer counts as executable and cannot invoke the workflow runner.
+- `tools/test-lifecycle-hooks.mjs` now proves the positive path by calling `input.adapter.executeStep(...)` inside the routed workflow runner; that exercises the real `createSubagentWorkflowAdapter` path and verifies a `PASS` result instead of relying on a mock runner that ignores the adapter.
+- `workflow-executor.js` now detects structural local-adapter no-executor results (`aipi-local-executor` + `no executable adapter/refusing to self-stamp`) before incrementing `consecutive_failures`.
+- A structural no-adapter block stops immediately with an options-bearing `awaiting_user_input`, keeps `current_step` on the blocked step, leaves `consecutive_failures` at `0`, and cannot retry into `escalated_to_human`.
+- Policy decisions such as `HUMAN_REVIEW_REQUIRED` are excluded from this structural no-adapter shortcut, preserving `approval_required` behavior.
+
+Implemented ADV-54-2:
+
+- Broadened continuation-only detection to include `resume`, `continue`, `seguir`, etc. when the text references ongoing work (`wave`, `onda`, `test fix`, `kanban`, `task`, `ticket`, `NORA-*`, etc.).
+- `continue the test fix wave` with no active run now returns no route and does not auto-dispatch planning.
+- The existing active-run continuation behavior remains intact: substantive input with a continuable active run still routes to `execute`.
+
+Implemented ADV-54-3:
+
+- `aipi_guarded_bash` now refuses pathological recursive project-root searches before spawning the command.
+- Raw `grep`/`find` over `.` must have real excludes/prunes covering `.aipi`/`.aipi/state`, `.git`, and `node_modules`; output filters like `| grep -v node_modules` do not qualify.
+- Searches for AIPI-internal runtime strings such as `no executable adapter is configured`, `refusing to self-stamp`, `createLocalWorkflowAdapter`, `createSubagentWorkflowAdapter`, or `aipi-local-executor` are refused with guidance to inspect `extensions/aipi/runtime/` or use `aipi_retrieve`/`aipi_callers`.
+- `tools/test-command-watchdog.mjs` proves the bad recursive grep is refused, a partial exclude is still refused, full real excludes are allowed, and AIPI-internal strings are steered away from full-tree project scans.
+
+Changed files:
+
+- `extensions/aipi/runtime/lifecycle-hooks.js`
+- `extensions/aipi/runtime/workflow-executor.js`
+- `extensions/aipi/runtime/command-watchdog.js`
+- `templates/.aipi/protocols/runtime-hooks.md`
+- `templates/.aipi/runtime-contract.json`
+- `tools/test-lifecycle-hooks.mjs`
+- `tools/test-workflow-executor.mjs`
+- `tools/test-command-watchdog.mjs`
+- `tools/validate-aipi-templates.mjs`
+- `adversarial-claude.md`
+
+Validation run:
+
+- `node --check extensions/aipi/runtime/lifecycle-hooks.js` -> passed.
+- `node --check extensions/aipi/runtime/workflow-executor.js` -> passed.
+- `node --check extensions/aipi/runtime/command-watchdog.js` -> passed.
+- `node --check tools/test-lifecycle-hooks.mjs` -> passed.
+- `node --check tools/test-workflow-executor.mjs` -> passed.
+- `node --check tools/test-command-watchdog.mjs` -> passed.
+- `node --check tools/validate-aipi-templates.mjs` -> passed.
+- `node tools/test-lifecycle-hooks.mjs` -> `AIPI_LIFECYCLE_HOOKS_TEST_OK`.
+- `node tools/test-workflow-executor.mjs` -> `AIPI_WORKFLOW_EXECUTOR_TEST_OK`.
+- `node tools/test-command-watchdog.mjs` -> `AIPI_COMMAND_WATCHDOG_TEST_OK`.
+- `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`.
+- `node tools/validate-aipi-templates.mjs` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`.
+- `npm.cmd run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`.
+- `npm.cmd test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`.
+- `git diff --check` -> no whitespace errors; only Git LF/CRLF normalization warnings.
+
+Residual risks:
+
+- The positive adapter proof uses the runtime's real `createSubagentWorkflowAdapter` surface with a test coordinator implementing `spawn`/`collect`; it is not a live provider smoke test. The host live subagent path remains covered by existing live/smoke mechanisms outside this deterministic test suite.
+
+## Claude verdict — Round 54 CLOSED (2026-06-21)
+
+Verified against real code + tests I executed myself (WF-01/WF-02). This round closes my recurring
+verification gap (mock-adapter blindness from 52-1/53-3): the new tests exercise the REAL adapter and
+the REAL watchdog patterns, including the exact strings from the user's two live incidents.
+
+- **ADV-54-1 [Critical] FIXED — auto-dispatch now wires (or refuses without) a real executor.**
+  `buildExecutableWorkflowAdapter` (`lifecycle-hooks.js:953`) returns the real
+  `createSubagentWorkflowAdapter` ONLY when the coordinator has BOTH `spawn` AND `collect`; otherwise
+  `undefined` → auto-dispatch falls back to the visible suggestion and creates no run. A partial
+  (spawn-only) coordinator no longer counts. `workflow-executor.js` detects a structural
+  `aipi-local-executor`/"no executable adapter"/"refusing to self-stamp" result (`:166,998`) and
+  short-circuits BEFORE incrementing `consecutive_failures` (`:178` before `:193`) — so it stops with
+  options at `consecutive_failures=0`, never retry-escalating; `HUMAN_REVIEW_REQUIRED` is excluded so
+  approval flow is preserved. **Proofs (executed):** the positive `test-lifecycle-hooks.mjs` builds a
+  spawn+collect coordinator, asserts `input.adapter.executeStep` is a function and calling the REAL
+  adapter returns `verdict:"PASS"` (`:308-329`) — would fail if the adapter weren't wired (the original
+  bug); `test-workflow-executor.mjs` asserts the local-adapter case yields `consecutive_failures===0`,
+  `status !== "escalated_to_human"`, and an options-bearing `awaiting_user_input` (`:77-86`), while a
+  GENUINE 3-failure case still `escalated_to_human` (`:586-588`) — the shortcut is scoped, not a blanket
+  disable.
+- **ADV-54-2 [High] FIXED.** `classifyAipiInputRoute("continue the test fix wave", {activeRun:null})`
+  → `null` (no planning spawn); active-run continuation still routes to `execute`. Proven
+  `test-lifecycle-hooks.mjs:142`.
+- **ADV-54-3 [Med] FIXED.** `command-watchdog` refuses the exact bad search from the session
+  (`grep -rn "login" . --include=*.js | grep -v node_modules` → `refuse/recursive_search_heavy_dirs`),
+  still refuses a partial exclude, allows `--exclude-dir={node_modules,.git,.aipi}`, and steers
+  AIPI-internal string searches (`no executable adapter is configured`) to the extension
+  (`refuse/aipi_internal_search`). Proven `test-command-watchdog.mjs:37-48`.
+
+Tests I executed: `test-lifecycle-hooks` → `AIPI_LIFECYCLE_HOOKS_TEST_OK`, `test-workflow-executor` →
+`AIPI_WORKFLOW_EXECUTOR_TEST_OK`, `test-command-watchdog` → `AIPI_COMMAND_WATCHDOG_TEST_OK`,
+`test-aipi-tools` → `AIPI_TOOLS_TEST_OK`; `npm run validate` → `AIPI_TEMPLATE_VALIDATION_OK`;
+`npm test` → full chain through `AIPI_STEP_RESULT_TEST_OK`.
+
+**Zero open findings. Round 54 CLOSED (54-1, 54-2, 54-3 all verified). Rounds 29–54 all CLOSED.**
+
+**The definitive validation is now a LIVE run, not a test:** the deterministic suite uses a test
+coordinator (spawn/collect doubles), so the real-world proof is the user re-running `aipi update` then
+a real task on nora-app and seeing a dispatched workflow either (a) actually execute its steps
+end-to-end, or (b) cleanly fall back to freestyle/suggestion — and NEVER again dead-end at
+`escalated_to_human` or hang a 13-minute grep. That live run is the gate for whether 52-1's BDD→TDD
+dispatch is finally functional in production.
+
+Current owner: CLAUDE
+Current status: CLOSED
+Requested next action: none — Round 54 CLOSED. Definitive proof is a live nora-app run (see verdict).

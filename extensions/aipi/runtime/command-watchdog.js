@@ -309,6 +309,9 @@ export function detectInteractiveTrap(command, { platform = process.platform } =
   const args = tokens.slice(1);
   if (!first) return allowTrap();
 
+  const searchTrap = detectPathologicalSearchTrap({ text, first, args });
+  if (searchTrap.action !== "allow") return searchTrap;
+
   if (["python", "python3", "py"].includes(first) && isPythonInteractiveArgs(first, args)) {
     return refuseTrap("python_repl", "Python was invoked without a script or with stdin `-`.", "Use `python -c`, a temporary .py file, or an explicit script path.");
   }
@@ -579,6 +582,59 @@ function sshHasRemoteCommand(args) {
     if (positionals >= 2) return true;
   }
   return false;
+}
+
+function detectPathologicalSearchTrap({ text, first, args }) {
+  if (!["grep", "egrep", "fgrep", "find"].includes(first)) return allowTrap();
+  if (!searchesFromProjectRoot(first, args)) return allowTrap();
+
+  if (isAipiInternalSearch(text)) {
+    return refuseTrap(
+      "aipi_internal_search",
+      "This search targets AIPI extension/runtime internals that are not normally present in the project tree.",
+      "Inspect the AIPI extension source, for example extensions/aipi/runtime/, or use aipi_retrieve/aipi_callers instead of scanning the project repository.",
+    );
+  }
+
+  if (first === "find" || grepIsRecursive(args)) {
+    if (!hasRealHeavyDirExcludes(args)) {
+      return refuseTrap(
+        "recursive_search_heavy_dirs",
+        "Recursive project-root search would traverse heavy directories such as .aipi/state, .git, or node_modules.",
+        "Use rg with real excludes, for example `rg --glob '!{.aipi,.git,node_modules}/**' <pattern>`, or add grep/find exclude/prune flags before running.",
+      );
+    }
+  }
+
+  return allowTrap();
+}
+
+function searchesFromProjectRoot(first, args) {
+  if (first === "find") return args.includes(".");
+  return args.includes(".") || args.includes("./");
+}
+
+function grepIsRecursive(args) {
+  return args.some((arg) => arg === "-r" || arg === "-R" || /^-[A-Za-z]*[rR][A-Za-z]*$/.test(arg) ||
+    arg === "--recursive" || arg === "--dereference-recursive");
+}
+
+function hasRealHeavyDirExcludes(args) {
+  const text = args.join(" ").toLowerCase();
+  const mentionsNodeModules = /node_modules/.test(text);
+  const mentionsGit = /\.git/.test(text);
+  const mentionsAipiState = /\.aipi(?:\/state)?/.test(text);
+  const coversHeavyDirs = mentionsNodeModules && mentionsGit && mentionsAipiState;
+  const hasGrepExclude = /--exclude-dir(?:=|\s+)/.test(text) && coversHeavyDirs;
+  const hasFindPrune = coversHeavyDirs && (
+    /(\.aipi\/state|\.aipi|\.git|node_modules).*(-prune|-not|-path)/.test(text) ||
+    /(-prune|-not|-path).*(\.aipi\/state|\.aipi|\.git|node_modules)/.test(text)
+  );
+  return hasGrepExclude || hasFindPrune;
+}
+
+function isAipiInternalSearch(text) {
+  return /\b(no executable adapter is configured|refusing to self-stamp|createLocalWorkflowAdapter|createSubagentWorkflowAdapter|aipi-local-executor)\b/i.test(text);
 }
 
 function allowTrap() {

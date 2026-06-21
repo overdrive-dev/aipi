@@ -465,11 +465,23 @@ for (const hook of ["agent_end", "turn_end", "message_end"]) {
 if (!lifecycleHooks.rule?.includes("message_end warning on unsupported")) {
   errors.push("runtime-contract lifecycleHooks.rule must document non-blocking message_end claim-evidence audit");
 }
-if (!lifecycleHooks.rule?.includes("auto-dispatch only when an executable workflow adapter is available")) {
-  errors.push("runtime-contract lifecycleHooks.rule must document auto-dispatch adapter availability fallback");
+if (!lifecycleHooks.rule?.includes("auto-dispatch only when a genuinely executable workflow adapter is available")) {
+  errors.push("runtime-contract lifecycleHooks.rule must document genuinely executable auto-dispatch adapter availability fallback");
+}
+if (!lifecycleHooks.rule?.includes("coordinator with spawn and collect")) {
+  errors.push("runtime-contract lifecycleHooks.rule must document spawn+collect requirement for executable workflow adapters");
+}
+if (!lifecycleHooks.rule?.includes("local workflow adapter is a non-executable fallback")) {
+  errors.push("runtime-contract lifecycleHooks.rule must document that local workflow adapter is not valid for auto-dispatch");
 }
 if (!runtimeHooksProtocol.includes("Workflow gates that would stop a run with `BLOCKED` or `FAIL` must persist")) {
   errors.push("runtime-hooks.md must document no dead hard-block workflow gate behavior");
+}
+if (!contract.commandWatchdog?.rule?.includes("pathological recursive project-root searches")) {
+  errors.push("runtime-contract commandWatchdog.rule must document recursive search protection");
+}
+if (!contract.commandWatchdog?.rule?.includes(".aipi/state, .git, or node_modules")) {
+  errors.push("runtime-contract commandWatchdog.rule must document heavy directory search exclusions");
 }
 
 for (const rel of [

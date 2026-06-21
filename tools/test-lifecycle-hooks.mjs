@@ -139,6 +139,7 @@ try {
   assert.equal(classifyAipiInputRoute("ok continua", { activeRun: started }).workflowArgs, "execute");
   assert.equal(classifyAipiInputRoute("pode seguir", { activeRun: null }), null);
   assert.equal(classifyAipiInputRoute("continuar de onde parou depois da atualizacao", { activeRun: null }), null);
+  assert.equal(classifyAipiInputRoute("continue the test fix wave", { activeRun: null }), null);
   assertWorkflowSuggestion(classifyAipiInputRoute("planejar regra de negocio"), "planning");
   assertWorkflowDispatch(classifyAipiInputRoute("corrigir bug no login"), "bugfix", "root_cause_bugfix");
   assertWorkflowSuggestion(classifyAipiInputRoute("pesquisar docs do provider"), "research");
@@ -274,12 +275,59 @@ try {
     const routerNotifications = [];
     const routerEntries = [];
     const routerUserInputs = [];
+    const routerAdapterProofs = [];
+    const routerCoordinator = {
+      spawn(descriptor) {
+        const agentId = `${descriptor.agent_id}:router-proof-${routerAdapterProofs.length + 1}`;
+        routerAdapterProofs.push({ agentId, descriptor });
+        return { agent_id: agentId };
+      },
+      collect(agentId) {
+        return {
+          ready: true,
+          state: "done",
+          agent_id: agentId,
+          step_result: {
+            schema: "aipi.step-result.v1",
+            step_id: "quick_change",
+            agent_ids: [agentId],
+            verdict: "PASS",
+            evidence: [{ rung: "ran", source: "router-real-adapter-proof", ref: agentId, result: "adapter executed" }],
+            artifacts: [],
+          },
+        };
+      },
+    };
     const routerHandlers = createAipiLifecycleHandlers({
       pi: { appendEntry(type, data) { routerEntries.push({ type, data }); } },
       projectRootResolver: () => routerRoot,
-      coordinator: { spawn() {}, collect() {} },
+      coordinator: routerCoordinator,
       workflowCommandRunner: async (input) => {
         routerRunnerCalls.push(input);
+        if (input.args.startsWith("run ")) {
+          assert.equal(typeof input.adapter?.executeStep, "function");
+          const adapterResult = await input.adapter.executeStep({
+            root: input.projectRoot,
+            state: {
+              run_id: "router-adapter-proof",
+              run_rel_dir: ".aipi/runtime/runs/router-adapter-proof",
+              contract_path: ".aipi/runtime/runs/router-adapter-proof/BDD-CONTRACT.md",
+            },
+            workflow: { name: "quick" },
+            step: {
+              id: "quick_change",
+              name: "Quick change",
+              prompt: "prove adapter execution",
+              agents: ["implementer"],
+              produces: [],
+              controller_updates: [],
+              gate: {},
+            },
+            context: {},
+            contract: {},
+          });
+          assert.equal(adapterResult.verdict, "PASS");
+        }
         if (input.args === "execute") {
           const active = await readActiveRun(input.projectRoot);
           return { action: "execute", execution: { runId: active.runId, status: active.state.status, state: active.state } };
@@ -332,6 +380,8 @@ try {
     assert.equal(routerRunnerCalls.length, 2);
     assert.equal(routerRunnerCalls[0].args, "run bugfix");
     assert.equal(routerRunnerCalls[1].args, "run planning");
+    assert.equal(routerAdapterProofs.length, 2);
+    assert.equal(routerAdapterProofs.every((proof) => proof.descriptor.step_id === "quick_change"), true);
     assert.equal(routerUserInputs.length, 2);
     assert.equal(routerUserInputs[0].runId, "fake-bugfix-1");
     assert.equal(routerUserInputs[1].runId, "fake-planning-2");
@@ -403,6 +453,30 @@ try {
         text: "continuar de onde parou depois da atualizacao",
         source: "interactive",
       }, noAdapterCtx),
+      { action: "continue" },
+    );
+    assert.equal(noAdapterRunnerCalls.length, 0);
+    assert.deepEqual(
+      await noAdapterHandlers.input({
+        type: "input",
+        text: "continue the test fix wave",
+        source: "interactive",
+      }, noAdapterCtx),
+      { action: "continue" },
+    );
+    assert.equal(noAdapterRunnerCalls.length, 0);
+
+    const partialCoordinatorHandlers = createAipiLifecycleHandlers({
+      pi: { appendEntry(type, data) { noAdapterEntries.push({ type, data }); } },
+      projectRootResolver: () => routerRoot,
+      coordinator: { spawn() {} },
+      workflowCommandRunner: async (input) => {
+        noAdapterRunnerCalls.push(input);
+        throw new Error("partial coordinator must not invoke the workflow runner");
+      },
+    });
+    assert.deepEqual(
+      await partialCoordinatorHandlers.input({ type: "input", text: "corrigir bug no login", source: "interactive" }, noAdapterCtx),
       { action: "continue" },
     );
     assert.equal(noAdapterRunnerCalls.length, 0);

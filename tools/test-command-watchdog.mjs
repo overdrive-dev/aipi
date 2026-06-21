@@ -34,6 +34,19 @@ try {
     detectInteractiveTrap("python3 - << 'PY'\nprint(1)\nPY", { platform: "win32" }).pattern,
     "python_stdin_heredoc_windows",
   );
+  const heavySearch = detectInteractiveTrap("grep -rn \"login\" . --include=*.js | grep -v node_modules | head");
+  assert.equal(heavySearch.action, "refuse");
+  assert.equal(heavySearch.pattern, "recursive_search_heavy_dirs");
+  assert.match(heavySearch.recommendation, /--glob|exclude/);
+  assert.equal(
+    detectInteractiveTrap("grep -rn --exclude-dir=node_modules \"login\" .").pattern,
+    "recursive_search_heavy_dirs",
+  );
+  assert.equal(detectInteractiveTrap("grep -rn --exclude-dir={node_modules,.git,.aipi} \"login\" .").action, "allow");
+  const internalSearch = detectInteractiveTrap("grep -rn \"no executable adapter is configured\" . --include=*.js");
+  assert.equal(internalSearch.action, "refuse");
+  assert.equal(internalSearch.pattern, "aipi_internal_search");
+  assert.match(internalSearch.recommendation, /extensions\/aipi\/runtime|aipi_retrieve/);
   assert.equal(isAmbiguousLongRunningCommand("npm test"), true);
   assert.equal(isAmbiguousLongRunningCommand(nodeCommand("setInterval(()=>{},1000)")), false);
 

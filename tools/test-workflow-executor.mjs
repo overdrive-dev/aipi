@@ -74,6 +74,8 @@ try {
   assert.equal(Object.hasOwn(state.policy, "parent_session_tool_call"), false);
   assert.match(state.steps[0].error, /refusing to self-stamp PASS|step result did not pass gate|not allowed by pass_verdicts/);
   assert.equal(state.current_step, "quick_scope");
+  assert.equal(state.consecutive_failures, 0);
+  assert.notEqual(state.status, "escalated_to_human");
   assert.equal(state.awaiting_user_input.step_id, "quick_scope");
   assert.match(state.awaiting_user_input.question, /nenhum executor esta configurado|Como voce quer seguir/);
   assert.deepEqual(state.awaiting_user_input.options, [
@@ -86,6 +88,7 @@ try {
   const activeExecution = await runWorkflowCommand({ args: "execute", projectRoot: tempRoot });
   assert.equal(activeExecution.action, "execute");
   assert.equal(activeExecution.execution.status, "blocked");
+  assert.equal(activeExecution.execution.state.consecutive_failures, 0);
   assert.equal(activeExecution.execution.state.awaiting_user_input.step_id, "quick_scope");
 
   const restartStarted = await runWorkflowCommand({ args: "start quick", projectRoot: tempRoot });

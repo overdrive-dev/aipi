@@ -265,11 +265,7 @@ export async function handleInput({
     await recordCodePipelineTrace({ projectRoot, pi, activeRun: active, pipeline: codePipeline }).catch(() => null);
   }
 
-  const adapter = coordinator?.spawn
-    ? createSubagentWorkflowAdapter(coordinator, {
-        modelResolver: (modelArgs) => resolveStepModel({ ...modelArgs, ctx }),
-      })
-    : undefined;
+  const adapter = buildExecutableWorkflowAdapter({ coordinator, ctx });
 
   if (route?.autoDispatch && !adapter) {
     const fallbackCommand = route.suggestedCommand ?? `/aipi-workflow ${route.workflowArgs}`;
@@ -947,8 +943,22 @@ function isContinuableActiveRun(activeRun) {
 }
 
 function isContinuationOnlyRequest(normalized) {
-  return /^(ok\s+)?(continue|continuar|continua|segue|seguir|pode seguir|prossiga|prosseguir)\b/.test(normalized) &&
-    /\b(onde parou|de onde parou|parou|atualizacao|update|depois da atualizacao|apos atualizacao)\b/.test(normalized);
+  return /^(ok\s+)?(resume|continue|continuar|continua|seguir|segue|pode seguir|prossiga|prosseguir)\b/.test(normalized) &&
+    (
+      /\b(onde parou|de onde parou|parou|atualizacao|update|depois da atualizacao|apos atualizacao)\b/.test(normalized) ||
+      /\b(wave|onda|fix wave|test fix|trabalho|work|kanban|tarefa|task|ticket|nora-\d+)\b/.test(normalized)
+    );
+}
+
+function buildExecutableWorkflowAdapter({ coordinator = null, ctx = {} } = {}) {
+  if (typeof coordinator?.spawn !== "function" || typeof coordinator?.collect !== "function") return undefined;
+  try {
+    return createSubagentWorkflowAdapter(coordinator, {
+      modelResolver: (modelArgs) => resolveStepModel({ ...modelArgs, ctx }),
+    });
+  } catch {
+    return undefined;
+  }
 }
 
 function isAwaitingUserInput(activeRun) {

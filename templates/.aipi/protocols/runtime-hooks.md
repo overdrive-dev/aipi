@@ -49,6 +49,10 @@ contract.
 - Workflow gates that would stop a run with `BLOCKED` or `FAIL` must persist an
   options-bearing `awaiting_user_input` prompt instead of dead-ending with
   `awaiting_user_input:null`.
+- Natural-language auto-dispatch must only run when the workflow adapter is
+  backed by a coordinator that can both spawn and collect workers. The local
+  workflow adapter is a non-executable safety fallback and must not be used to
+  auto-dispatch agent-backed workflows.
 - `pi.setActiveTools` is session-wide. Use it to initialize managed worker
   sessions or restore controller state carefully; do not use it as a replacement
   parent-session permission profile.

@@ -162,17 +162,35 @@ export async function executeWorkflowRun({
       : validation.errors.length
         ? validation.errors.join("; ")
         : policyGateMessage(validation, target);
-    state.consecutive_failures = (state.consecutive_failures ?? 0) + 1;
     const failedStatus = gateFailureStatus(result, validation);
+    const structuralNoAdapter = isStructuralNoExecutableAdapterBlock(result, error, validation);
+    const finishedAt = now().toISOString();
     markStep(state, step.id, {
       status: failedStatus,
       verdict: result?.verdict ?? null,
       error,
-      finished_at: now().toISOString(),
+      finished_at: finishedAt,
       result_path: resultPathFor(state, step),
       artifacts: result?.artifacts ?? [],
     });
     events.push({ type: failedStatus, step_id: step.id, verdict: validation.verdict, error, target });
+
+    if (structuralNoAdapter) {
+      state.status = "blocked";
+      state.current_step = step.id;
+      state.blocked_reason = error;
+      state.awaiting_user_input = awaitingUserDecisionForBlockedGate({
+        step,
+        result,
+        reason: error,
+        createdAt: finishedAt,
+      });
+      events.push({ type: "structural_no_executable_adapter", step_id: step.id, reason: error });
+      await persistRunState(root, state);
+      break;
+    }
+
+    state.consecutive_failures = (state.consecutive_failures ?? 0) + 1;
 
     if (state.consecutive_failures >= maxConsecutiveFailures) {
       exhaustRunLimit(
@@ -970,6 +988,16 @@ function gateFailureStatus(result, validation) {
   if (validation.policyDecision === "BLOCK") return "blocked";
   if (result?.verdict === "BLOCKED" || result?.verdict === "BLOCKED_TO_PLANNING") return "blocked";
   return "failed";
+}
+
+function isStructuralNoExecutableAdapterBlock(result, error = "", validation = {}) {
+  if (validation?.policyDecision) return false;
+  if (result?.verdict !== "BLOCKED") return false;
+  const evidence = Array.isArray(result?.evidence) ? result.evidence : [];
+  return evidence.some((item) =>
+    item?.source === "aipi-local-executor" &&
+      /no executable adapter|refusing to self-stamp/i.test(`${item?.result ?? ""}\n${error}`),
+  );
 }
 
 function shouldAskUserOnGateStop({ target, failedStatus } = {}) {
