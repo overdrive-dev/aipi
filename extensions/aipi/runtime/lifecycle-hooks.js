@@ -271,6 +271,44 @@ export async function handleInput({
       })
     : undefined;
 
+  if (route?.autoDispatch && !adapter) {
+    const fallbackCommand = route.suggestedCommand ?? `/aipi-workflow ${route.workflowArgs}`;
+    const message = formatWorkflowSuggestion(route.workflowSuggestion, fallbackCommand);
+    if (codePipeline.trace) {
+      await recordCodePipelineTrace({
+        projectRoot,
+        pi,
+        activeRun: active,
+        pipeline: codePipelineWithDispatch({
+          pipeline: {
+            ...codePipeline,
+            default_action: "suggest_workflow",
+          },
+          route: {
+            ...route,
+            workflowArgs: fallbackCommand,
+          },
+          skipped: "no_executable_adapter",
+        }),
+      }).catch(() => null);
+    }
+    safeAppendEntry(pi, "aipi.input.route", {
+      schema: "aipi.input-route.v1",
+      routed_at: new Date().toISOString(),
+      input: route.intent,
+      workflow_suggestion: route.workflowSuggestion,
+      suggested_command: fallbackCommand,
+      auto_dispatch: false,
+      pipeline_classification: route.pipelineClassification ?? null,
+      recorded_user_input: false,
+      active_run_id: active?.runId ?? null,
+      result_action: "continue",
+      reason: "no_executable_adapter",
+    });
+    safeNotify(ctx, message, "info");
+    return { action: "continue" };
+  }
+
   if (!route) {
     if (isAwaitingUserInput(active)) {
       safeAppendEntry(pi, "aipi.input.route", {
@@ -508,6 +546,9 @@ export function classifyAipiInputRoute(text, { activeRun = null, codePipeline = 
   const continuableRun = isContinuableActiveRun(activeRun);
   if (continuableRun && /^(ok|sim|s|continue|continuar|continua|segue|seguir|pode seguir|prossiga|prosseguir|vai|bora)\b/.test(normalized)) {
     return { intent: "continue_active_workflow", workflowArgs: "execute" };
+  }
+  if (!continuableRun && isContinuationOnlyRequest(normalized)) {
+    return null;
   }
 
   if (continuableRun && /\b(review|revisao|revisar|adversarial|critica|auditoria)\b/.test(normalized)) {
@@ -767,19 +808,21 @@ async function recordCodePipelineTrace({ projectRoot, pi, activeRun = null, pipe
   return entry;
 }
 
-function codePipelineWithDispatch({ pipeline = {}, route = {}, result = null, error = null } = {}) {
+function codePipelineWithDispatch({ pipeline = {}, route = {}, result = null, error = null, skipped = null } = {}) {
   const dispatchedRun = activeRunFromWorkflowCommandResult(result);
+  const dispatchAction = skipped ? "suggest_workflow" : "auto_dispatch_workflow";
   return {
     ...pipeline,
     workflow: route.workflowSuggestion ?? pipeline.workflow ?? null,
-    default_action: "auto_dispatch_workflow",
+    default_action: pipeline.default_action ?? dispatchAction,
     dispatch: {
-      action: "auto_dispatch_workflow",
+      action: dispatchAction,
       workflow: route.workflowSuggestion ?? null,
       workflow_args: route.workflowArgs ?? null,
       run_id: dispatchedRun?.runId ?? result?.run?.runId ?? null,
-      result_action: error ? "error" : result?.action ?? null,
+      result_action: error ? "error" : result?.action ?? "skipped",
       error: error?.message ?? null,
+      skipped,
     },
   };
 }
@@ -803,19 +846,19 @@ function auditEndDisciplineEvent({ event, hook, activeDisciplines = [] } = {}) {
     },
     {
       id: "claim-evidence",
-      state: claims.length ? "block" : "pass",
+      state: claims.length ? "warn" : "pass",
       evidence: claims.length
         ? `unsupported claim(s): ${claims.map((claim) => claim.term).join(", ")}`
         : "no unsupported fixed/passed/safe/done claim without an evidence rung",
     },
   ];
-  const state = hook === "message_end" && claims.length ? "block" : "pass";
+  const state = hook === "message_end" && claims.length ? "warn" : "pass";
   return {
     state,
-    reason: state === "block" ? "AIPI_MESSAGE_END_CLAIM_EVIDENCE_REQUIRED" : null,
+    reason: state === "warn" ? "AIPI_MESSAGE_END_CLAIM_EVIDENCE_REQUIRED" : null,
     message:
-      state === "block"
-        ? "AIPI message_end blocked: user-facing claim requires an evidence rung such as written/ran/verified plus a concrete command, test, or artifact."
+      state === "warn"
+        ? "AIPI message_end audit: user-facing claim requires an evidence rung such as written/ran/verified plus a concrete command, test, or artifact."
         : null,
     text_excerpt: truncateText(text, 480),
     checks,
@@ -901,6 +944,11 @@ function isContinuableActiveRun(activeRun) {
   if (!activeRun?.runId) return false;
   const status = String(activeRun?.state?.status ?? "active").toLowerCase();
   return !["complete", "completed", "done", "failed", "cancelled", "canceled"].includes(status);
+}
+
+function isContinuationOnlyRequest(normalized) {
+  return /^(ok\s+)?(continue|continuar|continua|segue|seguir|pode seguir|prossiga|prosseguir)\b/.test(normalized) &&
+    /\b(onde parou|de onde parou|parou|atualizacao|update|depois da atualizacao|apos atualizacao)\b/.test(normalized);
 }
 
 function isAwaitingUserInput(activeRun) {
@@ -1079,14 +1127,6 @@ export async function handleEndDisciplineAudit({ event, ctx, pi, projectRoot, ho
   safeAppendEntry(pi, "aipi.discipline.end_audit", entry);
   await appendRuntimeEvent(projectRoot, DISCIPLINE_AUDIT_LOG, entry);
   if (snapshot.active) await appendRuntimeEvent(projectRoot, runScopedLog(snapshot.run_id, "discipline-audit.jsonl"), entry);
-  if (audit.state === "block") {
-    return {
-      action: "block",
-      reason: audit.reason,
-      message: audit.message,
-      audit: entry,
-    };
-  }
   return undefined;
 }
 

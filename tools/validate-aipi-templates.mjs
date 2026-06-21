@@ -462,8 +462,14 @@ for (const hook of ["agent_end", "turn_end", "message_end"]) {
     errors.push(`runtime-hooks.md must document ${hook} as registered`);
   }
 }
-if (!lifecycleHooks.rule?.includes("message_end blocking unsupported")) {
-  errors.push("runtime-contract lifecycleHooks.rule must document message_end claim-evidence audit");
+if (!lifecycleHooks.rule?.includes("message_end warning on unsupported")) {
+  errors.push("runtime-contract lifecycleHooks.rule must document non-blocking message_end claim-evidence audit");
+}
+if (!lifecycleHooks.rule?.includes("auto-dispatch only when an executable workflow adapter is available")) {
+  errors.push("runtime-contract lifecycleHooks.rule must document auto-dispatch adapter availability fallback");
+}
+if (!runtimeHooksProtocol.includes("Workflow gates that would stop a run with `BLOCKED` or `FAIL` must persist")) {
+  errors.push("runtime-hooks.md must document no dead hard-block workflow gate behavior");
 }
 
 for (const rel of [
@@ -941,7 +947,7 @@ const parsedDisciplineCatalog = parseDisciplineCatalog(disciplineCatalog);
 const runtimeHooksDoc = read("templates/.aipi/protocols/runtime-hooks.md");
 for (const requiredText of [
   "Runtime status",
-  "registered | Runtime audit of user-facing claims",
+  "registered | Non-blocking runtime audit of user-facing claims",
   "registered for discipline audit only",
   "permission policy and profiles were intentionally removed",
 ]) {

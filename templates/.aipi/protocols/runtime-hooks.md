@@ -20,7 +20,7 @@ contract.
 | `user_bash` | registered for discipline audit only | Observe user-triggered `!` and `!!` commands without permission-policy blocking. |
 | `agent_end` | registered | Runtime discipline audit after the agent finishes a turn. |
 | `turn_end` | registered | Runtime finish-turn/outcome-first audit after a full turn completes. |
-| `message_end` | registered | Runtime audit of user-facing claims and final reply shape before display. |
+| `message_end` | registered | Non-blocking runtime audit of user-facing claims and final reply shape before display. |
 | `session_before_compact` | registered | Preserve BDD contract and run state during compaction. |
 | `session_before_tree` | registered | Preserve branch summaries when navigating session history. |
 | `model_select` | registered | Reconcile manual model changes with the active agent class. |
@@ -43,6 +43,12 @@ contract.
   discipline into every prompt.
 - When AIPI registers a Pi hook, matching protocol rules can be runtime gates;
   unregistered hooks remain `prompt_only`, not enforcement.
+- `message_end` handlers must return `undefined` or a message with the same
+  role. Claim-evidence failures are recorded as audits/warnings, not hard
+  blocks.
+- Workflow gates that would stop a run with `BLOCKED` or `FAIL` must persist an
+  options-bearing `awaiting_user_input` prompt instead of dead-ending with
+  `awaiting_user_input:null`.
 - `pi.setActiveTools` is session-wide. Use it to initialize managed worker
   sessions or restore controller state carefully; do not use it as a replacement
   parent-session permission profile.

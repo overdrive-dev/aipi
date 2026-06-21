@@ -138,6 +138,7 @@ try {
   assert.equal(classifyAipiInputRoute("pode seguir", { activeRun: started }).workflowArgs, "execute");
   assert.equal(classifyAipiInputRoute("ok continua", { activeRun: started }).workflowArgs, "execute");
   assert.equal(classifyAipiInputRoute("pode seguir", { activeRun: null }), null);
+  assert.equal(classifyAipiInputRoute("continuar de onde parou depois da atualizacao", { activeRun: null }), null);
   assertWorkflowSuggestion(classifyAipiInputRoute("planejar regra de negocio"), "planning");
   assertWorkflowDispatch(classifyAipiInputRoute("corrigir bug no login"), "bugfix", "root_cause_bugfix");
   assertWorkflowSuggestion(classifyAipiInputRoute("pesquisar docs do provider"), "research");
@@ -276,6 +277,7 @@ try {
     const routerHandlers = createAipiLifecycleHandlers({
       pi: { appendEntry(type, data) { routerEntries.push({ type, data }); } },
       projectRootResolver: () => routerRoot,
+      coordinator: { spawn() {}, collect() {} },
       workflowCommandRunner: async (input) => {
         routerRunnerCalls.push(input);
         if (input.args === "execute") {
@@ -364,6 +366,47 @@ try {
     );
     assert.equal(skipTrace.data.dispatch, null);
 
+    const noAdapterRunnerCalls = [];
+    const noAdapterNotifications = [];
+    const noAdapterEntries = [];
+    const noAdapterHandlers = createAipiLifecycleHandlers({
+      pi: { appendEntry(type, data) { noAdapterEntries.push({ type, data }); } },
+      projectRootResolver: () => routerRoot,
+      workflowCommandRunner: async (input) => {
+        noAdapterRunnerCalls.push(input);
+        throw new Error("no-adapter fallback must not invoke the workflow runner");
+      },
+      userInputRecorder: async (input) => ({ record: input, relPath: "USER-INPUT.jsonl" }),
+    });
+    const noAdapterCtx = {
+      cwd: routerRoot,
+      ui: { notify(message, kind) { noAdapterNotifications.push({ message, kind }); } },
+    };
+    assert.deepEqual(
+      await noAdapterHandlers.input({ type: "input", text: "corrigir bug no login", source: "interactive" }, noAdapterCtx),
+      { action: "continue" },
+    );
+    assert.equal(noAdapterRunnerCalls.length, 0);
+    assert.match(noAdapterNotifications.at(-1).message, /\/aipi-workflow run bugfix/);
+    assert.equal(
+      noAdapterEntries.some(
+        (entry) =>
+          entry.type === "aipi.input.route" &&
+          entry.data.reason === "no_executable_adapter" &&
+          entry.data.auto_dispatch === false,
+      ),
+      true,
+    );
+    assert.deepEqual(
+      await noAdapterHandlers.input({
+        type: "input",
+        text: "continuar de onde parou depois da atualizacao",
+        source: "interactive",
+      }, noAdapterCtx),
+      { action: "continue" },
+    );
+    assert.equal(noAdapterRunnerCalls.length, 0);
+
     const activeForContinuation = await startWorkflowRun({
       projectRoot: routerRoot,
       workflow: "feature",
@@ -420,15 +463,13 @@ try {
     await handlers.turn_end({ type: "turn_end", text: "Done. Evidence: ran `npm test` -> passed." }, ctx),
     undefined,
   );
-  const blockedMessageEnd = await handlers.message_end({
+  const unsupportedMessageEnd = await invokeMessageEndWithHostContract(handlers.message_end, {
     type: "message_end",
     message: { role: "assistant", content: "Fixed and safe to deploy." },
   }, ctx);
-  assert.equal(blockedMessageEnd.action, "block");
-  assert.equal(blockedMessageEnd.reason, "AIPI_MESSAGE_END_CLAIM_EVIDENCE_REQUIRED");
-  assert.equal(blockedMessageEnd.audit.unsupported_claims.some((claim) => claim.term === "fixed"), true);
+  assert.equal(unsupportedMessageEnd, undefined);
   assert.equal(
-    await handlers.message_end({
+    await invokeMessageEndWithHostContract(handlers.message_end, {
       type: "message_end",
       message: { role: "assistant", content: "Fixed. Evidence: ran `npm test` -> passed." },
     }, ctx),
@@ -448,7 +489,9 @@ try {
       (entry) =>
         entry.type === "aipi.discipline.end_audit" &&
         entry.data.hook === "message_end" &&
-        entry.data.state === "block",
+        entry.data.state === "warn" &&
+        entry.data.reason === "AIPI_MESSAGE_END_CLAIM_EVIDENCE_REQUIRED" &&
+        entry.data.unsupported_claims.some((claim) => claim.term === "fixed"),
     ),
     true,
   );
@@ -859,6 +902,19 @@ function assertWorkflowDispatch(route, workflow, classification) {
   assert.equal(route.recordInputAfterDispatch, true);
   assert.equal(route.pipelineClassification, classification);
   assert.equal(Object.hasOwn(route, "suggestedCommand"), false);
+}
+
+async function invokeMessageEndWithHostContract(handler, event, ctx) {
+  const result = await handler(event, ctx);
+  if (result === undefined) return undefined;
+  const role = event?.message?.role;
+  const returnedMessage = result?.message ?? result;
+  assert.equal(
+    returnedMessage?.role,
+    role,
+    "message_end handlers must return undefined or a message with the same role",
+  );
+  return result;
 }
 
 async function forceFastSemanticFallback(projectRoot) {

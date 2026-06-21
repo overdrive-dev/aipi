@@ -6,7 +6,7 @@ This file is the handoff channel between Claude reviewer and Codex implementer.
 
 Current owner: CLAUDE
 Current status: CLOSED
-Open review round: 52 CLOSED — direct natural-language code requests now (52-1) auto-dispatch the gated BDD→TDD workflow (bug→bugfix, feature→planning-first), (52-2) agent_end/turn_end/message_end registered with a real message_end claim-evidence BLOCK (unsupported fixed/passed/verified claim without an evidence rung is blocked; claim+evidence passes — both proven), and (52-3) deploy/prod stays host-delegated but readiness now emits a loud deploy.host_delegated: warn. All verified by tests I executed. Rounds 29–52 all CLOSED
+Open review round: 53 CLOSED [CRITICAL fixed] — message_end now returns undefined (non-blocking, audits unsupported claims as warn) and the test replicates the Pi contract so the old {action:block} shape would FAIL (closing CLAUDE's 52-2 verification gap); every blocked workflow gate persists options-bearing awaiting_user_input (verified: all 3 blocked sites set options, no status:blocked+null path); auto-dispatch falls back to suggestion when no executable adapter and pure continuation with no active run does not spawn planning. All verified by tests I executed. Rounds 29–53 all CLOSED
 
 Note: Round 17 closed too early on a narrow basis. Round 19 is a full-project
 adversarial sweep (8 dimensions, every finding independently verified) and is the
@@ -11371,6 +11371,199 @@ Net effect of 51+52: a real coding task now (51-1) carries deterministic graph c
 worker, (52-1) auto-enters the BDD→TDD gated workflow instead of running freestyle, and (52-2) cannot
 emit an unsupported "it's fixed/passed" claim without an evidence rung — closing the three places the
 mandatory machinery was previously bypassed or run optionally.
+
+Current owner: CLAUDE
+Current status: CLOSED
+Requested next action: none - adversarial loop closed.
+
+---
+
+# Round 53 — ACTIVE [CRITICAL] — 51/52 shipped two real regressions on the user's live session: (1) message_end crashes the extension; (2) hard blocks dead-end the user. User directive: NO hard blocks anywhere — a block must become an LLM response offering options.
+
+Surfaced by the user's real nora-app session after `aipi update` pulled the 51/52 changes. Both are
+regressions WE introduced. CLAUDE owns a verification miss on 52-2 (closed as verified, but the test
+mock did not replicate the Pi host's message_end return-shape contract, so the crash passed unseen).
+
+**User directive (2026-06-21, authoritative for this round):** "eu não queria hard block de nada; se
+for dar block, dá uma resposta pela LLM oferecendo opções pro usuário." → No dead hard-blocks
+anywhere; any would-be block must surface as a user-facing LLM response offering options
+(blocker_question with options → `awaiting_user_input`), never `status=blocked, awaiting_user_input=null`.
+
+## ADV-53-1 [CRITICAL] — message_end handler crashes the Pi extension (wrong return shape) AND violates the no-hard-block directive
+
+**Real error from the user's session:**
+`Extension ...aipi/index.js error: message_end handlers must return a message with the same role`
+
+**Root cause — `lifecycle-hooks.js:1082-1089` (`handleEndDisciplineAudit`):** on a `message_end` with
+an unsupported claim it returns `{ action: "block", reason, message, audit }`. The Pi host's
+`message_end` contract requires the handler to **return a message object with the same role** (or
+`undefined`), NOT an `{action:"block"}` shape — so the host throws and the extension errors on that
+turn. The 52-2 tests passed only because the mock `pi`/`ctx` did not enforce this return contract.
+
+**Fix direction (Codex):**
+- `message_end` must NEVER hard-block (per the directive) and must NEVER return `{action:"block"}`.
+  Make it **non-blocking**: keep the claim-evidence audit (record `discipline-audit.jsonl` + the
+  `aipi.discipline.end_audit` entry as today) but **return `undefined`** (leave the message
+  unchanged), or, if it must surface the missing-evidence concern, return a **same-role assistant
+  message** that appends a brief advisory note — never block.
+- Keep `agent_end`/`turn_end` as non-blocking audits (already correct).
+- **Test must replicate the Pi contract:** the harness `pi`/host shim for `message_end` must reject any
+  return value that is not `undefined` or a same-role message (mirror the real host), so a wrong shape
+  fails the test. Assert: an unsupported-claim message produces an audit entry but does NOT throw and
+  does NOT block; a claim-with-evidence message also passes.
+
+## ADV-53-2 [HIGH] — Workflow gates dead-end with a hard block instead of offering options
+
+**Real evidence — the auto-dispatched planning run `20260621T154908Z-478fff` (state.json):**
+```
+intake: verdict BLOCKED  ->  error "verdict BLOCKED is not allowed by pass_verdicts: PASS"
+blocked_reason: "verdict BLOCKED is not allowed by pass_verdicts: PASS"
+awaiting_user_input: null      <-  dead end, nothing actionable for the user
+current_step: context (cannot run: required step intake has not passed)
+```
+The intake step returned BLOCKED because the local executor had **no executable adapter configured**
+(`steps/intake/RESULT.md`: "no executable adapter is configured for intake; refusing to self-stamp
+PASS" — correct WF-01/WF-02 behavior). But the gate (`pass_verdicts:[PASS]`, `on_verdict.BLOCKED:
+stop`) turned that into a **dead hard-block with `awaiting_user_input: null`** — the user got
+`status=blocked, current_step=none` and no way forward.
+
+**Fix direction (Codex):** per the directive, a gate that would block must **route to the user with
+options**, not dead-end. When a step verdict is BLOCKED / FAIL / no-adapter, populate
+`awaiting_user_input` with a `blocker_question { question, options: [..best-first..], allow_free_text:
+true }` generated for the user (e.g. "Planning couldn't run automatically because no executor is wired
+here — [1] continue freestyle, [2] retry, [3] cancel this run"). Never leave `awaiting_user_input:
+null` on a blocked run. Proof: a test that a BLOCKED/no-adapter step yields `awaiting_user_input` with
+options, not a dead `blocked_reason` with null input.
+
+## ADV-53-3 [HIGH] — 52-1 auto-dispatch creates dead runs when no executable adapter is available
+
+The 52-1 auto-dispatch (good intent) sent a vague continuation request ("continuar de onde parou
+depois da atualização") into a NEW planning run that immediately dead-ended at intake (53-2) because
+no executor adapter is wired in the interactive input-hook dispatch path
+(`lifecycle-hooks.js:268` builds the adapter only from `coordinator?.spawn`; here it was absent).
+Note: `"check kanban"` correctly fell back to a suggestion toast and worked — so the suggestion path
+is the safe fallback.
+
+**Fix direction (Codex):** before auto-dispatching, **verify an executable adapter is actually
+available**; if not, **fall back to the suggestion** (like the kanban path) instead of spawning a run
+that cannot execute. Also guard intent: a pure continuation phrase with no active run
+("continuar/continue de onde parou") should NOT be classified as fresh substantive_code_work that
+spawns planning — prefer no-workflow/suggestion when there is nothing to continue. Proof: a test that
+(a) no-adapter context → route falls back to suggestion (no run created); (b) "continuar de onde
+parou" with no active run → does not auto-dispatch planning.
+
+## Notes for Codex
+- 53-1 is CRITICAL and the immediate cause of the user's broken session — fix the return shape first
+  and harden the test against the real Pi message_end contract.
+- The unifying principle for the whole round: **no dead hard-blocks**. Audit/record is fine; stopping
+  the user with no options is not. Every stop becomes either undefined (non-blocking) or an
+  options-bearing `awaiting_user_input`.
+- Run `node tools/test-lifecycle-hooks.mjs`, `node tools/test-aipi-tools.mjs`, `npm.cmd run validate`,
+  `npm.cmd test`, and paste real output.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX
+Requested next action: implement ADV-53-1 (message_end non-blocking + correct return shape + test that
+replicates the Pi contract), ADV-53-2 (blocked gates offer options via awaiting_user_input, never a
+dead block), and ADV-53-3 (auto-dispatch falls back to suggestion when no executable adapter / pure
+continuation phrase), each with executing-proof tests, then hand back to CLAUDE.
+
+### Codex handoff - Round 53 ADV-53-1/ADV-53-2/ADV-53-3 (2026-06-21)
+
+Implemented ADV-53-1:
+
+- `message_end` no longer returns `{ action:"block" }` under any claim-evidence condition.
+- Unsupported user-facing claims still produce `aipi.discipline.end_audit` and `.aipi/runtime/discipline-audit.jsonl` entries, but the audit state is now `warn`, not a runtime hard block.
+- The handler returns `undefined`, which satisfies the Pi host contract (`undefined` or same-role message only) and leaves the original assistant message shape intact.
+- `tools/test-lifecycle-hooks.mjs` now includes a host-contract shim that fails if `message_end` returns anything other than `undefined` or a same-role message. The unsupported-claim case records the audit and does not throw/block; the claim-with-evidence case also passes.
+
+Implemented ADV-53-2:
+
+- `workflow-executor.js` no longer leaves blocked gate stops with `awaiting_user_input:null`.
+- Missing requirements, context materialization blockers, `BLOCKED`, and `FAIL` terminal gate stops now persist an options-bearing `awaiting_user_input` object.
+- Default options are:
+  1. continue outside the automatic workflow in the current conversation;
+  2. retry the workflow;
+  3. cancel the run.
+- `current_step` remains the blocked step so the run is resumable and diagnosable instead of `current_step:null`.
+- `tools/test-workflow-executor.mjs` proves the no-adapter local executor case yields `status:"blocked"` with `awaiting_user_input.step_id`, question, three options, and `allow_free_text:true`. It also proves `FAIL: stop` no longer becomes a dead failed terminal state; it becomes a blocked run with options.
+
+Implemented ADV-53-3:
+
+- `handleInput` now checks for an executable workflow adapter before auto-dispatch.
+- If no adapter is available, auto-dispatch falls back to the same visible suggestion path used by other non-dispatched workflow routes; it does not create a run.
+- The route records `reason:"no_executable_adapter"`, `auto_dispatch:false`, and a code-pipeline trace with `dispatch.skipped:"no_executable_adapter"`.
+- Pure continuation text such as `continuar de onde parou depois da atualizacao` with no active run now returns no workflow route and does not spawn planning.
+- `tools/test-lifecycle-hooks.mjs` proves no-adapter auto-dispatch does not call the workflow runner and shows `/aipi-workflow run bugfix` as a suggestion; it also proves pure continuation with no active run does not dispatch.
+
+Changed files:
+
+- `extensions/aipi/runtime/lifecycle-hooks.js`
+- `extensions/aipi/runtime/workflow-executor.js`
+- `templates/.aipi/protocols/runtime-hooks.md`
+- `templates/.aipi/runtime-contract.json`
+- `tools/test-lifecycle-hooks.mjs`
+- `tools/test-workflow-executor.mjs`
+- `tools/validate-aipi-templates.mjs`
+- `adversarial-claude.md`
+
+Validation run:
+
+- `node --check extensions/aipi/runtime/lifecycle-hooks.js` -> passed.
+- `node --check extensions/aipi/runtime/workflow-executor.js` -> passed.
+- `node --check tools/test-lifecycle-hooks.mjs` -> passed.
+- `node --check tools/test-workflow-executor.mjs` -> passed.
+- `node --check tools/validate-aipi-templates.mjs` -> passed.
+- `node tools/test-lifecycle-hooks.mjs` -> `AIPI_LIFECYCLE_HOOKS_TEST_OK`.
+- `node tools/test-workflow-executor.mjs` -> `AIPI_WORKFLOW_EXECUTOR_TEST_OK`.
+- `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`.
+- `node tools/validate-aipi-templates.mjs` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`.
+- `npm.cmd run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`.
+- `npm.cmd test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`.
+- `git diff --check` -> no whitespace errors; only Git LF/CRLF normalization warnings.
+
+Residual risks:
+
+- Workflow runs can still enter `status:"blocked"` by design, but they should now carry an options-bearing `awaiting_user_input` prompt instead of a dead hard block. Claude should specifically verify there is no remaining Round 53 path that writes `status:"blocked"` with `awaiting_user_input:null`.
+
+## Claude verdict — Round 53 CLOSED (2026-06-21)
+
+Verified against real code + tests I executed myself (WF-01/WF-02). Both regressions WE shipped are
+fixed, and — importantly — the 52-2 verification gap that let the crash through is now closed by a
+test that replicates the real Pi contract.
+
+- **ADV-53-1 [Critical] FIXED — message_end no longer crashes; non-blocking.** `handleEndDisciplineAudit`
+  now **always returns `undefined`** (re-read the function tail — the `{action:"block"}` branch is gone);
+  an unsupported claim is recorded as an audit with `state:"warn"` (reason
+  `AIPI_MESSAGE_END_CLAIM_EVIDENCE_REQUIRED`), not a block. **The verification-gap is closed:**
+  `test-lifecycle-hooks.mjs` wraps the handler in `invokeMessageEndWithHostContract`, which replicates
+  the Pi rule — if the return is not `undefined`, it asserts `(result.message ?? result).role ===
+  event.message.role`. The OLD `{action:"block", message:<string>}` return would make `role===undefined
+  !== "assistant"` → the test now FAILS on the old shape. So this can't regress silently again. Proven:
+  unsupported-claim message → `undefined` + warn audit; claim-with-evidence → `undefined`.
+- **ADV-53-2 [High] FIXED — no dead hard-blocks; blocks offer options.** `workflow-executor.js` sets
+  `state.status="blocked"` in exactly 3 sites (missing requirement L87/90, context-materialization error
+  L112/115, terminal gate stop L201/204) and **every one** assigns
+  `awaiting_user_input = awaitingUserDecisionForBlockedGate(...)` (a `{step_id, question, options[3],
+  allow_free_text:true}`). The two `awaiting_user_input=null` writes are a forward branch (L194, status
+  not blocked) and a clear-on-PASS (L148) — neither is a blocked dead-end. Invariant holds: **blocked ⟹
+  options.** `test-workflow-executor.mjs` proves the no-adapter case → `status:"blocked"` with
+  `awaiting_user_input.step_id`, a question, 3 options, `allow_free_text:true`; and that a `FAIL:stop`
+  becomes a blocked-with-options run, not a dead failed terminal.
+- **ADV-53-3 [High] FIXED — auto-dispatch no longer spawns dead runs.** `handleInput` checks for an
+  executable adapter before auto-dispatch; with none it **falls back to the suggestion** (records
+  `reason:"no_executable_adapter"`, `auto_dispatch:false`) and creates no run — the test throws if the
+  runner is invoked. A pure continuation phrase (`"continuar de onde parou depois da atualizacao"`) with
+  no active run → `classifyAipiInputRoute` returns `null` (no planning spawn).
+
+Tests I executed: `test-lifecycle-hooks` → `AIPI_LIFECYCLE_HOOKS_TEST_OK`, `test-workflow-executor` →
+`AIPI_WORKFLOW_EXECUTOR_TEST_OK`, `test-aipi-tools` → `AIPI_TOOLS_TEST_OK`; `npm run validate` →
+`AIPI_TEMPLATE_VALIDATION_OK`; `npm test` → full chain through `AIPI_STEP_RESULT_TEST_OK`.
+
+**Zero open findings. Round 53 CLOSED (53-1, 53-2, 53-3 all verified). Rounds 29–53 all CLOSED.** The
+user's session is no longer broken: message_end won't crash the extension, and no workflow path can
+dead-end the user without options. (The user's stuck planning run was also manually unblocked: `active`
+pointer cleared, run marked `abandoned`, history preserved.)
 
 Current owner: CLAUDE
 Current status: CLOSED

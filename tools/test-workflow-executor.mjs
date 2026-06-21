@@ -73,10 +73,20 @@ try {
   assert.equal(state.policy.parent_interactive_tool_call_hook, "registered_parent_interactive_tool_call_hook");
   assert.equal(Object.hasOwn(state.policy, "parent_session_tool_call"), false);
   assert.match(state.steps[0].error, /refusing to self-stamp PASS|step result did not pass gate|not allowed by pass_verdicts/);
+  assert.equal(state.current_step, "quick_scope");
+  assert.equal(state.awaiting_user_input.step_id, "quick_scope");
+  assert.match(state.awaiting_user_input.question, /nenhum executor esta configurado|Como voce quer seguir/);
+  assert.deepEqual(state.awaiting_user_input.options, [
+    "Continuar fora do workflow automatico nesta conversa",
+    "Tentar executar este workflow novamente",
+    "Cancelar este run",
+  ]);
+  assert.equal(state.awaiting_user_input.allow_free_text, true);
 
   const activeExecution = await runWorkflowCommand({ args: "execute", projectRoot: tempRoot });
   assert.equal(activeExecution.action, "execute");
   assert.equal(activeExecution.execution.status, "blocked");
+  assert.equal(activeExecution.execution.state.awaiting_user_input.step_id, "quick_scope");
 
   const restartStarted = await runWorkflowCommand({ args: "start quick", projectRoot: tempRoot });
   assert.equal(restartStarted.action, "start");
@@ -230,10 +240,13 @@ try {
     projectRoot: tempRoot,
     adapter: createMemoryPromotionWorkflowAdapter({ quick_memory: [] }),
   });
-  assert.equal(emptyMemoryRun.execution.status, "failed");
+  assert.equal(emptyMemoryRun.execution.status, "blocked");
   const emptyMemoryStep = emptyMemoryRun.execution.state.steps.find((step) => step.id === "quick_memory");
   assert.equal(emptyMemoryStep.status, "failed");
   assert.match(emptyMemoryStep.error, /PASS requires memory_promotions/);
+  assert.equal(emptyMemoryRun.execution.state.awaiting_user_input.step_id, "quick_memory");
+  assert.match(emptyMemoryRun.execution.state.awaiting_user_input.question, /quick_memory/);
+  assert.equal(emptyMemoryRun.execution.state.awaiting_user_input.options.length, 3);
   const emptyMemoryRecord = JSON.parse(await fs.readFile(
     path.join(
       tempRoot,

@@ -76,15 +76,18 @@ export async function executeWorkflowRun({
 
     const requirement = firstUnpassedRequirement(step, state);
     if (requirement) {
+      const reason = `required step ${requirement} has not passed`;
+      const blockedAt = now().toISOString();
       markStep(state, step.id, {
         status: "blocked",
         verdict: "BLOCKED",
-        error: `required step ${requirement} has not passed`,
-        finished_at: now().toISOString(),
+        error: reason,
+        finished_at: blockedAt,
       });
       state.status = "blocked";
       state.current_step = step.id;
-      state.awaiting_user_input = null;
+      state.blocked_reason = reason;
+      state.awaiting_user_input = awaitingUserDecisionForBlockedGate({ step, reason, createdAt: blockedAt });
       events.push({ type: "blocked", step_id: step.id, reason: `missing requirement ${requirement}` });
       break;
     }
@@ -99,16 +102,21 @@ export async function executeWorkflowRun({
       context = await buildStepContext({ root, state, workflow, step, contract });
     } catch (error) {
       if (!(error instanceof ContextMaterializationError)) throw error;
+      const blockedAt = now().toISOString();
       markStep(state, step.id, {
         status: "blocked",
         verdict: "BLOCKED",
         error: error.message,
-        finished_at: now().toISOString(),
+        finished_at: blockedAt,
       });
       state.status = "blocked";
       state.current_step = step.id;
       state.blocked_reason = error.message;
-      state.awaiting_user_input = null;
+      state.awaiting_user_input = awaitingUserDecisionForBlockedGate({
+        step,
+        reason: error.message,
+        createdAt: blockedAt,
+      });
       events.push({ type: "blocked", step_id: step.id, reason: error.message });
       await persistRunState(root, state);
       break;
@@ -188,13 +196,13 @@ export async function executeWorkflowRun({
       continue;
     }
 
-    const awaitingUserInput = target === "stop_for_user_question";
+    const awaitingUserInput = shouldAskUserOnGateStop({ target, failedStatus });
     const blockedAt = now().toISOString();
-    state.status = terminalStatus(target, failedStatus);
+    state.status = awaitingUserInput ? "blocked" : terminalStatus(target, failedStatus);
     state.current_step = awaitingUserInput ? step.id : terminalActions.has(target) ? null : step.id;
     state.blocked_reason = error;
     state.awaiting_user_input = awaitingUserInput
-      ? awaitingUserInputFromStepResult({
+      ? awaitingUserDecisionForBlockedGate({
           step,
           result,
           reason: error,
@@ -962,6 +970,48 @@ function gateFailureStatus(result, validation) {
   if (validation.policyDecision === "BLOCK") return "blocked";
   if (result?.verdict === "BLOCKED" || result?.verdict === "BLOCKED_TO_PLANNING") return "blocked";
   return "failed";
+}
+
+function shouldAskUserOnGateStop({ target, failedStatus } = {}) {
+  if (target === "stop_for_user_question") return true;
+  if (target === "stop" || !target) return ["blocked", "failed"].includes(failedStatus);
+  return false;
+}
+
+function awaitingUserDecisionForBlockedGate({ step, result = null, reason = "", createdAt } = {}) {
+  const hasQuestion = Boolean(
+    result?.blocker_question ||
+      result?.awaiting_user_input ||
+      result?.user_question ||
+      result?.question,
+  );
+  return awaitingUserInputFromStepResult({
+    step,
+    result: hasQuestion
+      ? result
+      : {
+          ...(result ?? {}),
+          blocker_question: defaultBlockedGateQuestion({ step, reason }),
+        },
+    reason,
+    createdAt,
+  });
+}
+
+function defaultBlockedGateQuestion({ step, reason = "" } = {}) {
+  const stepId = step?.id ?? "current step";
+  const noAdapter = /no executable adapter|refusing to self-stamp/i.test(reason);
+  return {
+    question: noAdapter
+      ? `AIPI nao conseguiu executar ${stepId} automaticamente porque nenhum executor esta configurado. Como voce quer seguir?`
+      : `AIPI parou em ${stepId}: ${reason || "o gate nao passou"}. Como voce quer seguir?`,
+    options: [
+      "Continuar fora do workflow automatico nesta conversa",
+      "Tentar executar este workflow novamente",
+      "Cancelar este run",
+    ],
+    allow_free_text: true,
+  };
 }
 
 function localPolicyDecision(step) {
