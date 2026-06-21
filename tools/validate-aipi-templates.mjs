@@ -427,6 +427,9 @@ for (const hook of [
   "session_tree",
   "input",
   "context",
+  "agent_end",
+  "turn_end",
+  "message_end",
   "model_select",
   "thinking_level_select",
   "user_bash",
@@ -441,7 +444,7 @@ for (const hook of [
 if (lifecycleHooks.implementationPath !== "extensions/aipi/runtime/lifecycle-hooks.js") {
   errors.push("runtime-contract lifecycleHooks.implementationPath must point at runtime/lifecycle-hooks.js");
 }
-for (const field of ["lifecycleLog", "contextEventLog", "subagentRestoreEntry", "inputRouteEntry", "toolResultLog", "modelRoutingLog", "providerEventLog", "providerUsageLog", "providerBudgetLog", "providerPricingConfig", "providerBudgetConfig", "handoffArtifact", "providerPayloadPolicy", "compactionSummarySchema"]) {
+for (const field of ["lifecycleLog", "contextEventLog", "disciplineAuditLog", "subagentRestoreEntry", "inputRouteEntry", "toolResultLog", "modelRoutingLog", "providerEventLog", "providerUsageLog", "providerBudgetLog", "providerPricingConfig", "providerBudgetConfig", "handoffArtifact", "providerPayloadPolicy", "compactionSummarySchema"]) {
   if (!lifecycleHooks[field]) {
     errors.push(`runtime-contract lifecycleHooks.${field} is required`);
   }
@@ -449,23 +452,18 @@ for (const field of ["lifecycleLog", "contextEventLog", "subagentRestoreEntry", 
 const promptOnlyHooks = new Map((lifecycleHooks.declaredPromptOnlyHooks ?? []).map((item) => [item?.hook, item]));
 const runtimeHooksProtocol = read("templates/.aipi/protocols/runtime-hooks.md");
 for (const hook of ["agent_end", "turn_end", "message_end"]) {
-  const entry = promptOnlyHooks.get(hook);
-  if (!entry) {
-    errors.push(`runtime-contract lifecycleHooks.declaredPromptOnlyHooks missing ${hook}`);
-    continue;
+  if (promptOnlyHooks.has(hook)) {
+    errors.push(`runtime-contract lifecycleHooks.declaredPromptOnlyHooks must not include implemented hook ${hook}`);
   }
-  if (entry.status !== "prompt_only") {
-    errors.push(`runtime-contract declaredPromptOnlyHooks.${hook} must be prompt_only`);
+  if (!lifecycleHooks.verifiedHooks?.includes(hook)) {
+    errors.push(`runtime-contract lifecycleHooks.verifiedHooks missing implemented end hook ${hook}`);
   }
-  if (lifecycleHooks.verifiedHooks?.includes(hook)) {
-    errors.push(`runtime-contract must not list prompt_only hook ${hook} in verifiedHooks until implemented`);
-  }
-  if (!runtimeHooksProtocol.includes(`| \`${hook}\` | not registered; prompt_only discipline moment |`)) {
-    errors.push(`runtime-hooks.md must document ${hook} as a prompt_only discipline moment`);
+  if (!runtimeHooksProtocol.includes(`| \`${hook}\` | registered |`)) {
+    errors.push(`runtime-hooks.md must document ${hook} as registered`);
   }
 }
-if (!lifecycleHooks.rule?.includes("declaredPromptOnlyHooks")) {
-  errors.push("runtime-contract lifecycleHooks.rule must explain declaredPromptOnlyHooks vs verifiedHooks");
+if (!lifecycleHooks.rule?.includes("message_end blocking unsupported")) {
+  errors.push("runtime-contract lifecycleHooks.rule must document message_end claim-evidence audit");
 }
 
 for (const rel of [
@@ -943,7 +941,7 @@ const parsedDisciplineCatalog = parseDisciplineCatalog(disciplineCatalog);
 const runtimeHooksDoc = read("templates/.aipi/protocols/runtime-hooks.md");
 for (const requiredText of [
   "Runtime status",
-  "not registered; prompt_only discipline moment",
+  "registered | Runtime audit of user-facing claims",
   "registered for discipline audit only",
   "permission policy and profiles were intentionally removed",
 ]) {

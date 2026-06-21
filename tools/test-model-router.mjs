@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   evaluateModelCapabilityFloor,
+  inspectAdversarialFamilyIsolation,
   inspectModelCapabilityFloors,
   parseAgentClasses,
   parseModelClasses,
@@ -24,10 +25,13 @@ const modelClasses = `
 classes:
   code-strong:
     effort: medium
-    preferred_families: [openai, anthropic, zai]
+    preferred_families: [openai, anthropic]
   adversarial-heavy:
     effort: high
-    preferred_families: [anthropic, openai, zai]
+    preferred_families: [anthropic, openai]
+  verifier-fast:
+    effort: low
+    preferred_families: [anthropic, openai]
 `;
 
 const agents = parseAgentClasses(agentCatalog);
@@ -35,7 +39,7 @@ assert.equal(agents.get("implementer").class, "code-strong");
 const classes = parseModelClasses(modelClasses);
 assert.equal(classes.get("adversarial-heavy").effort, "high");
 assert.deepEqual(classes.get("adversarial-heavy").capability_floor, undefined);
-assert.deepEqual(classes.get("code-strong").preferred_families, ["openai", "anthropic", "zai"]);
+assert.deepEqual(classes.get("code-strong").preferred_families, ["openai", "anthropic"]);
 
 const floors = parseModelClasses(`
 classes:
@@ -150,6 +154,12 @@ try {
   assert.deepEqual(contextFastRoute.model, { provider: "anthropic", id: "claude-opus-4-8" });
   assert.equal(contextFastRoute.capability_report.state, "pass");
   assert.equal(contextFastRoute.capability_report.model, "anthropic/claude-opus-4-8");
+  const templateClasses = parseModelClasses(
+    await fs.readFile(path.join(templateRoot, ".aipi", "model-classes.yaml"), "utf8"),
+  );
+  for (const [modelClass, classMeta] of templateClasses) {
+    assert.equal(classMeta.preferred_families?.includes("zai") ?? false, false, `${modelClass} includes zai`);
+  }
   const templateFloorReport = await inspectModelCapabilityFloors({ root: templateRoot });
   assert.equal(templateFloorReport.state, "pass");
   assert.equal(templateFloorReport.failing, 0);
@@ -221,6 +231,74 @@ try {
   assert.equal(envResolvedWithoutRegistry.source, "env");
   assert.deepEqual(envResolvedWithoutRegistry.model, { provider: "openai", id: "gpt-env-only" });
   assert.equal(envResolvedWithoutRegistry.thinking_level, "high");
+
+  await fs.writeFile(
+    path.join(tempRoot, ".aipi", "model-capabilities.json"),
+    `${JSON.stringify({
+      schema: "aipi.model-capabilities.v1",
+      classes: {
+        "code-strong": "anthropic/claude-code",
+        "adversarial-heavy": "anthropic/claude-review",
+        "verifier-fast": "anthropic/claude-verify",
+      },
+      models: {
+        "anthropic:claude-code": { capabilities: {}, evidence: ["unit-test"] },
+        "anthropic:claude-review": { capabilities: {}, evidence: ["unit-test"] },
+        "anthropic:claude-verify": { capabilities: {}, evidence: ["unit-test"] },
+        "openai:gpt-review": { capabilities: {}, evidence: ["unit-test"] },
+      },
+    }, null, 2)}\n`,
+  );
+  const crossFamilyConfiguredReviewer = await resolveModelClass({
+    root: tempRoot,
+    modelClass: "adversarial-heavy",
+  });
+  assert.equal(crossFamilyConfiguredReviewer.source, "model-capabilities:cross-family");
+  assert.deepEqual(crossFamilyConfiguredReviewer.model, { provider: "openai", id: "gpt-review" });
+  assert.equal(crossFamilyConfiguredReviewer.cross_family_selection.provider, "openai");
+
+  const crossFamilyConfiguredVerifier = await resolveModelClass({
+    root: tempRoot,
+    modelClass: "verifier-fast",
+  });
+  assert.equal(crossFamilyConfiguredVerifier.source, "model-capabilities:cross-family");
+  assert.deepEqual(crossFamilyConfiguredVerifier.model, { provider: "openai", id: "gpt-review" });
+  assert.equal(crossFamilyConfiguredVerifier.cross_family_selection.provider, "openai");
+
+  const envSameFamilyReviewer = await resolveModelClass({
+    root: tempRoot,
+    modelClass: "adversarial-heavy",
+    env: {
+      AIPI_MODEL_CLASS_CODE_STRONG: "anthropic/claude-code",
+      AIPI_MODEL_CLASS_ADVERSARIAL_HEAVY: "anthropic/claude-review",
+    },
+  });
+  assert.equal(envSameFamilyReviewer.source, "model-capabilities:cross-family");
+  assert.deepEqual(envSameFamilyReviewer.model, { provider: "openai", id: "gpt-review" });
+
+  await fs.writeFile(
+    path.join(tempRoot, ".aipi", "model-capabilities.json"),
+    `${JSON.stringify({
+      schema: "aipi.model-capabilities.v1",
+      classes: {
+        "code-strong": "anthropic/claude-code",
+        "adversarial-heavy": "anthropic/claude-review",
+        "verifier-fast": "anthropic/claude-verify",
+      },
+      models: {
+        "anthropic:claude-code": { capabilities: {}, evidence: ["unit-test"] },
+        "anthropic:claude-review": { capabilities: {}, evidence: ["unit-test"] },
+        "anthropic:claude-verify": { capabilities: {}, evidence: ["unit-test"] },
+      },
+    }, null, 2)}\n`,
+  );
+  const familyIsolation = await inspectAdversarialFamilyIsolation({ root: tempRoot });
+  assert.equal(familyIsolation.state, "warn");
+  assert.match(familyIsolation.evidence, /Only one configured model family \(anthropic\)/);
+  assert.equal(
+    familyIsolation.review_routes.every((route) => route.distinct_from_code_strong === false),
+    true,
+  );
 
   const crossModelReviewer = await resolveCrossModelAdversarialRoute({
     root: tempRoot,

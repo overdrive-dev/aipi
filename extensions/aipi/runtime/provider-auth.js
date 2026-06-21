@@ -11,7 +11,11 @@ import {
   modelPressureScenarioById,
   scoreModelPressureScenario,
 } from "./model-pressure-scorer.js";
-import { inspectModelCapabilityFloors, MODEL_CAPABILITIES_REL_PATH } from "./model-router.js";
+import {
+  inspectAdversarialFamilyIsolation,
+  inspectModelCapabilityFloors,
+  MODEL_CAPABILITIES_REL_PATH,
+} from "./model-router.js";
 
 export const ANTHROPIC_AUTH_FILE_NAME = "auth.json";
 export const MODEL_PRESSURE_BASELINE_REPORT = ".aipi/evals/model-pressure-baseline-results.json";
@@ -185,12 +189,20 @@ export async function buildAipiStatusReport({
         error: String(error?.message ?? error),
       }))
     : { state: "block", checks: [], failing: 1, error: "project not installed" };
+  const adversarialFamilyIsolation = project.installed
+    ? await inspectAdversarialFamilyIsolation({ root: project.root, env }).catch((error) => ({
+        schema: "aipi.adversarial-family-isolation.v1",
+        state: "warn",
+        evidence: `adversarial family isolation could not be inspected: ${String(error?.message ?? error)}`,
+      }))
+    : { state: "not_applicable", evidence: "project not installed" };
   const readiness = buildAipiReadinessReport({
     project,
     anthropic,
     capabilities: capabilityReport,
     externalEvidence,
     modelCapabilityFloors,
+    adversarialFamilyIsolation,
     env,
   });
 
@@ -199,6 +211,7 @@ export async function buildAipiStatusReport({
     anthropic,
     capabilities: capabilityReport,
     modelCapabilityFloors,
+    adversarialFamilyIsolation,
     readiness,
     subagents: {
       preferredBackend: backend.preferredSpike ?? "unknown",
@@ -270,6 +283,7 @@ export function buildAipiReadinessReport({
   anthropic,
   capabilities,
   modelCapabilityFloors = null,
+  adversarialFamilyIsolation = null,
   externalEvidence = {},
   env = process.env,
 } = {}) {
@@ -307,6 +321,23 @@ export function buildAipiReadinessReport({
         modelCapabilityFloors?.state === "pass"
           ? null
           : `populate ${MODEL_CAPABILITIES_REL_PATH} with class-to-model mappings and capabilities that satisfy templates/.aipi/model-classes.yaml`,
+    },
+    {
+      id: "model.adversarial_family_isolation",
+      state: adversarialFamilyIsolation?.state === "warn" ? "warn" : "pass",
+      evidence: adversarialFamilyIsolation?.evidence ?? "adversarial family isolation report unavailable",
+      next_action:
+        adversarialFamilyIsolation?.state === "warn"
+          ? "configure a second provider/model family, e.g. keep code-strong on one family and adversarial-heavy/verifier-fast on another"
+          : null,
+    },
+    {
+      id: "deploy.host_delegated",
+      state: "warn",
+      evidence:
+        "irreversible deploy/prod/migration command blocking is host-delegated: AIPI ops workflow gates planning/review, but the parent-session tool-call permission policy is intentionally absent and not a runtime block",
+      next_action:
+        "use host approval/sandbox/least-privilege controls for irreversible deploy/prod/migration commands; treat AIPI deployment outputs as advisory unless the host blocks the command",
     },
     {
       id: "pressure.model_backed",

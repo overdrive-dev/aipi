@@ -762,6 +762,7 @@ export async function aipiRetrieve({
   const needle = query.trim();
   const resultLimit = Math.max(1, limit);
   const signalLimit = Math.max(16, Math.min(64, resultLimit * 4));
+  const queryPaths = queryGraphPaths(graph, needle);
 
   const semanticRefs = await graphRefs({
     root,
@@ -773,7 +774,12 @@ export async function aipiRetrieve({
     embeddingFetch,
   }).catch(() => []);
   const lexicalRefs = await graphLexicalRefs({ root, graph, query: needle, limit: signalLimit }).catch(() => []);
-  const matchingRelationships = await graphRelationships({ root, graph, query: needle, limit: signalLimit }).catch(() => []);
+  const matchingRelationships = uniqueRelationships([
+    ...await graphRelationships({ root, graph, query: needle, limit: signalLimit }).catch(() => []),
+    ...(graph.relationships ?? [])
+      .filter((edge) => relationshipTouchesAnyPath(edge, queryPaths, graph))
+      .map((edge) => ({ ...edge, source: edge.source ?? "manifest" })),
+  ]).slice(0, signalLimit);
   const seedRefs = mergeRefs([...semanticRefs, ...lexicalRefs], signalLimit);
   const graphExpansionRefs = graphProximityRefs({
     graph,
@@ -1294,6 +1300,17 @@ function graphProximityRefs({ graph, query = "", seedRefs = [], seedRelationship
     }
   }
   return mergeRefs(out, limit);
+}
+
+function queryGraphPaths(graph, query = "") {
+  const haystack = String(query ?? "").replaceAll("\\", "/").toLowerCase();
+  const paths = new Set();
+  if (!haystack) return paths;
+  for (const file of graph.files ?? []) {
+    const normalized = String(file.path ?? "").replaceAll("\\", "/");
+    if (normalized && haystack.includes(normalized.toLowerCase())) paths.add(normalized);
+  }
+  return paths;
 }
 
 function ruleLinkedRefs({ graph, query = "", seedRefs = [], seedRelationships = [], limit = 16 } = {}) {

@@ -15,7 +15,7 @@ classes:
       context: very_high
       tool_use: required
       structured_outputs: required
-    preferred_families: [openai, anthropic, zai]
+    preferred_families: [openai, anthropic]
     fallback_policy: Resolve to the strongest available long-context reasoning model; fail loudly if no configured provider satisfies the floor.
 
   planner-heavy:
@@ -28,7 +28,7 @@ classes:
       context: high
       tool_use: required
       structured_outputs: required
-    preferred_families: [openai, anthropic, zai]
+    preferred_families: [openai, anthropic]
     fallback_policy: Prefer accuracy and context retention over cost; fail if the BDD contract cannot be held.
 
   adversarial-heavy:
@@ -41,7 +41,7 @@ classes:
       context: high
       tool_use: read_only
       structured_outputs: required
-    preferred_families: [anthropic, openai, zai]
+    preferred_families: [anthropic, openai]
     fallback_policy: Prefer a different model family than the implementation model when configured.
 
   research-heavy:
@@ -54,7 +54,7 @@ classes:
       context: high
       web: required_when_current_facts_matter
       citations: required
-    preferred_families: [openai, anthropic, zai]
+    preferred_families: [openai, anthropic]
     fallback_policy: Require web/search tools when claims depend on current facts.
 
   code-strong:
@@ -67,7 +67,7 @@ classes:
       context: medium_high
       tool_use: write_capable
       structured_outputs: required
-    preferred_families: [openai, anthropic, zai]
+    preferred_families: [openai, anthropic]
     fallback_policy: Use targeted context packets instead of full-run context; fail if write/tool support is unavailable.
 
   test-strong:
@@ -80,7 +80,7 @@ classes:
       reasoning: medium_high
       context: medium
       structured_outputs: required
-    preferred_families: [openai, anthropic, zai]
+    preferred_families: [openai, anthropic]
     fallback_policy: Escalate to planner-heavy when testability depends on business semantics.
 
   context-fast:
@@ -93,7 +93,7 @@ classes:
       context: medium
       tool_use: read_only
       citations: required
-    preferred_families: [zai, openai, anthropic]
+    preferred_families: [openai, anthropic]
     fallback_policy: Prefer speed and low cost; outputs must cite source paths.
 
   verifier-fast:
@@ -106,5 +106,5 @@ classes:
       context: medium
       structured_outputs: required
       evidence_audit: required
-    preferred_families: [anthropic, zai, openai]
+    preferred_families: [anthropic, openai]
     fallback_policy: Prefer a model family different from code-strong when possible.

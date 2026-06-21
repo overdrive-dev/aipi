@@ -4,6 +4,7 @@ import path from "node:path";
 
 export const MODEL_CAPABILITIES_REL_PATH = ".aipi/model-capabilities.json";
 const BOOLEAN_CAPABILITY_FLOORS = new Set(["structured_outputs", "web", "citations", "evidence_audit"]);
+const CROSS_FAMILY_REVIEW_CLASSES = new Set(["adversarial-heavy", "verifier-fast"]);
 
 export async function resolveStepModel({
   root,
@@ -51,17 +52,32 @@ export async function resolveModelClass({
   const capabilityRegistry = ctx?.modelCapabilities ?? await readModelCapabilities(root);
   const envModel = resolveEnvModel({ modelClass, env, registry });
   if (envModel) {
+    const crossFamilyModel = resolveCrossFamilyConfiguredModel({
+      registry: capabilityRegistry,
+      modelClasses,
+      modelClass,
+      preferredFamilies,
+      configuredModel: { model: envModel.model, source: "env" },
+      env,
+    });
+    const selectedEnvModel = crossFamilyModel ?? { model: envModel.model, source: "env" };
     return {
       model_class: modelClass,
-      model: envModel.model,
+      model: selectedEnvModel.model,
       thinking_level: envModel.thinkingLevel ?? thinkingLevel,
-      source: "env",
+      source: selectedEnvModel.source,
       preferred_families: preferredFamilies,
-      family_warning: preferredFamilyWarning({ modelClass, model: envModel.model, preferredFamilies, source: "env" }),
+      family_warning: preferredFamilyWarning({
+        modelClass,
+        model: selectedEnvModel.model,
+        preferredFamilies,
+        source: selectedEnvModel.source,
+      }),
+      cross_family_selection: crossFamilyModel?.cross_family_selection ?? null,
       capability_floor: classMeta.capability_floor ?? {},
       capability_report: evaluateModelCapabilityFloor({
         modelClass,
-        model: envModel.model,
+        model: selectedEnvModel.model,
         classMeta,
         registry: capabilityRegistry,
       }),
@@ -69,26 +85,36 @@ export async function resolveModelClass({
   }
 
   const configuredModel = configuredClassModel({ registry: capabilityRegistry, modelClass, env: {} });
-  if (configuredModel) {
+  const crossFamilyModel = resolveCrossFamilyConfiguredModel({
+    registry: capabilityRegistry,
+    modelClasses,
+    modelClass,
+    preferredFamilies,
+    configuredModel,
+    env,
+  });
+  const selectedConfiguredModel = crossFamilyModel ?? configuredModel;
+  if (selectedConfiguredModel) {
     return {
       model_class: modelClass,
-      model: configuredModel.model,
+      model: selectedConfiguredModel.model,
       thinking_level: thinkingLevel,
-      source: configuredModel.source,
+      source: selectedConfiguredModel.source,
       preferred_families: preferredFamilies,
       family_warning: preferredFamilyWarning({
         modelClass,
-        model: configuredModel.model,
+        model: selectedConfiguredModel.model,
         preferredFamilies,
-        source: configuredModel.source,
+        source: selectedConfiguredModel.source,
       }),
+      cross_family_selection: crossFamilyModel?.cross_family_selection ?? null,
       capability_floor: classMeta.capability_floor ?? {},
       capability_report: evaluateModelCapabilityFloor({
         modelClass,
-        model: configuredModel.model,
+        model: selectedConfiguredModel.model,
         classMeta,
         registry: capabilityRegistry,
-        source: configuredModel.source,
+        source: selectedConfiguredModel.source,
       }),
     };
   }
@@ -196,7 +222,7 @@ export async function resolveCrossModelAdversarialRoute({
   };
 }
 
-function collectAdversarialModelCandidates({ route, registry, modelClasses, env }) {
+function collectAdversarialModelCandidates({ route, registry, modelClasses, env = {} }) {
   const out = [];
   const seen = new Set();
   const push = (model, source) => {
@@ -216,6 +242,146 @@ function collectAdversarialModelCandidates({ route, registry, modelClasses, env 
     push(modelRefFromCapabilityKey(key, value), "model-capabilities");
   }
   return out;
+}
+
+function resolveCrossFamilyConfiguredModel({
+  registry,
+  modelClasses,
+  modelClass,
+  preferredFamilies = [],
+  configuredModel = null,
+  env = {},
+} = {}) {
+  if (!CROSS_FAMILY_REVIEW_CLASSES.has(modelClass)) return null;
+  const implementer = configuredClassModel({ registry, modelClass: "code-strong", env });
+  const implementerProvider = providerOfModel(implementer?.model);
+  if (!implementerProvider) return null;
+  const currentProvider = providerOfModel(configuredModel?.model);
+  if (currentProvider && currentProvider !== implementerProvider) return null;
+
+  const candidates = collectAdversarialModelCandidates({
+    route: configuredModel ? { model: configuredModel.model, source: configuredModel.source } : null,
+    registry,
+    modelClasses,
+    env,
+  })
+    .filter((candidate) => {
+      const provider = providerOfModel(candidate.model);
+      if (!provider || provider === implementerProvider) return false;
+      if (ADVERSARIAL_OUT_OF_SCOPE_PROVIDERS.has(provider) || !ADVERSARIAL_IN_SCOPE_PROVIDERS.has(provider)) return false;
+      return true;
+    })
+    .sort((left, right) =>
+      preferredFamilyIndex(providerOfModel(left.model), preferredFamilies) -
+        preferredFamilyIndex(providerOfModel(right.model), preferredFamilies) ||
+      String(left.source ?? "").localeCompare(String(right.source ?? "")) ||
+      describeModel(left.model).localeCompare(describeModel(right.model))
+    );
+
+  const selected = candidates[0];
+  if (!selected) return null;
+  return {
+    source: `${selected.source}:cross-family`,
+    model: selected.model,
+    cross_family_selection: {
+      schema: "aipi.cross-family-review-selection.v1",
+      model_class: modelClass,
+      implementation_class: "code-strong",
+      implementation_provider: implementerProvider,
+      provider: providerOfModel(selected.model),
+      model: describeModel(selected.model),
+      reason: `${modelClass} must use a different configured model family than code-strong when available.`,
+    },
+  };
+}
+
+function preferredFamilyIndex(provider, preferredFamilies = []) {
+  const index = preferredFamilies.indexOf(provider);
+  return index >= 0 ? index : preferredFamilies.length + 1;
+}
+
+export async function inspectAdversarialFamilyIsolation({
+  root,
+  env = process.env,
+} = {}) {
+  const [modelClasses, registry] = await Promise.all([
+    readModelClasses(root),
+    readModelCapabilities(root),
+  ]);
+  return evaluateAdversarialFamilyIsolation({ modelClasses, registry, env });
+}
+
+export function evaluateAdversarialFamilyIsolation({
+  modelClasses = new Map(),
+  registry = null,
+  env = process.env,
+} = {}) {
+  const implementer = configuredClassModel({ registry, modelClass: "code-strong", env });
+  const implementerProvider = providerOfModel(implementer?.model);
+  const reviewClasses = [...CROSS_FAMILY_REVIEW_CLASSES].filter((modelClass) => modelClasses.has(modelClass));
+  const reviewRoutes = reviewClasses.map((modelClass) => {
+    const classMeta = modelClasses.get(modelClass) ?? {};
+    const configured = configuredClassModel({ registry, modelClass, env });
+    const selected = resolveCrossFamilyConfiguredModel({
+      registry,
+      modelClasses,
+      modelClass,
+      preferredFamilies: classMeta.preferred_families ?? [],
+      configuredModel: configured,
+      env,
+    }) ?? configured;
+    return {
+      model_class: modelClass,
+      model: describeModel(selected?.model),
+      provider: providerOfModel(selected?.model),
+      source: selected?.source ?? "none",
+      distinct_from_code_strong: Boolean(implementerProvider && providerOfModel(selected?.model) && providerOfModel(selected?.model) !== implementerProvider),
+    };
+  });
+  const configuredFamilies = configuredModelFamilies(registry, modelClasses, env);
+  const sameFamily = reviewRoutes.filter((route) => route.provider && route.provider === implementerProvider);
+  const distinctConfigured = implementerProvider && [...configuredFamilies].some((provider) =>
+    provider !== implementerProvider &&
+    ADVERSARIAL_IN_SCOPE_PROVIDERS.has(provider) &&
+    !ADVERSARIAL_OUT_OF_SCOPE_PROVIDERS.has(provider)
+  );
+  const state = !implementerProvider || !reviewRoutes.length
+    ? "not_applicable"
+    : sameFamily.length && !distinctConfigured
+      ? "warn"
+      : "pass";
+  return {
+    schema: "aipi.adversarial-family-isolation.v1",
+    state,
+    implementation_class: "code-strong",
+    implementation_model: describeModel(implementer?.model),
+    implementation_provider: implementerProvider ?? null,
+    configured_families: [...configuredFamilies].sort(),
+    review_routes: reviewRoutes,
+    evidence:
+      state === "warn"
+        ? `Only one configured model family (${implementerProvider}) is available; adversarial-heavy/verifier-fast run same-family-as-implementation, creating correlated blind spots.`
+        : state === "pass"
+          ? "Adversarial review classes resolve to a distinct configured model family when one is available."
+          : "Adversarial family isolation is not applicable because code-strong or review classes are unconfigured.",
+  };
+}
+
+function configuredModelFamilies(registry = null, modelClasses = new Map(), env = {}) {
+  const families = new Set();
+  for (const modelClass of modelClasses.keys()) {
+    const provider = providerOfModel(configuredClassModel({ registry: null, modelClass, env })?.model);
+    if (provider) families.add(provider);
+  }
+  for (const value of Object.values(registry?.classes ?? {})) {
+    const provider = providerOfModel(normalizeConfiguredModelRef(value));
+    if (provider) families.add(provider);
+  }
+  for (const [key, value] of Object.entries(registry?.models ?? {})) {
+    const provider = providerOfModel(modelRefFromCapabilityKey(key, value));
+    if (provider) families.add(provider);
+  }
+  return families;
 }
 
 function modelRefFromCapabilityKey(key, value = {}) {

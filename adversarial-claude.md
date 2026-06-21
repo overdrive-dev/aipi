@@ -6,7 +6,7 @@ This file is the handoff channel between Claude reviewer and Codex implementer.
 
 Current owner: CLAUDE
 Current status: CLOSED
-Open review round: 50 CLOSED (relationship cap interleaves per-type so no single type monopolizes + test_covers no longer matches generic `__init__`/`index` stems — proven with a 2601-edge fixture; blast-radius functional at scale); Rounds 29–50 all CLOSED
+Open review round: 52 CLOSED — direct natural-language code requests now (52-1) auto-dispatch the gated BDD→TDD workflow (bug→bugfix, feature→planning-first), (52-2) agent_end/turn_end/message_end registered with a real message_end claim-evidence BLOCK (unsupported fixed/passed/verified claim without an evidence rung is blocked; claim+evidence passes — both proven), and (52-3) deploy/prod stays host-delegated but readiness now emits a loud deploy.host_delegated: warn. All verified by tests I executed. Rounds 29–52 all CLOSED
 
 Note: Round 17 closed too early on a narrow basis. Round 19 is a full-project
 adversarial sweep (8 dimensions, every finding independently verified) and is the
@@ -10879,3 +10879,499 @@ visualization (Obsidian/Mermaid/HTML) finally shows useful structure.
 
 Current owner: CLAUDE
 Current status: CLOSED
+
+---
+
+# Round 51 — ACTIVE [HIGH] — Two real gaps found on the user's live run: (1) the worker never uses the hybrid retriever (only grep/read); (2) adversarial review is single-model (Opus reviews Opus)
+
+Found while inspecting the user's actual task run on the nora-app test repo (not a synthetic
+fixture). Both are backed by real artifacts, not reasoning.
+
+## ADV-51-1 [HIGH] — The worker bypasses the ENTIRE hybrid-retrieval subsystem; context = bash/grep + read, 0× graph/semantic tools
+
+**Symptom (user-observed):** during context gathering the agent "only uses grep, never consults the graphs."
+
+**Empirical proof — `nora-app/.aipi/runtime/tool-results.jsonl` (494 real tool calls this run):**
+
+| tool | calls |
+|---|---|
+| `bash` | 315 |
+| `read` | 112 |
+| `edit` | 47 |
+| `write` | 9 |
+| `aipi_kanban_update` | 5 |
+| `aipi_rule_lookup` | 2 |
+| `aipi_promote_memory` | 2 |
+| `aipi_memory_query` | 1 |
+| **`aipi_retrieve`** | **0** |
+| **`aipi_semantic_search`** | **0** |
+| **`aipi_impact`** | **0** |
+| **`aipi_callers`** | **0** |
+
+(The lone raw `aipi_impact`/`aipi_callers` string hits in the log are inside `"tool_name":"bash"`
+lines — the agent grepping for those strings — NOT real tool calls.) So the graph + bge-m3 vector
+subsystem we built across Rounds 40–50 was used **zero times** to gather code context.
+
+**Root cause — two context paths, neither delivers the graph to the worker:**
+1. **Deterministic prefetch** (`context-builder.js:92` `buildStepContext` → `materializeBlastRadius`
+   → `aipiRetrieve`) DOES run `aipi_retrieve` and writes its refs/relationships into `CONTEXT.json`
+   — but it only fires for **multi-step contract workflow steps**. Confirmed there is **no
+   `CONTEXT.json` anywhere** under either repo's `.aipi/runtime/runs`, so this path never ran for
+   the user's task.
+2. **Worker augmentation** (`subagents.js:1036-1052` `buildWorkerContextAugmentation`) is the only
+   thing the worker actually receives, and it is a **soft text nudge**:
+   `"- use aipi_retrieve for fused semantic/lexical/graph/rule context before editing; use
+   aipi_impact/aipi_callers for narrower follow-up."` plus a one-line graph *status* summary. It
+   injects **no actual refs/relationships** — just an instruction the LLM is free to (and did)
+   ignore in favor of familiar grep/read.
+
+**Impact:** the expensive embedding builds (the whole reason we fought Rounds 40–50, and the cache
+saga of 49) produce **zero value** for real coding tasks. The agent navigates blind via grep,
+exactly what the graph was meant to replace.
+
+**Fix direction (Codex):** make the worker's code context **deterministic**, mirroring
+`materializeBlastRadius`:
+- Before the worker runs, prefetch `aipiRetrieve({ query, ... })` using the worker's seeds
+  (`owned_files` + `expected_artifacts` + `artifact_target` + task/goal text) and **inject the
+  actual fused refs + relationships + governing_rules into `context_packet`** — not a sentence about
+  them. Keep the existing nudge as a secondary follow-up hint.
+- Degrade loudly: if `aipi_retrieve` is unavailable (no embeddings), say so in the packet instead of
+  silently falling back to a bare nudge.
+- Optionally record that retrieval fired (a provenance/tool-result entry) so we can prove it.
+
+**Proof of closure required (WF-01/WF-02 — must execute, not self-stamp):**
+- A test that builds a worker descriptor and asserts its `context_packet` contains **real graph
+  refs/relationships** sourced from `aipi_retrieve` (not just the nudge string).
+- On a fixture project with a built graph, assert the injected packet's relationships are a real
+  subset of the graph's edges for the seed files.
+
+## ADV-51-2 [MED→HIGH] — Adversarial review is single-model: every class resolves to claude-opus-4-8, so "different family than implementation" is silently void (Opus reviews Opus)
+
+**The user's question that surfaced this:** is the adversarial loop alternating two models
+(opus / gpt-5.5) in the nora-app repo? **No.**
+
+**Evidence — `nora-app/.aipi/model-capabilities.json`:** all 8 capability classes map to one model:
+```
+"adversarial-heavy": "anthropic/claude-opus-4-8",
+"code-strong":       "anthropic/claude-opus-4-8",
+"verifier-fast":     "anthropic/claude-opus-4-8",
+... (all 8) → anthropic/claude-opus-4-8
+```
+and the `models` map contains a **single** model. No OpenAI / second family is configured anywhere.
+
+**The defeated policy — `nora-app/.aipi/model-classes.yaml`:**
+- `adversarial-heavy.fallback_policy: "Prefer a different model family than the implementation
+  model when configured."`
+- `verifier-fast.fallback_policy: "Prefer a model family different from code-strong when possible."`
+
+Both are **silently moot**: with only Anthropic configured, the adversarial reviewer and the
+`code-strong` implementer resolve to the **same weights**. The reviewer cannot catch the class of
+errors it would itself make — the cross-family independence the design promises is absent, and
+**nothing warns** the user. (Contrast: this repo's manual loop DOES alternate Opus-reviewer ↔
+Codex/GPT-implementer — that independence is exactly what nora-app lacks.)
+
+**Fix direction (Codex):**
+- In the runtime model resolver: when **two families are configured**, resolve `adversarial-heavy`
+  and `verifier-fast` to a family **different from** `code-strong`'s resolved family.
+- When **only one family** is configured, **emit a loud readiness warning** (consistent with the
+  existing `model-capabilities.json` "missing mappings → readiness blocker" rule) that adversarial
+  review is running **same-family-as-implementation → correlated blind spots**, instead of silently
+  degrading. Do not hard-fail (single-provider users must still work), but never let it pass quietly.
+- **Drop `zai` from `preferred_families`** across the shipped `model-classes.yaml` template and the
+  nora-app copy (project decision — Z.ai/GLM not wanted). New lists: `[anthropic, openai]` (keep each
+  class's existing relative order otherwise; e.g. `context-fast` becomes `[openai, anthropic]`).
+
+**Proof of closure required:**
+- A test where two families are configured and `code-strong`→family A: assert `adversarial-heavy`
+  and `verifier-fast` resolve to a non-A family.
+- A test where one family is configured: assert a loud same-family warning is emitted (captured in
+  readiness output / lifecycle log), not silence.
+- Assert no `zai` remains in any `preferred_families` after the change.
+
+## Notes for Codex
+- 51-1 is the higher-value fix: it's why the user sees "only grep" and why the embedding work feels
+  wasted. Prioritize the deterministic worker prefetch.
+- Keep bge-m3/1024 pinned; do not touch chunking/cache. These changes are about *consumption* of the
+  graph (worker context) and *who reviews* (model family), not how the graph is built.
+- Run `node tools/test-aipi-tools.mjs`, `npm.cmd run validate`, `npm.cmd test` and paste real output.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX
+Requested next action: implement ADV-51-1 (deterministic worker graph prefetch) and ADV-51-2
+(cross-family reviewer resolution + loud same-family warning + remove zai), with executing-proof
+tests for each, then hand back to CLAUDE.
+
+### Codex handoff - Round 51 (2026-06-21)
+
+Implemented fixes:
+
+- **ADV-51-1 [HIGH]**: worker spawn now materializes deterministic retrieval context before building the worker prompt. `SubagentCoordinator` calls `aipiRetrieve` with worker seeds (`context_packet`, `owned_files`, expected artifacts, artifact target, task/goal text), injects an `AIPI deterministic retrieval prefetch` JSON block into the worker `context_packet`, and records a `worker_context_prefetch` trace event. If the graph/retriever is unavailable, the worker receives an explicit unavailable/skipped payload instead of a silent nudge.
+- **ADV-51-1 retrieval quality**: `aipi_retrieve` now treats explicit graph paths in the query as graph seeds, so worker-owned files pull real relationships from the graph even when exact lexical/semantic refs are sparse. The subagent fixture asserts the injected relationships are a subset of the fixture graph edges.
+- **ADV-51-2 [MED/HIGH]**: model routing now forces `adversarial-heavy` and `verifier-fast` to a configured family different from `code-strong` when an in-scope second family exists, including env-resolved routes. If only one configured family exists, readiness emits `model.adversarial_family_isolation: warn` with same-family/correlated-blind-spot evidence instead of passing silently.
+- **ADV-51-2 template cleanup**: removed `zai` from all shipped `preferred_families` in `templates/.aipi/model-classes.yaml`; relative OpenAI/Anthropic order was preserved per class.
+
+Changed files:
+
+- `extensions/aipi/runtime/aipi-tools.js`
+- `extensions/aipi/runtime/subagents.js`
+- `extensions/aipi/runtime/model-router.js`
+- `extensions/aipi/runtime/provider-auth.js`
+- `templates/.aipi/model-classes.yaml`
+- `tools/test-subagents.mjs`
+- `tools/test-model-router.mjs`
+- `tools/test-provider-auth.mjs`
+
+Validation run:
+
+- `node --check extensions/aipi/runtime/aipi-tools.js` -> passed.
+- `node --check extensions/aipi/runtime/subagents.js` -> passed.
+- `node --check extensions/aipi/runtime/model-router.js` -> passed.
+- `node --check extensions/aipi/runtime/provider-auth.js` -> passed.
+- `node tools/test-subagents.mjs` -> `AIPI_SUBAGENTS_TEST_OK`.
+- `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`.
+- `node tools/test-model-router.mjs` -> `AIPI_MODEL_ROUTER_TEST_OK`.
+- `node tools/test-provider-auth.mjs` -> `AIPI_PROVIDER_AUTH_TEST_OK`.
+- `npm.cmd run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`.
+- `npm.cmd test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`.
+- `git diff --check` -> no whitespace errors; only Git LF/CRLF normalization warnings.
+- `rg -n "zai" templates/.aipi/model-classes.yaml` -> no matches.
+
+Residual risks:
+
+- Single-provider projects remain allowed by design; they now get a readiness warning instead of a hard block.
+- The worker prefetch is deterministic and loud, but follow-up `aipi_impact`/`aipi_callers` use still depends on the worker needing narrower blast-radius detail after the prefetch.
+
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE
+
+## Claude verdict — Round 51 CLOSED (2026-06-21)
+
+Verified against real code + tests I executed myself (not Codex's self-reported PASS — WF-01/WF-02).
+Both fixes are genuine and their executing-proof tests assert exactly the closure bars I set.
+
+- **ADV-51-1 [High] FIXED — worker now gets the graph deterministically.** `SubagentCoordinator`
+  calls `#materializeWorkerRetrievalContext` BEFORE building the worker prompt, which runs
+  `buildWorkerRetrievalPrefetch` → real `aipiRetrieve({ projectRoot, query, limit })` over the
+  worker's seeds, and **injects the actual refs + relationships JSON into `context_packet`** (not a
+  nudge). Graph missing → explicit `status:"unavailable"` payload (loud, not silent). Re-read the
+  code: the injection is real and the trace event `worker_context_prefetch` records ref/relationship
+  counts. **Proof I required is met:** `test-subagents.mjs` asserts the worker task contains the
+  `AIPI deterministic retrieval prefetch` block with `status:"available"`, a real ref
+  (`src/review.js`) and a real edge (`calls → renewSubscription`), AND
+  `prefetchRelationshipKeys.every(k => graphRelationshipKeys.has(k)) === true` — injected
+  relationships are a strict subset of the fixture graph edges. `node tools/test-subagents.mjs` →
+  `AIPI_SUBAGENTS_TEST_OK` on my run.
+- **ADV-51-2 [Med→High] FIXED — reviewer no longer same-family-as-implementer, and silence is gone.**
+  `model-router.js` now resolves `adversarial-heavy`/`verifier-fast` to a configured family DIFFERENT
+  from `code-strong` when a second family exists (even overriding an env route), tagged
+  `source:"model-capabilities:cross-family"`. When only one family is configured,
+  `inspectAdversarialFamilyIsolation` returns `state:"warn"` with evidence
+  `"Only one configured model family (anthropic)"` + `distinct_from_code_strong:false` — a loud
+  readiness warning, not a hard block (single-provider users still work). `zai` removed from every
+  `preferred_families` in `templates/.aipi/model-classes.yaml` (`code-strong` → `["openai","anthropic"]`;
+  `grep zai` → none). `node tools/test-model-router.mjs` → `AIPI_MODEL_ROUTER_TEST_OK`,
+  `test-provider-auth.mjs` → `AIPI_PROVIDER_AUTH_TEST_OK` on my run.
+
+Tests I executed (not trusting self-stamp): `test-subagents`, `test-aipi-tools`, `test-model-router`,
+`test-provider-auth` all OK; `npm run validate` → `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6
+stages=24 skipConditions=8`; `npm test` → full chain through `AIPI_STEP_RESULT_TEST_OK`.
+
+**Zero open findings. Round 51 CLOSED. Rounds 29–51 all CLOSED.**
+
+Residual (not blockers, noted for honesty):
+- 51-1 guarantees the graph context is now **injected** into the worker (the core gap — it was
+  absent). Whether the LLM then leans on it vs. still greps is softer behavior, but the relations are
+  now IN the prompt instead of missing. Live re-verify below.
+- 51-2 cross-family only activates when a 2nd family is actually configured; nora-app today is
+  single-family, so it will (correctly) emit the same-family `warn` until a second provider is added.
+
+### Live re-verify for the user (nora-app)
+Re-run a real task on nora-app: the worker prompt should now contain an `AIPI deterministic retrieval
+prefetch` block with real refs/relationships from the graph (check `.aipi/runtime/*` traces for a
+`worker_context_prefetch` event with `relationship_count > 0`). And readiness should now show a loud
+`model.adversarial_family_isolation: warn` until a 2nd model family (e.g. an OpenAI route) is
+configured — at which point the adversarial reviewer auto-routes to it.
+
+Current owner: CLAUDE
+Current status: CLOSED
+Requested next action: none - adversarial loop closed.
+
+---
+
+# Round 52 — ACTIVE [HIGH] — Direct natural-language code requests never enter the BDD→TDD gate; the agent runs freestyle (decision: AUTO-DISPATCH)
+
+Found by inspecting the user's real run on nora-app after they confirmed they invoked the agent
+directly ("preciso que você faça X"), not via a workflow command. Backed by real artifacts.
+
+## ADV-52-1 [HIGH] — Substantive code work is classified correctly but only *suggested*, never dispatched → BDD/TDD pipeline is silently bypassed
+
+**Empirical proof — `nora-app/.aipi/runtime/code-pipeline.jsonl` (the system's own trace this run):**
+```json
+{ "schema": "aipi.code-pipeline-trace.v1", "classification": "substantive_code_work",
+  "substantive": true, "non_blocking": true, "workflow": null,
+  "stages": ["plan","adversarial_review","diff_review"],
+  "default_action": "suggest_workflow_only" }
+```
+And corroborating:
+- All **626** tool calls in `tool-results.jsonl` carry `"workflow":null`, `run_id:null`, `step_id:null`.
+- **No** `runtime/runs/` dir, and **no** `BDD-CONTRACT.md` / `TDD-GATE.md` / `TESTS.md` /
+  `IMPLEMENTATION.md` anywhere → the gated `planning(BDD) → tdd → implementation` chain never ran.
+
+**Root cause — `lifecycle-hooks.js`:**
+- `classifyAipiInputRoute` (`:476-482`): for any fresh natural-language code request that matches
+  `workflowForInput`, it returns **`{ intent:"suggest_workflow", workflowSuggestion, suggestedCommand:
+  "/aipi-workflow run <workflow>" }`** — a `suggestedCommand`, NOT `workflowArgs`.
+- `handleBeforeAgentStart` (`:283-298`): `if (route.suggestedCommand)` → it only `safeNotify`s a toast
+  and returns **`{ action: "continue" }`** → the agent proceeds freestyle.
+- The ONLY routes that actually dispatch (`workflowArgs` → `workflowCommandRunner`, `action:"handled"`)
+  are `status`, `continue_active_workflow`, and `review_active_workflow` — i.e. **status, or "ok/continue/
+  review" on an ALREADY-active run.** A fresh code request is never auto-entered into the gate.
+- `classifyAipiCodePipeline` runs in parallel but is `non_blocking: true` and only records a trace
+  (`default_action: "suggest_workflow_only"`) — advisory, no enforcement.
+
+**Net:** the entire BDD→TDD value proposition is **opt-in via a slash command the user must know and
+run**, surfaced only as a missable toast — even when the system itself labels the work
+`substantive_code_work`. Same failure family as 51-1 (machinery exists, real tasks aren't routed
+through it) and 51-2 (silent degradation instead of a loud/forcing action).
+
+## Decision (user-selected): AUTO-DISPATCH
+
+When classification is `substantive_code_work` (and NOT `trivial_or_mechanical` and NOT an explicit
+skip phrase), the request must **automatically dispatch into the gated workflow** instead of
+`suggest_workflow_only`. No confirmation prompt; fully autonomous BDD→TDD→implementation.
+
+**Fix direction (Codex):**
+- Make `classifyAipiInputRoute` (or the handler) return a **dispatching** route (`workflowArgs` →
+  `workflowCommandRunner`, `action:"handled"`) for substantive code work, not a `suggestedCommand`.
+- **Never skip BDD coverage** (routing.md invariant: *"Routing never skips BDD coverage"*; *"FEATURE
+  after contract acceptance"*). So pick the target workflow that STARTS at the gate:
+  - **bug intent** (`classifyAipiCodePipeline` → `root_cause_bugfix`) → dispatch **bugfix** (self-contained:
+    requirements → rule-check → tdd(failing regression) → implementation).
+  - **feature/other substantive code, no accepted contract** → dispatch **planning** (which produces
+    the accepted `BDD-CONTRACT.md`) and chain into feature — do NOT jump straight to feature
+    implementation with no contract.
+  - Honor existing invariants: higher-risk route wins; planning wins when business meaning is unclear;
+    bugfix wins over feature for broken behavior; ops stays policy-gated.
+- **Preserve escape hatches** (do not force the heavy workflow on everything):
+  - `trivial_or_mechanical` → quick lane / freestyle as today.
+  - explicit skip phrases (`classifyAipiCodePipeline` `explicit_skip_phrase`) → bypass honored.
+- **No double-dispatch / idempotency:** if a run is already active, continue it (existing behavior),
+  do not spawn a second run.
+- Update the trace: `default_action` becomes `auto_dispatch_workflow` (or similar) for substantive
+  code work, and record which workflow was dispatched + the resulting `run_id`.
+
+**Proof of closure required (WF-01/WF-02 — must execute, not self-stamp):**
+- Test: a fresh substantive code request with no active run → asserts `workflowCommandRunner` is
+  invoked with the gated workflow args and the handler returns `action:"handled"` (dispatch, not a
+  toast); trace `default_action` is auto-dispatch, not `suggest_workflow_only`.
+- Test: clear bug request → routes to **bugfix**; feature request with no accepted contract → routes
+  to **planning** (BDD contract first), NOT straight to feature implementation.
+- Test: `trivial_or_mechanical` and explicit-skip requests → NOT auto-dispatched (escape hatch intact).
+- Test: active run present → continuation ("ok/continue/review") still works; no duplicate run spawned.
+- Run `node tools/test-aipi-tools.mjs`, the lifecycle/route test (e.g. `test-lifecycle-hooks` if
+  present), `npm.cmd run validate`, `npm.cmd test`, and paste real output.
+
+## Notes for Codex
+- This is consumption/routing, not graph-build: do NOT touch chunking/cache/bge-m3.
+- Keep the 51-2 philosophy: when in doubt, the gate runs — never silently degrade a code task to
+  freestyle.
+
+## CLAUDE review TODO — fold these into the Round 52 review (do NOT close 52 until covered)
+
+User instruction (2026-06-21): when reviewing Round 52, also include the two extra "mandatory but
+soft-enforced" findings below. On Codex handback, verify 52-1 AND append these as ADV-52-2 / ADV-52-3
+and hand back rather than closing — 52 stays open until all are resolved.
+
+- **ADV-52-2 [HIGH] — turn-end & message-end disciplines are unenforced.** `lifecycle-hooks.js:80-177`
+  registers `session_*`, `before_agent_start`, `input`, `context`, `tool_call`, `model_select`,
+  `tool_result`, `before/after_provider_request` — but **`agent_end`, `turn_end`, `message_end` are
+  NOT registered.** Per `protocols/behavioral-discipline.md:33-36`, those carry `finish-turn`,
+  `outcome-first`, and the **`message_end` audit of the final reply for evidence rungs + outcome-first
+  shape**. So the `prove-it` discipline ("Before claims or status reports") that should verify the
+  agent's user-facing CLAIMS have evidence before display has **no runtime gate** — claims ship
+  unaudited. Declared mandatory in the Lifecycle Activation table, runs `prompt_only`. Fix: register
+  `agent_end`/`turn_end`/`message_end` and wire the finish-turn / outcome-first / claim-evidence
+  audit so it is `runtime_gate`, not prompt-only. Proof of closure: an executing test that the
+  message_end/turn_end hook fires and flags/records a claim lacking an evidence rung.
+- **ADV-52-3 [MED — partly by-design] — deploy/prod/migration safety is advisory, not blocking.**
+  `classifyAipiCodePipeline` deploy gate is `blocks_chat_or_editing:false`; `onboarding.js:1182`
+  ("deployment and production files are advisory planning artifacts only"); contract policyRule
+  ("tool-call approval gates are intentionally absent"). An irreversible deploy/migration command is
+  not runtime-gated; `confirm_before_execute` is prompt-only. Caveat: the contract says the host owns
+  permissions, so this is partly intentional — Codex should either (a) wire a real `tool_call` block
+  for irreversible prod/migration commands, or (b) if it stays host-delegated, make that explicit and
+  emit a loud readiness line so it is not mistaken for an enforced gate. Decide with evidence, do not
+  silently leave it advisory.
+
+Empirical context (this round's investigation): on the user's nora-app run, `review` /
+`local-verification` / `final-verification` / `memory-promotion` produced ZERO artifacts — but that
+is downstream of 52-1 (no workflow ran), so it should self-resolve once 52-1 dispatches the gate; it
+is NOT a separate finding.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX
+Requested next action: implement ADV-52-1 (auto-dispatch substantive_code_work into the gated
+BDD→TDD workflow, bug→bugfix / feature→planning-first, preserving trivial/skip escape hatches and
+active-run continuation), with executing-proof tests, then hand back to CLAUDE. NOTE: on handback,
+CLAUDE will also raise ADV-52-2 (register agent_end/turn_end/message_end to enforce
+finish-turn/outcome-first/claim-evidence) and ADV-52-3 (deploy/prod runtime gate vs. explicit
+host-delegated disclosure) before Round 52 can close.
+
+### Codex handoff - Round 52 ADV-52-1 (2026-06-21)
+
+Implemented ADV-52-1:
+
+- Fresh `root_cause_bugfix` requests now auto-dispatch with `workflowArgs: "run bugfix"` and return `action:"handled"` instead of showing a missable `/aipi-workflow run bugfix` suggestion.
+- Fresh feature/other substantive code requests now auto-dispatch with `workflowArgs: "run planning"` so BDD contract creation runs before feature implementation; the route intentionally does not jump straight to `feature`.
+- Explicit skip phrases still bypass the pipeline, and `trivial_or_mechanical` requests still avoid forced auto-dispatch.
+- If a run is already active, substantive code input routes to `execute` and records user input for the active run instead of spawning a second run.
+- `aipi.code_pipeline.trace` now records `default_action: "auto_dispatch_workflow"` plus a `dispatch` object with workflow, workflow args, result action, and resulting run id for auto-dispatched work.
+- Auto-dispatched requests are recorded into the newly created run's `USER-INPUT.jsonl` when a run id is available, preserving the user's natural-language request after the input hook handles the message.
+
+Changed files for ADV-52-1:
+
+- `extensions/aipi/runtime/lifecycle-hooks.js`
+- `tools/test-lifecycle-hooks.mjs`
+
+Validation run:
+
+- `node --check extensions/aipi/runtime/lifecycle-hooks.js` -> passed.
+- `node --check tools/test-lifecycle-hooks.mjs` -> passed.
+- `node tools/test-lifecycle-hooks.mjs` -> `AIPI_LIFECYCLE_HOOKS_TEST_OK`.
+- `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`.
+- `npm.cmd run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`.
+- `npm.cmd test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`.
+- `git diff --check` -> no whitespace errors; only Git LF/CRLF normalization warnings.
+
+Scope note:
+
+- This handoff covers the current requested action, ADV-52-1. I saw the `CLAUDE review TODO` for ADV-52-2 and ADV-52-3 in this same Round 52 section; I am not claiming Round 52 closure until Claude formalizes/verifies those follow-ups and hands them back.
+
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE
+Requested next action: verify ADV-52-1 and then either close that item or hand back ADV-52-2/ADV-52-3 as concrete implementation findings per the TODO above.
+
+## Claude verdict — ADV-52-1 VERIFIED (2026-06-21); Round 52 stays OPEN for ADV-52-2 / ADV-52-3
+
+Verified against real code + tests I executed myself (WF-01/WF-02), not Codex's self-reported PASS.
+
+- **ADV-52-1 [High] FIXED — substantive code requests now auto-dispatch the gated workflow.**
+  `classifyAipiInputRoute` (`lifecycle-hooks.js`) now: `explicit_skip_phrase` → `null` (bypass kept);
+  active run + substantive + non-trivial → `workflowArgs:"execute"` (continue, no second run);
+  otherwise `autoDispatchWorkflowForPipeline` → `intent:"auto_dispatch_workflow"`,
+  `workflowArgs:"run <wf>"`, `autoDispatch:true`. `root_cause_bugfix → bugfix`,
+  `substantive_code_work → planning` (BDD contract first — does NOT jump to feature). Handler dispatches
+  via `workflowCommandRunner` and returns `action:"handled"`; trace records
+  `default_action:"auto_dispatch_workflow"` + a `dispatch` object with workflow/args/run_id.
+  **Proofs I required, all met** (`test-lifecycle-hooks.mjs`): `"corrigir bug no login"` → dispatch
+  **bugfix**; `"implementar nova tela"` → dispatch **planning**; the router test asserts
+  `routerRunnerCalls[0].args==="run bugfix"`, `[1]==="run planning"` (runner ACTUALLY invoked, not a
+  toast) and handler returns `{action:"handled"}`; `"skip aipi pipeline e corrigir bug"` →
+  `{action:"continue"}` with `dispatch:null` (escape hatch); user input recorded into the new run's
+  `USER-INPUT.jsonl`. Tests I executed: `test-lifecycle-hooks` → `AIPI_LIFECYCLE_HOOKS_TEST_OK`,
+  `test-aipi-tools` → `AIPI_TOOLS_TEST_OK`, `npm run validate` → `AIPI_TEMPLATE_VALIDATION_OK`,
+  `npm test` → full chain through `AIPI_STEP_RESULT_TEST_OK`.
+
+ADV-52-1 is accepted. **Round 52 does NOT close** — ADV-52-2 and ADV-52-3 (specced in the CLAUDE
+review TODO above) are now the active requested action. Their closure bars:
+
+- **ADV-52-2 [HIGH]** — register `agent_end` + `turn_end` + `message_end` in the lifecycle hook map
+  (`lifecycle-hooks.js:80-177` currently omits all three) and wire `finish-turn` / `outcome-first` /
+  the `message_end` claim-evidence audit so they are `runtime_gate`, not `prompt_only`. Proof of
+  closure: an executing test that the registered hook fires at turn/message end and flags or records a
+  user-facing claim/status that lacks an evidence rung (the `prove-it` discipline actually enforced).
+- **ADV-52-3 [MED]** — decide with evidence: either (a) wire a real `tool_call` block for irreversible
+  prod/deploy/migration commands, or (b) keep it host-delegated but emit a loud readiness line so the
+  advisory deploy gate is never mistaken for an enforced one. Proof of closure: a test asserting either
+  the block fires on an irreversible command, or the readiness output carries the explicit
+  "deploy gate is advisory / host-delegated" disclosure.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX
+Requested next action: implement ADV-52-2 (register agent_end/turn_end/message_end and enforce
+finish-turn/outcome-first/claim-evidence at runtime) and ADV-52-3 (irreversible-deploy runtime block
+OR explicit loud host-delegated disclosure), each with an executing-proof test, then hand back to
+CLAUDE. Round 52 closes only when 52-1, 52-2, and 52-3 are all verified.
+
+### Codex handoff - Round 52 ADV-52-2/ADV-52-3 (2026-06-21)
+
+Implemented ADV-52-2:
+
+- Registered `agent_end`, `turn_end`, and `message_end` in `createAipiLifecycleHandlers`.
+- Added `handleEndDisciplineAudit`, which loads/records active disciplines for those hooks and writes `.aipi/runtime/discipline-audit.jsonl` plus run-scoped `discipline-audit.jsonl` when a run is active.
+- Added deterministic `message_end` claim-evidence enforcement: user-facing claims such as fixed/passed/works/verified/safe/done require an evidence rung or concrete command/test/artifact. Unsupported claims return `action:"block"` with reason `AIPI_MESSAGE_END_CLAIM_EVIDENCE_REQUIRED`.
+- Kept `agent_end` and `turn_end` as runtime audits that record finish-turn/outcome-first/claim-evidence checks; `message_end` is the blocking gate for unsupported final claims.
+- Updated `templates/.aipi/protocols/runtime-hooks.md`, `templates/.aipi/runtime-contract.json`, and `tools/validate-aipi-templates.mjs` so those hooks are now verified/registered rather than `prompt_only`.
+
+Implemented ADV-52-3 via option (b), explicit host-delegated disclosure:
+
+- Kept deploy/prod/migration parent-session command blocking host-delegated, consistent with the existing contract that parent-session permission policy was intentionally removed.
+- Added readiness check `deploy.host_delegated` with `state:"warn"` and evidence that AIPI ops workflow gates planning/review but does not provide a parent-session runtime block for irreversible deploy/prod/migration commands.
+- `formatAipiReadiness` now surfaces this warning because it already prints all non-pass checks. `tools/test-provider-auth.mjs` asserts the warning exists and includes `host-delegated`.
+
+Changed files for ADV-52-2/ADV-52-3:
+
+- `extensions/aipi/runtime/lifecycle-hooks.js`
+- `extensions/aipi/runtime/provider-auth.js`
+- `templates/.aipi/protocols/runtime-hooks.md`
+- `templates/.aipi/runtime-contract.json`
+- `tools/test-lifecycle-hooks.mjs`
+- `tools/test-provider-auth.mjs`
+- `tools/validate-aipi-templates.mjs`
+
+Validation run:
+
+- `node --check extensions/aipi/runtime/lifecycle-hooks.js` -> passed.
+- `node --check extensions/aipi/runtime/provider-auth.js` -> passed.
+- `node --check tools/test-lifecycle-hooks.mjs` -> passed.
+- `node --check tools/test-provider-auth.mjs` -> passed.
+- `node --check tools/validate-aipi-templates.mjs` -> passed.
+- `node tools/test-lifecycle-hooks.mjs` -> `AIPI_LIFECYCLE_HOOKS_TEST_OK`.
+- `node tools/test-provider-auth.mjs` -> `AIPI_PROVIDER_AUTH_TEST_OK`.
+- `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`.
+- `npm.cmd run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`.
+- `npm.cmd test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`.
+- `git diff --check` -> no whitespace errors; only Git LF/CRLF normalization warnings.
+
+Residual risks:
+
+- ADV-52-3 intentionally does not implement parent-session deploy command blocking; the chosen closure path is explicit readiness disclosure because host permissions/sandboxing own irreversible command control in this architecture.
+
+## Claude verdict — Round 52 CLOSED (2026-06-21)
+
+Verified against real code + tests I executed myself (WF-01/WF-02), not Codex's self-reported PASS.
+All three items confirmed genuine.
+
+- **ADV-52-1 [High] FIXED** (verified earlier) — substantive code requests auto-dispatch the gated
+  workflow (bug→bugfix, feature→planning-first); runner actually invoked, escape hatches + active-run
+  continuation preserved.
+- **ADV-52-2 [High] FIXED — turn/message-end disciplines now enforced.** `lifecycle-hooks.js:165-169`
+  now registers `agent_end`, `turn_end`, `message_end` (re-read: previously absent). `message_end` is a
+  real **blocking** gate: a final message making a claim (`fixed/passed/verified/safe/done`) with NO
+  evidence rung returns `action:"block"`, reason `AIPI_MESSAGE_END_CLAIM_EVIDENCE_REQUIRED`;
+  `agent_end`/`turn_end` are non-blocking audits. **Both sides proven** (`test-lifecycle-hooks.mjs:423-436`):
+  `"Fixed and safe to deploy."` → **block** with `unsupported_claims` incl. `fixed`; `"Fixed. Evidence:
+  ran \`npm test\` -> passed."` → **undefined (NOT blocked)** — the evidence-rung path prevents false
+  positives. `prove-it` recorded active at message_end + `discipline-audit.jsonl` written. The
+  claim-audit discipline is now `runtime_gate`, not prompt_only.
+- **ADV-52-3 [Med] FIXED via option (b) — explicit host-delegated disclosure.** Irreversible
+  deploy/prod/migration stays host-delegated (per the contract's intentional removal of parent-session
+  permission gates), but readiness now carries `deploy.host_delegated: warn` with evidence containing
+  `host-delegated`, surfaced by `formatAipiReadiness` — so the advisory deploy gate can no longer be
+  mistaken for an enforced one. Proven by `test-provider-auth.mjs` (`deployHostDelegatedCheck.state ===
+  "warn"`, evidence matches `/host-delegated/`, readiness string includes `deploy.host_delegated: warn`).
+
+Tests I executed: `test-lifecycle-hooks` → `AIPI_LIFECYCLE_HOOKS_TEST_OK`, `test-provider-auth` →
+`AIPI_PROVIDER_AUTH_TEST_OK`, `test-aipi-tools` → `AIPI_TOOLS_TEST_OK`; `npm run validate` →
+`AIPI_TEMPLATE_VALIDATION_OK`; `npm test` → full chain through `AIPI_STEP_RESULT_TEST_OK`.
+
+**Zero open findings. Round 52 CLOSED (52-1, 52-2, 52-3 all verified). Rounds 29–52 all CLOSED.**
+
+Net effect of 51+52: a real coding task now (51-1) carries deterministic graph context into the
+worker, (52-1) auto-enters the BDD→TDD gated workflow instead of running freestyle, and (52-2) cannot
+emit an unsupported "it's fixed/passed" claim without an evidence rung — closing the three places the
+mandatory machinery was previously bypassed or run optionally.
+
+Current owner: CLAUDE
+Current status: CLOSED
+Requested next action: none - adversarial loop closed.

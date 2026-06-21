@@ -139,10 +139,10 @@ try {
   assert.equal(classifyAipiInputRoute("ok continua", { activeRun: started }).workflowArgs, "execute");
   assert.equal(classifyAipiInputRoute("pode seguir", { activeRun: null }), null);
   assertWorkflowSuggestion(classifyAipiInputRoute("planejar regra de negocio"), "planning");
-  assertWorkflowSuggestion(classifyAipiInputRoute("corrigir bug no login"), "bugfix");
+  assertWorkflowDispatch(classifyAipiInputRoute("corrigir bug no login"), "bugfix", "root_cause_bugfix");
   assertWorkflowSuggestion(classifyAipiInputRoute("pesquisar docs do provider"), "research");
   assertWorkflowSuggestion(classifyAipiInputRoute("deploy em homolog"), "ops");
-  assertWorkflowSuggestion(classifyAipiInputRoute("implementar nova tela"), "feature");
+  assertWorkflowDispatch(classifyAipiInputRoute("implementar nova tela"), "planning", "substantive_code_work");
   assertWorkflowSuggestion(classifyAipiInputRoute("pequeno ajuste"), "quick");
   assert.equal(classifyAipiInputRoute("review adversarial", { activeRun: started }).workflowArgs, "execute");
   assertWorkflowSuggestion(classifyAipiInputRoute("review adversarial", { activeRun: null }), "planning");
@@ -158,6 +158,8 @@ try {
   assert.equal(classifyAipiInputRoute("me explica isso"), null);
   const bugPipeline = classifyAipiCodePipeline("corrigir bug no login");
   assert.equal(bugPipeline.classification, "root_cause_bugfix");
+  assert.equal(bugPipeline.default_action, "auto_dispatch_workflow");
+  assert.equal(bugPipeline.dispatch_workflow, "bugfix");
   assert.deepEqual(bugPipeline.stages, [
     "reproduce",
     "root_cause_hypotheses",
@@ -173,7 +175,14 @@ try {
   assert.equal(bugPipeline.cross_model_review.reviewer_distinct_from_implementer, true);
   const featurePipeline = classifyAipiCodePipeline("implementar nova tela");
   assert.equal(featurePipeline.classification, "substantive_code_work");
+  assert.equal(featurePipeline.workflow, "planning");
+  assert.equal(featurePipeline.default_action, "auto_dispatch_workflow");
+  assert.equal(featurePipeline.dispatch_workflow, "planning");
   assert.deepEqual(featurePipeline.stages, ["plan", "adversarial_review", "diff_review"]);
+  assert.equal(
+    classifyAipiCodePipeline("corrigir bug no login", { activeRun: started }).default_action,
+    "continue_active_workflow",
+  );
   const deployDefaultPipeline = classifyAipiCodePipeline("deploy em prod");
   assert.equal(deployDefaultPipeline.classification, "deploy_precheck");
   assert.deepEqual(deployDefaultPipeline.precheck.checks, [
@@ -263,25 +272,71 @@ try {
     const routerRunnerCalls = [];
     const routerNotifications = [];
     const routerEntries = [];
+    const routerUserInputs = [];
     const routerHandlers = createAipiLifecycleHandlers({
       pi: { appendEntry(type, data) { routerEntries.push({ type, data }); } },
       projectRootResolver: () => routerRoot,
       workflowCommandRunner: async (input) => {
         routerRunnerCalls.push(input);
-        return { action: "unexpected" };
+        if (input.args === "execute") {
+          const active = await readActiveRun(input.projectRoot);
+          return { action: "execute", execution: { runId: active.runId, status: active.state.status, state: active.state } };
+        }
+        const workflow = input.args.replace(/^run\s+/, "");
+        const runId = `fake-${workflow}-${routerRunnerCalls.length}`;
+        return {
+          action: "run",
+          run: {
+            runId,
+            workflow,
+            runRelDir: `.aipi/runtime/runs/${runId}`,
+            contractPath: `.aipi/runtime/runs/${runId}/BDD-CONTRACT.md`,
+          },
+          execution: {
+            runId,
+            status: "blocked",
+            state: { workflow, status: "blocked", current_step: "intake" },
+          },
+        };
+      },
+      userInputRecorder: async (input) => {
+        routerUserInputs.push(input);
+        return { record: input, relPath: "USER-INPUT.jsonl" };
       },
     });
-    for (const text of ["deploy no CI", "corrigir bug no login", "pipeline quebrou no deploy"]) {
-      const result = await routerHandlers.input(
-        { type: "input", text, source: "interactive" },
-        { cwd: routerRoot, ui: { notify(message, kind) { routerNotifications.push({ message, kind }); } } },
-      );
-      assert.deepEqual(result, { action: "continue" });
-    }
-    assert.equal(routerRunnerCalls.length, 0);
-    assert.equal(routerNotifications.length, 3);
+    const routerCtx = { cwd: routerRoot, ui: { notify(message, kind) { routerNotifications.push({ message, kind }); } } };
+
+    assert.deepEqual(
+      await routerHandlers.input({ type: "input", text: "deploy no CI", source: "interactive" }, routerCtx),
+      { action: "continue" },
+    );
+    assert.deepEqual(
+      await routerHandlers.input({ type: "input", text: "corrigir bug no login", source: "interactive" }, routerCtx),
+      { action: "handled" },
+    );
+    assert.deepEqual(
+      await routerHandlers.input({ type: "input", text: "implementar nova tela", source: "interactive" }, routerCtx),
+      { action: "handled" },
+    );
+    assert.deepEqual(
+      await routerHandlers.input({ type: "input", text: "skip aipi pipeline e corrigir bug", source: "interactive" }, routerCtx),
+      { action: "continue" },
+    );
+    assert.deepEqual(
+      await routerHandlers.input({ type: "input", text: "pequeno ajuste de texto", source: "interactive" }, routerCtx),
+      { action: "continue" },
+    );
+
+    assert.equal(routerRunnerCalls.length, 2);
+    assert.equal(routerRunnerCalls[0].args, "run bugfix");
+    assert.equal(routerRunnerCalls[1].args, "run planning");
+    assert.equal(routerUserInputs.length, 2);
+    assert.equal(routerUserInputs[0].runId, "fake-bugfix-1");
+    assert.equal(routerUserInputs[1].runId, "fake-planning-2");
     assert.match(routerNotifications[0].message, /\/aipi-workflow run ops/);
-    assert.match(routerNotifications[1].message, /\/aipi-workflow run bugfix/);
+    assert.match(routerNotifications[1].message, /AIPI workflow ran: bugfix/);
+    assert.match(routerNotifications[2].message, /AIPI workflow ran: planning/);
+    assert.match(routerNotifications.at(-1).message, /\/aipi-workflow run quick/);
     const deployTrace = routerEntries.find(
       (entry) => entry.type === "aipi.code_pipeline.trace" && entry.data.classification === "deploy_precheck",
     );
@@ -291,15 +346,41 @@ try {
     const bugTrace = routerEntries.find(
       (entry) => entry.type === "aipi.code_pipeline.trace" && entry.data.classification === "root_cause_bugfix",
     );
+    assert.equal(bugTrace.data.default_action, "auto_dispatch_workflow");
+    assert.equal(bugTrace.data.dispatch.workflow, "bugfix");
+    assert.equal(bugTrace.data.dispatch.workflow_args, "run bugfix");
+    assert.equal(bugTrace.data.dispatch.run_id, "fake-bugfix-1");
     assert.equal(bugTrace.data.stages.includes("verify_hypotheses"), true);
     assert.equal(bugTrace.data.root_cause.confirm_before_fix, true);
-    await assert.rejects(
-      () => fs.access(path.join(routerRoot, ".aipi", "runtime", "runs", "active")),
-      /ENOENT/,
+    const featureTrace = routerEntries.find(
+      (entry) => entry.type === "aipi.code_pipeline.trace" && entry.data.classification === "substantive_code_work",
     );
+    assert.equal(featureTrace.data.default_action, "auto_dispatch_workflow");
+    assert.equal(featureTrace.data.workflow, "planning");
+    assert.equal(featureTrace.data.dispatch.workflow, "planning");
+    assert.equal(featureTrace.data.dispatch.run_id, "fake-planning-2");
+    const skipTrace = routerEntries.find(
+      (entry) => entry.type === "aipi.code_pipeline.trace" && entry.data.reason === "explicit_skip_phrase",
+    );
+    assert.equal(skipTrace.data.dispatch, null);
+
+    const activeForContinuation = await startWorkflowRun({
+      projectRoot: routerRoot,
+      workflow: "feature",
+      now: () => new Date("2026-06-16T13:00:00.000Z"),
+      randomBytes: () => Buffer.from("445566", "hex"),
+    });
+    assert.deepEqual(
+      await routerHandlers.input({ type: "input", text: "corrigir outro bug", source: "interactive" }, routerCtx),
+      { action: "handled" },
+    );
+    assert.equal(routerRunnerCalls.at(-1).args, "execute");
+    assert.equal((await readActiveRun(routerRoot)).runId, activeForContinuation.runId);
+
     const explicit = await runWorkflowCommand({ args: "run bugfix", projectRoot: routerRoot });
     assert.equal(explicit.action, "run");
-    assert.equal((await readActiveRun(routerRoot)).state.workflow, "bugfix");
+    const activeAfterExplicit = await readActiveRun(routerRoot);
+    assert.equal(activeAfterExplicit.state.workflow, "bugfix");
   } finally {
     await fs.rm(routerRoot, { recursive: true, force: true });
   }
@@ -328,6 +409,51 @@ try {
     ),
     true,
   );
+  assert.equal(typeof handlers.agent_end, "function");
+  assert.equal(typeof handlers.turn_end, "function");
+  assert.equal(typeof handlers.message_end, "function");
+  assert.equal(
+    await handlers.agent_end({ type: "agent_end", text: "Evidence: ran `npm test` -> passed." }, ctx),
+    undefined,
+  );
+  assert.equal(
+    await handlers.turn_end({ type: "turn_end", text: "Done. Evidence: ran `npm test` -> passed." }, ctx),
+    undefined,
+  );
+  const blockedMessageEnd = await handlers.message_end({
+    type: "message_end",
+    message: { role: "assistant", content: "Fixed and safe to deploy." },
+  }, ctx);
+  assert.equal(blockedMessageEnd.action, "block");
+  assert.equal(blockedMessageEnd.reason, "AIPI_MESSAGE_END_CLAIM_EVIDENCE_REQUIRED");
+  assert.equal(blockedMessageEnd.audit.unsupported_claims.some((claim) => claim.term === "fixed"), true);
+  assert.equal(
+    await handlers.message_end({
+      type: "message_end",
+      message: { role: "assistant", content: "Fixed. Evidence: ran `npm test` -> passed." },
+    }, ctx),
+    undefined,
+  );
+  assert.equal(
+    entries.some(
+      (entry) =>
+        entry.type === "aipi.discipline.active" &&
+        entry.data.hook === "message_end" &&
+        entry.data.active_disciplines.includes("prove-it"),
+    ),
+    true,
+  );
+  assert.equal(
+    entries.some(
+      (entry) =>
+        entry.type === "aipi.discipline.end_audit" &&
+        entry.data.hook === "message_end" &&
+        entry.data.state === "block",
+    ),
+    true,
+  );
+  const disciplineAuditLog = await fs.readFile(path.join(tempRoot, ".aipi", "runtime", "discipline-audit.jsonl"), "utf8");
+  assert.match(disciplineAuditLog, /AIPI_MESSAGE_END_CLAIM_EVIDENCE_REQUIRED/);
 
   const longA = "A".repeat(1300);
   const longB = "B".repeat(1300);
@@ -723,6 +849,16 @@ function assertWorkflowSuggestion(route, workflow) {
   assert.equal(route.workflowSuggestion, workflow);
   assert.equal(route.suggestedCommand, `/aipi-workflow run ${workflow}`);
   assert.equal(Object.hasOwn(route, "workflowArgs"), false);
+}
+
+function assertWorkflowDispatch(route, workflow, classification) {
+  assert.equal(route.intent, "auto_dispatch_workflow");
+  assert.equal(route.workflowSuggestion, workflow);
+  assert.equal(route.workflowArgs, `run ${workflow}`);
+  assert.equal(route.autoDispatch, true);
+  assert.equal(route.recordInputAfterDispatch, true);
+  assert.equal(route.pipelineClassification, classification);
+  assert.equal(Object.hasOwn(route, "suggestedCommand"), false);
 }
 
 async function forceFastSemanticFallback(projectRoot) {

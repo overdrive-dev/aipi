@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import os from "node:os";
@@ -258,6 +259,50 @@ try {
 const piEntries = [];
 const piSubagentsCalls = [];
 const coordinatorRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-subagents-coordinator-"));
+const reviewSource = "import { renewSubscription } from './renewal.js';\nexport function reviewRenewal() {\n  return renewSubscription();\n}\n";
+const renewalSource = "export function renewSubscription() {\n  return 'price preserved';\n}\n";
+await fs.mkdir(path.join(coordinatorRoot, "src"), { recursive: true });
+await fs.mkdir(path.join(coordinatorRoot, ".aipi", "state"), { recursive: true });
+await fs.writeFile(path.join(coordinatorRoot, "src", "review.js"), reviewSource);
+await fs.writeFile(path.join(coordinatorRoot, "src", "renewal.js"), renewalSource);
+await fs.writeFile(
+  path.join(coordinatorRoot, ".aipi", "state", "aipi-graph.json"),
+  `${JSON.stringify({
+    schema: "aipi.code-graph.v1",
+    built_at: "2026-06-21T00:00:00.000Z",
+    source: "sqlite+lexical",
+    stale: false,
+    files: [
+      graphFile("src/review.js", reviewSource),
+      graphFile("src/renewal.js", renewalSource),
+    ],
+    symbols: [
+      { path: "src/review.js", name: "reviewRenewal", kind: "function", line: 2 },
+      { path: "src/renewal.js", name: "renewSubscription", kind: "function", line: 1 },
+    ],
+    relationships: [
+      {
+        source_kind: "file",
+        source_ref: "src/review.js",
+        relation: "calls",
+        target_kind: "symbol",
+        target_ref: "renewSubscription",
+        evidence: "references symbol defined in src/renewal.js",
+      },
+      {
+        source_kind: "file",
+        source_ref: "src/renewal.js",
+        relation: "defines",
+        target_kind: "symbol",
+        target_ref: "renewSubscription",
+        evidence: "line 1",
+      },
+    ],
+    run_outcomes: [],
+    sqlite: { path: ".aipi/state/aipi-graph.sqlite", status: "unavailable", engine: "node:sqlite" },
+    vector: { status: "unavailable", engine: "sqlite-vec", dimensions: 1024, embedding_model: "bge-m3" },
+  }, null, 2)}\n`,
+);
 const coordinator = new SubagentCoordinator(
   {
     appendEntry(name, value) {
@@ -328,6 +373,37 @@ assert.match(piSubagentsCalls[0].params.task, /AIPI worker id:/);
 assert.match(piSubagentsCalls[0].params.task, /AIPI injected context:/);
 assert.match(piSubagentsCalls[0].params.task, /memory_refs: \.aipi\/memory\/project\/business-rules\.md/);
 assert.match(piSubagentsCalls[0].params.task, /blast_radius_seeds: src\/review\.js/);
+assert.match(piSubagentsCalls[0].params.task, /AIPI deterministic retrieval prefetch:/);
+assert.match(piSubagentsCalls[0].params.task, /"source": "aipi_retrieve"/);
+assert.match(piSubagentsCalls[0].params.task, /"status": "available"/);
+assert.match(piSubagentsCalls[0].params.task, /"path": "src\/review\.js"/);
+assert.match(piSubagentsCalls[0].params.task, /"relation": "calls"/);
+assert.match(piSubagentsCalls[0].params.task, /"target_ref": "renewSubscription"/);
+const prefetchPayload = JSON.parse(
+  piSubagentsCalls[0].params.task.match(
+    /AIPI deterministic retrieval prefetch:\n([\s\S]*?)\nAIPI follow-up hint:/,
+  )?.[1] ?? "null",
+);
+assert.equal(prefetchPayload.source, "aipi_retrieve");
+const graphRelationshipKeys = new Set([
+  "file|src/review.js|calls|symbol|renewSubscription",
+  "file|src/renewal.js|defines|symbol|renewSubscription",
+]);
+const prefetchRelationshipKeys = prefetchPayload.relationships.map((edge) =>
+  [edge.source_kind, edge.source_ref, edge.relation, edge.target_kind, edge.target_ref].join("|"),
+);
+assert.equal(prefetchRelationshipKeys.includes("file|src/review.js|calls|symbol|renewSubscription"), true);
+assert.equal(prefetchRelationshipKeys.every((key) => graphRelationshipKeys.has(key)), true);
+assert.equal(
+  piEntries.some(
+    (entry) =>
+      entry.name === SUBAGENT_EVENT_ENTRY &&
+      entry.value.event === "worker_context_prefetch" &&
+      entry.value.status === "available" &&
+      entry.value.relationship_count > 0,
+  ),
+  true,
+);
 assert.equal(piSubagentsCalls[0].options.ctx.aipi_backend, "pi_subagents");
 assert.equal(piEntries.some((entry) => entry.name === SUBAGENT_STATE_ENTRY), true);
 assert.equal(piEntries.some((entry) => entry.name === SUBAGENT_EVENT_ENTRY && entry.value.event === "queued"), true);
@@ -707,6 +783,15 @@ async function writeEvidenceFile(root, relPath, content) {
   const target = path.join(root, relPath);
   await fs.mkdir(path.dirname(target), { recursive: true });
   await fs.writeFile(target, content);
+}
+
+function graphFile(relPath, content) {
+  return {
+    path: relPath,
+    line_count: content.split(/\r?\n/).length,
+    size: Buffer.byteLength(content, "utf8"),
+    hash: crypto.createHash("sha256").update(content).digest("hex"),
+  };
 }
 
 function makeSpawnStub(calls, handler) {

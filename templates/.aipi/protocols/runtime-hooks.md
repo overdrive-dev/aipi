@@ -18,9 +18,9 @@ contract.
 | `tool_call` | registered for discipline audit only | Observe lifecycle discipline moments without blocking tool calls. |
 | `tool_result` | registered | Normalize evidence and redact sensitive output. |
 | `user_bash` | registered for discipline audit only | Observe user-triggered `!` and `!!` commands without permission-policy blocking. |
-| `agent_end` | not registered; prompt_only discipline moment | Future turn-end discipline checks after the agent finishes a turn. |
-| `turn_end` | not registered; prompt_only discipline moment | Future run-state and observability flush after a full turn completes. |
-| `message_end` | not registered; prompt_only discipline moment | Future audit of user-facing claims and final reply shape before display. |
+| `agent_end` | registered | Runtime discipline audit after the agent finishes a turn. |
+| `turn_end` | registered | Runtime finish-turn/outcome-first audit after a full turn completes. |
+| `message_end` | registered | Runtime audit of user-facing claims and final reply shape before display. |
 | `session_before_compact` | registered | Preserve BDD contract and run state during compaction. |
 | `session_before_tree` | registered | Preserve branch summaries when navigating session history. |
 | `model_select` | registered | Reconcile manual model changes with the active agent class. |
@@ -41,8 +41,8 @@ contract.
   native Pi lifecycle events.
 - Behavioral disciplines are activated by lifecycle moment. Do not inject every
   discipline into every prompt.
-- Until the Pi extension implements a hook, any matching protocol rule is
-  `prompt_only`, not enforcement.
+- When AIPI registers a Pi hook, matching protocol rules can be runtime gates;
+  unregistered hooks remain `prompt_only`, not enforcement.
 - `pi.setActiveTools` is session-wide. Use it to initialize managed worker
   sessions or restore controller state carefully; do not use it as a replacement
   parent-session permission profile.

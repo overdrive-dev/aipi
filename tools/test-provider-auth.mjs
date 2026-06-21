@@ -225,6 +225,58 @@ try {
   });
   assert.equal(statusWithCapabilities.readiness.status, "needs_external_evidence");
   assert.equal(statusWithCapabilities.readiness.checks.find((check) => check.id === "model.capability_floors").state, "pass");
+  const deployHostDelegatedCheck = statusWithCapabilities.readiness.checks.find((check) => check.id === "deploy.host_delegated");
+  assert.equal(deployHostDelegatedCheck.state, "warn");
+  assert.match(deployHostDelegatedCheck.evidence, /host-delegated/);
+  assert.match(formatAipiReadiness(statusWithCapabilities.readiness), /deploy\.host_delegated: warn/);
+
+  await fs.writeFile(
+    path.join(projectRoot, ".aipi", "model-classes.yaml"),
+    `classes:
+  code-strong:
+    effort: medium
+    preferred_families: [anthropic, openai]
+  adversarial-heavy:
+    effort: high
+    preferred_families: [anthropic, openai]
+  verifier-fast:
+    effort: low
+    preferred_families: [anthropic, openai]
+`,
+  );
+  await fs.writeFile(
+    path.join(projectRoot, ".aipi", "model-capabilities.json"),
+    `${JSON.stringify({
+      schema: "aipi.model-capabilities.v1",
+      classes: {
+        "code-strong": "anthropic/claude-code",
+        "adversarial-heavy": "anthropic/claude-review",
+        "verifier-fast": "anthropic/claude-verify",
+      },
+      models: {
+        "anthropic:claude-code": { capabilities: {}, evidence: ["unit-test"] },
+        "anthropic:claude-review": { capabilities: {}, evidence: ["unit-test"] },
+        "anthropic:claude-verify": { capabilities: {}, evidence: ["unit-test"] },
+      },
+    }, null, 2)}\n`,
+  );
+  const sameFamilyStatus = await buildAipiStatusReport({
+    projectRoot,
+    env: { PI_CODING_AGENT_DIR: agentDir },
+    homeDir: tempRoot,
+  });
+  assert.equal(sameFamilyStatus.adversarialFamilyIsolation.state, "warn");
+  assert.equal(
+    sameFamilyStatus.readiness.checks.find((check) => check.id === "model.adversarial_family_isolation").state,
+    "warn",
+  );
+  assert.match(
+    sameFamilyStatus.readiness.checks.find((check) => check.id === "model.adversarial_family_isolation").evidence,
+    /same-family-as-implementation/,
+  );
+  assert.equal(sameFamilyStatus.readiness.status, "needs_external_evidence");
+  assert.match(formatAipiReadiness(sameFamilyStatus.readiness), /model\.adversarial_family_isolation: warn/);
+
   await fs.mkdir(path.join(projectRoot, ".aipi", "evals"), { recursive: true });
   await fs.writeFile(
     path.join(projectRoot, ".aipi", "evals", "model-pressure-verify-results.json"),

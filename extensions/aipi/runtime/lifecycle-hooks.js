@@ -22,6 +22,7 @@ const CODE_PIPELINE_LOG = ".aipi/runtime/code-pipeline.jsonl";
 const PROVIDER_PRICING_REL_PATH = ".aipi/provider-pricing.json";
 const PROVIDER_BUDGET_REL_PATH = ".aipi/provider-budget.json";
 const CONTEXT_EVENT_LOG = ".aipi/runtime/context-events.jsonl";
+const DISCIPLINE_AUDIT_LOG = ".aipi/runtime/discipline-audit.jsonl";
 const AGENT_CATALOG_REL_PATH = ".aipi/agents/catalog.yaml";
 const DISCIPLINE_CATALOG_REL_PATH = ".aipi/disciplines/catalog.yaml";
 
@@ -161,6 +162,12 @@ export function createAipiLifecycleHandlers({
     context: async (event, ctx) => handleContext({ event, projectRoot: rootFor(ctx, event) }),
     tool_call: async (event, ctx) =>
       handleDisciplineHook({ event, ctx, pi, projectRoot: rootFor(ctx, event), hook: "tool_call" }),
+    agent_end: async (event, ctx) =>
+      handleEndDisciplineAudit({ event, ctx, pi, projectRoot: rootFor(ctx, event), hook: "agent_end" }),
+    turn_end: async (event, ctx) =>
+      handleEndDisciplineAudit({ event, ctx, pi, projectRoot: rootFor(ctx, event), hook: "turn_end" }),
+    message_end: async (event, ctx) =>
+      handleEndDisciplineAudit({ event, ctx, pi, projectRoot: rootFor(ctx, event), hook: "message_end" }),
     model_select: async (event, ctx) => handleModelSelect({
       event,
       ctx,
@@ -252,9 +259,9 @@ export async function handleInput({
 } = {}) {
   if (!(await isAipiInstalled(projectRoot))) return { action: "continue" };
   const active = await readActiveRun(projectRoot).catch(() => null);
-  const route = classifyAipiInputRoute(event?.text ?? "", { activeRun: active });
   const codePipeline = classifyAipiCodePipeline(event?.text ?? "", { activeRun: active, projectRoot });
-  if (codePipeline.trace) {
+  const route = classifyAipiInputRoute(event?.text ?? "", { activeRun: active, codePipeline });
+  if (codePipeline.trace && !route?.autoDispatch) {
     await recordCodePipelineTrace({ projectRoot, pi, activeRun: active, pipeline: codePipeline }).catch(() => null);
   }
 
@@ -296,6 +303,7 @@ export async function handleInput({
       safeNotify(ctx, message, "info");
       return { action: "continue" };
     }
+    let recordedUserInput = false;
     if (route.recordUserInput) {
       await userInputRecorder({
         projectRoot,
@@ -303,6 +311,7 @@ export async function handleInput({
         text: event?.text ?? "",
         source: event?.source ?? "input",
       });
+      recordedUserInput = true;
     }
     const result = await workflowCommandRunner({
       args: route.workflowArgs,
@@ -310,18 +319,39 @@ export async function handleInput({
       adapter,
       parentInteractiveToolCallHook: "registered_parent_interactive_tool_call_hook",
     });
+    const blockedAfterCommand = activeRunFromWorkflowCommandResult(result);
+    if (route.recordInputAfterDispatch && blockedAfterCommand?.runId) {
+      await userInputRecorder({
+        projectRoot,
+        runId: blockedAfterCommand.runId,
+        text: event?.text ?? "",
+        source: event?.source ?? "input",
+      });
+      recordedUserInput = true;
+    }
+    if (codePipeline.trace && route.autoDispatch) {
+      await recordCodePipelineTrace({
+        projectRoot,
+        pi,
+        activeRun: active,
+        pipeline: codePipelineWithDispatch({ pipeline: codePipeline, route, result }),
+      }).catch(() => null);
+    }
     const entry = {
       schema: "aipi.input-route.v1",
       routed_at: new Date().toISOString(),
       input: route.intent,
       workflow_args: route.workflowArgs,
-      recorded_user_input: Boolean(route.recordUserInput),
+      workflow: route.workflowSuggestion ?? null,
+      auto_dispatch: Boolean(route.autoDispatch),
+      pipeline_classification: route.pipelineClassification ?? null,
+      recorded_user_input: recordedUserInput,
       active_run_id: active?.runId ?? null,
       result_action: result.action,
+      result_run_id: blockedAfterCommand?.runId ?? result?.run?.runId ?? null,
     };
     safeAppendEntry(pi, "aipi.input.route", entry);
     safeNotify(ctx, formatWorkflowCommandResult(result), "info");
-    const blockedAfterCommand = activeRunFromWorkflowCommandResult(result);
     if (isAwaitingUserInput(blockedAfterCommand) && hasPickerUi(ctx, blockedAfterCommand)) {
       const pickerResult = await handleBlockedRunPicker({
         event,
@@ -338,11 +368,22 @@ export async function handleInput({
     return { action: "handled" };
   } catch (error) {
     const message = `AIPI routing failed: ${error.message}`;
+    if (codePipeline.trace && route?.autoDispatch) {
+      await recordCodePipelineTrace({
+        projectRoot,
+        pi,
+        activeRun: active,
+        pipeline: codePipelineWithDispatch({ pipeline: codePipeline, route, error }),
+      }).catch(() => null);
+    }
     safeAppendEntry(pi, "aipi.input.route", {
       schema: "aipi.input-route.v1",
       routed_at: new Date().toISOString(),
       input: route.intent,
       workflow_args: route.workflowArgs,
+      workflow: route.workflowSuggestion ?? null,
+      auto_dispatch: Boolean(route.autoDispatch),
+      pipeline_classification: route.pipelineClassification ?? null,
       recorded_user_input: Boolean(route.recordUserInput),
       active_run_id: active?.runId ?? null,
       error: error.message,
@@ -451,7 +492,7 @@ export async function handleBlockedRunPicker({
   return { action: "handled" };
 }
 
-export function classifyAipiInputRoute(text, { activeRun = null } = {}) {
+export function classifyAipiInputRoute(text, { activeRun = null, codePipeline = null, projectRoot = null } = {}) {
   const original = String(text ?? "").trim();
   if (!original || original.startsWith("/") || original.startsWith("@")) return null;
   const normalized = normalizeInputText(original);
@@ -471,6 +512,29 @@ export function classifyAipiInputRoute(text, { activeRun = null } = {}) {
 
   if (continuableRun && /\b(review|revisao|revisar|adversarial|critica|auditoria)\b/.test(normalized)) {
     return { intent: "review_active_workflow", workflowArgs: "execute" };
+  }
+
+  const pipeline = codePipeline ?? classifyAipiCodePipeline(original, { activeRun, projectRoot });
+  if (pipeline.reason === "explicit_skip_phrase") return null;
+  if (continuableRun && pipeline.substantive && pipeline.classification !== "trivial_or_mechanical") {
+    return {
+      intent: "continue_active_workflow",
+      workflowArgs: "execute",
+      recordUserInput: true,
+      pipelineClassification: pipeline.classification,
+    };
+  }
+
+  const autoWorkflow = autoDispatchWorkflowForPipeline(pipeline);
+  if (autoWorkflow) {
+    return {
+      intent: "auto_dispatch_workflow",
+      workflowSuggestion: autoWorkflow,
+      workflowArgs: `run ${autoWorkflow}`,
+      autoDispatch: true,
+      recordInputAfterDispatch: true,
+      pipelineClassification: pipeline.classification,
+    };
   }
 
   const workflow = workflowForInput(normalized);
@@ -572,7 +636,8 @@ export function classifyAipiCodePipeline(text, { activeRun = null, projectRoot =
         reviewer_distinct_from_implementer: true,
         applies_to: "diagnosis_and_fix",
       },
-      default_action: activeWorkflow ? "continue_active_workflow" : "suggest_workflow_only",
+      default_action: activeWorkflow ? "continue_active_workflow" : "auto_dispatch_workflow",
+      dispatch_workflow: activeWorkflow ? null : "bugfix",
     };
   }
   if (codeIntent && !trivialIntent) {
@@ -582,8 +647,15 @@ export function classifyAipiCodePipeline(text, { activeRun = null, projectRoot =
       trace: true,
       non_blocking: true,
       active_run_id: activeRun?.runId ?? null,
+      workflow: "planning",
+      workflow_alignment: {
+        workflow: "planning.yaml",
+        stages: ["intake", "context", "requirements", "acceptance"],
+        reason: "BDD contract must be created before feature implementation.",
+      },
       stages: ["plan", "adversarial_review", "diff_review"],
-      default_action: activeWorkflow ? "continue_active_workflow" : "suggest_workflow_only",
+      default_action: activeWorkflow ? "continue_active_workflow" : "auto_dispatch_workflow",
+      dispatch_workflow: activeWorkflow ? null : "planning",
     };
   }
   if (trivialIntent) {
@@ -598,6 +670,13 @@ export function classifyAipiCodePipeline(text, { activeRun = null, projectRoot =
     };
   }
   return { classification: "not_code_work", substantive: false, trace: false };
+}
+
+function autoDispatchWorkflowForPipeline(pipeline = {}) {
+  if (pipeline.default_action !== "auto_dispatch_workflow") return null;
+  if (pipeline.classification === "root_cause_bugfix") return "bugfix";
+  if (pipeline.classification === "substantive_code_work") return "planning";
+  return null;
 }
 
 function resolveAutoDeployPolicy({ normalized, projectRoot = null, env = process.env }) {
@@ -678,6 +757,7 @@ async function recordCodePipelineTrace({ projectRoot, pi, activeRun = null, pipe
     adversarial_review: pipeline.adversarial_review ?? null,
     cross_model_review: pipeline.cross_model_review ?? null,
     default_action: pipeline.default_action ?? "continue",
+    dispatch: pipeline.dispatch ?? null,
   };
   safeAppendEntry(pi, "aipi.code_pipeline.trace", entry);
   await appendRuntimeEvent(projectRoot, CODE_PIPELINE_LOG, entry);
@@ -685,6 +765,127 @@ async function recordCodePipelineTrace({ projectRoot, pi, activeRun = null, pipe
     await appendRuntimeEvent(projectRoot, runScopedLog(activeRun.runId, "code-pipeline.jsonl"), entry);
   }
   return entry;
+}
+
+function codePipelineWithDispatch({ pipeline = {}, route = {}, result = null, error = null } = {}) {
+  const dispatchedRun = activeRunFromWorkflowCommandResult(result);
+  return {
+    ...pipeline,
+    workflow: route.workflowSuggestion ?? pipeline.workflow ?? null,
+    default_action: "auto_dispatch_workflow",
+    dispatch: {
+      action: "auto_dispatch_workflow",
+      workflow: route.workflowSuggestion ?? null,
+      workflow_args: route.workflowArgs ?? null,
+      run_id: dispatchedRun?.runId ?? result?.run?.runId ?? null,
+      result_action: error ? "error" : result?.action ?? null,
+      error: error?.message ?? null,
+    },
+  };
+}
+
+function auditEndDisciplineEvent({ event, hook, activeDisciplines = [] } = {}) {
+  const text = extractUserFacingText(event);
+  const claims = claimEvidenceFindings(text);
+  const outcome = outcomeFirstFinding(text);
+  const checks = [
+    {
+      id: "finish-turn",
+      state: "recorded",
+      evidence: activeDisciplines.some((discipline) => discipline.id === "finish-turn")
+        ? "finish-turn discipline activated for end-of-turn hook"
+        : "finish-turn discipline not active for inferred role/stage",
+    },
+    {
+      id: "outcome-first",
+      state: outcome ? "warn" : "pass",
+      evidence: outcome ?? "first sentence is outcome-oriented or no user-facing text was present",
+    },
+    {
+      id: "claim-evidence",
+      state: claims.length ? "block" : "pass",
+      evidence: claims.length
+        ? `unsupported claim(s): ${claims.map((claim) => claim.term).join(", ")}`
+        : "no unsupported fixed/passed/safe/done claim without an evidence rung",
+    },
+  ];
+  const state = hook === "message_end" && claims.length ? "block" : "pass";
+  return {
+    state,
+    reason: state === "block" ? "AIPI_MESSAGE_END_CLAIM_EVIDENCE_REQUIRED" : null,
+    message:
+      state === "block"
+        ? "AIPI message_end blocked: user-facing claim requires an evidence rung such as written/ran/verified plus a concrete command, test, or artifact."
+        : null,
+    text_excerpt: truncateText(text, 480),
+    checks,
+    unsupported_claims: claims,
+  };
+}
+
+function extractUserFacingText(event = {}) {
+  const candidates = [
+    event.text,
+    event.output,
+    event.content,
+    event.message?.content,
+    event.message?.text,
+    event.response?.content,
+  ];
+  for (const candidate of candidates) {
+    const text = flattenText(candidate).trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function flattenText(value) {
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(flattenText).filter(Boolean).join("\n");
+  if (typeof value === "object") {
+    if (typeof value.text === "string") return value.text;
+    if (typeof value.content === "string") return value.content;
+    if (Array.isArray(value.content)) return flattenText(value.content);
+  }
+  return "";
+}
+
+function claimEvidenceFindings(text) {
+  const normalized = normalizeInputText(text);
+  if (!normalized || hasEvidenceRung(text)) return [];
+  const claimPatterns = [
+    { term: "fixed", pattern: /\b(fixed|corrigido|corrigida|resolvido|resolvida|consertado|consertada)\b/ },
+    { term: "passes", pattern: /\b(passes|passed|passou|passaram|ok|green)\b/ },
+    { term: "works", pattern: /\b(works|working|funciona|funcionando)\b/ },
+    { term: "verified", pattern: /\b(verified|verificado|validado|validada|testado|testada)\b/ },
+    { term: "safe", pattern: /\b(safe|seguro|segura|safe to deploy|pronto para deploy)\b/ },
+    { term: "done", pattern: /\b(done|completed|complete|concluido|concluida|feito|feita)\b/ },
+  ];
+  return claimPatterns
+    .filter((claim) => claim.pattern.test(normalized))
+    .map((claim) => ({
+      term: claim.term,
+      evidence_required: "written|ran|verified plus concrete command/test/artifact",
+    }));
+}
+
+function hasEvidenceRung(text) {
+  const normalized = String(text ?? "").toLowerCase();
+  return /\b(written|ran|verified|blocked)\b/.test(normalized) ||
+    /\bevidence\b/.test(normalized) ||
+    /`[^`]*(npm|node|git|pytest|cargo|go test|pnpm|yarn)[^`]*`/.test(normalized) ||
+    /\b(npm|node|git|pytest|cargo|go test|pnpm|yarn)\b[^\n]*(->|passed|ok|exit\s*0|green)/.test(normalized) ||
+    /\b[A-Z0-9_]+_OK\b/.test(String(text ?? ""));
+}
+
+function outcomeFirstFinding(text) {
+  const firstSentence = String(text ?? "").trim().split(/(?<=[.!?])\s+/)[0] ?? "";
+  if (!firstSentence) return null;
+  if (/^(i will|i'll|vou|posso|i can|next|plan|planned|pretendo)\b/i.test(firstSentence.trim())) {
+    return "first sentence starts with process/intent instead of the user-facing outcome";
+  }
+  return null;
 }
 
 function normalizeInputText(text) {
@@ -857,6 +1058,35 @@ export async function handleDisciplineHook({ event, ctx, pi, projectRoot, hook }
   if (!(await isAipiInstalled(projectRoot))) return undefined;
   const snapshot = await buildRunSnapshot(projectRoot);
   await loadAndRecordActiveDisciplines({ projectRoot, snapshot, event, ctx, pi, hook });
+  return undefined;
+}
+
+export async function handleEndDisciplineAudit({ event, ctx, pi, projectRoot, hook }) {
+  if (!(await isAipiInstalled(projectRoot))) return undefined;
+  const snapshot = await buildRunSnapshot(projectRoot);
+  const activeDisciplines = await loadAndRecordActiveDisciplines({ projectRoot, snapshot, event, ctx, pi, hook });
+  const audit = auditEndDisciplineEvent({ event, hook, activeDisciplines });
+  const entry = {
+    schema: "aipi.end-discipline-audit.v1",
+    audited_at: new Date().toISOString(),
+    hook,
+    run_id: snapshot.run_id ?? null,
+    workflow: snapshot.workflow ?? null,
+    step_id: snapshot.step_id ?? null,
+    active_disciplines: activeDisciplines.map((discipline) => discipline.id),
+    ...audit,
+  };
+  safeAppendEntry(pi, "aipi.discipline.end_audit", entry);
+  await appendRuntimeEvent(projectRoot, DISCIPLINE_AUDIT_LOG, entry);
+  if (snapshot.active) await appendRuntimeEvent(projectRoot, runScopedLog(snapshot.run_id, "discipline-audit.jsonl"), entry);
+  if (audit.state === "block") {
+    return {
+      action: "block",
+      reason: audit.reason,
+      message: audit.message,
+      audit: entry,
+    };
+  }
   return undefined;
 }
 

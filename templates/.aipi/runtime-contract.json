@@ -320,6 +320,9 @@
       "session_tree",
       "input",
       "context",
+      "agent_end",
+      "turn_end",
+      "message_end",
       "model_select",
       "thinking_level_select",
       "user_bash",
@@ -327,35 +330,7 @@
       "before_provider_request",
       "after_provider_response"
     ],
-    "declaredPromptOnlyHooks": [
-      {
-        "hook": "agent_end",
-        "status": "prompt_only",
-        "usedBy": [
-          "finish-turn",
-          "outcome-first"
-        ],
-        "source": "templates/.aipi/protocols/runtime-hooks.md"
-      },
-      {
-        "hook": "turn_end",
-        "status": "prompt_only",
-        "usedBy": [
-          "finish-turn",
-          "outcome-first"
-        ],
-        "source": "templates/.aipi/protocols/runtime-hooks.md"
-      },
-      {
-        "hook": "message_end",
-        "status": "prompt_only",
-        "usedBy": [
-          "prove-it",
-          "outcome-first"
-        ],
-        "source": "templates/.aipi/protocols/runtime-hooks.md"
-      }
-    ],
+    "declaredPromptOnlyHooks": [],
     "lifecycleLog": ".aipi/runtime/lifecycle.jsonl",
     "contextEventLog": ".aipi/runtime/context-events.jsonl",
     "subagentRestoreEntry": "aipi.subagents.restore",
@@ -365,12 +340,13 @@
     "providerEventLog": ".aipi/runtime/provider-events.jsonl",
     "providerUsageLog": ".aipi/runtime/provider-usage.jsonl",
     "providerBudgetLog": ".aipi/runtime/provider-budget.jsonl",
+    "disciplineAuditLog": ".aipi/runtime/discipline-audit.jsonl",
     "providerPricingConfig": ".aipi/provider-pricing.json",
     "providerBudgetConfig": ".aipi/provider-budget.json",
     "handoffArtifact": ".aipi/runtime/runs/{{ run_id }}/SESSION-HANDOFF.md",
     "providerPayloadPolicy": "before_provider_request redacts obvious secret patterns and prunes duplicate/oversized AIPI context messages before returning the replacement payload to Pi.",
     "compactionSummarySchema": "aipi.compaction-summary.v1",
-    "rule": "Lifecycle hooks preserve active run pointers across session transitions, restore the latest aipi.subagents.state snapshot on session_start by marking queued/running workers interrupted, route recognized natural-language input through AIPI workflow commands before the agent turn, render the blocked-run picker with ctx.ui.select/ctx.ui.input when awaiting_user_input.options exists and ctx.hasUI is true, record picker answers before resuming awaiting_user_input runs, fall back to a visible textual prompt without swallowing headless free text, provide AIPI compaction summaries for active runs, inject and prune compact AIPI context pointers before provider calls, resolve model_select and thinking_level_select from event model_class, event agent_id, or the active workflow step using explicit env overrides, .aipi/model-capabilities.json class mappings, current-session models, and thinking-level policy, record manual model drift and unresolved class-only routes in .aipi/runtime/model-routing.jsonl, apply provider payload redaction/pruning before model calls, observe user_bash discipline hooks without blocking user commands through a permission policy, normalize provider token/cost usage when metadata is available, estimate missing cost only from fresh .aipi/provider-pricing.json rates that include source_url and checked_at metadata, report optional provider budget state from .aipi/provider-budget.json, record cost_unknown instead of zero spend when token usage has no provider cost or fresh local rate, and normalize tool/provider evidence without storing provider payloads or secrets. declaredPromptOnlyHooks records discipline hook names that are known from runtime-hooks.md but not implemented in verifiedHooks; they remain prompt_only until the runtime registers them."
+    "rule": "Lifecycle hooks preserve active run pointers across session transitions, restore the latest aipi.subagents.state snapshot on session_start by marking queued/running workers interrupted, route recognized natural-language input through AIPI workflow commands before the agent turn, render the blocked-run picker with ctx.ui.select/ctx.ui.input when awaiting_user_input.options exists and ctx.hasUI is true, record picker answers before resuming awaiting_user_input runs, fall back to a visible textual prompt without swallowing headless free text, provide AIPI compaction summaries for active runs, inject and prune compact AIPI context pointers before provider calls, resolve model_select and thinking_level_select from event model_class, event agent_id, or the active workflow step using explicit env overrides, .aipi/model-capabilities.json class mappings, current-session models, and thinking-level policy, record manual model drift and unresolved class-only routes in .aipi/runtime/model-routing.jsonl, apply provider payload redaction/pruning before model calls, run agent_end/turn_end/message_end discipline audits for finish-turn, outcome-first, and claim-evidence with message_end blocking unsupported fixed/passed/safe/done claims that lack a concrete evidence rung, observe user_bash discipline hooks without blocking user commands through a permission policy, normalize provider token/cost usage when metadata is available, estimate missing cost only from fresh .aipi/provider-pricing.json rates that include source_url and checked_at metadata, report optional provider budget state from .aipi/provider-budget.json, record cost_unknown instead of zero spend when token usage has no provider cost or fresh local rate, and normalize tool/provider evidence without storing provider payloads or secrets. declaredPromptOnlyHooks records discipline hook names that are known from runtime-hooks.md but not implemented in verifiedHooks; they remain prompt_only until the runtime registers them."
   },
   "isolationModel": {
     "v1": "pi_subagents",

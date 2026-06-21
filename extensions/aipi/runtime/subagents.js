@@ -15,6 +15,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { OwnedFileRegistry, wrapWriteToolWithOwnership } from "./owned-files.js";
 import { validateStepResult } from "./step-result.js";
+import { aipiRetrieve } from "./aipi-tools.js";
 import {
   BUILTIN_MODEL_CLASSES,
   loadKnownModelClassesSync,
@@ -528,6 +529,7 @@ export class SubagentCoordinator {
   async #spawnPiSubagentsWorker(job, signal) {
     if (signal?.aborted) throw new Error(`${job.agentId} was aborted before start`);
     const runner = normalizePiSubagentsRunner(this.#piSubagentsRunner, this.#pi, { root: this.#root });
+    await this.#materializeWorkerRetrievalContext(job);
     const prompt = buildWorkerPrompt(job);
     const spawnParams = {
       agent: "aipi-worker",
@@ -605,6 +607,16 @@ export class SubagentCoordinator {
       isolation: PI_SUBAGENTS_ISOLATION,
     });
     throw new Error(job.error);
+  }
+
+  async #materializeWorkerRetrievalContext(job) {
+    const prefetch = await buildWorkerRetrievalPrefetch({ descriptor: job.descriptor, root: this.#root });
+    this.#trace("worker_context_prefetch", job, prefetch.trace);
+    if (!prefetch.text) return;
+    job.descriptor = {
+      ...job.descriptor,
+      context_packet: [job.descriptor.context_packet?.trim(), prefetch.text].filter(Boolean).join("\n\n"),
+    };
   }
 
   #steerWorkerSession(_job, _message) {
@@ -1051,6 +1063,145 @@ function buildWorkerContextAugmentation({ descriptor = {}, root = process.cwd() 
   ].join("\n");
 }
 
+async function buildWorkerRetrievalPrefetch({ descriptor = {}, root = process.cwd(), limit = 8 } = {}) {
+  const graph = readGraphSummarySync(root);
+  const query = workerRetrievalQuery(descriptor);
+  const baseTrace = {
+    source: "aipi_retrieve",
+    query: query ? truncateText(query, 240) : null,
+    graph_status: graph.status,
+    graph_source: graph.source ?? null,
+  };
+  if (graph.status !== "available") {
+    const payload = {
+      schema: "aipi.worker-retrieval-prefetch.v1",
+      source: "aipi_retrieve",
+      status: "unavailable",
+      reason: "AIPI code graph is missing; run /aipi-onboard or rebuild the graph before spawning workers.",
+      graph,
+      refs: [],
+      relationships: [],
+    };
+    return {
+      text: workerRetrievalPrefetchText(payload),
+      trace: { ...baseTrace, status: payload.status, reason: payload.reason, ref_count: 0, relationship_count: 0 },
+    };
+  }
+  if (!query) {
+    const payload = {
+      schema: "aipi.worker-retrieval-prefetch.v1",
+      source: "aipi_retrieve",
+      status: "skipped",
+      reason: "No worker retrieval seeds were available.",
+      graph,
+      refs: [],
+      relationships: [],
+    };
+    return {
+      text: workerRetrievalPrefetchText(payload),
+      trace: { ...baseTrace, status: payload.status, reason: payload.reason, ref_count: 0, relationship_count: 0 },
+    };
+  }
+
+  try {
+    const retrieval = await aipiRetrieve({ projectRoot: root, query, limit });
+    const refs = compactWorkerRetrievalRefs(retrieval.refs, limit);
+    const relationships = compactWorkerRetrievalRelationships(retrieval.relationships, limit * 2);
+    const payload = {
+      schema: "aipi.worker-retrieval-prefetch.v1",
+      source: "aipi_retrieve",
+      status: "available",
+      query: truncateText(query, 600),
+      graph: retrieval.graph ?? graph,
+      fusion: retrieval.fusion ?? null,
+      refs,
+      relationships,
+      provenance: "prefetched before worker prompt from aipi_retrieve using worker seeds",
+    };
+    return {
+      text: workerRetrievalPrefetchText(payload),
+      trace: {
+        ...baseTrace,
+        status: payload.status,
+        ref_count: refs.length,
+        relationship_count: relationships.length,
+      },
+    };
+  } catch (error) {
+    const payload = {
+      schema: "aipi.worker-retrieval-prefetch.v1",
+      source: "aipi_retrieve",
+      status: "unavailable",
+      reason: String(error?.message ?? error),
+      graph,
+      refs: [],
+      relationships: [],
+    };
+    return {
+      text: workerRetrievalPrefetchText(payload),
+      trace: { ...baseTrace, status: payload.status, reason: payload.reason, ref_count: 0, relationship_count: 0 },
+    };
+  }
+}
+
+function workerRetrievalQuery(descriptor = {}) {
+  const parts = [
+    descriptor.task,
+    descriptor.goal,
+    descriptor.prompt,
+    descriptor.context_packet,
+    ...(descriptor.owned_files ?? []),
+    ...(descriptor.expected_artifacts ?? []),
+    descriptor.artifact_target,
+  ]
+    .filter(Boolean)
+    .map((item) => String(item).replaceAll("\\", "/").trim())
+    .filter(Boolean);
+  return uniqueStrings(parts).join("\n").slice(0, 4000);
+}
+
+function workerRetrievalPrefetchText(payload) {
+  return [
+    "AIPI deterministic retrieval prefetch:",
+    JSON.stringify(payload, null, 2),
+    "AIPI follow-up hint: use aipi_impact or aipi_callers only when this prefetch leaves a narrower blast-radius question.",
+  ].join("\n");
+}
+
+function compactWorkerRetrievalRefs(refs = [], limit = 8) {
+  return (refs ?? []).slice(0, Math.max(1, limit)).map((ref) => ({
+    path: ref.path ?? null,
+    line: ref.line ?? ref.ref?.span?.start_line ?? null,
+    source: ref.source ?? null,
+    excerpt: truncateText(ref.excerpt ?? ref.text ?? "", 360),
+    relationships: compactWorkerRetrievalRelationships(ref.relationships, 4),
+    governing_rules: compactWorkerRetrievalRelationships(ref.governing_rules, 4),
+  }));
+}
+
+function compactWorkerRetrievalRelationships(relationships = [], limit = 12) {
+  return (relationships ?? []).slice(0, Math.max(1, limit)).map((edge) => ({
+    source_kind: edge.source_kind ?? null,
+    source_ref: edge.source_ref ?? null,
+    relation: edge.relation ?? null,
+    target_kind: edge.target_kind ?? null,
+    target_ref: edge.target_ref ?? null,
+    evidence: edge.evidence ?? null,
+    source: edge.source ?? null,
+  }));
+}
+
+function uniqueStrings(values = []) {
+  const out = [];
+  const seen = new Set();
+  for (const value of values) {
+    if (seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
+
 function readGraphSummarySync(root) {
   try {
     const graph = JSON.parse(fsSync.readFileSync(path.join(root, ".aipi", "state", "aipi-graph.json"), "utf8"));
@@ -1062,6 +1213,11 @@ function readGraphSummarySync(root) {
   } catch {
     return { status: "missing", source: null, built_at: null };
   }
+}
+
+function truncateText(value, maxLength) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  return text.length <= maxLength ? text : `${text.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
 function currentHostModelFromContext(ctx = {}) {
