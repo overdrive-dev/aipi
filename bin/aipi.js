@@ -3,7 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createInterface } from "node:readline";
+import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 
 const currentFile = fileURLToPath(import.meta.url);
@@ -678,9 +678,12 @@ export async function runAipiMemory({
 }
 
 // CR-60-1: a readline-backed prompt UI so a bare interactive `aipi effort` can drive the setup wizard
-// from the terminal. Built only when the CLI is interactive and not in --json mode.
-function createCliPromptUi() {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+// from the terminal. Built only when the CLI is interactive and not in --json mode. Uses the PROMISE
+// readline API (`node:readline/promises`) so `rl.question()` actually awaits and RETURNS the user's
+// answer — the callback API returns `undefined`, which left `ui.input()` answer-less and broke the
+// bare-CLI wizard. `input`/`output` are injectable so the real UI can be exercised in tests.
+export function createCliPromptUi({ input = process.stdin, output = process.stdout } = {}) {
+  const rl = createInterface({ input, output });
   return {
     async input(question) {
       return rl.question(`${question}: `);
@@ -704,6 +707,8 @@ export async function runAipiModels({
   // non-interactive (piped/CI) callers stay status-only so stdout remains machine-safe.
   isInteractive = process.stdin?.isTTY === true,
   promptAdapter = null,
+  // Injectable streams for the readline prompt UI (tests drive the REAL createCliPromptUi this way).
+  promptStreams = null,
 } = {}) {
   let options;
   try {
@@ -718,7 +723,7 @@ export async function runAipiModels({
     const fns = modelsFns ?? await import("../extensions/aipi/runtime/models-command.js");
     // Pass a prompt UI ONLY for an interactive, non-JSON invocation. runModelsCommand then opens the
     // 4-bucket wizard for a bare action; explicit `status`/`setup ...` flags keep their behavior.
-    const ui = options.json ? null : (promptAdapter ?? (isInteractive ? createCliPromptUi() : null));
+    const ui = options.json ? null : (promptAdapter ?? (isInteractive ? createCliPromptUi(promptStreams ?? undefined) : null));
     try {
       const result = await fns.runModelsCommand({
         args: options.modelsArgs,

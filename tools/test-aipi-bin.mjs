@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import {
   aipiExtensionPaths,
   aipiProviderExtensionPaths,
@@ -23,6 +24,7 @@ import {
   readAipiPackageVersion,
   readPiVersion,
   runAipiMemory,
+  createCliPromptUi,
   runAipiModels,
   runAipiOnboard,
   runAipiDiagnose,
@@ -550,6 +552,20 @@ assert.deepEqual(JSON.parse(jsonUiOut[0]), { action: "setup", state: "ready" });
 // Non-interactive (piped/CI) -> no UI (status-only, never opens the wizard).
 await runAipiModels({ userArgs: [], isInteractive: false, log: () => {}, modelsFns: captureModelsFns });
 assert.equal(captureModelsFns.results.at(-1), null);
+
+// CR-60-1 regression: the CLI-created prompt UI must actually RETURN the typed answer. The callback
+// readline API made rl.question() return undefined (answer-less), which broke the bare-CLI wizard;
+// readline/promises awaits and resolves the line.
+{
+  const promptInput = new PassThrough();
+  const promptOutput = new PassThrough();
+  const cliUi = createCliPromptUi({ input: promptInput, output: promptOutput });
+  const answerPromise = cliUi.input("Doer model");
+  promptInput.write("openai-codex/gpt-5.5\n");
+  const answer = await answerPromise;
+  assert.equal(answer, "openai-codex/gpt-5.5", "createCliPromptUi.input() must resolve to the typed line");
+  cliUi.close();
+}
 
 const diagnoseOutput = [];
 const diagnoseResult = {

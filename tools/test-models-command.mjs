@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import {
   formatModelsCommandResult,
   parseModelsArgs,
@@ -352,44 +353,57 @@ try {
 
 // ===================================================================
 // CR-60-1 end-to-end CLI surface: a bare, interactive `aipi effort` (via runAipiModels) drives the
-// real setup wizard from the terminal and writes the config — not just the Pi command surface.
+// REAL terminal prompt UI (createCliPromptUi, NOT an injected adapter) over readline/promises and
+// writes the config. This exercises the exact path Codex flagged: the built UI must return answers.
 // ===================================================================
 const cliRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-effort-cli-"));
 try {
   await initProject({ sourceRoot: path.resolve("templates/.aipi"), targetRoot: cliRoot });
+  const cliInput = new PassThrough();
+  const cliOutput = new PassThrough();
   const cliAnswers = {
     planner: { model: "openai-codex/gpt-5.5", level: "high" },
     adversarial: { model: "anthropic/claude-opus-4-8", level: "high" },
     doer: { model: "openai-codex/gpt-5.5", level: "medium" },
     mover: { model: "anthropic/claude-haiku-4-5", level: "low" },
   };
+  // Respond to each wizard prompt as the REAL createCliPromptUi writes it to the output stream (the
+  // readline prompt) — order-independent and proves the built UI both writes prompts and reads answers.
   const cliPrompts = [];
-  const cliPromptAdapter = {
-    async input(question) {
-      cliPrompts.push(question);
-      for (const [bucket, answer] of Object.entries(cliAnswers)) {
-        if (new RegExp(`^${bucket}`, "i").test(question)) {
-          return /thinking level/i.test(question) ? answer.level : answer.model;
-        }
+  cliOutput.on("data", (chunk) => {
+    const question = chunk.toString();
+    if (!/model|thinking level/i.test(question)) return;
+    cliPrompts.push(question);
+    let answer = "";
+    for (const [bucket, value] of Object.entries(cliAnswers)) {
+      if (new RegExp(`^${bucket}`, "i").test(question.trim())) {
+        answer = /thinking level/i.test(question) ? value.level : value.model;
+        break;
       }
-      return "";
-    },
-  };
+    }
+    cliInput.write(`${answer}\n`);
+  });
   const cliOut = [];
-  // Bare CLI `aipi effort` (classifyAipiInvocation strips the "effort" token) + interactive TTY.
+  // Bare CLI `aipi effort` (classifyAipiInvocation strips the "effort" token) + interactive TTY,
+  // driving the real readline-backed prompt UI through injected streams (no promptAdapter).
   const cliResult = await runAipiModels({
     cwd: cliRoot,
     userArgs: ["--target", cliRoot],
     isInteractive: true,
-    promptAdapter: cliPromptAdapter,
+    promptStreams: { input: cliInput, output: cliOutput },
     log: (line) => cliOut.push(line),
   });
   assert.equal(cliResult.action, "setup", "bare interactive CLI `aipi effort` must run the wizard");
   assert.equal(cliResult.state, "ready");
-  assert.equal(cliPrompts.some((prompt) => /^Doer.*model/i.test(prompt)), true);
+  // The real terminal UI actually emitted the bucket prompts (not a no-op stub).
+  assert.equal(cliPrompts.some((prompt) => /^Doer.*model/i.test(prompt.trim())), true);
   const cliConfig = JSON.parse(await fs.readFile(path.join(cliRoot, ".aipi", "model-capabilities.json"), "utf8"));
-  assert.equal(cliConfig.classes["code-strong"], "openai-codex/gpt-5.5");
+  // The real terminal UI collected the typed answers and fanned them out to the bucket classes.
+  assert.equal(cliConfig.classes["code-strong"], "openai-codex/gpt-5.5"); // doer
   assert.equal(cliConfig.classes["adversarial-heavy"], "anthropic/claude-opus-4-8");
+  assert.equal(cliConfig.classes["context-fast"], "anthropic/claude-haiku-4-5"); // mover
+  assert.equal(cliConfig.class_thinking["code-strong"], "medium");
+  assert.equal(cliConfig.class_thinking["context-fast"], "low");
 } finally {
   await fs.rm(cliRoot, { recursive: true, force: true });
 }
