@@ -502,11 +502,7 @@ async function executeFanoutSubagentStep({
       collectTimeoutMs,
     });
     if (!collect.ready) {
-      return blockedStepResult({
-        step,
-        agentId: worker.agent_id,
-        reason: `fan-out worker ${worker.agent_id} did not finish: ${collect.state ?? "unknown"}`,
-      });
+      return workerOutcomeOrThrow({ step, agentId: worker.agent_id, collect });
     }
     collected.push(collect);
   }
@@ -589,11 +585,7 @@ async function executeSubagentStep({
     collectTimeoutMs,
   });
   if (!collect.ready) {
-    return blockedStepResult({
-      step,
-      agentId,
-      reason: `worker ${agentId} did not finish: ${collect.state ?? "unknown"}`,
-    });
+    return workerOutcomeOrThrow({ step, agentId, collect });
   }
   return {
     ...collect.step_result,
@@ -637,6 +629,25 @@ function blockedStepResult({ step, agentId, reason }) {
     ],
     artifacts: [],
   };
+}
+
+// When a worker did not finish, a TRANSIENT provider failure (e.g. an Anthropic overloaded_error/529 or
+// a 429 rate-limit that the worker's own LLM calls hit) is THROWN so executeStepWithTransientRetries
+// retries the step with backoff — a single 529 burst then self-heals instead of hard-blocking the whole
+// run. A STRUCTURAL failure (bad config, invalid schema, unknown model class, …) returns a plain block
+// (fail-loud, no retry). The classification probe carries ONLY collect.state + collect.error so a config
+// error can't accidentally look transient.
+function workerOutcomeOrThrow({ step, agentId, collect }) {
+  const detail = collect?.error ?? collect?.abort_reason ?? null;
+  const reason = `worker ${agentId} did not finish: ${collect?.state ?? "unknown"}${detail ? ` (${detail})` : ""}`;
+  // Only the worker's reported error (a real provider error envelope) classifies as transient — NOT the
+  // collect STATE. A bare collect "timeout" means the worker ran past the 20-min ceiling (structural —
+  // retrying would just burn another 20 min), so it blocks; a provider overloaded_error/429 in the
+  // worker error retries with backoff.
+  if (detail && isTransientProviderError({ message: String(detail) })) {
+    throw new Error(reason);
+  }
+  return blockedStepResult({ step, agentId, reason });
 }
 
 export function assertControllerWriteAllowed({ root, state, step, relPath, internal = false }) {

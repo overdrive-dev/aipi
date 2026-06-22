@@ -222,7 +222,11 @@ export class SubagentCoordinator {
   collect(agentId) {
     const job = this.#requireJob(agentId);
     if (job.state !== JobState.DONE) {
-      return { agent_id: agentId, ready: false, state: job.state };
+      // Surface the captured failure reason (e.g. an Anthropic overloaded_error/429 from the worker's
+      // own LLM calls) so the executor can classify it as a transient provider error and RETRY with
+      // backoff instead of blocking the whole run on a "did not finish: failed" with no actionable
+      // reason. Additive — existing { ready, state } consumers are unaffected.
+      return { agent_id: agentId, ready: false, state: job.state, error: job.error ?? null, abort_reason: job.abortReason ?? null };
     }
     return {
       agent_id: agentId,
@@ -377,6 +381,9 @@ export class SubagentCoordinator {
         job.error ??= String(err?.message ?? err);
         this.#trace("cancelled", job, { reason: job.abortReason, error: job.error });
       }
+      // Release the failed/cancelled worker's owned-file allocation immediately so a transient-retry
+      // re-spawn of the same step can re-allocate those files instead of hitting an owned-file conflict.
+      this.#registry.release(job.agentId);
     } finally {
       if (budgetTimer) clearTimeout(budgetTimer);
       job.finishedAt = Date.now();

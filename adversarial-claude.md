@@ -13558,3 +13558,39 @@ abandoned mid-work and stamped BLOCKED, while the worker finished a minute later
 
 Current owner: CODEX
 Current status: WAITING_FOR_CODEX_REVIEW
+
+---
+
+## Round 62 — CLAUDE finds + fixes: ADV-62-2 transient Anthropic 529 overload hard-blocked the run (no retry, no real reason, no resource release)
+
+User updated aipi, re-ran bugfix, still blocked on triage. Multi-agent investigation (3 agents) was
+DECISIVE: the forked worker's LLM calls returned a literal Anthropic envelope
+`{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"req_..."}` on all
+4 attempts — an HTTP 529 CAPACITY rejection (request_id minted AFTER auth ⇒ NOT auth/billing; auth would be
+401/402/403, absent). Same auth/model/code as a run that succeeded 40 min earlier. So it is a TRANSIENT
+provider overload that should be RETRIED — but three engine gaps turned it into a hard block:
+
+### ADV-62-2 [CRITICAL] — Worker transient provider failures (529/429/overload) hard-block instead of retrying
+- Gap 1: `SubagentCoordinator.collect()` returned `{ready:false, state:"failed"}` and DROPPED `job.error`, so
+  the overloaded_error text never reached the classifier. Fix (`subagents.js`): collect() now surfaces
+  `error` + `abort_reason` for non-DONE jobs.
+- Gap 2: `executeSubagentStep`/`executeFanoutSubagentStep` RETURNED a plain `blockedStepResult` on a worker
+  failure, so `executeStepWithTransientRetries` (which only retries on a THROW) never engaged — the worker
+  path bypassed the whole transient-retry mechanism. Fix (`workflow-executor.js`): new `workerOutcomeOrThrow`
+  THROWS when the worker's error matches `isTransientProviderError` (overloaded_error/429/529/503/504/rate-limit/
+  timeout) so the backoff/retry loop runs; otherwise returns a plain block (fail-loud for config errors). A
+  bare collect "timeout" stays a plain block (no point retrying a 20-min ceiling).
+- Gap 3 (surfaced by the retry): a FAILED worker's owned-file allocation wasn't released until cleanup, so a
+  retry re-spawn hit "owned-file conflict". Fix (`subagents.js`): release the failed/cancelled worker's
+  owned files immediately in the job catch.
+- Net: a transient 529 burst now self-heals (retry with backoff); after maxAttempts it surfaces as a proper
+  transient-provider blocked-with-question instead of a generic "did not finish: failed".
+- Proof (`tools/test-workflow-executor.mjs`, real SubagentCoordinator + flaky runner): (a) 2×529 then PASS ⇒
+  `transient_provider_retries.recovered:true`, attempts:3; (b) always-529 ⇒ blocked "transient provider
+  failure after 3 attempts"; (c) a non-transient "unknown model class" worker error is NOT retried (spawned
+  once) ⇒ plain block. Full `npm test` green.
+- Optional follow-up: give workers an Anthropic fallback model (fallbackModels:[] today) so a 529 on one model
+  falls to another within the worker itself.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX_REVIEW

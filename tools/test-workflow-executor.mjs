@@ -843,6 +843,58 @@ try {
   assert.equal(transientBlocked.state.consecutive_failures, 0);
   assert.equal(transientBlockedAdapter.attempts.quick_scope, 3);
 
+  // WORKER-PATH transient retry (ADV-62-2): the subagent adapter's worker return-path now routes a
+  // transient provider failure (an Anthropic overloaded_error/529 surfaced by the worker's own LLM
+  // calls) through the transient-retry/backoff loop — previously only inline THROWING adapters retried,
+  // and a worker failure hard-blocked the run with a generic "did not finish: failed".
+  const overloadEnvelope = '{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"req_x"}';
+  const flakyWorkerRunner = ({ failFirst = 0, alwaysFail = false, error = overloadEnvelope } = {}) => {
+    const calls = [];
+    const base = fakeWorkflowRunner({ calls: [], rawWrites: [], root: tempRoot });
+    let spawns = 0;
+    return {
+      spawnCount: () => spawns,
+      calls,
+      async spawn(params) {
+        spawns += 1;
+        calls.push(params);
+        if (alwaysFail || spawns <= failFirst) throw new Error(error);
+        return base.spawn(params);
+      },
+    };
+  };
+  const workerAdapterFor = (coordinator) =>
+    createSubagentWorkflowAdapter(coordinator, {
+      pollIntervalMs: 1,
+      collectTimeoutMs: 2_000,
+      modelResolver: async () => ({ model_class: "code-strong", model: { provider: "anthropic", id: "x" }, thinking_level: "medium", source: "t" }),
+    });
+  const coordinatorWith = (runner) =>
+    new SubagentCoordinator({ appendEntry() {} }, { root: tempRoot, maxConcurrent: 1, piSubagentsRunner: runner });
+
+  // (a) recovers: the first 2 worker spawns 529, the 3rd succeeds -> quick_scope PASSes via the retry loop.
+  const wRetryRun = await startWorkflowRun({ projectRoot: tempRoot, workflow: "quick", now: () => fixedDate, randomBytes: fixedRandom });
+  const recoverRunner = flakyWorkerRunner({ failFirst: 2 });
+  await executeWorkflowRun({ projectRoot: tempRoot, runId: wRetryRun.runId, now: () => fixedDate, adapter: workerAdapterFor(coordinatorWith(recoverRunner)) });
+  const wScope = JSON.parse(await fs.readFile(path.join(tempRoot, ".aipi", "runtime", "runs", wRetryRun.runId, "steps", "quick_scope", "RESULT.json"), "utf8"));
+  assert.equal(wScope.result.transient_provider_retries?.recovered, true, "worker transient failure recovers via retry");
+  assert.equal(wScope.result.transient_provider_retries?.attempts, 3);
+
+  // (b) always-529: blocks as a TRANSIENT-provider failure (with the retry question), not a generic block.
+  const wBlockRun = await startWorkflowRun({ projectRoot: tempRoot, workflow: "quick", now: () => fixedDate, randomBytes: fixedRandom });
+  const wBlocked = await executeWorkflowRun({ projectRoot: tempRoot, runId: wBlockRun.runId, now: () => fixedDate, adapter: workerAdapterFor(coordinatorWith(flakyWorkerRunner({ alwaysFail: true }))) });
+  assert.equal(wBlocked.status, "blocked");
+  assert.match(wBlocked.state.blocked_reason, /transient provider failure after 3 attempts/);
+  assert.equal(wBlocked.state.consecutive_failures, 0);
+
+  // (c) a NON-transient worker failure (bad config) is NOT retried — plain block, spawned once.
+  const wConfigRun = await startWorkflowRun({ projectRoot: tempRoot, workflow: "quick", now: () => fixedDate, randomBytes: fixedRandom });
+  const configRunner = flakyWorkerRunner({ alwaysFail: true, error: "unknown model class for worker" });
+  const wConfig = await executeWorkflowRun({ projectRoot: tempRoot, runId: wConfigRun.runId, now: () => fixedDate, adapter: workerAdapterFor(coordinatorWith(configRunner)) });
+  assert.equal(wConfig.status, "blocked");
+  assert.doesNotMatch(wConfig.state.blocked_reason ?? "", /transient provider failure/);
+  assert.equal(configRunner.spawnCount(), 1, "a non-transient worker failure must not be retried");
+
   const cascadeRun = await startWorkflowRun({
     projectRoot: tempRoot,
     workflow: "quick",
