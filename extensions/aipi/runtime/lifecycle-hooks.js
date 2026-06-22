@@ -11,6 +11,7 @@ import { latestSubagentStateFromEntries } from "./subagents.js";
 import { createSubagentWorkflowAdapter, parseWorkflowDefinition } from "./workflow-executor.js";
 import { describeModel, resolveModelClass, resolveStepModel } from "./model-router.js";
 import { aipiImpact } from "./aipi-tools.js";
+import { aipiHostModelReadiness } from "./pi-subagents.js";
 
 const LIFECYCLE_LOG = ".aipi/runtime/lifecycle.jsonl";
 const TOOL_RESULT_LOG = ".aipi/runtime/tool-results.jsonl";
@@ -56,6 +57,8 @@ export function registerAipiLifecycleHooks(pi, {
   coordinator = null,
   workflowCommandRunner = runWorkflowCommand,
   userInputRecorder = recordWorkflowUserInput,
+  intentClassifier = null,
+  intentClassifierTimeoutMs = 1500,
 } = {}) {
   const handlers = createAipiLifecycleHandlers({
     pi,
@@ -63,6 +66,8 @@ export function registerAipiLifecycleHooks(pi, {
     coordinator,
     workflowCommandRunner,
     userInputRecorder,
+    intentClassifier,
+    intentClassifierTimeoutMs,
   });
   for (const [eventName, handler] of Object.entries(handlers)) {
     pi.on?.(eventName, handler);
@@ -76,6 +81,8 @@ export function createAipiLifecycleHandlers({
   coordinator = null,
   workflowCommandRunner = runWorkflowCommand,
   userInputRecorder = recordWorkflowUserInput,
+  intentClassifier = null,
+  intentClassifierTimeoutMs = 1500,
 } = {}) {
   const rootFor = (ctx, event) => path.resolve(projectRootResolver(ctx, event) ?? process.cwd());
   return {
@@ -158,6 +165,8 @@ export function createAipiLifecycleHandlers({
       coordinator,
       workflowCommandRunner,
       userInputRecorder,
+      intentClassifier,
+      intentClassifierTimeoutMs,
     }),
     context: async (event, ctx) => handleContext({ event, projectRoot: rootFor(ctx, event) }),
     tool_call: async (event, ctx) =>
@@ -256,11 +265,63 @@ export async function handleInput({
   coordinator = null,
   workflowCommandRunner = runWorkflowCommand,
   userInputRecorder = recordWorkflowUserInput,
+  intentClassifier = null,
+  intentClassifierTimeoutMs = 1500,
 } = {}) {
+  if (routingDisabled(event, ctx)) return { action: "continue" };
   if (!(await isAipiInstalled(projectRoot))) return { action: "continue" };
   const active = await readActiveRun(projectRoot).catch(() => null);
   const codePipeline = classifyAipiCodePipeline(event?.text ?? "", { activeRun: active, projectRoot });
-  const route = classifyAipiInputRoute(event?.text ?? "", { activeRun: active, codePipeline });
+  let route = classifyAipiInputRoute(event?.text ?? "", { activeRun: active, codePipeline });
+  const classifier = await applyAutoDispatchVeto({
+    text: event?.text ?? "",
+    route,
+    codePipeline,
+    activeRun: active,
+    projectRoot,
+    ctx,
+    intentClassifier,
+    timeoutMs: intentClassifierTimeoutMs,
+  });
+  route = classifier.route;
+  if (routeExecutesWorkflow(route)) {
+    const hostReadiness = await resolveAipiHostInputReadiness({ event, ctx, coordinator });
+    if (!hostReadiness.ok) {
+      if (codePipeline.trace) {
+        await recordCodePipelineTrace({
+          projectRoot,
+          pi,
+          activeRun: active,
+          pipeline: codePipelineWithDispatch({
+            pipeline: codePipeline,
+            route,
+            skipped: "unsupported_host_model",
+          }),
+        }).catch(() => null);
+      }
+      safeAppendEntry(pi, "aipi.input.route", {
+        schema: "aipi.input-route.v1",
+        routed_at: new Date().toISOString(),
+        input: route.intent,
+        workflow_args: route.workflowArgs ?? null,
+        workflow: route.workflowSuggestion ?? null,
+        auto_dispatch: false,
+        pipeline_classification: route.pipelineClassification ?? null,
+        classifier_source: classifier.source,
+        classifier_verdict: classifier.verdict ?? null,
+        classifier_reason: classifier.reason ?? null,
+        recorded_user_input: false,
+        active_run_id: active?.runId ?? null,
+        result_action: "continue",
+        reason: "unsupported_host_model",
+        host_model: hostReadiness.model_id,
+        host_provider: hostReadiness.provider,
+        readiness: hostReadiness,
+      });
+      safeNotify(ctx, hostReadiness.message, "error");
+      return { action: "continue" };
+    }
+  }
   if (codePipeline.trace && !route?.autoDispatch) {
     await recordCodePipelineTrace({ projectRoot, pi, activeRun: active, pipeline: codePipeline }).catch(() => null);
   }
@@ -296,6 +357,9 @@ export async function handleInput({
       suggested_command: fallbackCommand,
       auto_dispatch: false,
       pipeline_classification: route.pipelineClassification ?? null,
+      classifier_source: classifier.source,
+      classifier_verdict: classifier.verdict ?? null,
+      classifier_reason: classifier.reason ?? null,
       recorded_user_input: false,
       active_run_id: active?.runId ?? null,
       result_action: "continue",
@@ -306,6 +370,23 @@ export async function handleInput({
   }
 
   if (!route) {
+    if (classifier.vetoed) {
+      safeAppendEntry(pi, "aipi.input.route", {
+        schema: "aipi.input-route.v1",
+        routed_at: new Date().toISOString(),
+        input: "auto_dispatch_vetoed",
+        original_intent: classifier.originalRoute?.intent ?? null,
+        workflow_args: classifier.originalRoute?.workflowArgs ?? null,
+        workflow: classifier.originalRoute?.workflowSuggestion ?? null,
+        auto_dispatch: false,
+        pipeline_classification: classifier.originalRoute?.pipelineClassification ?? codePipeline.classification ?? null,
+        classifier_source: classifier.source,
+        classifier_verdict: classifier.verdict ?? null,
+        classifier_reason: classifier.reason ?? null,
+        active_run_id: active?.runId ?? null,
+        result_action: "continue",
+      });
+    }
     if (isAwaitingUserInput(active)) {
       safeAppendEntry(pi, "aipi.input.route", {
         schema: "aipi.input-route.v1",
@@ -322,6 +403,34 @@ export async function handleInput({
   }
 
   try {
+    if (route.answerInline) {
+      const details = buildReadOnlyCheckDetails({ text: event?.text ?? "", route, codePipeline, activeRun: active });
+      safeAppendEntry(pi, "aipi.input.route", {
+        schema: "aipi.input-route.v1",
+        routed_at: new Date().toISOString(),
+        input: route.intent,
+        workflow: route.workflowSuggestion ?? null,
+        auto_dispatch: false,
+        answer_inline: true,
+        read_only: true,
+        pipeline_classification: route.pipelineClassification ?? null,
+        classifier_source: classifier.source,
+        classifier_verdict: classifier.verdict ?? null,
+        classifier_reason: classifier.reason ?? null,
+        active_run_id: active?.runId ?? null,
+        result_action: "continue",
+        grounding_tools: details.grounding_tools,
+      });
+      return {
+        action: "continue",
+        message: {
+          customType: "aipi.read-only-check",
+          display: false,
+          content: renderReadOnlyCheckHint(details),
+          details,
+        },
+      };
+    }
     if (route.suggestedCommand) {
       const message = formatWorkflowSuggestion(route.workflowSuggestion, route.suggestedCommand);
       safeAppendEntry(pi, "aipi.input.route", {
@@ -330,6 +439,9 @@ export async function handleInput({
         input: route.intent,
         workflow_suggestion: route.workflowSuggestion,
         suggested_command: route.suggestedCommand,
+        classifier_source: classifier.source,
+        classifier_verdict: classifier.verdict ?? null,
+        classifier_reason: classifier.reason ?? null,
         recorded_user_input: false,
         active_run_id: active?.runId ?? null,
         result_action: "continue",
@@ -379,6 +491,9 @@ export async function handleInput({
       workflow: route.workflowSuggestion ?? null,
       auto_dispatch: Boolean(route.autoDispatch),
       pipeline_classification: route.pipelineClassification ?? null,
+      classifier_source: classifier.source,
+      classifier_verdict: classifier.verdict ?? null,
+      classifier_reason: classifier.reason ?? null,
       recorded_user_input: recordedUserInput,
       active_run_id: active?.runId ?? null,
       result_action: result.action,
@@ -418,6 +533,9 @@ export async function handleInput({
       workflow: route.workflowSuggestion ?? null,
       auto_dispatch: Boolean(route.autoDispatch),
       pipeline_classification: route.pipelineClassification ?? null,
+      classifier_source: classifier.source,
+      classifier_verdict: classifier.verdict ?? null,
+      classifier_reason: classifier.reason ?? null,
       recorded_user_input: Boolean(route.recordUserInput),
       active_run_id: active?.runId ?? null,
       error: error.message,
@@ -562,6 +680,10 @@ export function classifyAipiInputRoute(text, { activeRun = null, codePipeline = 
     };
   }
 
+  if (pipeline.classification === "read_only_check") {
+    return buildReadOnlyCheckRoute(pipeline);
+  }
+
   const autoWorkflow = autoDispatchWorkflowForPipeline(pipeline);
   if (autoWorkflow) {
     return {
@@ -576,6 +698,7 @@ export function classifyAipiInputRoute(text, { activeRun = null, codePipeline = 
 
   const workflow = workflowForInput(normalized);
   if (!workflow) return null;
+  if (workflow === "check") return buildReadOnlyCheckRoute(pipeline);
   return {
     intent: "suggest_workflow",
     workflowSuggestion: workflow,
@@ -591,6 +714,26 @@ export function classifyAipiCodePipeline(text, { activeRun = null, projectRoot =
   const normalized = normalizeInputText(original);
   if (/\b(skip|ignora|ignorar|nao rode|nao usar|sem)\b.*\b(aipi|pipeline|workflow|review)\b|\b(no|skip)\s+(aipi|pipeline|workflow|review)\b/.test(normalized)) {
     return { classification: "bypass", substantive: false, trace: true, reason: "explicit_skip_phrase" };
+  }
+
+  if (isReadOnlyCheckQuestion(normalized)) {
+    return {
+      classification: "read_only_check",
+      substantive: false,
+      trace: true,
+      non_blocking: true,
+      active_run_id: activeRun?.runId ?? null,
+      workflow: "check",
+      default_action: "answer_inline",
+      reason: "interrogative_read_only_check",
+      read_only: true,
+      grounding: {
+        required: true,
+        mode: "inline",
+        tools: ["aipi_retrieve", "aipi_callers", "aipi_impact"],
+        cite: "path:line",
+      },
+    };
   }
 
   const deployIntent = /\b(deploy|deployment|release|prod|producao|homolog|homologacao|migration|migracao|rollback|pipeline|ci|cd|infra)\b/.test(normalized);
@@ -716,6 +859,37 @@ function autoDispatchWorkflowForPipeline(pipeline = {}) {
   return null;
 }
 
+function buildReadOnlyCheckRoute(pipeline = {}) {
+  return {
+    intent: "check_inline",
+    workflowSuggestion: "check",
+    answerInline: true,
+    autoDispatch: false,
+    pipelineClassification: pipeline.classification ?? "read_only_check",
+    groundingTools: ["aipi_retrieve", "aipi_callers", "aipi_impact"],
+  };
+}
+
+function routeExecutesWorkflow(route = null) {
+  if (!route || route.answerInline || route.suggestedCommand) return false;
+  const args = String(route.workflowArgs ?? "").trim();
+  if (!args || args === "status") return false;
+  return Boolean(route.autoDispatch || args === "execute" || args.startsWith("run "));
+}
+
+async function resolveAipiHostInputReadiness({ event = null, ctx = null, coordinator = null } = {}) {
+  const eventModel = await resolveHostModelCandidate({ event, ctx }).catch(() => null);
+  let coordinatorModel = null;
+  if (!eventModel && typeof coordinator?.getHostModel === "function") {
+    try {
+      coordinatorModel = coordinator.getHostModel();
+    } catch {
+      coordinatorModel = null;
+    }
+  }
+  return aipiHostModelReadiness(eventModel ?? coordinatorModel, { requireProvider: false });
+}
+
 function resolveAutoDeployPolicy({ normalized, projectRoot = null, env = process.env }) {
   if (/\b(auto[- ]?deploy|autodeploy|deploy automatico|implantacao automatica)\b/.test(normalized) ||
     /\b(sem confirmacao|sem pedir confirmacao|nao pedir confirmacao|skip confirm|no confirm)\b/.test(normalized)) {
@@ -773,6 +947,124 @@ function isTruthyFlag(value) {
 
 function formatWorkflowSuggestion(workflow, command) {
   return `AIPI: isto parece ${workflow}; execute \`${command}\` se quiser abrir esse workflow.`;
+}
+
+async function applyAutoDispatchVeto({
+  text = "",
+  route = null,
+  codePipeline = {},
+  activeRun = null,
+  projectRoot = null,
+  ctx = {},
+  intentClassifier = null,
+  timeoutMs = 1500,
+} = {}) {
+  const base = {
+    route,
+    originalRoute: route,
+    source: route?.autoDispatch ? "regex-fallback" : "regex",
+    verdict: null,
+    reason: route?.autoDispatch ? "no_intent_classifier" : null,
+    vetoed: false,
+  };
+  if (!route?.autoDispatch) return base;
+  if (typeof intentClassifier !== "function") return base;
+
+  const started = Date.now();
+  try {
+    const raw = await withTimeout(
+      intentClassifier({
+        text,
+        normalized: normalizeInputText(text),
+        route,
+        codePipeline,
+        activeRun,
+        projectRoot,
+        ctx: { ...(ctx ?? {}), aipiDisableRouting: true },
+        timeoutMs,
+      }),
+      timeoutMs,
+      "intent_classifier_timeout",
+    );
+    const verdict = normalizeIntentClassifierVerdict(raw);
+    const elapsedMs = Date.now() - started;
+    if (verdict.veto) {
+      return {
+        route: null,
+        originalRoute: route,
+        source: "llm-veto",
+        verdict: verdict.verdict,
+        reason: verdict.reason,
+        elapsedMs,
+        vetoed: true,
+      };
+    }
+    return {
+      route,
+      originalRoute: route,
+      source: "llm-veto",
+      verdict: verdict.verdict,
+      reason: verdict.reason,
+      elapsedMs,
+      vetoed: false,
+    };
+  } catch (error) {
+    return {
+      ...base,
+      source: "regex-fallback",
+      verdict: "unavailable",
+      reason: String(error?.message ?? error),
+    };
+  }
+}
+
+function normalizeIntentClassifierVerdict(raw) {
+  const value = typeof raw === "string" ? { verdict: raw } : raw ?? {};
+  const verdict = String(value.verdict ?? value.intent ?? value.route ?? "").trim().toLowerCase();
+  const reason = String(value.reason ?? value.rationale ?? verdict ?? "unspecified").slice(0, 240);
+  const veto = value.veto === true ||
+    ["question", "no-workflow", "no_workflow", "check", "read_only_check", "answer_inline"].includes(verdict);
+  return {
+    verdict: verdict || "unknown",
+    reason,
+    veto,
+  };
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  const ms = Number(timeoutMs);
+  if (!Number.isFinite(ms) || ms <= 0) return Promise.resolve(promise);
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${message}_${Math.floor(ms)}ms`)), ms);
+  });
+  return Promise.race([Promise.resolve(promise), timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+function buildReadOnlyCheckDetails({ text = "", route = {}, codePipeline = {}, activeRun = null } = {}) {
+  return {
+    schema: "aipi.read-only-check.v1",
+    input: String(text ?? ""),
+    workflow: route.workflowSuggestion ?? "check",
+    mode: "inline",
+    read_only: true,
+    active_run_id: activeRun?.runId ?? null,
+    pipeline_classification: route.pipelineClassification ?? codePipeline.classification ?? null,
+    grounding_tools: route.groundingTools ?? ["aipi_retrieve", "aipi_callers", "aipi_impact"],
+    grounding_required: "Use AIPI read-only retrieval/call graph tools before answering codebase questions; cite path:line refs.",
+  };
+}
+
+function renderReadOnlyCheckHint(details = {}) {
+  return [
+    "AIPI read-only check lane.",
+    "Do not start a write workflow for this input.",
+    `Question: ${details.input ?? ""}`,
+    `Use: ${(details.grounding_tools ?? []).join(", ")}`,
+    "Answer inline only after grounding in project files; cite path:line references.",
+  ].join("\n");
 }
 
 async function recordCodePipelineTrace({ projectRoot, pi, activeRun = null, pipeline }) {
@@ -950,6 +1242,25 @@ function isContinuationOnlyRequest(normalized) {
     );
 }
 
+function isReadOnlyCheckQuestion(normalized) {
+  const text = String(normalized ?? "").trim();
+  if (!text) return false;
+  if (isPoliteMutationRequest(text)) return false;
+  const interrogative = /\?$/.test(text) ||
+    /^(como|onde|por que|porque|qual|quais|quem|quando|sobrou|resta|existe|tem|ha|how|where|why|what|which|who|does|do|is|are)\b/.test(text) ||
+    /\b(quem chama|who calls|what calls|onde fica|where is|como funciona|how does|how do)\b/.test(text);
+  if (!interrogative) return false;
+  return /\b(teste|testes|tests?|api|endpoint|funcao|function|componente|component|codigo|code|arquivo|file|classe|class|modulo|module|chama|calls?|impacto|impact|funciona|works|cobre|coverage|fluxo|flow|dependency|dependencia)\b/.test(text);
+}
+
+function isPoliteMutationRequest(normalized) {
+  return /^(can you|could you|please|por favor|pode|voce pode|vc pode)\b.*\b(corrigir|corrige|corrija|consertar|implementar|implementa|adicionar|adiciona|criar|fix|implement|add|create|change|update)\b/.test(normalized);
+}
+
+function routingDisabled(event, ctx) {
+  return Boolean(event?.aipiDisableRouting || ctx?.aipiDisableRouting || isTruthyFlag(process.env.AIPI_DISABLE_ROUTING));
+}
+
 function buildExecutableWorkflowAdapter({ coordinator = null, ctx = {} } = {}) {
   if (typeof coordinator?.spawn !== "function" || typeof coordinator?.collect !== "function") return undefined;
   try {
@@ -991,6 +1302,10 @@ function activeRunFromWorkflowCommandResult(result) {
 }
 
 function workflowForInput(normalized) {
+  if (isReadOnlyCheckQuestion(normalized)) {
+    return "check";
+  }
+
   if (/\b(deploy|deployment|rollback|release|producao|prod|homolog|homologacao|infra|ci|cd|pipeline)\b/.test(normalized)) {
     return "ops";
   }

@@ -142,6 +142,27 @@ export function parseAipiMemoryArgs(userArgs = [], { cwd = process.cwd() } = {})
   return options;
 }
 
+export function parseAipiModelsArgs(userArgs = [], { cwd = process.cwd() } = {}) {
+  const options = { json: false, target: cwd, modelsArgs: [] };
+  for (let index = 0; index < userArgs.length; index += 1) {
+    const arg = userArgs[index];
+    if (arg === "--json") {
+      options.json = true;
+      continue;
+    }
+    if (arg === "--target") {
+      const value = userArgs[index + 1];
+      if (!value) throw new Error("missing value after --target");
+      options.target = path.resolve(cwd, value);
+      options.modelsArgs.push(arg, value);
+      index += 1;
+      continue;
+    }
+    options.modelsArgs.push(arg);
+  }
+  return options;
+}
+
 export function parseAipiOnboardArgs(userArgs = [], { cwd = process.cwd() } = {}) {
   const options = { json: false, target: cwd, noQuestions: false, noPullEmbeddings: false, onboardArgs: [] };
   for (let index = 0; index < userArgs.length; index += 1) {
@@ -434,6 +455,7 @@ export function classifyAipiInvocation(userArgs = []) {
   if (first === "status" || first === "doctor") return { kind: "aipi-status", args: userArgs.slice(1) };
   if (first === "workflow" || first === "workflows") return { kind: "aipi-workflow", args: userArgs.slice(1) };
   if (first === "memory" || first === "memories") return { kind: "aipi-memory", args: userArgs.slice(1) };
+  if (first === "models" || first === "model") return { kind: "aipi-models", args: userArgs.slice(1) };
   if (first === "onboard" || first === "onboarding") return { kind: "aipi-onboard", args: userArgs.slice(1) };
   if (first === "diagnose" || first === "diagnostics") return { kind: "aipi-diagnose", args: userArgs.slice(1) };
   if (first === "update") return { kind: "aipi-update", args: userArgs.slice(1) };
@@ -646,6 +668,38 @@ export async function runAipiMemory({
   }
 }
 
+export async function runAipiModels({
+  cwd = process.cwd(),
+  userArgs = [],
+  log = console.log,
+  errorLog = console.error,
+  modelsFns = null,
+} = {}) {
+  let options;
+  try {
+    options = parseAipiModelsArgs(userArgs, { cwd });
+  } catch (error) {
+    errorLog(`aipi models failed: ${error.message}`);
+    process.exitCode = 1;
+    return null;
+  }
+
+  try {
+    const fns = modelsFns ?? await import("../extensions/aipi/runtime/models-command.js");
+    const result = await fns.runModelsCommand({
+      args: options.modelsArgs,
+      projectRoot: options.target,
+      cwd,
+    });
+    log(options.json ? JSON.stringify(result, null, 2) : fns.formatModelsCommandResult(result));
+    return result;
+  } catch (error) {
+    errorLog(`aipi models failed: ${error.message}`);
+    process.exitCode = 1;
+    return null;
+  }
+}
+
 export async function runAipiOnboard({
   cwd = process.cwd(),
   userArgs = [],
@@ -731,6 +785,7 @@ export function formatAipiHelp({ aipiVersion }) {
     "  /aipi-status",
     "  /aipi-workflow [list | status | start <name> | run <name> | execute]",
     "  /aipi-memory [status | refs | query <terms>]",
+    "  /aipi-models [setup | status | check] [--host <provider/model>] [--adversarial <provider/model>]",
     "  /aipi-diagnose [<run_id>] [--share] [--json]",
     "  /aipi-mcp",
     "  /aipi-probe-a",
@@ -745,6 +800,8 @@ export function formatAipiHelp({ aipiVersion }) {
     "                  Inspect or drive AIPI workflow state outside a Pi session",
     "  aipi memory [--target <dir>] [--json] [status|refs|query <terms>]",
     "                  Inspect AIPI Markdown memory and code graph state outside a Pi session",
+    "  aipi models [--target <dir>] [--json] [setup|status|check] [--host <provider/model>] [--adversarial <provider/model>]",
+    "                  Configure and validate host/adversarial model topology",
     "  aipi onboard [--target <dir>] [--json] [--no-questions] [--no-pull-embeddings]",
     "                  Inventory a project and seed AIPI project memory outside a Pi session",
     "  aipi diagnose [<run_id>] [--target <dir>] [--share] [--json]",
@@ -800,6 +857,11 @@ export async function main() {
 
   if (invocation.kind === "aipi-memory") {
     await runAipiMemory({ userArgs: invocation.args });
+    return;
+  }
+
+  if (invocation.kind === "aipi-models") {
+    await runAipiModels({ userArgs: invocation.args });
     return;
   }
 

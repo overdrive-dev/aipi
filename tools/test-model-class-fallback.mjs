@@ -152,6 +152,37 @@ async function waitFor(predicate, { timeoutMs = 1000 } = {}) {
   console.log("OK host-fallback: forked runner received the real host model");
 }
 
+// --- Test 3: non-Anthropic host fallback runs normally and never falls into TypeError. ---
+{
+  const runnerCalls = [];
+  const coordinator = newCoordinator({ hostModel: "openai-codex/gpt-5.5", runnerCalls });
+  const { agent_id } = coordinator.spawn({
+    agent_id: "reviewer",
+    model_class: "code-strong",
+    owned_files: ["src/non-anthropic-host.js"],
+  });
+  const live = coordinator.status(agent_id);
+  assert.equal(live.model_resolved, "openai-codex/gpt-5.5");
+  assert.equal(live.model_fallback, true);
+  await waitFor(() => coordinator.status(agent_id).state === "done");
+  assert.equal(runnerCalls[0].params.model, "openai-codex/gpt-5.5");
+  const collected = coordinator.collect(agent_id);
+  assert.equal(collected.step_result.model_resolved, "openai-codex/gpt-5.5");
+  assert.doesNotMatch(collected.step_result.model_warning ?? "", /Cannot read properties of undefined/);
+
+  const unqualifiedCalls = [];
+  const unqualifiedCoordinator = newCoordinator({ hostModel: "gpt-5.5", runnerCalls: unqualifiedCalls });
+  const { agent_id: unqualifiedAgentId } = unqualifiedCoordinator.spawn({
+    agent_id: "reviewer",
+    model_class: "code-strong",
+    owned_files: ["src/unqualified-host.js"],
+  });
+  await waitFor(() => unqualifiedCoordinator.status(unqualifiedAgentId).state === "done");
+  assert.equal(unqualifiedCalls[0].params.model, "gpt-5.5");
+  assert.equal(unqualifiedCoordinator.collect(unqualifiedAgentId).step_result.model_resolved, "gpt-5.5");
+  console.log("OK provider-agnostic-host: openai-codex host fallback runs normally");
+}
+
 // --- Test 3: the public aipi_spawn_agent tool threads ctx.model into spawn. ---
 {
   const runnerCalls = [];

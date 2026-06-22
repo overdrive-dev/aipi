@@ -349,6 +349,44 @@ try {
   assert.deepEqual(openaiCodexReviewer.model, { provider: "openai-codex", id: "gpt-5.5" });
   assert.equal(openaiCodexReviewer.cross_model_adversarial.provider, "openai-codex");
   assert.equal(openaiCodexReviewer.cross_model_adversarial.distinct_provider, true);
+  assert.equal(openaiCodexReviewer.cross_model_adversarial.provider_scope.source, "configured-providers");
+
+  const hostOpenaiCodexReviewer = await resolveStepModel({
+    root: tempRoot,
+    step: { agents: ["code-reviewer"] },
+    ctx: { model: { provider: "openai-codex", id: "gpt-5.5" } },
+  });
+  assert.equal(hostOpenaiCodexReviewer.model.provider, "anthropic");
+  assert.notEqual(hostOpenaiCodexReviewer.model.provider, "openai-codex");
+  assert.equal(hostOpenaiCodexReviewer.cross_model_adversarial.distinct_provider, true);
+
+  await fs.writeFile(
+    path.join(tempRoot, ".aipi", "model-capabilities.json"),
+    `${JSON.stringify({
+      schema: "aipi.model-capabilities.v1",
+      classes: {
+        "code-strong": "openai-codex/gpt-5.5",
+        "adversarial-heavy": "mistral/mistral-large",
+        "verifier-fast": "anthropic/claude-verify",
+      },
+      models: {
+        "openai-codex:gpt-5.5": { capabilities: {}, evidence: ["unit-test"] },
+        "mistral:mistral-large": { capabilities: {}, evidence: ["unit-test"] },
+        "anthropic:claude-verify": { capabilities: {}, evidence: ["unit-test"] },
+      },
+    }, null, 2)}\n`,
+  );
+  const mistralIsolation = await inspectAdversarialFamilyIsolation({ root: tempRoot });
+  assert.equal(mistralIsolation.state, "pass");
+  assert.equal(mistralIsolation.configured_families.includes("mistral"), true);
+  assert.equal(mistralIsolation.provider_scope.in_scope.includes("mistral"), true);
+  const mistralReviewer = await resolveStepModel({
+    root: tempRoot,
+    step: { agents: ["code-reviewer"] },
+    ctx: { model: { provider: "openai-codex", id: "gpt-5.5" } },
+  });
+  assert.deepEqual(mistralReviewer.model, { provider: "mistral", id: "mistral-large" });
+  assert.equal(mistralReviewer.cross_model_adversarial.distinct_provider, true);
 
   const crossModelBlocked = await resolveCrossModelAdversarialRoute({
     root: tempRoot,

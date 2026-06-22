@@ -6,6 +6,7 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
+import { createJiti } from "jiti";
 import {
   SUBAGENT_EVENT_ENTRY,
   SUBAGENT_STATE_ENTRY,
@@ -18,7 +19,9 @@ import {
 import {
   AIPI_SUBAGENTS_AGENT_NAME,
   AIPI_SUBAGENTS_RUNTIME_ROOT,
+  aipiHostModelReadiness,
   assertAipiHostScopedModel,
+  assertAipiSupportedHostModel,
   createAipiSubagentsRunner,
   projectSubagentsRuntimePaths,
   runAipiForkedSubagent,
@@ -28,6 +31,7 @@ import registerAipiGuardedWriteChild from "../extensions/aipi/runtime/aipi-guard
 import { OwnedFileRegistry } from "../extensions/aipi/runtime/owned-files.js";
 
 const require = createRequire(import.meta.url);
+const jiti = createJiti(import.meta.url, { interopDefault: true, moduleCache: false });
 
 const stepResult = {
   schema: "aipi.step-result.v1",
@@ -93,12 +97,40 @@ assert.equal(toolTraceEvents.some((entry) => entry.event === "tool_end" && entry
 assert.doesNotThrow(() => assertAipiHostScopedModel("anthropic/claude-opus-4-8"));
 assert.doesNotThrow(() => assertAipiHostScopedModel("openai/gpt-5.5"));
 assert.doesNotThrow(() => assertAipiHostScopedModel("codex/gpt-5.5-codex"));
-assert.throws(() => assertAipiHostScopedModel("host-default", { requireProvider: true }), /provider-qualified host model/);
-assert.throws(() => assertAipiHostScopedModel(null, { requireProvider: true }), /provider-qualified host model/);
-assert.throws(() => assertAipiHostScopedModel("bedrock/claude-opus-4-8"), /non-host provider/);
-assert.throws(() => assertAipiHostScopedModel("deepseek/deepseek-r1"), /non-host provider/);
-assert.throws(() => assertAipiHostScopedModel("zai/glm-4.5"), /non-host provider/);
+assert.doesNotThrow(() => assertAipiHostScopedModel("host-default", { requireProvider: true }));
+assert.throws(() => assertAipiHostScopedModel(null, { requireProvider: true }), /concrete host model/);
+assert.throws(() => assertAipiHostScopedModel(null, { requireModel: true }), /concrete host model/);
+assert.doesNotThrow(() => assertAipiHostScopedModel("bedrock/claude-opus-4-8"));
+assert.doesNotThrow(() => assertAipiHostScopedModel("deepseek/deepseek-r1"));
+assert.doesNotThrow(() => assertAipiHostScopedModel("zai/glm-4.5"));
 assert.throws(() => assertAipiHostScopedModel("openai/gpt-5.5", { allowedProvider: "anthropic" }), /only allow host provider anthropic/);
+assert.doesNotThrow(() => assertAipiSupportedHostModel("anthropic/claude-opus-4-8", { requireProvider: true }));
+assert.doesNotThrow(() => assertAipiSupportedHostModel("openai-codex/gpt-5.5", { requireProvider: true }));
+assert.doesNotThrow(() => assertAipiSupportedHostModel("gpt-5.5", { requireProvider: true }));
+assert.equal(aipiHostModelReadiness(null, { requireProvider: false }).ok, true);
+assert.equal(aipiHostModelReadiness("gpt-5.5", { requireProvider: false }).code, "AIPI_HOST_MODEL_UNQUALIFIED_ALLOWED");
+
+const { buildModelCandidates, resolveModelCandidate } = jiti(
+  "../extensions/aipi/runtime/vendor/pi-subagents/src/runs/shared/model-fallback.ts",
+);
+assert.deepEqual(buildModelCandidates(undefined, undefined, undefined), []);
+assert.deepEqual(buildModelCandidates(null, [null, undefined], undefined), []);
+assert.equal(resolveModelCandidate(undefined, undefined), undefined);
+assert.equal(resolveModelCandidate(null, undefined), undefined);
+assert.deepEqual(buildModelCandidates("gpt-5.5", undefined, undefined), ["gpt-5.5"]);
+assert.deepEqual(
+  buildModelCandidates(
+    "gpt-5.5",
+    [null, "gpt-5.5", "openai-codex/gpt-5.5"],
+    [{ provider: "openai-codex", id: "gpt-5.5", fullId: "openai-codex/gpt-5.5" }],
+    "openai-codex",
+  ),
+  ["openai-codex/gpt-5.5"],
+);
+assert.deepEqual(
+  buildModelCandidates("openai-codex/gpt-5.5", [undefined], undefined),
+  ["openai-codex/gpt-5.5"],
+);
 
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-subagents-paths-"));
 try {
@@ -157,6 +189,40 @@ try {
     true,
   );
 
+  const openaiCodexRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-subagents-openai-host-"));
+  try {
+    await runAipiForkedSubagent({
+      root: openaiCodexRoot,
+      params: {
+        id: "openai-host",
+        task: "Reply OK.",
+        model: "openai-codex/gpt-5.5",
+      },
+    });
+    assert.equal(realRuntimeCalls.length, 2);
+    const openaiArgs = realRuntimeCalls[1].args;
+    assert.equal(openaiArgs[openaiArgs.indexOf("--model") + 1], "openai-codex/gpt-5.5");
+  } finally {
+    await fs.rm(openaiCodexRoot, { recursive: true, force: true });
+  }
+
+  const unqualifiedRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-subagents-unqualified-host-"));
+  try {
+    await runAipiForkedSubagent({
+      root: unqualifiedRoot,
+      params: {
+        id: "unqualified-host",
+        task: "Reply OK.",
+        model: "gpt-5.5",
+      },
+    });
+    assert.equal(realRuntimeCalls.length, 3);
+    const unqualifiedArgs = realRuntimeCalls[2].args;
+    assert.equal(unqualifiedArgs[unqualifiedArgs.indexOf("--model") + 1], "gpt-5.5");
+  } finally {
+    await fs.rm(unqualifiedRoot, { recursive: true, force: true });
+  }
+
   const defaultRunnerRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-subagents-default-runner-"));
   try {
     await createAipiSubagentsRunner({ root: defaultRunnerRoot }).spawn({
@@ -164,8 +230,8 @@ try {
       task: "Reply OK.",
       model: "anthropic/claude-opus-4-8",
     });
-    assert.equal(realRuntimeCalls.length, 2);
-    assert.equal(realRuntimeCalls[1].options.cwd, defaultRunnerRoot);
+    assert.equal(realRuntimeCalls.length, 4);
+    assert.equal(realRuntimeCalls[3].options.cwd, defaultRunnerRoot);
   } finally {
     await fs.rm(defaultRunnerRoot, { recursive: true, force: true });
   }
@@ -174,9 +240,9 @@ try {
   try {
     await assert.rejects(
       () => runAipiForkedSubagent({ root: noModelRoot, params: { id: "no-model", task: "no model" } }),
-      /provider-qualified host model/,
+      /concrete host model/,
     );
-    assert.equal(realRuntimeCalls.length, 2);
+    assert.equal(realRuntimeCalls.length, 4);
   } finally {
     await fs.rm(noModelRoot, { recursive: true, force: true });
   }
@@ -451,23 +517,12 @@ assert.throws(
 assert.throws(
   () =>
     coordinator.spawn({
-      agent_id: "bedrock",
-      step_id: "model",
-      context_packet: "BDD: non-host providers are blocked.",
-      owned_files: ["src/bedrock.js"],
-      model: { provider: "bedrock", id: "claude-opus-4-8" },
-    }),
-  /non-host provider/,
-);
-assert.throws(
-  () =>
-    coordinator.spawn({
       agent_id: "no-model",
       step_id: "model",
       context_packet: "BDD: worker model scoping is fail-closed.",
       owned_files: ["src/no-model.js"],
     }),
-  /provider-qualified host model/,
+  /concrete host model/,
 );
 
 const cleanup = coordinator.cleanup();

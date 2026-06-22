@@ -17,7 +17,7 @@ Alpha. What exists today:
   memory, model classes) and a machine-readable `runtime-contract.json`, all
   enforced by a structured validator + CI.
 - A Pi extension with working commands: `/aipi-init`, `/aipi-status`,
-  `/aipi-workflow`, `/aipi-memory`, `/aipi-mcp`, `/aipi-probe-a`,
+  `/aipi-workflow`, `/aipi-memory`, `/aipi-models`, `/aipi-mcp`, `/aipi-probe-a`,
   `/aipi-probe-a-prime`.
 - An optional MCP bridge extension. When a project has `.aipi/mcp.json`, the
   `aipi` wrapper starts configured stdio MCP servers and exposes their tools to
@@ -91,6 +91,7 @@ aipi workflow list
 aipi workflow status
 aipi memory status
 aipi memory query business rules
+aipi models status
 aipi "/aipi-status"
 aipi "/aipi-mcp"
 ```
@@ -162,10 +163,9 @@ runtime is a fork of `pi-subagents@0.28.0` under
 `runtime/pi-subagents.js`; it is not an npm dependency, not a separately-loaded
 Pi extension, and not selected by an environment flag. Workers run in the
 project cwd, write runtime state under `.aipi/runtime/subagents/`, inherit the
-host-scoped Anthropic OAuth model, and reject provider-qualified non-host models
-such as Bedrock before owned-file allocation. Child sessions receive `read`,
-`grep`, `find`, `ls`, and the guarded AIPI `write` extension, not Pi's unguarded
-`write` builtin.
+selected host/configured provider model, and keep worker fallback scoped to that
+selected model. Child sessions receive `read`, `grep`, `find`, `ls`, and the
+guarded AIPI `write` extension, not Pi's unguarded `write` builtin.
 
 ### Provider auth
 

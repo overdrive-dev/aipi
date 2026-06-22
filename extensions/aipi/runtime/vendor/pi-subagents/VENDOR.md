@@ -32,7 +32,7 @@ uses `jiti` to execute this vendored TypeScript entrypoint:
 
 The fork runs in the project cwd and writes agent/session/artifact/result state
 under `.aipi/runtime/subagents/`. AIPI passes the host-scoped model into the
-fork, disables fallback models, and rejects non-host providers before worker
+fork, disables fallback models, and keeps workers on the selected provider/model before worker
 allocation.
 
 End users do not run `pi install npm:pi-subagents`.

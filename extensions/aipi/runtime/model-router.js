@@ -154,8 +154,8 @@ export async function resolveModelClass({
   };
 }
 
-const ADVERSARIAL_IN_SCOPE_PROVIDERS = new Set(["anthropic", "openai", "codex", "openai-codex"]);
-const ADVERSARIAL_OUT_OF_SCOPE_PROVIDERS = new Set(["bedrock", "deepseek", "glm", "zai"]);
+const DEFAULT_ADVERSARIAL_IN_SCOPE_PROVIDERS = new Set(["anthropic", "openai", "codex", "openai-codex"]);
+const DEFAULT_ADVERSARIAL_OUT_OF_SCOPE_PROVIDERS = new Set(["bedrock", "deepseek", "glm", "zai"]);
 
 export async function resolveCrossModelAdversarialRoute({
   root,
@@ -172,6 +172,7 @@ export async function resolveCrossModelAdversarialRoute({
   const implementerProvider = providerOfModel(implementer);
   const registry = ctx?.modelCapabilities ?? await readModelCapabilities(root);
   const modelClasses = await readModelClasses(root).catch(() => new Map());
+  const providerScope = adversarialProviderScope({ registry, modelClasses, env });
   const candidates = collectAdversarialModelCandidates({ route, registry, modelClasses, env });
   const rejected = [];
 
@@ -181,8 +182,9 @@ export async function resolveCrossModelAdversarialRoute({
       rejected.push({ model: describeModel(candidate.model), reason: "missing_provider" });
       continue;
     }
-    if (ADVERSARIAL_OUT_OF_SCOPE_PROVIDERS.has(provider) || !ADVERSARIAL_IN_SCOPE_PROVIDERS.has(provider)) {
-      rejected.push({ model: describeModel(candidate.model), reason: "provider_out_of_scope" });
+    const providerRejection = adversarialProviderRejection(provider, providerScope);
+    if (providerRejection) {
+      rejected.push({ model: describeModel(candidate.model), reason: providerRejection });
       continue;
     }
     if (implementerProvider && provider === implementerProvider) {
@@ -198,6 +200,7 @@ export async function resolveCrossModelAdversarialRoute({
       model: candidate.model,
       model_id: describeModel(candidate.model),
       provider,
+      provider_scope: compactAdversarialProviderScope(providerScope),
       source: candidate.source,
       distinct_provider: Boolean(implementerProvider && provider !== implementerProvider),
       blocked: false,
@@ -214,6 +217,7 @@ export async function resolveCrossModelAdversarialRoute({
     model: null,
     model_id: null,
     provider: null,
+    provider_scope: compactAdversarialProviderScope(providerScope),
     source: "unresolved",
     distinct_provider: false,
     blocked: true,
@@ -258,6 +262,7 @@ function resolveCrossFamilyConfiguredModel({
   if (!implementerProvider) return null;
   const currentProvider = providerOfModel(configuredModel?.model);
   if (currentProvider && currentProvider !== implementerProvider) return null;
+  const providerScope = adversarialProviderScope({ registry, modelClasses, env });
 
   const candidates = collectAdversarialModelCandidates({
     route: configuredModel ? { model: configuredModel.model, source: configuredModel.source } : null,
@@ -268,8 +273,7 @@ function resolveCrossFamilyConfiguredModel({
     .filter((candidate) => {
       const provider = providerOfModel(candidate.model);
       if (!provider || provider === implementerProvider) return false;
-      if (ADVERSARIAL_OUT_OF_SCOPE_PROVIDERS.has(provider) || !ADVERSARIAL_IN_SCOPE_PROVIDERS.has(provider)) return false;
-      return true;
+      return providerInAdversarialScope(provider, providerScope);
     })
     .sort((left, right) =>
       preferredFamilyIndex(providerOfModel(left.model), preferredFamilies) -
@@ -339,11 +343,10 @@ export function evaluateAdversarialFamilyIsolation({
     };
   });
   const configuredFamilies = configuredModelFamilies(registry, modelClasses, env);
+  const providerScope = adversarialProviderScope({ registry, modelClasses, env });
   const sameFamily = reviewRoutes.filter((route) => route.provider && route.provider === implementerProvider);
   const distinctConfigured = implementerProvider && [...configuredFamilies].some((provider) =>
-    provider !== implementerProvider &&
-    ADVERSARIAL_IN_SCOPE_PROVIDERS.has(provider) &&
-    !ADVERSARIAL_OUT_OF_SCOPE_PROVIDERS.has(provider)
+    provider !== implementerProvider && providerInAdversarialScope(provider, providerScope)
   );
   const state = !implementerProvider || !reviewRoutes.length
     ? "not_applicable"
@@ -357,6 +360,7 @@ export function evaluateAdversarialFamilyIsolation({
     implementation_model: describeModel(implementer?.model),
     implementation_provider: implementerProvider ?? null,
     configured_families: [...configuredFamilies].sort(),
+    provider_scope: compactAdversarialProviderScope(providerScope),
     review_routes: reviewRoutes,
     evidence:
       state === "warn"
@@ -365,6 +369,60 @@ export function evaluateAdversarialFamilyIsolation({
           ? "Adversarial review classes resolve to a distinct configured model family when one is available."
           : "Adversarial family isolation is not applicable because code-strong or review classes are unconfigured.",
   };
+}
+
+function adversarialProviderScope({ registry = null, modelClasses = new Map(), env = process.env } = {}) {
+  const envInScope = csvSet(env?.AIPI_ADVERSARIAL_IN_SCOPE_PROVIDERS ?? env?.AIPI_ADVERSARIAL_PROVIDERS);
+  const envOutOfScope = csvSet(env?.AIPI_ADVERSARIAL_OUT_OF_SCOPE_PROVIDERS);
+  const configured = configuredModelFamilies(registry, modelClasses, env);
+  const inScope = envInScope.size
+    ? envInScope
+    : configured.size
+      ? configured
+      : new Set(DEFAULT_ADVERSARIAL_IN_SCOPE_PROVIDERS);
+  const outOfScope = envOutOfScope.size
+    ? envOutOfScope
+    : new Set(DEFAULT_ADVERSARIAL_OUT_OF_SCOPE_PROVIDERS);
+  return {
+    inScope,
+    outOfScope,
+    source: envInScope.size ? "env" : configured.size ? "configured-providers" : "default",
+  };
+}
+
+function providerInAdversarialScope(provider, scope) {
+  const normalized = String(provider ?? "").trim().toLowerCase();
+  if (!normalized) return false;
+  if (scope?.outOfScope?.has(normalized)) return false;
+  return !scope?.inScope?.size || scope.inScope.has(normalized);
+}
+
+function adversarialProviderRejection(provider, scope) {
+  const normalized = String(provider ?? "").trim().toLowerCase();
+  if (!normalized) return "missing_provider";
+  if (scope?.outOfScope?.has(normalized)) return "provider_out_of_scope";
+  if (scope?.inScope?.size && !scope.inScope.has(normalized)) return "provider_not_configured";
+  return null;
+}
+
+function compactAdversarialProviderScope(scope) {
+  return {
+    source: scope?.source ?? "unknown",
+    in_scope: [...(scope?.inScope ?? [])].sort(),
+    out_of_scope: [...(scope?.outOfScope ?? [])].sort(),
+  };
+}
+
+function csvSet(value) {
+  if (Array.isArray(value)) {
+    return new Set(value.map((item) => String(item ?? "").trim().toLowerCase()).filter(Boolean));
+  }
+  return new Set(
+    String(value ?? "")
+      .split(/[,\s]+/)
+      .map((item) => item.trim().toLowerCase())
+      .filter(Boolean),
+  );
 }
 
 function configuredModelFamilies(registry = null, modelClasses = new Map(), env = {}) {
@@ -861,6 +919,7 @@ export function resolveSpawnModelDecision({ knownClasses, descriptor = {} }) {
   const strict = descriptor.allow_fallback === false;
   const fallbackModel = concrete ?? hostModel ?? null;
   const fallbackModelId = resolvedModelId ?? hostModelId ?? HOST_DEFAULT_MODEL;
+  const hostFallback = !resolvedModelId && Boolean(hostModelId);
   const fallbackSource = upstreamSource ?? (
     concrete ? "explicit" : hostModel ? "host-default" : "host-default-unavailable"
   );
@@ -873,6 +932,8 @@ export function resolveSpawnModelDecision({ knownClasses, descriptor = {} }) {
       source: fallbackSource,
       known: true,
       fallback: false,
+      host_fallback: hostFallback,
+      host_model: hostModelId,
       mismatch: !resolvedModelId && Boolean(hostModelId),
       warning: null,
     };
@@ -928,6 +989,8 @@ export function resolveSpawnModelDecision({ knownClasses, descriptor = {} }) {
     source: resolvedModelId ? (upstreamSource ?? "resolved") : fallbackSource,
     known: isKnown,
     fallback: mismatch,
+    host_fallback: hostFallback,
+    host_model: hostModelId,
     mismatch,
     warning,
   };

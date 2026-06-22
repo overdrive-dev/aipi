@@ -335,11 +335,10 @@ if (!backendOptions) {
   }
   if (!backendOptions.workerProviderRule?.includes("host Pi runtime") ||
     !backendOptions.workerProviderRule?.includes("fallbackModels") ||
-    !backendOptions.workerProviderRule?.includes("bedrock") ||
-    !backendOptions.workerProviderRule?.includes("owned-file allocation") ||
+    !backendOptions.workerProviderRule?.includes("selected worker model") ||
     !backendOptions.workerProviderRule?.includes("guarded write extension") ||
     !backendOptions.workerProviderRule?.includes("not the unguarded builtin write")) {
-    errors.push("runtime-contract subagentBackendOptions.workerProviderRule must document host Pi runtime, fallback stripping, bedrock rejection, pre-allocation rejection, and guarded child write");
+    errors.push("runtime-contract subagentBackendOptions.workerProviderRule must document host Pi runtime, fallback stripping, selected worker model scoping, and guarded child write");
   }
   if (!backendOptions.hostModelFallbackRule?.includes("ctx.model") ||
     !backendOptions.hostModelFallbackRule?.includes("model_select") ||
@@ -362,7 +361,7 @@ if (!backendOptions) {
     !backendOptions.piSubagentsPhaseOneRule?.includes("@earendil-works/pi-tui is not a direct AIPI dependency") ||
     !backendOptions.piSubagentsPhaseOneRule?.includes("/aipi-pi-subagents-spike") ||
     !backendOptions.piSubagentsPhaseOneRule?.includes("provider_event_observed=true") ||
-    !backendOptions.piSubagentsPhaseOneRule?.includes("no bedrock/non-host provider")) {
+    !backendOptions.piSubagentsPhaseOneRule?.includes("no provider/model other than the selected worker model")) {
     errors.push("runtime-contract subagentBackendOptions.piSubagentsPhaseOneRule must document the forked runtime, no npm package, no separate extension/flag, project runtime root, minimized deps, live command, and GO/NO-GO criteria");
   }
   if (!backendOptions.stableToolSurface?.includes("aipi_cleanup_agents")) {
@@ -1116,6 +1115,12 @@ if (!extensionIndex.includes('pi.registerCommand("aipi-memory"')) {
 if (!extensionIndex.includes("./runtime/memory-command.js")) {
   errors.push("extensions/aipi/index.js must load runtime/memory-command.js");
 }
+if (!extensionIndex.includes('pi.registerCommand("aipi-models"')) {
+  errors.push("extensions/aipi/index.js must register /aipi-models");
+}
+if (!extensionIndex.includes("./runtime/models-command.js")) {
+  errors.push("extensions/aipi/index.js must load runtime/models-command.js");
+}
 if (!extensionIndex.includes('pi.registerCommand("aipi-onboard"')) {
   errors.push("extensions/aipi/index.js must register /aipi-onboard");
 }
@@ -1134,6 +1139,9 @@ if (!binWrapper.includes("mcp-bridge.js") || !binWrapper.includes("mcp.json")) {
 }
 if (!binWrapper.includes("runAipiOnboard") || !binWrapper.includes("aipi onboard")) {
   errors.push("bin/aipi.js must expose aipi onboard outside a Pi session");
+}
+if (!binWrapper.includes("runAipiModels") || !binWrapper.includes("aipi models")) {
+  errors.push("bin/aipi.js must expose aipi models outside a Pi session");
 }
 if (!fs.existsSync(path.join(root, "extensions/aipi/mcp-bridge.js"))) {
   errors.push("extensions/aipi/mcp-bridge.js is required for MCP bridge loading");
@@ -1643,6 +1651,9 @@ if (!fs.existsSync(path.join(root, "bin/aipi.js"))) {
   if (!binAipi.includes("runAipiMemory") || !binAipi.includes("aipi memory")) {
     errors.push("bin/aipi.js must expose aipi memory without starting Pi");
   }
+  if (!binAipi.includes("runAipiModels") || !binAipi.includes("aipi models")) {
+    errors.push("bin/aipi.js must expose aipi models without starting Pi");
+  }
   if (!binAipi.includes("runAipiDiagnose") || !binAipi.includes("aipi diagnose")) {
     errors.push("bin/aipi.js must expose aipi diagnose without starting Pi");
   }
@@ -1697,6 +1708,12 @@ if (packageJson.scripts?.["test:model-router"] !== "node tools/test-model-router
 }
 if (!packageJson.scripts?.test?.includes("npm run test:model-router")) {
   errors.push("package.json test script must run test:model-router");
+}
+if (packageJson.scripts?.["test:models-command"] !== "node tools/test-models-command.mjs") {
+  errors.push("package.json must include test:models-command for aipi models setup");
+}
+if (!packageJson.scripts?.test?.includes("npm run test:models-command")) {
+  errors.push("package.json test script must run test:models-command");
 }
 if (packageJson.scripts?.["test:model-class"] !== "node tools/test-model-class-fallback.mjs") {
   errors.push("package.json must include test:model-class for host-model fallback coverage");

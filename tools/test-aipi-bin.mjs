@@ -13,6 +13,7 @@ import {
   pathCommandCandidates,
   piCliJsCandidates,
   parseAipiMemoryArgs,
+  parseAipiModelsArgs,
   parseAipiOnboardArgs,
   parseAipiDiagnoseArgs,
   parseAipiStatusArgs,
@@ -22,6 +23,7 @@ import {
   readAipiPackageVersion,
   readPiVersion,
   runAipiMemory,
+  runAipiModels,
   runAipiOnboard,
   runAipiDiagnose,
   runAipiStatus,
@@ -118,6 +120,8 @@ assert.deepEqual(classifyAipiInvocation(["profile", "list"]), { kind: "pass-thro
 assert.deepEqual(classifyAipiInvocation(["profiles", "status"]), { kind: "pass-through" });
 assert.deepEqual(classifyAipiInvocation(["memory", "refs"]), { kind: "aipi-memory", args: ["refs"] });
 assert.deepEqual(classifyAipiInvocation(["memories", "status"]), { kind: "aipi-memory", args: ["status"] });
+assert.deepEqual(classifyAipiInvocation(["models", "status"]), { kind: "aipi-models", args: ["status"] });
+assert.deepEqual(classifyAipiInvocation(["model", "check"]), { kind: "aipi-models", args: ["check"] });
 assert.deepEqual(classifyAipiInvocation(["onboard", "--no-questions"]), { kind: "aipi-onboard", args: ["--no-questions"] });
 assert.deepEqual(classifyAipiInvocation(["onboarding"]), { kind: "aipi-onboard", args: [] });
 assert.deepEqual(classifyAipiInvocation(["diagnose", "run-1"]), { kind: "aipi-diagnose", args: ["run-1"] });
@@ -137,6 +141,11 @@ assert.deepEqual(parseAipiMemoryArgs(["--target", "project", "--json", "query", 
   target: path.resolve(path.join("C:", "repo"), "project"),
   json: true,
   memoryArgs: ["query", "billing"],
+});
+assert.deepEqual(parseAipiModelsArgs(["--target", "project", "--json", "setup", "--host", "openai-codex/gpt-5.5"], { cwd: path.join("C:", "repo") }), {
+  target: path.resolve(path.join("C:", "repo"), "project"),
+  json: true,
+  modelsArgs: ["--target", "project", "setup", "--host", "openai-codex/gpt-5.5"],
 });
 assert.deepEqual(parseAipiOnboardArgs(["--target", "project", "--json", "--no-questions"], { cwd: path.join("C:", "repo") }), {
   target: path.resolve(path.join("C:", "repo"), "project"),
@@ -167,6 +176,7 @@ assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-init \[--dry-run\
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-onboard \[--target <dir>\] \[--no-questions\] \[--no-pull-embeddings\]/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-workflow \[list \| status \| start <name> \| run <name> \| execute\]/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-memory \[status \| refs \| query <terms>\]/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-models \[setup \| status \| check\]/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-diagnose \[<run_id>\] \[--share\] \[--json\]/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-mcp/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-pi-subagents-spike/);
@@ -174,6 +184,7 @@ assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /--pi-help/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi status \[--target <dir>\] \[--json\] \[--strict\]/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi workflow \[--target <dir>\] \[--json\]/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi memory \[--target <dir>\] \[--json\]/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi models \[--target <dir>\] \[--json\]/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi onboard \[--target <dir>\] \[--json\] \[--no-questions\] \[--no-pull-embeddings\]/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi diagnose \[<run_id>\] \[--target <dir>\] \[--share\] \[--json\]/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi update \[--dry-run\]/);
@@ -418,6 +429,52 @@ await runAipiMemory({
   },
 });
 assert.deepEqual(JSON.parse(jsonMemoryOutput[0]), { action: "query", query: "billing", refs: [] });
+
+const modelsOutput = [];
+const modelsResult = {
+  schema: "aipi.models-command.v1",
+  state: "ready",
+  classes: [],
+  warnings: [],
+  adversarial_family_isolation: { state: "pass" },
+};
+const returnedModels = await runAipiModels({
+  cwd: path.join("C:", "repo"),
+  userArgs: ["--target", "project", "setup", "--host", "openai-codex/gpt-5.5", "--adversarial", "anthropic/claude-opus-4-8"],
+  log: (line) => modelsOutput.push(line),
+  modelsFns: {
+    async runModelsCommand({ args, projectRoot }) {
+      assert.deepEqual(args, [
+        "--target",
+        "project",
+        "setup",
+        "--host",
+        "openai-codex/gpt-5.5",
+        "--adversarial",
+        "anthropic/claude-opus-4-8",
+      ]);
+      assert.equal(projectRoot, path.resolve(path.join("C:", "repo"), "project"));
+      return modelsResult;
+    },
+    formatModelsCommandResult: () => "AIPI models ready",
+  },
+});
+assert.equal(returnedModels, modelsResult);
+assert.deepEqual(modelsOutput, ["AIPI models ready"]);
+
+const jsonModelsOutput = [];
+await runAipiModels({
+  userArgs: ["--json", "status"],
+  log: (line) => jsonModelsOutput.push(line),
+  modelsFns: {
+    async runModelsCommand({ args }) {
+      assert.deepEqual(args, ["status"]);
+      return modelsResult;
+    },
+    formatModelsCommandResult: () => "unused",
+  },
+});
+assert.deepEqual(JSON.parse(jsonModelsOutput[0]), modelsResult);
 
 const diagnoseOutput = [];
 const diagnoseResult = {

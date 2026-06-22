@@ -14,6 +14,13 @@ const terminalActions = new Set([
   "escalate_to_planning",
 ]);
 
+const DEFAULT_TRANSIENT_PROVIDER_RETRY = {
+  maxAttempts: 3,
+  baseDelayMs: 250,
+  maxDelayMs: 2_000,
+  jitterMs: 100,
+};
+
 export async function executeWorkflowRun({
   projectRoot,
   runId = null,
@@ -76,19 +83,19 @@ export async function executeWorkflowRun({
 
     const requirement = firstUnpassedRequirement(step, state);
     if (requirement) {
-      const reason = `required step ${requirement} has not passed`;
+      const rootBlock = rootRequirementBlock({ requirement, state, stepById });
+      const blockedStep = rootBlock.step ?? stepById.get(requirement) ?? step;
+      const reason = rootBlock.reason ?? `required step ${requirement} has not passed`;
       const blockedAt = now().toISOString();
-      markStep(state, step.id, {
-        status: "blocked",
-        verdict: "BLOCKED",
-        error: reason,
-        finished_at: blockedAt,
-      });
       state.status = "blocked";
-      state.current_step = step.id;
+      state.current_step = blockedStep.id;
       state.blocked_reason = reason;
-      state.awaiting_user_input = awaitingUserDecisionForBlockedGate({ step, reason, createdAt: blockedAt });
-      events.push({ type: "blocked", step_id: step.id, reason: `missing requirement ${requirement}` });
+      state.awaiting_user_input = awaitingUserDecisionForBlockedGate({
+        step: blockedStep,
+        reason,
+        createdAt: blockedAt,
+      });
+      events.push({ type: "blocked", step_id: blockedStep.id, reason, blocked_dependency: step.id });
       break;
     }
 
@@ -122,7 +129,11 @@ export async function executeWorkflowRun({
       break;
     }
 
-    const result = await adapter.executeStep({ root, state, workflow, step, context, contract });
+    const result = await executeStepWithTransientRetries({
+      adapter,
+      args: { root, state, workflow, step, context, contract },
+      retry: transientProviderRetryConfig(contract),
+    });
     const artifactContents = await readStepArtifactContents({ root, result });
     const validation = validateStepResult(result, { step, contract, artifactContents });
     recordPolicyDecision({ state, step, result, validation, now });
@@ -156,15 +167,19 @@ export async function executeWorkflowRun({
     const target = missingArtifacts.length || memoryPromotionGate?.error
       ? step.gate.on_verdict?.FAIL ?? null
       : branchTarget(step, validation);
+    const transientProviderError = transientProviderFailureMessage(result);
     const error = missingArtifacts.length
       ? `missing required artifacts: ${missingArtifacts.join(", ")}`
       : memoryPromotionGate?.error
         ? memoryPromotionGate.error
+      : transientProviderError
+        ? transientProviderError
       : validation.errors.length
         ? validation.errors.join("; ")
         : policyGateMessage(validation, target);
     const failedStatus = gateFailureStatus(result, validation);
     const structuralNoAdapter = isStructuralNoExecutableAdapterBlock(result, error, validation);
+    const transientProviderBlock = isTransientProviderFailureBlock(result, validation);
     const finishedAt = now().toISOString();
     markStep(state, step.id, {
       status: failedStatus,
@@ -176,7 +191,7 @@ export async function executeWorkflowRun({
     });
     events.push({ type: failedStatus, step_id: step.id, verdict: validation.verdict, error, target });
 
-    if (structuralNoAdapter) {
+    if (structuralNoAdapter || transientProviderBlock) {
       state.status = "blocked";
       state.current_step = step.id;
       state.blocked_reason = error;
@@ -184,9 +199,13 @@ export async function executeWorkflowRun({
         step,
         result,
         reason: error,
-        createdAt: finishedAt,
+          createdAt: finishedAt,
+        });
+      events.push({
+        type: transientProviderBlock ? "transient_provider_failure" : "structural_no_executable_adapter",
+        step_id: step.id,
+        reason: error,
       });
-      events.push({ type: "structural_no_executable_adapter", step_id: step.id, reason: error });
       await persistRunState(root, state);
       break;
     }
@@ -812,6 +831,114 @@ async function missingRequiredArtifacts({ root, state, step, result }) {
   return missing;
 }
 
+async function executeStepWithTransientRetries({ adapter, args, retry } = {}) {
+  const maxAttempts = retry.maxAttempts;
+  const events = [];
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const result = await adapter.executeStep(args);
+      if (events.length && result && typeof result === "object") {
+        result.transient_provider_retries = {
+          schema: "aipi.transient-provider-retries.v1",
+          recovered: true,
+          attempts: attempt,
+          events,
+        };
+      }
+      return result;
+    } catch (error) {
+      if (!isTransientProviderError(error)) throw error;
+      const summary = transientProviderErrorSummary(error);
+      if (attempt >= maxAttempts) {
+        return transientProviderBlockedResult({ step: args.step, error, attempts: attempt, events });
+      }
+      const delayMs = transientProviderRetryDelayMs({ retry, attempt });
+      events.push({
+        attempt,
+        error: summary,
+        delay_ms: delayMs,
+      });
+      await sleep(delayMs);
+    }
+  }
+  return transientProviderBlockedResult({ step: args.step, error: new Error("transient provider retry exhausted"), attempts: maxAttempts, events });
+}
+
+function transientProviderRetryConfig(contract = {}) {
+  const configured = contract.transientProviderRetry ?? contract.providerRetry ?? {};
+  return {
+    maxAttempts: positiveInt(configured.maxAttempts ?? configured.attempts, DEFAULT_TRANSIENT_PROVIDER_RETRY.maxAttempts),
+    baseDelayMs: positiveInt(configured.baseDelayMs ?? configured.base_delay_ms, DEFAULT_TRANSIENT_PROVIDER_RETRY.baseDelayMs),
+    maxDelayMs: positiveInt(configured.maxDelayMs ?? configured.max_delay_ms, DEFAULT_TRANSIENT_PROVIDER_RETRY.maxDelayMs),
+    jitterMs: nonNegativeInt(configured.jitterMs ?? configured.jitter_ms, DEFAULT_TRANSIENT_PROVIDER_RETRY.jitterMs),
+  };
+}
+
+function transientProviderRetryDelayMs({ retry, attempt }) {
+  const exponential = retry.baseDelayMs * (2 ** Math.max(0, attempt - 1));
+  const bounded = Math.min(retry.maxDelayMs, exponential);
+  const jitter = retry.jitterMs ? Math.floor(Math.random() * (retry.jitterMs + 1)) : 0;
+  return bounded + jitter;
+}
+
+function isTransientProviderError(error) {
+  const text = [
+    error?.type,
+    error?.code,
+    error?.status,
+    error?.statusCode,
+    error?.name,
+    error?.message,
+    error?.cause?.message,
+  ].filter(Boolean).join(" ").toLowerCase();
+  return /\b(overloaded_error|rate_limit_error|rate.?limit|too many requests|timeout|timed out|etimedout|econnreset|network)\b/.test(text) ||
+    /\b(429|529|503|504)\b/.test(text);
+}
+
+function transientProviderErrorSummary(error) {
+  return String(error?.message ?? error?.code ?? error?.type ?? error ?? "transient provider error").slice(0, 240);
+}
+
+function transientProviderBlockedResult({ step, error, attempts, events }) {
+  const summary = transientProviderErrorSummary(error);
+  return {
+    schema: "aipi.step-result.v1",
+    step_id: step.id,
+    agent_ids: step.agents.length ? step.agents : ["aipi-provider-retry"],
+    verdict: "BLOCKED",
+    evidence: [
+      {
+        rung: "blocked",
+        source: "aipi-provider-retry",
+        ref: "transient-provider",
+        result: `transient provider failure after ${attempts} attempts: ${summary}`,
+      },
+    ],
+    artifacts: [],
+    blocker_question: {
+      question: `AIPI encontrou erro transitorio do provider em ${step.id} apos ${attempts} tentativas. Como voce quer seguir?`,
+      options: [
+        "Tentar executar este workflow novamente",
+        "Continuar fora do workflow automatico nesta conversa",
+        "Cancelar este run",
+      ],
+      allow_free_text: true,
+    },
+    transient_provider_failure: {
+      schema: "aipi.transient-provider-failure.v1",
+      attempts,
+      error: summary,
+      events,
+    },
+  };
+}
+
+function transientProviderFailureMessage(result) {
+  if (!result?.transient_provider_failure) return null;
+  const failure = result.transient_provider_failure;
+  return `transient provider failure after ${failure.attempts} attempts: ${failure.error}`;
+}
+
 async function readStepArtifactContents({ root, result }) {
   if (!Array.isArray(result?.artifacts) || result.verdict !== "PASS") return {};
   const out = {};
@@ -970,6 +1097,27 @@ function firstUnpassedRequirement(step, state) {
   return null;
 }
 
+function rootRequirementBlock({ requirement, state, stepById }) {
+  const visited = new Set();
+  let currentId = requirement;
+  let fallbackReason = `required step ${requirement} has not passed`;
+  while (currentId && !visited.has(currentId)) {
+    visited.add(currentId);
+    const entry = state.steps.find((candidate) => candidate.id === currentId);
+    const step = stepById.get(currentId);
+    if (!entry) return { step, reason: fallbackReason };
+    if (entry.error) return { step, reason: entry.error, entry };
+    if (entry.status === "blocked" || entry.status === "failed" || entry.status === "approval_required") {
+      return { step, reason: `${currentId} is ${entry.status}`, entry };
+    }
+    const nested = step ? firstUnpassedRequirement(step, state) : null;
+    if (!nested) return { step, reason: fallbackReason, entry };
+    fallbackReason = `required step ${nested} has not passed`;
+    currentId = nested;
+  }
+  return { step: stepById.get(requirement), reason: fallbackReason };
+}
+
 function branchTarget(step, validation) {
   if (validation.policyDecision) return step.gate.on_policy_decision?.[validation.policyDecision] ?? null;
   return step.gate.on_verdict?.[validation.verdict] ?? null;
@@ -1014,6 +1162,11 @@ function isStructuralNoExecutableAdapterBlock(result, error = "", validation = {
     item?.source === "aipi-local-executor" &&
       /no executable adapter|refusing to self-stamp/i.test(`${item?.result ?? ""}\n${error}`),
   );
+}
+
+function isTransientProviderFailureBlock(result, validation = {}) {
+  if (validation?.policyDecision) return false;
+  return result?.verdict === "BLOCKED" && Boolean(result?.transient_provider_failure);
 }
 
 function shouldAskUserOnGateStop({ target, failedStatus } = {}) {
@@ -1094,6 +1247,22 @@ function terminalStatus(target, failedStatus) {
   if (target === "stop_for_human_approval") return "approval_required";
   if (target === "stop") return failedStatus;
   return failedStatus;
+}
+
+function sleep(ms) {
+  const delay = Math.max(0, Number(ms) || 0);
+  if (delay === 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, delay));
+}
+
+function positiveInt(value, fallback) {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : fallback;
+}
+
+function nonNegativeInt(value, fallback) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 ? number : fallback;
 }
 
 function exhaustRunLimit(state, contract, reason) {

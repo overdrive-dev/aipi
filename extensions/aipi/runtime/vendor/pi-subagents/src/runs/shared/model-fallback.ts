@@ -20,36 +20,42 @@ export function splitThinkingSuffix(model: string): { baseModel: string; thinkin
 	};
 }
 
+function modelText(value: unknown): string | undefined {
+	if (value == null) return undefined;
+	const text = String(value).trim();
+	return text || undefined;
+}
+
 export function resolveModelCandidate(
-	model: string | undefined,
+	model: unknown,
 	availableModels: AvailableModelInfo[] | undefined,
 	preferredProvider?: string,
 ): string | undefined {
-	if (!model) return undefined;
-	if (model.includes("/")) return model;
-	if (!availableModels || availableModels.length === 0) return model;
+	const text = modelText(model);
+	if (!text) return undefined;
+	if (text.includes("/")) return text;
+	if (!availableModels || availableModels.length === 0) return text;
 
-	const { baseModel, thinkingSuffix } = splitThinkingSuffix(model);
+	const { baseModel, thinkingSuffix } = splitThinkingSuffix(text);
 	const matches = availableModels.filter((entry) => entry.id === baseModel);
 	if (preferredProvider) {
 		const preferredMatch = matches.find((entry) => entry.provider === preferredProvider);
 		if (preferredMatch) return `${preferredMatch.fullId}${thinkingSuffix}`;
 	}
-	if (matches.length !== 1) return model;
+	if (matches.length !== 1) return text;
 	return `${matches[0]!.fullId}${thinkingSuffix}`;
 }
 
 export function buildModelCandidates(
-	primaryModel: string | undefined,
-	fallbackModels: string[] | undefined,
+	primaryModel: unknown,
+	fallbackModels: unknown[] | undefined,
 	availableModels: AvailableModelInfo[] | undefined,
 	preferredProvider?: string,
 ): string[] {
 	const seen = new Set<string>();
 	const candidates: string[] = [];
 	for (const raw of [primaryModel, ...(fallbackModels ?? [])]) {
-		if (!raw) continue;
-		const normalized = resolveModelCandidate(raw.trim(), availableModels, preferredProvider);
+		const normalized = resolveModelCandidate(raw, availableModels, preferredProvider);
 		if (!normalized || seen.has(normalized)) continue;
 		seen.add(normalized);
 		candidates.push(normalized);

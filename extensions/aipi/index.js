@@ -22,6 +22,10 @@ import {
   runMemoryCommand,
 } from "./runtime/memory-command.js";
 import {
+  formatModelsCommandResult,
+  runModelsCommand,
+} from "./runtime/models-command.js";
+import {
   formatOnboardingResult,
   maybeRunPostInitOnboarding,
   parseOnboardArgs,
@@ -134,6 +138,19 @@ export default function aipiExtension(pi) {
         ctx.ui.notify(formatMemoryCommandResult(result), "info");
       } catch (error) {
         ctx.ui.notify(`AIPI memory failed: ${error.message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("aipi-models", {
+    description: "Configure and validate AIPI host/adversarial model topology.",
+    handler: async (args, ctx) => {
+      try {
+        const projectRoot = resolveProjectRoot(ctx);
+        const result = await runModelsCommand({ args: args ?? "", projectRoot, ui: ctx?.ui });
+        ctx.ui.notify(formatModelsCommandResult(result), result.state === "ready" ? "info" : "warning");
+      } catch (error) {
+        ctx.ui.notify(`AIPI models failed: ${error.message}`, "error");
       }
     },
   });

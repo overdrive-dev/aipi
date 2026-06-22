@@ -12,7 +12,9 @@ export const AIPI_SUBAGENTS_AGENT_NAME = "aipi-worker";
 export const AIPI_SUBAGENTS_ALLOWED_TOOLS = ["read", "grep", "find", "ls", "write"];
 export const AIPI_SUBAGENTS_READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
 export const AIPI_SUBAGENTS_GUARDED_WRITE_EXTENSION = "extensions/aipi/runtime/aipi-guarded-write-child.js";
-export const AIPI_SUBAGENTS_DISALLOWED_PROVIDERS = ["bedrock", "deepseek", "glm", "zai"];
+export const AIPI_SUBAGENTS_DISALLOWED_PROVIDERS = [];
+export const AIPI_HOST_MODEL_READINESS_MESSAGE =
+  "AIPI host model is unavailable to the AIPI/Pi worker runtime.";
 
 const LIVE_SPIKE_TASK = "Reply with the single word OK.";
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
@@ -55,28 +57,96 @@ export function modelProvider(modelId) {
   return separator > 0 ? text.slice(0, separator).toLowerCase() : null;
 }
 
+export function aipiHostModelReadiness(model, { requireProvider = false, requireModel = false } = {}) {
+  const modelId = modelToPiModelId(model);
+  const normalizedModelId = String(modelId ?? "").trim();
+  const provider = modelProvider(normalizedModelId);
+  if (!normalizedModelId) {
+    return (requireProvider || requireModel)
+      ? unsupportedHostModelReadiness({
+          code: "AIPI_HOST_MODEL_UNAVAILABLE",
+          modelId: null,
+          provider: null,
+          detail: "No host model was available.",
+        })
+      : {
+          ok: true,
+          code: "AIPI_HOST_MODEL_UNKNOWN",
+          model_id: null,
+          provider: null,
+          message: null,
+        };
+  }
+  if (!provider) {
+    return {
+      ok: true,
+      code: "AIPI_HOST_MODEL_UNQUALIFIED_ALLOWED",
+      model_id: normalizedModelId,
+      provider: null,
+      message: null,
+    };
+  }
+  if (AIPI_SUBAGENTS_DISALLOWED_PROVIDERS.includes(provider)) {
+    return unsupportedHostModelReadiness({
+      code: "AIPI_HOST_MODEL_UNSUPPORTED",
+      modelId: normalizedModelId,
+      provider,
+      detail: `Provider ${provider} is not available in this installed AIPI/Pi worker runtime.`,
+    });
+  }
+  return {
+    ok: true,
+    code: "AIPI_HOST_MODEL_SUPPORTED",
+    model_id: normalizedModelId,
+    provider,
+    message: null,
+  };
+}
+
+export function assertAipiSupportedHostModel(model, options = {}) {
+  const readiness = aipiHostModelReadiness(model, options);
+  if (readiness.ok) return readiness;
+  const error = new Error(readiness.message);
+  error.code = readiness.code;
+  error.readiness = readiness;
+  throw error;
+}
+
 export function assertAipiHostScopedModel(modelId, {
   allowedProvider = null,
   allowedProviders = null,
   requireProvider = false,
+  requireModel = false,
 } = {}) {
   const normalizedModelId = String(modelId ?? "").trim();
   const provider = modelProvider(normalizedModelId);
-  if (!provider) {
-    if (requireProvider) {
-      throw new Error(
-        `AIPI forked subagents require a provider-qualified host model; got ${normalizedModelId || "none"}`,
-      );
+  if (!normalizedModelId) {
+    if (requireProvider || requireModel) {
+      throw new Error("AIPI forked subagents require a concrete host model; got none");
     }
     return;
   }
+  if (!provider) {
+    return;
+  }
   if (AIPI_SUBAGENTS_DISALLOWED_PROVIDERS.includes(provider)) {
-    throw new Error(`AIPI forked subagents cannot run non-host provider model ${normalizedModelId}`);
+    throw new Error(`AIPI forked subagents cannot run provider model ${normalizedModelId} in this installation`);
   }
   const allowed = normalizeAllowedProviders(allowedProviders ?? allowedProvider);
   if (allowed.size && !allowed.has(provider)) {
     throw new Error(`AIPI forked subagents only allow host provider ${[...allowed].join(", ")}; got ${normalizedModelId}`);
   }
+}
+
+function unsupportedHostModelReadiness({ code, modelId, provider, detail }) {
+  const suffix = modelId ? ` Current host model: ${modelId}.` : "";
+  return {
+    ok: false,
+    code,
+    model_id: modelId,
+    provider,
+    message: `${AIPI_HOST_MODEL_READINESS_MESSAGE}${suffix} ${detail}`.trim(),
+  };
 }
 
 function normalizeAllowedProviders(value) {
@@ -149,7 +219,8 @@ export async function runAipiForkedSubagent({
   ]);
 
   const modelId = modelToPiModelId(params.model ?? job?.descriptor?.model);
-  assertAipiHostScopedModel(modelId, { requireProvider: true });
+  assertAipiHostScopedModel(modelId, { requireModel: true });
+  const modelIdProvider = modelProvider(modelId);
   const maxToolCalls = normalizeMaxToolCalls(
     params.max_tool_calls ?? params.maxToolCalls ?? job?.budget?.maxToolCalls ?? job?.budget?.max_tool_calls,
   );
@@ -186,14 +257,14 @@ export async function runAipiForkedSubagent({
           cleanupDays: 7,
         },
         modelOverride: modelId ?? undefined,
-        availableModels: modelId
+        availableModels: modelId && modelIdProvider
           ? [{
-              provider: modelProvider(modelId) ?? "anthropic",
-              id: modelId.includes("/") ? modelId.slice(modelId.indexOf("/") + 1) : modelId,
+              provider: modelIdProvider,
+              id: modelId.slice(modelId.indexOf("/") + 1),
               fullId: modelId,
             }]
           : undefined,
-        preferredModelProvider: modelProvider(modelId) ?? "anthropic",
+        preferredModelProvider: modelIdProvider ?? undefined,
         maxSubagentDepth: 0,
         maxToolCalls: maxToolCalls ?? undefined,
       },
@@ -252,7 +323,7 @@ function createAipiWorkerAgentConfig({ thinking = undefined } = {}) {
     systemPrompt: [
       "You are an AIPI worker running inside the project-scoped AIPI subagent runtime.",
       "Use only the allowed project tools. The write tool is guarded by AIPI owned-file scope.",
-      "Do not use shell, bash, exec, or non-host providers.",
+      "Do not use shell, bash, exec, or a provider/model other than the selected worker model.",
       "Follow the task exactly and return the requested output format.",
     ].join("\n"),
   };
@@ -392,7 +463,7 @@ export function formatPiSubagentsSmokeInstructions() {
     "1. assistant_text_ok=true for the worker reply to `OK`.",
     "2. provider_event_observed=true in .aipi/runtime/provider-events.jsonl after the worker run.",
     "3. worker session/artifact/result files are under .aipi/runtime/subagents/.",
-    "4. no Bedrock or other non-host provider is attempted.",
+    "4. no provider/model other than the selected worker model is attempted.",
     "",
     "No `pi install npm:pi-subagents` step is required.",
     "The forked pi-subagents runtime is the default AIPI worker runtime; no backend flag is required.",

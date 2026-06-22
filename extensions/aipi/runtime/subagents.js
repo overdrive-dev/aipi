@@ -18,12 +18,14 @@ import { validateStepResult } from "./step-result.js";
 import { aipiRetrieve } from "./aipi-tools.js";
 import {
   BUILTIN_MODEL_CLASSES,
+  HOST_DEFAULT_MODEL,
   loadKnownModelClassesSync,
   resolveSpawnModelDecision,
 } from "./model-router.js";
 import {
   PI_SUBAGENTS_ISOLATION,
   assertAipiHostScopedModel,
+  assertAipiSupportedHostModel,
   extractToolText,
   normalizePiSubagentsBackend,
   normalizePiSubagentsRunner,
@@ -140,7 +142,17 @@ export class SubagentCoordinator {
       knownClasses: this.#knownModelClasses,
       descriptor: descriptorWithHostModel,
     });
-    assertAipiHostScopedModel(modelResolution.resolved, { requireProvider: true });
+    if (modelResolution.resolved === HOST_DEFAULT_MODEL) {
+      const err = new Error("AIPI worker spawn requires a concrete host model; current session model was unavailable.");
+      err.code = "AIPI_HOST_MODEL_UNAVAILABLE";
+      throw err;
+    }
+    if (modelResolution.host_fallback) {
+      assertAipiSupportedHostModel(descriptorWithHostModel.host_model ?? descriptorWithHostModel.hostModel, {
+        requireModel: true,
+      });
+    }
+    assertAipiHostScopedModel(modelResolution.resolved, { requireModel: true });
     const workerDescriptor = withWorkerContextPacket(
       descriptorWithResolvedModel(descriptorWithHostModel, modelResolution),
       { root: this.#root },

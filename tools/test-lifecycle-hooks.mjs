@@ -158,6 +158,14 @@ try {
     null,
   );
   assert.equal(classifyAipiInputRoute("me explica isso"), null);
+  const leftoverTestsQuestion = classifyAipiInputRoute("sobrou algum teste?");
+  assert.equal(leftoverTestsQuestion.intent, "check_inline");
+  assert.equal(leftoverTestsQuestion.answerInline, true);
+  assert.equal(leftoverTestsQuestion.autoDispatch, false);
+  assert.equal(classifyAipiCodePipeline("sobrou algum teste?").classification, "read_only_check");
+  assert.equal(classifyAipiInputRoute("qual api chama login?").intent, "check_inline");
+  assert.equal(classifyAipiInputRoute("quem chama a funcao renewSubscription?").intent, "check_inline");
+  assertWorkflowDispatch(classifyAipiInputRoute("can you fix bug no login?"), "bugfix", "root_cause_bugfix");
   const bugPipeline = classifyAipiCodePipeline("corrigir bug no login");
   assert.equal(bugPipeline.classification, "root_cause_bugfix");
   assert.equal(bugPipeline.default_action, "auto_dispatch_workflow");
@@ -356,6 +364,73 @@ try {
     });
     const routerCtx = { cwd: routerRoot, ui: { notify(message, kind) { routerNotifications.push({ message, kind }); } } };
 
+    const checkBeforeRunnerCalls = routerRunnerCalls.length;
+    const checkResult = await routerHandlers.input({ type: "input", text: "sobrou algum teste?", source: "interactive" }, routerCtx);
+    assert.equal(checkResult.action, "continue");
+    assert.equal(checkResult.message.customType, "aipi.read-only-check");
+    assert.equal(checkResult.message.display, false);
+    assert.match(checkResult.message.content, /aipi_retrieve/);
+    assert.equal(routerRunnerCalls.length, checkBeforeRunnerCalls);
+    const checkEntry = routerEntries.find((entry) => entry.type === "aipi.input.route" && entry.data.input === "check_inline");
+    assert.equal(checkEntry.data.answer_inline, true);
+    assert.equal(checkEntry.data.read_only, true);
+    assert.equal(checkEntry.data.auto_dispatch, false);
+
+    const hostAgnosticRunnerCalls = [];
+    const hostAgnosticNotifications = [];
+    const hostAgnosticEntries = [];
+    const hostAgnosticHandlers = createAipiLifecycleHandlers({
+      pi: { appendEntry(type, data) { hostAgnosticEntries.push({ type, data }); } },
+      projectRootResolver: () => routerRoot,
+      coordinator: routerCoordinator,
+      workflowCommandRunner: async (input) => {
+        hostAgnosticRunnerCalls.push(input);
+        return {
+          action: "run",
+          run: {
+            runId: "host-openai-codex",
+            workflow: "bugfix",
+            runRelDir: ".aipi/runtime/runs/host-openai-codex",
+            contractPath: ".aipi/runtime/runs/host-openai-codex/BDD-CONTRACT.md",
+          },
+          execution: {
+            runId: "host-openai-codex",
+            status: "blocked",
+            state: { workflow: "bugfix", status: "blocked", current_step: "intake" },
+          },
+        };
+      },
+      userInputRecorder: async () => ({ relPath: "USER-INPUT.jsonl" }),
+    });
+    const hostAgnosticCtx = {
+      cwd: routerRoot,
+      model: "openai-codex/gpt-5.5",
+      ui: { notify(message, kind) { hostAgnosticNotifications.push({ message, kind }); } },
+    };
+    assert.deepEqual(
+      await hostAgnosticHandlers.input(
+        { type: "input", text: "corrigir bug no login", source: "interactive" },
+        hostAgnosticCtx,
+      ),
+      { action: "handled" },
+    );
+    assert.equal(hostAgnosticRunnerCalls.length, 1);
+    assert.equal(hostAgnosticRunnerCalls[0].args, "run bugfix");
+    assert.notEqual(hostAgnosticNotifications.at(-1)?.kind, "error");
+    assert.doesNotMatch(hostAgnosticNotifications.at(-1)?.message ?? "", /Cannot read properties of undefined/);
+    const unsupportedHostEntry = hostAgnosticEntries.find(
+      (entry) => entry.type === "aipi.input.route" && entry.data.reason === "unsupported_host_model",
+    );
+    assert.equal(unsupportedHostEntry, undefined);
+    const hostAgnosticEntry = hostAgnosticEntries.find(
+      (entry) =>
+        entry.type === "aipi.input.route" &&
+        entry.data.input === "auto_dispatch_workflow" &&
+        entry.data.workflow_args === "run bugfix",
+    );
+    assert.equal(hostAgnosticEntry.data.auto_dispatch, true);
+    assert.equal(hostAgnosticEntry.data.result_action, "run");
+
     assert.deepEqual(
       await routerHandlers.input({ type: "input", text: "deploy no CI", source: "interactive" }, routerCtx),
       { action: "continue" },
@@ -415,6 +490,126 @@ try {
       (entry) => entry.type === "aipi.code_pipeline.trace" && entry.data.reason === "explicit_skip_phrase",
     );
     assert.equal(skipTrace.data.dispatch, null);
+
+    const vetoRunnerCalls = [];
+    const vetoClassifierCalls = [];
+    const vetoEntries = [];
+    const vetoHandlers = createAipiLifecycleHandlers({
+      pi: { appendEntry(type, data) { vetoEntries.push({ type, data }); } },
+      projectRootResolver: () => routerRoot,
+      coordinator: routerCoordinator,
+      intentClassifier: async (input) => {
+        vetoClassifierCalls.push(input);
+        if (input.text === "api login") return { verdict: "question", reason: "ambiguous API question" };
+        return { verdict: "workflow", reason: "mutation request" };
+      },
+      workflowCommandRunner: async (input) => {
+        vetoRunnerCalls.push(input);
+        if (input.args.startsWith("run ")) {
+          assert.equal(typeof input.adapter?.executeStep, "function");
+          await input.adapter.executeStep({
+            root: input.projectRoot,
+            state: {
+              run_id: "router-veto-proof",
+              run_rel_dir: ".aipi/runtime/runs/router-veto-proof",
+              contract_path: ".aipi/runtime/runs/router-veto-proof/BDD-CONTRACT.md",
+            },
+            workflow: { name: "quick" },
+            step: {
+              id: "quick_change",
+              name: "Quick change",
+              prompt: "prove adapter execution",
+              agents: ["implementer"],
+              produces: [],
+              controller_updates: [],
+              gate: {},
+            },
+            context: {},
+            contract: {},
+          });
+        }
+        return {
+          action: "run",
+          run: { runId: `veto-${vetoRunnerCalls.length}`, workflow: input.args.replace(/^run\s+/, "") },
+          execution: { runId: `veto-${vetoRunnerCalls.length}`, status: "blocked", state: { status: "blocked" } },
+        };
+      },
+      userInputRecorder: async () => ({ relPath: "USER-INPUT.jsonl" }),
+    });
+    assert.deepEqual(
+      await vetoHandlers.input({ type: "input", text: "api login", source: "interactive" }, routerCtx),
+      { action: "continue" },
+    );
+    assert.equal(vetoRunnerCalls.length, 0);
+    assert.equal(vetoClassifierCalls.length, 1);
+    assert.equal(vetoClassifierCalls[0].ctx.aipiDisableRouting, true);
+    const vetoEntry = vetoEntries.find((entry) => entry.type === "aipi.input.route" && entry.data.input === "auto_dispatch_vetoed");
+    assert.equal(vetoEntry.data.classifier_source, "llm-veto");
+    assert.equal(vetoEntry.data.classifier_verdict, "question");
+
+    assert.deepEqual(
+      await vetoHandlers.input({ type: "input", text: "corrigir bug no login", source: "interactive" }, routerCtx),
+      { action: "handled" },
+    );
+    assert.equal(vetoRunnerCalls.at(-1).args, "run bugfix");
+    const allowedEntry = vetoEntries.find((entry) => entry.type === "aipi.input.route" && entry.data.workflow_args === "run bugfix");
+    assert.equal(allowedEntry.data.classifier_source, "llm-veto");
+    assert.equal(allowedEntry.data.classifier_verdict, "workflow");
+
+    const fallbackRunnerCalls = [];
+    const fallbackEntries = [];
+    const fallbackHandlers = createAipiLifecycleHandlers({
+      pi: { appendEntry(type, data) { fallbackEntries.push({ type, data }); } },
+      projectRootResolver: () => routerRoot,
+      coordinator: routerCoordinator,
+      intentClassifier: async () => {
+        throw new Error("classifier auth unavailable");
+      },
+      workflowCommandRunner: async (input) => {
+        fallbackRunnerCalls.push(input);
+        return {
+          action: "run",
+          run: { runId: `fallback-${fallbackRunnerCalls.length}`, workflow: input.args.replace(/^run\s+/, "") },
+          execution: { runId: `fallback-${fallbackRunnerCalls.length}`, status: "blocked", state: { status: "blocked" } },
+        };
+      },
+      userInputRecorder: async () => ({ relPath: "USER-INPUT.jsonl" }),
+    });
+    assert.deepEqual(
+      await fallbackHandlers.input({ type: "input", text: "corrigir bug no login", source: "interactive" }, routerCtx),
+      { action: "handled" },
+    );
+    assert.equal(fallbackRunnerCalls.at(-1).args, "run bugfix");
+    const fallbackEntry = fallbackEntries.find((entry) => entry.type === "aipi.input.route" && entry.data.workflow_args === "run bugfix");
+    assert.equal(fallbackEntry.data.classifier_source, "regex-fallback");
+    assert.match(fallbackEntry.data.classifier_reason, /classifier auth unavailable/);
+
+    const timeoutEntries = [];
+    const timeoutRunnerCalls = [];
+    const timeoutHandlers = createAipiLifecycleHandlers({
+      pi: { appendEntry(type, data) { timeoutEntries.push({ type, data }); } },
+      projectRootResolver: () => routerRoot,
+      coordinator: routerCoordinator,
+      intentClassifierTimeoutMs: 1,
+      intentClassifier: () => new Promise(() => {}),
+      workflowCommandRunner: async (input) => {
+        timeoutRunnerCalls.push(input);
+        return {
+          action: "run",
+          run: { runId: `timeout-${timeoutRunnerCalls.length}`, workflow: input.args.replace(/^run\s+/, "") },
+          execution: { runId: `timeout-${timeoutRunnerCalls.length}`, status: "blocked", state: { status: "blocked" } },
+        };
+      },
+      userInputRecorder: async () => ({ relPath: "USER-INPUT.jsonl" }),
+    });
+    assert.deepEqual(
+      await timeoutHandlers.input({ type: "input", text: "implementar nova tela", source: "interactive" }, routerCtx),
+      { action: "handled" },
+    );
+    assert.equal(timeoutRunnerCalls.at(-1).args, "run planning");
+    const timeoutEntry = timeoutEntries.find((entry) => entry.type === "aipi.input.route" && entry.data.workflow_args === "run planning");
+    assert.equal(timeoutEntry.data.classifier_source, "regex-fallback");
+    assert.match(timeoutEntry.data.classifier_reason, /intent_classifier_timeout/);
 
     const noAdapterRunnerCalls = [];
     const noAdapterNotifications = [];

@@ -555,6 +555,81 @@ try {
   assert.match(contradictoryReviewStep.error, /PASS contradicts unresolved CRITICAL finding/);
   assert.equal(contradictoryReviewExecution.state.current_step, "quick_review");
 
+  await patchTransientProviderRetry(tempRoot, {
+    maxAttempts: 3,
+    baseDelayMs: 0,
+    maxDelayMs: 0,
+    jitterMs: 0,
+  });
+  const transientSuccessRun = await startWorkflowRun({
+    projectRoot: tempRoot,
+    workflow: "quick",
+    now: () => fixedDate,
+    randomBytes: fixedRandom,
+  });
+  const transientSuccessAdapter = transientProviderAdapter({ failuresBeforeSuccess: 2 });
+  const transientSuccess = await executeWorkflowRun({
+    projectRoot: tempRoot,
+    runId: transientSuccessRun.runId,
+    now: () => fixedDate,
+    adapter: transientSuccessAdapter,
+  });
+  assert.equal(transientSuccess.status, "completed");
+  assert.equal(transientSuccess.state.consecutive_failures, 0);
+  assert.equal(transientSuccessAdapter.attempts.quick_scope, 3);
+  const transientSuccessResult = JSON.parse(await fs.readFile(
+    path.join(tempRoot, ".aipi", "runtime", "runs", transientSuccessRun.runId, "steps", "quick_scope", "RESULT.json"),
+    "utf8",
+  ));
+  assert.equal(transientSuccessResult.result.transient_provider_retries.recovered, true);
+  assert.equal(transientSuccessResult.result.transient_provider_retries.attempts, 3);
+
+  const transientBlockedRun = await startWorkflowRun({
+    projectRoot: tempRoot,
+    workflow: "quick",
+    now: () => fixedDate,
+    randomBytes: fixedRandom,
+  });
+  const transientBlockedAdapter = transientProviderAdapter({ alwaysFail: true });
+  const transientBlocked = await executeWorkflowRun({
+    projectRoot: tempRoot,
+    runId: transientBlockedRun.runId,
+    now: () => fixedDate,
+    adapter: transientBlockedAdapter,
+  });
+  assert.equal(transientBlocked.status, "blocked");
+  assert.equal(transientBlocked.state.current_step, "quick_scope");
+  assert.equal(transientBlocked.state.steps.find((step) => step.id === "quick_scope").status, "blocked");
+  assert.match(transientBlocked.state.blocked_reason, /transient provider failure after 3 attempts/);
+  assert.match(transientBlocked.state.awaiting_user_input.question, /erro transitorio do provider/);
+  assert.equal(transientBlocked.state.consecutive_failures, 0);
+  assert.equal(transientBlockedAdapter.attempts.quick_scope, 3);
+
+  const cascadeRun = await startWorkflowRun({
+    projectRoot: tempRoot,
+    workflow: "quick",
+    now: () => fixedDate,
+    randomBytes: fixedRandom,
+  });
+  const cascadeStatePath = path.join(tempRoot, ".aipi", "runtime", "runs", cascadeRun.runId, "state.json");
+  const cascadeState = JSON.parse(await fs.readFile(cascadeStatePath, "utf8"));
+  cascadeState.current_step = "quick_change";
+  cascadeState.steps.find((step) => step.id === "quick_scope").status = "blocked";
+  cascadeState.steps.find((step) => step.id === "quick_scope").verdict = "BLOCKED";
+  cascadeState.steps.find((step) => step.id === "quick_scope").error = "root provider overload at quick_scope";
+  await fs.writeFile(cascadeStatePath, `${JSON.stringify(cascadeState, null, 2)}\n`);
+  const cascadeBlocked = await executeWorkflowRun({
+    projectRoot: tempRoot,
+    runId: cascadeRun.runId,
+    now: () => fixedDate,
+    adapter: createTestPassWorkflowAdapter(),
+  });
+  assert.equal(cascadeBlocked.status, "blocked");
+  assert.equal(cascadeBlocked.state.current_step, "quick_scope");
+  assert.equal(cascadeBlocked.state.blocked_reason, "root provider overload at quick_scope");
+  assert.equal(cascadeBlocked.state.steps.find((step) => step.id === "quick_change").status, "pending");
+  assert.equal(/required step quick_scope has not passed/.test(cascadeBlocked.state.blocked_reason), false);
+
   const started = await startWorkflowRun({
     projectRoot: tempRoot,
     workflow: "quick",
@@ -700,6 +775,24 @@ function quickChangeLoopFailureAdapter() {
         ],
         artifacts: [],
       };
+    },
+  };
+}
+
+function transientProviderAdapter({ failuresBeforeSuccess = 0, alwaysFail = false } = {}) {
+  const pass = createTestPassWorkflowAdapter();
+  const attempts = {};
+  return {
+    attempts,
+    async executeStep(args) {
+      attempts[args.step.id] = (attempts[args.step.id] ?? 0) + 1;
+      if (args.step.id === "quick_scope" && (alwaysFail || attempts[args.step.id] <= failuresBeforeSuccess)) {
+        const error = new Error("overloaded_error: provider temporarily overloaded");
+        error.type = "overloaded_error";
+        error.status = 529;
+        throw error;
+      }
+      return pass.executeStep(args);
     },
   };
 }
@@ -1038,6 +1131,13 @@ async function patchRunLimits(projectRoot, runLimits) {
   const contractPath = path.join(projectRoot, ".aipi", "runtime-contract.json");
   const contract = JSON.parse(await fs.readFile(contractPath, "utf8"));
   contract.runLimits = runLimits;
+  await fs.writeFile(contractPath, `${JSON.stringify(contract, null, 2)}\n`);
+}
+
+async function patchTransientProviderRetry(projectRoot, transientProviderRetry) {
+  const contractPath = path.join(projectRoot, ".aipi", "runtime-contract.json");
+  const contract = JSON.parse(await fs.readFile(contractPath, "utf8"));
+  contract.transientProviderRetry = transientProviderRetry;
   await fs.writeFile(contractPath, `${JSON.stringify(contract, null, 2)}\n`);
 }
 
