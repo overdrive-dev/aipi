@@ -143,14 +143,24 @@ try {
   assert.equal(classifyAipiInputRoute("pode seguir", { activeRun: null }), null);
   assert.equal(classifyAipiInputRoute("continuar de onde parou depois da atualizacao", { activeRun: null }), null);
   assert.equal(classifyAipiInputRoute("continue the test fix wave", { activeRun: null }), null);
-  assertWorkflowSuggestion(classifyAipiInputRoute("planejar regra de negocio"), "planning");
-  assertWorkflowDispatch(classifyAipiInputRoute("corrigir bug no login"), "bugfix", "root_cause_bugfix");
-  assertWorkflowSuggestion(classifyAipiInputRoute("pesquisar docs do provider"), "research");
-  assertWorkflowSuggestion(classifyAipiInputRoute("deploy em homolog"), "ops");
-  assertWorkflowDispatch(classifyAipiInputRoute("implementar nova tela"), "planning", "substantive_code_work");
-  assertWorkflowSuggestion(classifyAipiInputRoute("pequeno ajuste"), "quick");
+  // Flexible-agent DEFAULT: keyword tasks do NOT auto-dispatch or suggest a workflow — they fall through
+  // to null so the full-tool main agent handles them (no pipeline hijack).
+  assert.equal(classifyAipiInputRoute("planejar regra de negocio"), null);
+  assert.equal(classifyAipiInputRoute("corrigir bug no login"), null);
+  assert.equal(classifyAipiInputRoute("pesquisar docs do provider"), null);
+  assert.equal(classifyAipiInputRoute("implementar nova tela"), null);
+  assert.equal(classifyAipiInputRoute("pequeno ajuste"), null);
+  assert.equal(classifyAipiInputRoute("review adversarial", { activeRun: null }), null);
+  // Opt-in (AIPI_AUTO_DISPATCH=1 / autoDispatchEnabled:true) restores keyword auto-dispatch + suggestions.
+  assertWorkflowSuggestion(classifyAipiInputRoute("planejar regra de negocio", { autoDispatchEnabled: true }), "planning");
+  assertWorkflowDispatch(classifyAipiInputRoute("corrigir bug no login", { autoDispatchEnabled: true }), "bugfix", "root_cause_bugfix");
+  assertWorkflowSuggestion(classifyAipiInputRoute("pesquisar docs do provider", { autoDispatchEnabled: true }), "research");
+  assertWorkflowSuggestion(classifyAipiInputRoute("deploy em homolog", { autoDispatchEnabled: true }), "ops");
+  assertWorkflowDispatch(classifyAipiInputRoute("implementar nova tela", { autoDispatchEnabled: true }), "planning", "substantive_code_work");
+  assertWorkflowSuggestion(classifyAipiInputRoute("pequeno ajuste", { autoDispatchEnabled: true }), "quick");
+  // Explicit continue/review of an ACTIVE run is NOT auto-dispatch — still works without the flag.
   assert.equal(classifyAipiInputRoute("review adversarial", { activeRun: started }).workflowArgs, "execute");
-  assertWorkflowSuggestion(classifyAipiInputRoute("review adversarial", { activeRun: null }), "planning");
+  assertWorkflowSuggestion(classifyAipiInputRoute("review adversarial", { activeRun: null, autoDispatchEnabled: true }), "planning");
   assert.equal(
     classifyAipiInputRoute("Sim, essa regra vale para enterprise", {
       activeRun: {
@@ -168,7 +178,8 @@ try {
   assert.equal(classifyAipiCodePipeline("sobrou algum teste?").classification, "read_only_check");
   assert.equal(classifyAipiInputRoute("qual api chama login?").intent, "check_inline");
   assert.equal(classifyAipiInputRoute("quem chama a funcao renewSubscription?").intent, "check_inline");
-  assertWorkflowDispatch(classifyAipiInputRoute("can you fix bug no login?"), "bugfix", "root_cause_bugfix");
+  assert.equal(classifyAipiInputRoute("can you fix bug no login?"), null); // off by default
+  assertWorkflowDispatch(classifyAipiInputRoute("can you fix bug no login?", { autoDispatchEnabled: true }), "bugfix", "root_cause_bugfix");
   const bugPipeline = classifyAipiCodePipeline("corrigir bug no login");
   assert.equal(bugPipeline.classification, "root_cause_bugfix");
   assert.equal(bugPipeline.default_action, "auto_dispatch_workflow");
@@ -296,6 +307,10 @@ try {
   );
 
   const routerRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-router-suggest-"));
+  // This block exercises the OPT-IN auto-dispatch path (AIPI_AUTO_DISPATCH=1); the flexible default (off)
+  // is covered by the classifyAipiInputRoute unit assertions above.
+  const priorAutoDispatch = process.env.AIPI_AUTO_DISPATCH;
+  process.env.AIPI_AUTO_DISPATCH = "1";
   try {
     await initProject({ sourceRoot, targetRoot: routerRoot });
     await forceFastSemanticFallback(routerRoot);
@@ -766,6 +781,8 @@ try {
     // clears runs/active and persists the run as abandoned, so no later hook re-traps the user.
     assert.equal(await readActiveRun(routerRoot), null);
   } finally {
+    if (priorAutoDispatch === undefined) delete process.env.AIPI_AUTO_DISPATCH;
+    else process.env.AIPI_AUTO_DISPATCH = priorAutoDispatch;
     await fs.rm(routerRoot, { recursive: true, force: true });
   }
 

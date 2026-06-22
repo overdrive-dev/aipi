@@ -333,7 +333,7 @@ export async function handleInput({
     codePipeline,
   });
   if (hostBlock) return hostBlock;
-  let route = classifyAipiInputRoute(event?.text ?? "", { activeRun: active, codePipeline });
+  let route = classifyAipiInputRoute(event?.text ?? "", { activeRun: active, codePipeline, autoDispatchEnabled: aipiAutoDispatchEnabled() });
   const classifier = await applyAutoDispatchVeto({
     text: event?.text ?? "",
     route,
@@ -771,7 +771,7 @@ export async function handleBlockedRunPicker({
   return { action: "handled" };
 }
 
-export function classifyAipiInputRoute(text, { activeRun = null, codePipeline = null, projectRoot = null } = {}) {
+export function classifyAipiInputRoute(text, { activeRun = null, codePipeline = null, projectRoot = null, autoDispatchEnabled = false } = {}) {
   const original = String(text ?? "").trim();
   if (!original || original.startsWith("/") || original.startsWith("@")) return null;
   const normalized = normalizeInputText(original);
@@ -798,7 +798,9 @@ export function classifyAipiInputRoute(text, { activeRun = null, codePipeline = 
 
   const pipeline = codePipeline ?? classifyAipiCodePipeline(original, { activeRun, projectRoot });
   if (pipeline.reason === "explicit_skip_phrase") return null;
-  if (continuableRun && pipeline.substantive && pipeline.classification !== "trivial_or_mechanical") {
+  // Auto-feeding substantive input into an active workflow is part of the auto-dispatch behavior; with
+  // auto-dispatch off (the flexible-agent default) it stays the user's turn — they continue explicitly.
+  if (autoDispatchEnabled && continuableRun && pipeline.substantive && pipeline.classification !== "trivial_or_mechanical") {
     return {
       intent: "continue_active_workflow",
       workflowArgs: "execute",
@@ -811,7 +813,11 @@ export function classifyAipiInputRoute(text, { activeRun = null, codePipeline = 
     return buildReadOnlyCheckRoute(pipeline);
   }
 
-  const autoWorkflow = autoDispatchWorkflowForPipeline(pipeline);
+  // Regex/heuristic auto-dispatch is OFF by default: a task no longer hijacks the turn into a forked,
+  // hard-gated pipeline. It falls through to `null` so the full-tool main agent handles it (with AIPI
+  // guidance injected via before_agent_start), and workflows run only when explicitly invoked
+  // (/aipi-workflow) or when a host opts in via AIPI_AUTO_DISPATCH=1.
+  const autoWorkflow = autoDispatchEnabled ? autoDispatchWorkflowForPipeline(pipeline) : null;
   if (autoWorkflow) {
     return {
       intent: "auto_dispatch_workflow",
@@ -826,7 +832,9 @@ export function classifyAipiInputRoute(text, { activeRun = null, codePipeline = 
     };
   }
 
-  const workflow = workflowForInput(normalized);
+  // Keyword "suggest a workflow" is also auto-dispatch behavior — off by default so the flexible agent
+  // isn't nagged to launch a pipeline for every task that mentions a trigger word.
+  const workflow = autoDispatchEnabled ? workflowForInput(normalized) : null;
   if (!workflow) return null;
   if (workflow === "check") return buildReadOnlyCheckRoute(pipeline);
   return {
@@ -1511,6 +1519,14 @@ function routingDisabled(event, ctx) {
 // and about to write its artifacts, so NO real workflow step could ever complete. The collect loop
 // returns as soon as the worker is ready, so a generous ceiling only bounds a genuinely hung worker.
 const AIPI_WORKFLOW_WORKER_COLLECT_TIMEOUT_MS = 20 * 60_000; // 20 minutes
+
+// Flexible-agent default: AIPI does NOT auto-launch a forked, hard-gated workflow from keyword/regex
+// intent. A task stays the main agent's turn (full tools, can ask questions, iterate) with AIPI guidance
+// injected as context; workflows run only when explicitly invoked (/aipi-workflow). Opt back into the old
+// auto-dispatch with AIPI_AUTO_DISPATCH=1. Read at call time so it can be toggled at runtime.
+function aipiAutoDispatchEnabled() {
+  return process.env.AIPI_AUTO_DISPATCH === "1";
+}
 
 function buildExecutableWorkflowAdapter({ coordinator = null, ctx = {} } = {}) {
   if (typeof coordinator?.spawn !== "function" || typeof coordinator?.collect !== "function") return undefined;
