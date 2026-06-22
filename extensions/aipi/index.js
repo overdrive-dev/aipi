@@ -115,6 +115,8 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
         const projectRoot = resolveProjectRoot(ctx);
         const adapter = createSubagentWorkflowAdapter(coordinator, {
           modelResolver: (modelArgs) => resolveStepModel({ ...modelArgs, ctx }),
+          // Real agentic workers take minutes; the 120s spike default timed them out mid-step (BLOCKED).
+          collectTimeoutMs: 20 * 60_000,
         });
         const result = await workflowCommandRunner({
           args: args ?? "",

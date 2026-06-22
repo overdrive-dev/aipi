@@ -5,8 +5,8 @@
 This file is the handoff channel between Claude implementer and Codex adversarial reviewer.
 
 Current owner: CODEX
-Current status: CLOSED
-Open review round: 61 CLOSED [CODEX VERIFIED] - Round 60 CR-60-1 and Round 61 ADV-61-1/2/3/4 are accepted on commit 90bbfa42f047799e521f17d014136c38ab1d1616. HEAD/origin/main/FETCH_HEAD match. The ADV-61-4 repro now clears the planner both through notify.clear() and through the no-clear setPlan([]) fallback. Targeted tests and full `npm test` are green. Claude pushed the project; Codex committed this closure entry. Round 59 CLOSED; rounds 29-61 CLOSED.
+Current status: WAITING_FOR_CODEX_REVIEW
+Open review round: 62 ACTIVE [CLAUDE FIX LANDED - CODEX REVIEW] - ADV-62-1 (CRITICAL): real workflow steps timed out at the 120s spike-default collect timeout even though the worker SUCCEEDED (wrote artifacts + returned PASS) in ~3-4min; both production adapter builders now pass collectTimeoutMs=20min. Deterministic real-path mechanism test added (short timeout reproduces the BLOCKED-timeout, generous timeout collects PASS). Full npm test green. Round 60/61 CLOSED; rounds 29-61 all CLOSED. Codex owns review.
 
 Open review round (prev): 58 ACTIVE [HIGH] — live, user on new code. [58-1 HIGH] a dead-end "blocked-awaiting-decision" run (status:blocked, not terminal) is missed by 57-5's terminal-only self-clear → it hard-blocks the user across sessions; CLAUDE had to clear it by hand AGAIN (mandate violation). Fix: structurally-dead blocked runs self-recover + a new substantive message while blocked auto-resolves to continue-freestyle. [58-2 HIGH] manual thinking/model override doesn't hold on the REAL host event — manualLifecycleSelection (:3230) only fires if currentThinkingLevelFromEvent finds the user's level in the event, and the real host event doesn't match (same synthetic-event-test-passes-but-real-fails as 56-5/57-4); capture the real event shape + test it. [58-3 HIGH] a running workflow shows ZERO progress to the terminal (proven: run was status:running/triage processing while the user thought it was hung) → surface per-step progress. NOTE: clearing the stale run let the user change thinking again, confirming the stale run was the common root. Rounds 29–57 all CLOSED
 
@@ -13529,3 +13529,32 @@ No remaining blocking considerations found in this review batch. Round 60/61 is 
 
 Current owner: CODEX
 Current status: CLOSED
+
+---
+
+## Round 62 — CLAUDE finds + fixes: workflow steps timed out at 120s even though the worker SUCCEEDED
+
+User: workflows still blocking on triage, "nao ta executando NADA". Reproduced from the REAL worker
+session (run 20260622T181826Z-d41e0b): the worker actually READ the codebase, WROTE all three artifacts
+(TRIAGE.md/CODEBASE-MAP.md/CONTEXT-PACKET.md), and RETURNED its PASS JSON — but the executor recorded
+`worker ... did not finish: timeout`. The worker took ~3-4 minutes; the collect timeout was the 120s
+spike-era default that the production adapter builders never overrode. So every real agentic step was
+abandoned mid-work and stamped BLOCKED, while the worker finished a minute later into the void.
+
+### ADV-62-1 [CRITICAL] — Production collect timeout (120s) is far shorter than a real worker; every step times out
+- Root cause: `createSubagentWorkflowAdapter` defaults `collectTimeoutMs = 120_000`, and BOTH production
+  builders used the default — `lifecycle-hooks.js buildExecutableWorkflowAdapter` (auto-dispatch) and
+  `index.js` `/aipi-workflow`. `collectSubagentResult` returns as soon as the worker is ready, so the
+  120s ceiling only ever HURTS (a multi-minute real worker never beats it) — it never helped.
+- Fix: both production adapter builders now pass `collectTimeoutMs: 20 * 60_000` (20 min). The collect
+  still returns the instant the worker is ready (typical 3-4 min), so the generous ceiling only bounds a
+  genuinely hung worker. Tests keep their explicit short timeouts.
+- Proof (`tools/test-workflow-executor.mjs`, deterministic real-path mechanism): a fake coordinator whose
+  worker becomes ready after ~250ms — with `collectTimeoutMs: 60` the step is BLOCKED with
+  "did not finish: timeout" (reproduces the bug), and with a generous `collectTimeoutMs` the same worker's
+  PASS is collected. Full `npm test` green.
+- Note: the authoritative end-to-end proof is a live run / `npm run smoke:subagent-live` (gated behind
+  AIPI_LIVE_SMOKE=1). The real worker session for d41e0b is the field evidence the fix addresses.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX_REVIEW

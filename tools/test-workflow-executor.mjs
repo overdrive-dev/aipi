@@ -717,6 +717,64 @@ try {
   assert.doesNotMatch(workerTask, /\{\{\s*bug\s*\}\}/, "rendered worker prompt must not contain the literal {{ bug }}");
   assert.ok(workerTask.includes(bugText), "rendered worker prompt must contain the user's task text");
 
+  // collect-timeout (real-path mechanism): a real agentic worker takes minutes; the 120s spike default
+  // timed it out mid-step (BLOCKED "did not finish: timeout") even though it would succeed. Prove the
+  // collect timeout governs this: a worker that becomes ready AFTER a short timeout times out, but with
+  // a generous timeout (production now uses 20min) the same worker's PASS result is collected.
+  const timeoutRun = await startWorkflowRun({
+    projectRoot: tempRoot,
+    workflow: "bugfix",
+    params: { bug: "slow worker repro" },
+    now: () => fixedDate,
+    randomBytes: fixedRandom,
+  });
+  const timeoutWorkflow = parseWorkflowDefinition(
+    await fs.readFile(path.join(tempRoot, ".aipi", "workflows", "bugfix.yaml"), "utf8"),
+    "bugfix",
+  );
+  const timeoutTriageStep = timeoutWorkflow.steps.find((step) => step.id === "triage");
+  const makeSlowCoordinator = (readyAfterMs) => {
+    let readyAt = null;
+    return {
+      spawn(descriptor) {
+        readyAt = Date.now() + readyAfterMs;
+        return { agent_id: descriptor.agent_id };
+      },
+      collect(agentId) {
+        if (readyAt !== null && Date.now() >= readyAt) {
+          return {
+            agent_id: agentId,
+            ready: true,
+            step_result: {
+              schema: "aipi.step-result.v1",
+              step_id: "triage",
+              agent_ids: [agentId],
+              verdict: "PASS",
+              evidence: [{ rung: "ran", source: "slow-worker", ref: agentId, result: "finished after delay" }],
+              artifacts: [],
+            },
+            artifacts: [],
+          };
+        }
+        return { agent_id: agentId, ready: false, state: "running" };
+      },
+    };
+  };
+  const runTriageWith = (coordinator, collectTimeoutMs) =>
+    createSubagentWorkflowAdapter(coordinator, {
+      pollIntervalMs: 5,
+      collectTimeoutMs,
+      modelResolver: async () => ({ model_class: "code-strong", model: { provider: "anthropic", id: "x" }, thinking_level: "medium", source: "t" }),
+    }).executeStep({ root: tempRoot, state: timeoutRun.state, workflow: timeoutWorkflow, step: timeoutTriageStep, context: {}, contract: {} });
+  // Too-short timeout: the worker (ready after ~250ms) is abandoned -> BLOCKED "did not finish: timeout"
+  // (this is exactly the production bug with the 120s default vs a multi-minute real worker).
+  const tooShort = await runTriageWith(makeSlowCoordinator(250), 60);
+  assert.equal(tooShort.verdict, "BLOCKED");
+  assert.match(JSON.stringify(tooShort.evidence), /did not finish: timeout/);
+  // Generous timeout: the same slow worker's PASS result is collected and the step succeeds.
+  const generous = await runTriageWith(makeSlowCoordinator(250), 10_000);
+  assert.equal(generous.verdict, "PASS");
+
   const contradictoryReviewRun = await startWorkflowRun({
     projectRoot: tempRoot,
     workflow: "quick",

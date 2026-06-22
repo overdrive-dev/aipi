@@ -1505,11 +1505,19 @@ function routingDisabled(event, ctx) {
   return Boolean(event?.aipiDisableRouting || ctx?.aipiDisableRouting || isTruthyFlag(process.env.AIPI_DISABLE_ROUTING));
 }
 
+// A real agentic worker (reads the codebase, reasons, writes several artifacts) routinely takes
+// minutes — far longer than the 120s spike-era default. With the short default the executor gave up
+// and stamped the step BLOCKED ("worker did not finish: timeout") while the worker was still working
+// and about to write its artifacts, so NO real workflow step could ever complete. The collect loop
+// returns as soon as the worker is ready, so a generous ceiling only bounds a genuinely hung worker.
+const AIPI_WORKFLOW_WORKER_COLLECT_TIMEOUT_MS = 20 * 60_000; // 20 minutes
+
 function buildExecutableWorkflowAdapter({ coordinator = null, ctx = {} } = {}) {
   if (typeof coordinator?.spawn !== "function" || typeof coordinator?.collect !== "function") return undefined;
   try {
     return createSubagentWorkflowAdapter(coordinator, {
       modelResolver: (modelArgs) => resolveStepModel({ ...modelArgs, ctx }),
+      collectTimeoutMs: AIPI_WORKFLOW_WORKER_COLLECT_TIMEOUT_MS,
     });
   } catch {
     return undefined;
