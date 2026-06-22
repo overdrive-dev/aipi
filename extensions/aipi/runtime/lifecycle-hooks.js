@@ -6,7 +6,13 @@ import {
   formatAwaitingUserInputPrompt,
   normalizeBlockerOptions,
 } from "./blocker-input.js";
-import { formatWorkflowCommandResult, readActiveRun, recordWorkflowUserInput, runWorkflowCommand } from "./run-state.js";
+import {
+  closeWorkflowRun,
+  formatWorkflowCommandResult,
+  readActiveRun,
+  recordWorkflowUserInput,
+  runWorkflowCommand,
+} from "./run-state.js";
 import { latestSubagentStateFromEntries } from "./subagents.js";
 import { createSubagentWorkflowAdapter, parseWorkflowDefinition } from "./workflow-executor.js";
 import { describeModel, resolveModelClass, resolveStepModel } from "./model-router.js";
@@ -20,6 +26,8 @@ const PROVIDER_USAGE_LOG = ".aipi/runtime/provider-usage.jsonl";
 const PROVIDER_BUDGET_LOG = ".aipi/runtime/provider-budget.jsonl";
 const MODEL_ROUTING_LOG = ".aipi/runtime/model-routing.jsonl";
 const CODE_PIPELINE_LOG = ".aipi/runtime/code-pipeline.jsonl";
+const RUNTIME_ERROR_LOG = ".aipi/runtime/errors.jsonl";
+const UNSUPPORTED_HOST_LOG = ".aipi/runtime/unsupported-host.jsonl";
 const PROVIDER_PRICING_REL_PATH = ".aipi/provider-pricing.json";
 const PROVIDER_BUDGET_REL_PATH = ".aipi/provider-budget.json";
 const CONTEXT_EVENT_LOG = ".aipi/runtime/context-events.jsonl";
@@ -85,7 +93,7 @@ export function createAipiLifecycleHandlers({
   intentClassifierTimeoutMs = 1500,
 } = {}) {
   const rootFor = (ctx, event) => path.resolve(projectRootResolver(ctx, event) ?? process.cwd());
-  return {
+  const handlers = {
     session_start: async (event, ctx) => handleSessionStart({
       event,
       ctx,
@@ -191,6 +199,39 @@ export function createAipiLifecycleHandlers({
     before_provider_request: async (event, ctx) => handleBeforeProviderRequest({ event, projectRoot: rootFor(ctx, event) }),
     after_provider_response: async (event, ctx) => handleAfterProviderResponse({ event, projectRoot: rootFor(ctx, event) }),
   };
+  return wrapLifecycleHandlers(handlers, { rootFor, pi });
+}
+
+function wrapLifecycleHandlers(handlers, { rootFor, pi } = {}) {
+  return Object.fromEntries(Object.entries(handlers).map(([hook, handler]) => [
+    hook,
+    async (event, ctx) => {
+      try {
+        return await handler(event, ctx);
+      } catch (error) {
+        const projectRoot = safeProjectRoot(rootFor, ctx, event);
+        if (projectRoot) {
+          const entry = await recordRuntimeError({
+            projectRoot,
+            hook,
+            event,
+            error,
+          }).catch(() => null);
+          if (entry) safeAppendEntry(pi, "aipi.runtime.error", entry);
+        }
+        safeNotify(ctx, `AIPI ${hook} failed: ${error.message}`, "error");
+        throw error;
+      }
+    },
+  ]));
+}
+
+function safeProjectRoot(rootFor, ctx, event) {
+  try {
+    return path.resolve(rootFor(ctx, event) ?? process.cwd());
+  } catch {
+    return null;
+  }
 }
 
 export async function handleSessionStart({ event, ctx, pi, projectRoot, coordinator = null }) {
@@ -272,6 +313,17 @@ export async function handleInput({
   if (!(await isAipiInstalled(projectRoot))) return { action: "continue" };
   const active = await readActiveRun(projectRoot).catch(() => null);
   const codePipeline = classifyAipiCodePipeline(event?.text ?? "", { activeRun: active, projectRoot });
+  const hostBlock = await blockUnsupportedHostTurn({
+    hook: "input",
+    event,
+    ctx,
+    pi,
+    projectRoot,
+    coordinator,
+    activeRun: active,
+    codePipeline,
+  });
+  if (hostBlock) return hostBlock;
   let route = classifyAipiInputRoute(event?.text ?? "", { activeRun: active, codePipeline });
   const classifier = await applyAutoDispatchVeto({
     text: event?.text ?? "",
@@ -388,6 +440,18 @@ export async function handleInput({
       });
     }
     if (isAwaitingUserInput(active)) {
+      const terminalAction = blockerTerminalAction(event?.text);
+      if (terminalAction) {
+        return applyBlockedRunTerminalAction({
+          ctx,
+          pi,
+          projectRoot,
+          active,
+          answer: event?.text,
+          terminalAction,
+          source: event?.source ?? "blocked_text",
+        });
+      }
       safeAppendEntry(pi, "aipi.input.route", {
         schema: "aipi.input-route.v1",
         routed_at: new Date().toISOString(),
@@ -610,6 +674,25 @@ export async function handleBlockedRunPicker({
         return { action: "continue" };
       }
       answer = String(typed).trim();
+    }
+
+    const terminalAction = blockerTerminalAction(answer);
+    if (terminalAction) {
+      await userInputRecorder({
+        projectRoot,
+        runId: current.runId,
+        text: answer,
+        source: "blocker_picker",
+      }).catch(() => null);
+      return applyBlockedRunTerminalAction({
+        ctx,
+        pi,
+        projectRoot,
+        active: current,
+        answer,
+        terminalAction,
+        source: "blocker_picker",
+      });
     }
 
     await userInputRecorder({
@@ -888,6 +971,102 @@ async function resolveAipiHostInputReadiness({ event = null, ctx = null, coordin
     }
   }
   return aipiHostModelReadiness(eventModel ?? coordinatorModel, { requireProvider: false });
+}
+
+async function blockUnsupportedHostTurn({
+  hook,
+  event = null,
+  ctx = null,
+  pi = null,
+  projectRoot,
+  coordinator = null,
+  activeRun = null,
+  snapshot = null,
+  codePipeline = null,
+} = {}) {
+  if (unsupportedHostGuardBypassed({ hook, event, ctx })) return null;
+  const readiness = await resolveAipiHostInputReadiness({ event, ctx, coordinator });
+  if (readiness.ok) return null;
+
+  const runSnapshot = snapshot ?? await buildRunSnapshot(projectRoot).catch(() => ({ active: false }));
+  const diagnosticError = new Error(readiness.message);
+  diagnosticError.name = "AipiUnsupportedHostError";
+  diagnosticError.code = readiness.code;
+  diagnosticError.readiness = readiness;
+  const errorEntry = await recordRuntimeError({
+    projectRoot,
+    hook,
+    event: {
+      ...compactEvent(event),
+      unsupported_host_model: readiness.model_id,
+      unsupported_host_provider: readiness.provider,
+    },
+    error: diagnosticError,
+  }).catch(() => null);
+
+  const entry = {
+    schema: "aipi.unsupported-host-block.v1",
+    recorded_at: new Date().toISOString(),
+    hook,
+    run_id: runSnapshot?.run_id ?? activeRun?.runId ?? null,
+    workflow: runSnapshot?.workflow ?? activeRun?.state?.workflow ?? null,
+    step_id: runSnapshot?.step_id ?? activeRun?.state?.current_step ?? null,
+    host_model: readiness.model_id,
+    host_provider: readiness.provider,
+    code: readiness.code,
+    message: readiness.message,
+    runtime_error_recorded: Boolean(errorEntry),
+    runtime_error_ref: errorEntry?.recorded_at ?? null,
+    pipeline_classification: codePipeline?.classification ?? null,
+  };
+  safeAppendEntry(pi, "aipi.host.unsupported", entry);
+  await appendRuntimeEvent(projectRoot, UNSUPPORTED_HOST_LOG, entry).catch(() => null);
+  if (runSnapshot?.active) {
+    await appendRuntimeEvent(projectRoot, runScopedLog(runSnapshot.run_id, "unsupported-host.jsonl"), entry).catch(() => null);
+  }
+  safeNotify(ctx, readiness.message, "error");
+
+  if (hook === "model_select") {
+    return {
+      model: null,
+      model_class: null,
+      modelClass: null,
+      source: "unsupported_host_model",
+      thinking_level: null,
+      thinkingLevel: null,
+      warning: {
+        code: readiness.code,
+        severity: "error",
+        message: readiness.message,
+        host_model: readiness.model_id,
+        host_provider: readiness.provider,
+      },
+      blocked: true,
+      block_reason: readiness.code,
+      status: "unsupported_host_model",
+      readiness,
+    };
+  }
+
+  return {
+    action: "blocked",
+    blocked: true,
+    block_reason: readiness.code,
+    readiness,
+    message: {
+      customType: "aipi.unsupported-host",
+      display: true,
+      content: readiness.message,
+      details: entry,
+    },
+  };
+}
+
+function unsupportedHostGuardBypassed({ hook, event = null, ctx = null } = {}) {
+  if (event?.aipiAllowUnsupportedHost === true || ctx?.aipiAllowUnsupportedHost === true) return true;
+  if (hook !== "input") return false;
+  const text = String(event?.text ?? "").trim();
+  return text.startsWith("/") || text.startsWith("@");
 }
 
 function resolveAutoDeployPolicy({ normalized, projectRoot = null, env = process.env }) {
@@ -1280,6 +1459,60 @@ function isAwaitingUserInput(activeRun) {
   );
 }
 
+function blockerTerminalAction(value) {
+  const normalized = normalizeInputText(value);
+  if (!normalized) return null;
+  if (/\b(cancelar|cancele|cancel|abort|abortar)\b.*\b(run|workflow|fluxo)\b/.test(normalized) ||
+    /^cancelar este run$/.test(normalized)) {
+    return {
+      status: "cancelled",
+      code: "blocked_run_cancelled",
+      message: "AIPI workflow cancelado; o proximo input sera tratado como uma conversa nova.",
+    };
+  }
+  if (/\b(continuar|continue|seguir|prosseguir)\b.*\b(fora|sem|outside|freestyle)\b.*\b(workflow|automatico|automatic)\b/.test(normalized) ||
+    /^continuar fora do workflow automatico nesta conversa$/.test(normalized)) {
+    return {
+      status: "abandoned",
+      code: "blocked_run_detached",
+      message: "AIPI workflow destacado; o proximo input sera tratado fora do workflow automatico.",
+    };
+  }
+  return null;
+}
+
+async function applyBlockedRunTerminalAction({
+  ctx,
+  pi,
+  projectRoot,
+  active,
+  answer = "",
+  terminalAction,
+  source = "blocked_run",
+} = {}) {
+  const closed = await closeWorkflowRun({
+    projectRoot,
+    runId: active?.runId,
+    status: terminalAction.status,
+    reason: String(answer ?? terminalAction.message ?? "").trim() || terminalAction.message,
+    source,
+  });
+  safeAppendEntry(pi, "aipi.input.route", {
+    schema: "aipi.input-route.v1",
+    routed_at: new Date().toISOString(),
+    input: terminalAction.code,
+    active_run_id: active?.runId ?? null,
+    result_action: terminalAction.status,
+    recorded_user_input: Boolean(answer),
+    active_cleared: true,
+  });
+  safeNotify(ctx, terminalAction.message, terminalAction.status === "cancelled" ? "warning" : "info");
+  return {
+    action: "handled",
+    run: closed,
+  };
+}
+
 function hasPickerUi(ctx, activeRun) {
   return Boolean(
     ctx?.hasUI === true &&
@@ -1340,6 +1573,16 @@ function workflowForInput(normalized) {
 
 export async function handleBeforeAgentStart({ event, ctx, pi, projectRoot, coordinator = null }) {
   const snapshot = await buildRunSnapshot(projectRoot);
+  const hostBlock = await blockUnsupportedHostTurn({
+    hook: "before_agent_start",
+    event,
+    ctx,
+    pi,
+    projectRoot,
+    coordinator,
+    snapshot,
+  });
+  if (hostBlock) return hostBlock;
   await captureCoordinatorHostModel({
     coordinator,
     event,
@@ -1457,8 +1700,17 @@ export async function handleEndDisciplineAudit({ event, ctx, pi, projectRoot, ho
 
 export async function handleModelSelect({ event, ctx, pi, projectRoot, coordinator = null }) {
   if (!(await isAipiInstalled(projectRoot))) return undefined;
+  const hostBlock = await blockUnsupportedHostTurn({
+    hook: "model_select",
+    event,
+    ctx,
+    pi,
+    projectRoot,
+    coordinator,
+  });
+  if (hostBlock) return hostBlock;
   let routing = await resolveLifecycleModelRoute({ event, ctx, projectRoot, hook: "model_select" });
-  if (modelCapabilityFloorBlocks(routing)) {
+  if (routing.status !== "manual_model_preserved" && modelCapabilityFloorBlocks(routing)) {
     await captureCoordinatorHostModel({
       coordinator,
       event,
@@ -1488,6 +1740,16 @@ export async function handleModelSelect({ event, ctx, pi, projectRoot, coordinat
   }
   await recordModelRoutingDecision({ projectRoot, routing });
   if (routing.warning) safeNotify(ctx, routing.warning.message, routing.warning.severity === "error" ? "error" : "warning");
+  if (routing.status === "manual_model_preserved") {
+    await captureCoordinatorHostModel({
+      coordinator,
+      event,
+      ctx,
+      routing: { ...routing, model: routing.manual_selection?.model ?? null },
+      source: "model_select_manual_preserved",
+    });
+    return undefined;
+  }
   await captureCoordinatorHostModel({
     coordinator,
     event,
@@ -1621,6 +1883,7 @@ export async function handleThinkingLevelSelect({ event, ctx, pi, projectRoot })
   const routing = await resolveLifecycleModelRoute({ event, ctx, projectRoot, hook: "thinking_level_select" });
   await recordModelRoutingDecision({ projectRoot, routing });
   if (routing.warning) safeNotify(ctx, routing.warning.message, routing.warning.severity === "error" ? "error" : "warning");
+  if (routing.status === "manual_thinking_preserved") return undefined;
   if (!routing.thinking_level) return undefined;
 
   const thinkingResult = await safeSetThinkingLevel(pi, routing.thinking_level);
@@ -1688,7 +1951,16 @@ export async function resolveLifecycleModelRoute({ event, ctx, projectRoot, hook
 
   const resolvedModelId = describeModel(resolution.model);
   const currentModelId = describeModel(normalizeModelRef(currentModel));
-  const warning = modelRoutingWarning({
+  const manualSelection = manualLifecycleSelection({
+    hook,
+    selector,
+    resolution,
+    currentModel,
+    currentModelId,
+    event,
+    ctx,
+  });
+  const warning = manualSelection ? null : modelRoutingWarning({
     modelClass: resolution.model_class,
     resolvedModelId,
     currentModelId,
@@ -1698,16 +1970,17 @@ export async function resolveLifecycleModelRoute({ event, ctx, projectRoot, hook
     capabilityReport: resolution.capability_report,
   });
   const capabilityState = resolution.capability_report?.state ?? null;
+  const routedStatus = resolvedModelId
+    ? warning?.code === "AIPI_MODEL_MANUAL_DRIFT"
+      ? "routed_with_drift"
+      : ["missing_registry", "missing_model_capabilities", "fail"].includes(capabilityState)
+      ? "needs_capability_evidence"
+      : "routed"
+    : "needs_configured_model";
   return {
     schema: "aipi.model-route.v1",
     hook,
-    status: resolvedModelId
-      ? warning?.code === "AIPI_MODEL_MANUAL_DRIFT"
-        ? "routed_with_drift"
-        : ["missing_registry", "missing_model_capabilities", "fail"].includes(capabilityState)
-        ? "needs_capability_evidence"
-        : "routed"
-      : "needs_configured_model",
+    status: manualSelection?.status ?? routedStatus,
     snapshot,
     selector,
     step_id: step?.id ?? snapshot.step_id ?? null,
@@ -1722,6 +1995,7 @@ export async function resolveLifecycleModelRoute({ event, ctx, projectRoot, hook
     capability_report: resolution.capability_report ?? null,
     current_model: currentModelId,
     warning,
+    manual_selection: manualSelection,
   };
 }
 
@@ -2183,6 +2457,32 @@ export async function recordLifecycleEvent({
   await appendRuntimeEvent(projectRoot, LIFECYCLE_LOG, entry);
   if (snapshot?.active) {
     await appendRuntimeEvent(projectRoot, runScopedLog(snapshot.run_id, "lifecycle.jsonl"), entry);
+  }
+  return entry;
+}
+
+export async function recordRuntimeError({
+  projectRoot,
+  hook,
+  event = {},
+  error,
+  now = () => new Date(),
+} = {}) {
+  if (!(await isAipiInstalled(projectRoot))) return null;
+  const snapshot = await buildRunSnapshot(projectRoot).catch(() => ({ active: false }));
+  const entry = {
+    schema: "aipi.runtime-error.v1",
+    recorded_at: now().toISOString(),
+    hook,
+    run_id: snapshot?.run_id ?? null,
+    workflow: snapshot?.workflow ?? null,
+    step_id: snapshot?.step_id ?? null,
+    event: compactEvent(event),
+    error: serializeRuntimeError(error),
+  };
+  await appendRuntimeEvent(projectRoot, RUNTIME_ERROR_LOG, entry);
+  if (snapshot?.active) {
+    await appendRuntimeEvent(projectRoot, runScopedLog(snapshot.run_id, "errors.jsonl"), entry);
   }
   return entry;
 }
@@ -2717,6 +3017,22 @@ function compactEvent(event = {}) {
   return result;
 }
 
+function serializeRuntimeError(error) {
+  return {
+    name: String(error?.name ?? "Error"),
+    message: String(error?.message ?? error ?? "unknown error"),
+    code: error?.code ?? null,
+    stack: typeof error?.stack === "string" ? redactSecrets(error.stack) : null,
+    cause: error?.cause
+      ? {
+          name: String(error.cause?.name ?? "Error"),
+          message: String(error.cause?.message ?? error.cause),
+          stack: typeof error.cause?.stack === "string" ? redactSecrets(error.cause.stack) : null,
+        }
+      : null,
+  };
+}
+
 function isAipiContextPointer(message) {
   return message?.customType === "aipi.context-pointer" ||
     message?.details?.schema === "aipi.context-pointer.v1" ||
@@ -2849,6 +3165,7 @@ async function recordModelRoutingDecision({ projectRoot, routing }) {
     family_warning: routing.family_warning ?? null,
     capability_report: routing.capability_report ?? null,
     warning: routing.warning ?? null,
+    manual_selection: routing.manual_selection ?? null,
   };
   await appendRuntimeEvent(projectRoot, MODEL_ROUTING_LOG, entry);
   if (snapshot.active) {
@@ -2889,6 +3206,55 @@ function currentModelFromEvent(event, ctx) {
     event?.payload?.model ??
     ctx?.model ??
     null;
+}
+
+function currentThinkingLevelFromEvent(event, ctx) {
+  return stringOrNull(
+    event?.selected_thinking_level ??
+      event?.selectedThinkingLevel ??
+      event?.current_thinking_level ??
+      event?.currentThinkingLevel ??
+      event?.thinking_level ??
+      event?.thinkingLevel ??
+      event?.payload?.thinking_level ??
+      event?.payload?.thinkingLevel ??
+      ctx?.selected_thinking_level ??
+      ctx?.selectedThinkingLevel ??
+      ctx?.current_thinking_level ??
+      ctx?.currentThinkingLevel ??
+      ctx?.thinking_level ??
+      ctx?.thinkingLevel,
+  );
+}
+
+function manualLifecycleSelection({ hook, selector, resolution, currentModel, currentModelId, event, ctx } = {}) {
+  if (selector?.source !== "active_workflow_step") return null;
+  if (event?.aipiApplyModelRoute === true || ctx?.aipiApplyModelRoute === true) return null;
+  if (hook === "model_select") {
+    if (!currentModelId || currentModelId === describeModel(resolution?.model)) return null;
+    return {
+      kind: "model",
+      status: "manual_model_preserved",
+      source: "current_user_selection",
+      model: normalizeModelRef(currentModel),
+      model_id: currentModelId,
+      resolved_model: describeModel(resolution?.model),
+      reason: "active workflow step cannot override an explicit user-facing /model selection",
+    };
+  }
+  if (hook === "thinking_level_select") {
+    const level = currentThinkingLevelFromEvent(event, ctx);
+    if (!level) return null;
+    return {
+      kind: "thinking_level",
+      status: "manual_thinking_preserved",
+      source: "current_user_selection",
+      thinking_level: level,
+      resolved_thinking_level: resolution?.thinking_level ?? null,
+      reason: "active workflow step cannot override an explicit user-facing thinking level selection",
+    };
+  }
+  return null;
 }
 
 function eventModelClass(event, ctx) {

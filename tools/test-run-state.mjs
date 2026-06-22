@@ -99,6 +99,18 @@ try {
   const updatedActive = await readActiveRun(tempRoot);
   assert.equal(updatedActive.state.last_user_input.path, userInput.relPath);
 
+  const statePath = path.join(runDir, "state.json");
+  const terminalState = JSON.parse(await fs.readFile(statePath, "utf8"));
+  terminalState.status = "escalated_to_human";
+  terminalState.current_step = null;
+  terminalState.awaiting_user_input = null;
+  await fs.writeFile(statePath, `${JSON.stringify(terminalState, null, 2)}\n`);
+  assert.equal(await readActiveRun(tempRoot), null);
+  await assert.rejects(
+    () => fs.readFile(path.join(tempRoot, ".aipi", "runtime", "runs", "active"), "utf8"),
+    /ENOENT/,
+  );
+
   console.log("AIPI_RUN_STATE_TEST_OK");
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });

@@ -96,6 +96,42 @@ try {
     }),
     /adversarial provider\/family to differ/,
   );
+
+  const interactiveRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-models-command-interactive-"));
+  try {
+    await initProject({ sourceRoot: path.resolve("templates/.aipi"), targetRoot: interactiveRoot });
+    const prompts = [];
+    const interactiveReport = await runModelsCommand({
+      projectRoot: interactiveRoot,
+      args: ["setup"],
+      ui: {
+        async input(question) {
+          prompts.push(question);
+          if (/^Host model/.test(question)) return "anthropic/claude-opus-4-8";
+          if (/^Adversarial model/.test(question)) return "openai-codex/gpt-5.5";
+          if (/^Model for context-fast/.test(question)) return "anthropic/claude-haiku-4";
+          return "";
+        },
+      },
+      now: () => new Date("2026-06-22T01:00:00.000Z"),
+    });
+    assert.equal(interactiveReport.state, "ready");
+    assert.equal(prompts.some((prompt) => /^Model for context-fast/.test(prompt)), true);
+    assert.equal(prompts.some((prompt) => /^Model for code-strong/.test(prompt)), true);
+    const interactiveConfig = JSON.parse(await fs.readFile(
+      path.join(interactiveRoot, ".aipi", "model-capabilities.json"),
+      "utf8",
+    ));
+    assert.equal(interactiveConfig.classes["orchestrator-heavy"], "anthropic/claude-opus-4-8");
+    assert.equal(interactiveConfig.classes["code-strong"], "anthropic/claude-opus-4-8");
+    assert.equal(interactiveConfig.classes["adversarial-heavy"], "openai-codex/gpt-5.5");
+    assert.equal(interactiveConfig.classes["verifier-fast"], "openai-codex/gpt-5.5");
+    assert.equal(interactiveConfig.classes["context-fast"], "anthropic/claude-haiku-4");
+    const contextFast = await resolveModelClass({ root: interactiveRoot, modelClass: "context-fast" });
+    assert.deepEqual(contextFast.model, { provider: "anthropic", id: "claude-haiku-4" });
+  } finally {
+    await fs.rm(interactiveRoot, { recursive: true, force: true });
+  }
 } finally {
   await fs.rm(root, { recursive: true, force: true });
 }

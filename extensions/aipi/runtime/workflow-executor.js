@@ -252,6 +252,9 @@ export async function executeWorkflowRun({
 
   state.completed_at = state.status === "completed" ? now().toISOString() : state.completed_at;
   await persistRunState(root, state);
+  if (isTerminalActiveStatus(state.status)) {
+    await clearActiveRunPointer(root, activeRunId);
+  }
   return { runId: activeRunId, status: state.status, state, events };
 }
 
@@ -1281,6 +1284,21 @@ async function readActiveRunId(root) {
     if (error.code === "ENOENT") return "";
     throw error;
   })).trim();
+}
+
+async function clearActiveRunPointer(root, runId) {
+  const activePath = path.join(root, ".aipi", "runtime", "runs", "active");
+  const activeRunId = (await fs.readFile(activePath, "utf8").catch((error) => {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  })).trim();
+  if (!activeRunId || activeRunId !== runId) return;
+  await fs.rm(activePath, { force: true });
+}
+
+function isTerminalActiveStatus(status) {
+  return ["completed", "failed", "cancelled", "canceled", "abandoned", "escalated_to_human", "escalated_to_planning"]
+    .includes(String(status ?? "").toLowerCase());
 }
 
 async function persistRunState(root, state) {

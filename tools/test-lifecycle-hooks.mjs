@@ -228,6 +228,29 @@ try {
   assert.equal(entries.some((entry) => entry.type === "aipi.run.session"), true);
   assert.match(sessionNames[0], /AIPI feature/);
 
+  const runtimeErrorEntries = [];
+  const runtimeErrorHandlers = createAipiLifecycleHandlers({
+    pi: { appendEntry(type, data) { runtimeErrorEntries.push({ type, data }); } },
+    projectRootResolver: () => tempRoot,
+    coordinator: {
+      setHostModel() {
+        throw new Error("host capture stack marker");
+      },
+    },
+  });
+  await assert.rejects(
+    () => runtimeErrorHandlers.session_start(
+      { type: "session_start", reason: "runtime-error-test" },
+      { ...ctx, model: { provider: "anthropic", id: "claude-error" } },
+    ),
+    /host capture stack marker/,
+  );
+  const runtimeErrorLog = await fs.readFile(path.join(tempRoot, ".aipi", "runtime", "errors.jsonl"), "utf8");
+  assert.match(runtimeErrorLog, /"hook":"session_start"/);
+  assert.match(runtimeErrorLog, /host capture stack marker/);
+  assert.match(runtimeErrorLog, /"stack":"Error: host capture stack marker/);
+  assert.equal(runtimeErrorEntries.some((entry) => entry.type === "aipi.runtime.error"), true);
+
   const beforeAgent = await handlers.before_agent_start({
     type: "before_agent_start",
     prompt: "continue billing renewal implementation",
@@ -376,15 +399,15 @@ try {
     assert.equal(checkEntry.data.read_only, true);
     assert.equal(checkEntry.data.auto_dispatch, false);
 
-    const hostAgnosticRunnerCalls = [];
-    const hostAgnosticNotifications = [];
-    const hostAgnosticEntries = [];
-    const hostAgnosticHandlers = createAipiLifecycleHandlers({
-      pi: { appendEntry(type, data) { hostAgnosticEntries.push({ type, data }); } },
+    const unsupportedHostRunnerCalls = [];
+    const unsupportedHostNotifications = [];
+    const unsupportedHostEntries = [];
+    const unsupportedHostHandlers = createAipiLifecycleHandlers({
+      pi: { appendEntry(type, data) { unsupportedHostEntries.push({ type, data }); } },
       projectRootResolver: () => routerRoot,
       coordinator: routerCoordinator,
       workflowCommandRunner: async (input) => {
-        hostAgnosticRunnerCalls.push(input);
+        unsupportedHostRunnerCalls.push(input);
         return {
           action: "run",
           run: {
@@ -402,34 +425,69 @@ try {
       },
       userInputRecorder: async () => ({ relPath: "USER-INPUT.jsonl" }),
     });
-    const hostAgnosticCtx = {
+    const unsupportedHostCtx = {
       cwd: routerRoot,
       model: "openai-codex/gpt-5.5",
-      ui: { notify(message, kind) { hostAgnosticNotifications.push({ message, kind }); } },
+      ui: { notify(message, kind) { unsupportedHostNotifications.push({ message, kind }); } },
     };
     assert.deepEqual(
-      await hostAgnosticHandlers.input(
+      await unsupportedHostHandlers.input(
         { type: "input", text: "corrigir bug no login", source: "interactive" },
-        hostAgnosticCtx,
+        unsupportedHostCtx,
       ),
-      { action: "handled" },
+      {
+        action: "blocked",
+        blocked: true,
+        block_reason: "AIPI_HOST_MODEL_UNSUPPORTED",
+        readiness: {
+          ok: false,
+          code: "AIPI_HOST_MODEL_UNSUPPORTED",
+          model_id: "openai-codex/gpt-5.5",
+          provider: "openai-codex",
+          message: "AIPI host model is unavailable to the AIPI orchestrator turn. Current host model: openai-codex/gpt-5.5. Host provider openai-codex is not supported for the orchestrator turn; use it as the adversarial reviewer or set the host to a supported Anthropic model.",
+        },
+        message: {
+          customType: "aipi.unsupported-host",
+          display: true,
+          content: "AIPI host model is unavailable to the AIPI orchestrator turn. Current host model: openai-codex/gpt-5.5. Host provider openai-codex is not supported for the orchestrator turn; use it as the adversarial reviewer or set the host to a supported Anthropic model.",
+          details: {
+            schema: "aipi.unsupported-host-block.v1",
+            recorded_at: unsupportedHostEntries.at(-1)?.data?.recorded_at,
+            hook: "input",
+            run_id: null,
+            workflow: null,
+            step_id: null,
+            host_model: "openai-codex/gpt-5.5",
+            host_provider: "openai-codex",
+            code: "AIPI_HOST_MODEL_UNSUPPORTED",
+            message: "AIPI host model is unavailable to the AIPI orchestrator turn. Current host model: openai-codex/gpt-5.5. Host provider openai-codex is not supported for the orchestrator turn; use it as the adversarial reviewer or set the host to a supported Anthropic model.",
+            runtime_error_recorded: true,
+            runtime_error_ref: unsupportedHostEntries.at(-1)?.data?.runtime_error_ref,
+            pipeline_classification: "root_cause_bugfix",
+          },
+        },
+      },
     );
-    assert.equal(hostAgnosticRunnerCalls.length, 1);
-    assert.equal(hostAgnosticRunnerCalls[0].args, "run bugfix");
-    assert.notEqual(hostAgnosticNotifications.at(-1)?.kind, "error");
-    assert.doesNotMatch(hostAgnosticNotifications.at(-1)?.message ?? "", /Cannot read properties of undefined/);
-    const unsupportedHostEntry = hostAgnosticEntries.find(
-      (entry) => entry.type === "aipi.input.route" && entry.data.reason === "unsupported_host_model",
+    assert.equal(unsupportedHostRunnerCalls.length, 0);
+    assert.equal(unsupportedHostNotifications.at(-1)?.kind, "error");
+    assert.match(unsupportedHostNotifications.at(-1)?.message ?? "", /not supported for the orchestrator turn/);
+    assert.doesNotMatch(unsupportedHostNotifications.at(-1)?.message ?? "", /Cannot read properties of undefined/);
+    const unsupportedHostEntry = unsupportedHostEntries.find((entry) => entry.type === "aipi.host.unsupported");
+    assert.equal(unsupportedHostEntry.data.host_provider, "openai-codex");
+    assert.equal(unsupportedHostEntry.data.hook, "input");
+    assert.equal(unsupportedHostEntry.data.runtime_error_recorded, true);
+    const unsupportedBeforeAgent = await unsupportedHostHandlers.before_agent_start(
+      { type: "before_agent_start", prompt: "test" },
+      unsupportedHostCtx,
     );
-    assert.equal(unsupportedHostEntry, undefined);
-    const hostAgnosticEntry = hostAgnosticEntries.find(
-      (entry) =>
-        entry.type === "aipi.input.route" &&
-        entry.data.input === "auto_dispatch_workflow" &&
-        entry.data.workflow_args === "run bugfix",
-    );
-    assert.equal(hostAgnosticEntry.data.auto_dispatch, true);
-    assert.equal(hostAgnosticEntry.data.result_action, "run");
+    assert.equal(unsupportedBeforeAgent.action, "blocked");
+    assert.equal(unsupportedBeforeAgent.block_reason, "AIPI_HOST_MODEL_UNSUPPORTED");
+    assert.equal(unsupportedBeforeAgent.message.customType, "aipi.unsupported-host");
+    const unsupportedHostErrorLog = await fs.readFile(path.join(routerRoot, ".aipi", "runtime", "errors.jsonl"), "utf8");
+    assert.match(unsupportedHostErrorLog, /"hook":"input"/);
+    assert.match(unsupportedHostErrorLog, /"hook":"before_agent_start"/);
+    assert.match(unsupportedHostErrorLog, /AipiUnsupportedHostError/);
+    assert.match(unsupportedHostErrorLog, /"stack":"AipiUnsupportedHostError: AIPI host model is unavailable/);
 
     assert.deepEqual(
       await routerHandlers.input({ type: "input", text: "deploy no CI", source: "interactive" }, routerCtx),
@@ -793,7 +851,7 @@ try {
   const modelRoute = await handlers.model_select({
     type: "model_select",
     model_class: "planner-heavy",
-    current_model: { provider: "openai", id: "manual" },
+    current_model: { provider: "anthropic", id: "manual" },
     env: { AIPI_MODEL_CLASS_PLANNER_HEAVY: "anthropic/claude-planner:high" },
   }, ctx);
   assert.equal(modelRoute.model_class, "planner-heavy");
@@ -819,6 +877,36 @@ try {
   assert.equal(modelSelections.length, modelSelectionCount);
   assert.equal(notifications.at(-1).kind, "error");
 
+  const manualModelSelectionCount = modelSelections.length;
+  const manualModelRoute = await handlers.model_select({
+    type: "model_select",
+    current_model: { provider: "anthropic", id: "manual" },
+    source: "interactive",
+    env: { AIPI_MODEL_CLASS_PLANNER_HEAVY: "anthropic/claude-planner:high" },
+  }, ctx);
+  assert.equal(manualModelRoute, undefined);
+  assert.equal(modelSelections.length, manualModelSelectionCount);
+
+  const unsupportedManualModelRoute = await handlers.model_select({
+    type: "model_select",
+    current_model: { provider: "openai-codex", id: "gpt-5.5" },
+    source: "interactive",
+  }, ctx);
+  assert.equal(unsupportedManualModelRoute.blocked, true);
+  assert.equal(unsupportedManualModelRoute.status, "unsupported_host_model");
+  assert.equal(unsupportedManualModelRoute.block_reason, "AIPI_HOST_MODEL_UNSUPPORTED");
+  assert.equal(modelSelections.length, manualModelSelectionCount);
+
+  const manualThinkingSelectionCount = thinkingSelections.length;
+  const manualThinkingRoute = await handlers.thinking_level_select({
+    type: "thinking_level_select",
+    selected_thinking_level: "medium",
+    source: "interactive",
+    env: { AIPI_THINKING_PLANNER_HEAVY: "low" },
+  }, ctx);
+  assert.equal(manualThinkingRoute, undefined);
+  assert.equal(thinkingSelections.length, manualThinkingSelectionCount);
+
   const activeThinkingRoute = await handlers.thinking_level_select({ type: "thinking_level_select" }, ctx);
   assert.equal(activeThinkingRoute.model_class, "planner-heavy");
   assert.equal(activeThinkingRoute.thinking_level, "high");
@@ -836,6 +924,8 @@ try {
   assert.match(modelRoutingLog, /"hook":"model_select"/);
   assert.match(modelRoutingLog, /"hook":"thinking_level_select"/);
   assert.match(modelRoutingLog, /AIPI_MODEL_MANUAL_DRIFT/);
+  assert.match(modelRoutingLog, /manual_model_preserved/);
+  assert.match(modelRoutingLog, /manual_thinking_preserved/);
   assert.match(modelRoutingLog, /needs_configured_model/);
   const runModelRoutingLog = await fs.readFile(
     path.join(tempRoot, ".aipi", "runtime", "runs", started.runId, "model-routing.jsonl"),

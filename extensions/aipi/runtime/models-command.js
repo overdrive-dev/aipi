@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import {
   MODEL_CAPABILITIES_REL_PATH,
@@ -272,42 +273,111 @@ function looksExpensiveFrontier(model) {
 }
 
 async function fillInteractiveOptions(options, { root, ui }) {
-  if (!options.interactive || (!ui?.input && !ui?.prompt && !ui?.select)) return options;
-  const candidates = await configuredModelCandidates(root);
-  if (!options.hostModel) {
-    options.hostModel = await promptModelSpec(ui, "Host model", candidates);
+  if (!options.interactive) return options;
+  const promptUi = createPromptUi(ui);
+  if (!promptUi) return options;
+  try {
+    const classIds = await readModelClassIds(root);
+    let candidates = await configuredModelCandidates(root);
+    if (!options.hostModel) {
+      options.hostModel = await promptModelSpec(promptUi, "Host model", candidates);
+    }
+    candidates = mergeModelCandidates(candidates, [
+      options.hostModel,
+      options.adversarialModel,
+      options.verifierModel,
+      ...options.models,
+      ...Object.values(options.classBindings ?? {}),
+    ]);
+    if (!options.adversarialModel) {
+      options.adversarialModel = await promptModelSpec(
+        promptUi,
+        "Adversarial model",
+        candidates.filter((candidate) => providerOfSpec(candidate) !== providerOfSpec(options.hostModel)),
+      );
+    }
+    if (!options.verifierModel && options.adversarialModel) {
+      options.verifierModel = await promptModelSpec(promptUi, "Verifier model", candidates, {
+        defaultValue: options.adversarialModel,
+      });
+    }
+    if (!options.verifierModel && options.adversarialModel) options.verifierModel = options.adversarialModel;
+    candidates = mergeModelCandidates(candidates, [
+      options.hostModel,
+      options.adversarialModel,
+      options.verifierModel,
+      ...options.models,
+      ...Object.values(options.classBindings ?? {}),
+    ]);
+    for (const modelClass of classIds) {
+      if (options.classBindings[modelClass]) continue;
+      const defaultValue = defaultModelForClass(modelClass, options);
+      const selected = await promptModelSpec(promptUi, `Model for ${modelClass}`, candidates, { defaultValue });
+      if (selected) {
+        options.classBindings[modelClass] = selected;
+        candidates = mergeModelCandidates(candidates, [selected]);
+      }
+    }
+  } finally {
+    await promptUi.close?.();
   }
-  if (!options.adversarialModel) {
-    options.adversarialModel = await promptModelSpec(
-      ui,
-      "Adversarial model",
-      candidates.filter((candidate) => providerOfSpec(candidate) !== providerOfSpec(options.hostModel)),
-    );
-  }
-  if (!options.verifierModel && options.adversarialModel) options.verifierModel = options.adversarialModel;
   return options;
 }
 
-async function promptModelSpec(ui, label, candidates = []) {
-  if (typeof ui?.select === "function" && candidates.length) {
+function createPromptUi(ui) {
+  if (ui?.input || ui?.prompt || ui?.select) return ui;
+  if (process.stdin?.isTTY !== true) return null;
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  return {
+    async input(question) {
+      return rl.question(`${question}: `);
+    },
+    async prompt(question) {
+      return rl.question(`${question}: `);
+    },
+    close() {
+      rl.close();
+    },
+  };
+}
+
+async function promptModelSpec(ui, label, candidates = [], { defaultValue = null } = {}) {
+  const uniqueCandidates = mergeModelCandidates(candidates, [defaultValue]);
+  if (typeof ui?.select === "function" && uniqueCandidates.length) {
     try {
       const selected = await ui.select({
         title: label,
-        message: `${label} (provider/model)`,
-        options: candidates.map((candidate) => ({ label: candidate, value: candidate })),
+        message: `${label} (provider/model)${defaultValue ? ` [${defaultValue}]` : ""}`,
+        options: uniqueCandidates.map((candidate) => ({ label: candidate, value: candidate })),
+        defaultValue,
       });
       const value = selected?.value ?? selected;
       if (typeof value === "string" && value.trim()) return value.trim();
+      if (defaultValue) return defaultValue;
     } catch {
       /* fall through to text input */
     }
   }
   const input = ui?.input ?? ui?.prompt;
   if (typeof input === "function") {
-    const value = await input(`${label} (provider/model)`);
+    const value = await input(`${label} (provider/model)${defaultValue ? ` [${defaultValue}]` : ""}`);
     if (typeof value === "string" && value.trim()) return value.trim();
+    if (defaultValue) return defaultValue;
   }
-  return null;
+  return defaultValue ?? null;
+}
+
+function defaultModelForClass(modelClass, options) {
+  if (modelClass === ADVERSARIAL_CLASS_ID) return options.adversarialModel;
+  if (modelClass === VERIFIER_CLASS_ID) return options.verifierModel ?? options.adversarialModel;
+  if (HOST_CLASS_IDS.includes(modelClass)) return options.hostModel;
+  return options.hostModel ?? options.adversarialModel ?? options.verifierModel;
+}
+
+function mergeModelCandidates(...groups) {
+  return [...new Set(groups.flat()
+    .map((item) => String(item ?? "").trim())
+    .filter((item) => item.includes("/")))].sort();
 }
 
 async function configuredModelCandidates(root) {

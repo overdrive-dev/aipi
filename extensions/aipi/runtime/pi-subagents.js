@@ -13,8 +13,9 @@ export const AIPI_SUBAGENTS_ALLOWED_TOOLS = ["read", "grep", "find", "ls", "writ
 export const AIPI_SUBAGENTS_READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
 export const AIPI_SUBAGENTS_GUARDED_WRITE_EXTENSION = "extensions/aipi/runtime/aipi-guarded-write-child.js";
 export const AIPI_SUBAGENTS_DISALLOWED_PROVIDERS = [];
+export const AIPI_HOST_SUPPORTED_PROVIDERS = ["anthropic"];
 export const AIPI_HOST_MODEL_READINESS_MESSAGE =
-  "AIPI host model is unavailable to the AIPI/Pi worker runtime.";
+  "AIPI host model is unavailable to the AIPI orchestrator turn.";
 
 const LIVE_SPIKE_TASK = "Reply with the single word OK.";
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
@@ -78,6 +79,15 @@ export function aipiHostModelReadiness(model, { requireProvider = false, require
         };
   }
   if (!provider) {
+    if (looksUnsupportedUnqualifiedHostModel(normalizedModelId)) {
+      return unsupportedHostModelReadiness({
+        code: "AIPI_HOST_MODEL_UNSUPPORTED",
+        modelId: normalizedModelId,
+        provider: null,
+        detail:
+          "Unqualified GPT/Codex-style host models are not supported for the orchestrator turn; use them as adversarial reviewers or choose a supported Anthropic host model.",
+      });
+    }
     return {
       ok: true,
       code: "AIPI_HOST_MODEL_UNQUALIFIED_ALLOWED",
@@ -85,6 +95,15 @@ export function aipiHostModelReadiness(model, { requireProvider = false, require
       provider: null,
       message: null,
     };
+  }
+  if (!AIPI_HOST_SUPPORTED_PROVIDERS.includes(provider)) {
+    return unsupportedHostModelReadiness({
+      code: "AIPI_HOST_MODEL_UNSUPPORTED",
+      modelId: normalizedModelId,
+      provider,
+      detail:
+        `Host provider ${provider} is not supported for the orchestrator turn; use it as the adversarial reviewer or set the host to a supported Anthropic model.`,
+    });
   }
   if (AIPI_SUBAGENTS_DISALLOWED_PROVIDERS.includes(provider)) {
     return unsupportedHostModelReadiness({
@@ -101,6 +120,12 @@ export function aipiHostModelReadiness(model, { requireProvider = false, require
     provider,
     message: null,
   };
+}
+
+function looksUnsupportedUnqualifiedHostModel(modelId) {
+  const normalized = String(modelId ?? "").toLowerCase();
+  if (!normalized || /\bclaude|anthropic\b/.test(normalized)) return false;
+  return /\b(gpt|codex|openai|gemini|mistral|llama|deepseek)\b/.test(normalized);
 }
 
 export function assertAipiSupportedHostModel(model, options = {}) {

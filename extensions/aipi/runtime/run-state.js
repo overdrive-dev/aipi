@@ -3,6 +3,18 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { executeWorkflowRun } from "./workflow-executor.js";
 
+const TERMINAL_ACTIVE_STATUSES = new Set([
+  "complete",
+  "completed",
+  "done",
+  "failed",
+  "cancelled",
+  "canceled",
+  "abandoned",
+  "escalated_to_human",
+  "escalated_to_planning",
+]);
+
 const workflowAliases = new Map([
   ["bug", "bugfix"],
   ["bugfix", "bugfix"],
@@ -177,8 +189,9 @@ export async function startWorkflowRun({
   };
 }
 
-export async function readActiveRun(projectRoot) {
-  const activePath = path.join(projectRoot, ".aipi", "runtime", "runs", "active");
+export async function readActiveRun(projectRoot, { includeTerminal = false } = {}) {
+  const root = path.resolve(projectRoot);
+  const activePath = path.join(root, ".aipi", "runtime", "runs", "active");
   const runId = (await fs.readFile(activePath, "utf8").catch((error) => {
     if (error.code === "ENOENT") return "";
     throw error;
@@ -186,9 +199,64 @@ export async function readActiveRun(projectRoot) {
 
   if (!runId) return null;
 
-  const statePath = path.join(projectRoot, ".aipi", "runtime", "runs", runId, "state.json");
+  const statePath = path.join(root, ".aipi", "runtime", "runs", runId, "state.json");
   const state = JSON.parse(await fs.readFile(statePath, "utf8"));
+  if (!includeTerminal && isTerminalActiveStatus(state.status)) {
+    await clearActiveRun(root, runId);
+    return null;
+  }
   return { runId, state };
+}
+
+export async function clearActiveRun(projectRoot, runId = null) {
+  const root = path.resolve(projectRoot);
+  const activePath = path.join(root, ".aipi", "runtime", "runs", "active");
+  if (runId) {
+    const activeRunId = (await fs.readFile(activePath, "utf8").catch((error) => {
+      if (error.code === "ENOENT") return "";
+      throw error;
+    })).trim();
+    if (activeRunId && activeRunId !== runId) {
+      return { cleared: false, active_run_id: activeRunId, reason: "different_active_run" };
+    }
+  }
+  await fs.rm(activePath, { force: true });
+  return { cleared: true, active_run_id: runId ?? null };
+}
+
+export async function closeWorkflowRun({
+  projectRoot,
+  runId = null,
+  status = "cancelled",
+  reason = "",
+  source = "system",
+  now = () => new Date(),
+} = {}) {
+  if (!projectRoot) throw new Error("projectRoot is required");
+  const root = path.resolve(projectRoot);
+  const terminalStatus = normalizeCloseStatus(status);
+  const active = runId ? await readRun(root, runId) : await readActiveRun(root, { includeTerminal: true });
+  if (!active?.runId) throw new Error("No active AIPI run; start a workflow first");
+
+  const at = now().toISOString();
+  const state = active.state;
+  state.status = terminalStatus;
+  state.current_step = null;
+  state.awaiting_user_input = null;
+  state.blocked_reason = reason || state.blocked_reason || null;
+  state.closed_by = source;
+  state.closed_at = at;
+  if (terminalStatus === "cancelled") {
+    state.cancelled_at = at;
+    state.cancel_reason = reason || "cancelled by user";
+  }
+  if (terminalStatus === "abandoned") {
+    state.abandoned_at = at;
+    state.abandon_reason = reason || "detached from automatic workflow";
+  }
+  await persistRunState(root, state);
+  await clearActiveRun(root, active.runId);
+  return { runId: active.runId, status: terminalStatus, state };
 }
 
 export async function recordWorkflowUserInput({
@@ -317,6 +385,17 @@ async function persistRunState(root, state) {
   await fs.mkdir(runDir, { recursive: true });
   await fs.writeFile(path.join(runDir, "state.json"), `${JSON.stringify(state, null, 2)}\n`);
   await fs.writeFile(path.join(runDir, "RUN-MANIFEST.md"), renderRunManifest(state));
+}
+
+function isTerminalActiveStatus(status) {
+  return TERMINAL_ACTIVE_STATUSES.has(String(status ?? "").toLowerCase());
+}
+
+function normalizeCloseStatus(status) {
+  const normalized = String(status ?? "").trim().toLowerCase();
+  if (["cancelled", "canceled"].includes(normalized)) return "cancelled";
+  if (normalized === "abandoned") return "abandoned";
+  throw new Error(`Unsupported AIPI run close status: ${status}`);
 }
 
 function redactWorkflowUserInput(text) {

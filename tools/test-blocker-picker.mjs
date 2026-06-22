@@ -110,6 +110,29 @@ try {
   assert.equal((await readUserInputRecords(tempRoot, started.runId)).at(-1).text, typedValue);
 
   await writeBlockedState(tempRoot, started.runId);
+  selectedValue = "Cancelar este run";
+  const runnerCallsBeforeCancel = runnerCalls.length;
+  const cancelResult = await handleBlockedRunPicker({
+    event: { type: "input", text: "cancelar", source: "interactive" },
+    ctx,
+    pi,
+    projectRoot: tempRoot,
+    active: await readActiveRun(tempRoot),
+    workflowCommandRunner,
+  });
+  assert.equal(cancelResult.action, "handled");
+  assert.equal(cancelResult.run.status, "cancelled");
+  assert.equal(runnerCalls.length, runnerCallsBeforeCancel);
+  assert.equal(await readActiveRun(tempRoot), null);
+  const cancelledState = JSON.parse(await fs.readFile(
+    path.join(tempRoot, ".aipi", "runtime", "runs", started.runId, "state.json"),
+    "utf8",
+  ));
+  assert.equal(cancelledState.status, "cancelled");
+  assert.equal(cancelledState.awaiting_user_input, null);
+  assert.equal(cancelledState.current_step, null);
+
+  await writeBlockedState(tempRoot, started.runId);
   const selectCountBeforeHeadless = selectCalls.length;
   const inputCountBeforeHeadless = (await readUserInputRecords(tempRoot, started.runId)).length;
   const headlessResult = await handlers.input(
@@ -162,6 +185,7 @@ async function writeBlockedState(projectRoot, runId) {
     }
   }
   await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`);
+  await fs.writeFile(path.join(projectRoot, ".aipi", "runtime", "runs", "active"), `${runId}\n`);
 }
 
 async function readUserInputRecords(projectRoot, runId) {

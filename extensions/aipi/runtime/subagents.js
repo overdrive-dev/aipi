@@ -25,7 +25,6 @@ import {
 import {
   PI_SUBAGENTS_ISOLATION,
   assertAipiHostScopedModel,
-  assertAipiSupportedHostModel,
   extractToolText,
   normalizePiSubagentsBackend,
   normalizePiSubagentsRunner,
@@ -148,7 +147,7 @@ export class SubagentCoordinator {
       throw err;
     }
     if (modelResolution.host_fallback) {
-      assertAipiSupportedHostModel(descriptorWithHostModel.host_model ?? descriptorWithHostModel.hostModel, {
+      assertAipiHostScopedModel(descriptorWithHostModel.host_model ?? descriptorWithHostModel.hostModel, {
         requireModel: true,
       });
     }

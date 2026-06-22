@@ -92,6 +92,7 @@ aipi workflow status
 aipi memory status
 aipi memory query business rules
 aipi models status
+aipi models setup --class context-fast=anthropic/<cheap-fast-model>
 aipi "/aipi-status"
 aipi "/aipi-mcp"
 ```
@@ -104,7 +105,12 @@ starting a Pi session. `aipi workflow
 [--target <dir>] [--json] ...` exposes workflow list/status/start/run/execute
 from the console using the same run-state runtime as `/aipi-workflow`. `aipi memory
 [--target <dir>] [--json] ...` exposes read-only memory status/refs/query using
-the same Markdown memory query runtime as `aipi_memory_query`. `aipi --version`
+the same Markdown memory query runtime as `aipi_memory_query`. `aipi models setup`
+runs an interactive terminal fallback when no flags are provided and can bind each
+model class with `--class <class>=<provider/model>` or the per-class prompts.
+Until the host adapter supports non-Anthropic providers, GPT/Codex models should
+be configured as adversarial reviewers or worker classes, not as the interactive
+host/orchestrator model. `aipi --version`
 reports both the AIPI package and wrapped Pi versions; use `aipi --pi-help` for
 the raw Pi flag reference. Point at a specific Pi with `AIPI_PI_CLI_JS` or
 `AIPI_PI_BIN`. See

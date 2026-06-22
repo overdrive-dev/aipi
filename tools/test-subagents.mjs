@@ -105,10 +105,16 @@ assert.doesNotThrow(() => assertAipiHostScopedModel("deepseek/deepseek-r1"));
 assert.doesNotThrow(() => assertAipiHostScopedModel("zai/glm-4.5"));
 assert.throws(() => assertAipiHostScopedModel("openai/gpt-5.5", { allowedProvider: "anthropic" }), /only allow host provider anthropic/);
 assert.doesNotThrow(() => assertAipiSupportedHostModel("anthropic/claude-opus-4-8", { requireProvider: true }));
-assert.doesNotThrow(() => assertAipiSupportedHostModel("openai-codex/gpt-5.5", { requireProvider: true }));
-assert.doesNotThrow(() => assertAipiSupportedHostModel("gpt-5.5", { requireProvider: true }));
+assert.throws(
+  () => assertAipiSupportedHostModel("openai-codex/gpt-5.5", { requireProvider: true }),
+  /not supported for the orchestrator turn/,
+);
+assert.throws(
+  () => assertAipiSupportedHostModel("gpt-5.5", { requireProvider: true }),
+  /Unqualified GPT\/Codex-style host models are not supported/,
+);
 assert.equal(aipiHostModelReadiness(null, { requireProvider: false }).ok, true);
-assert.equal(aipiHostModelReadiness("gpt-5.5", { requireProvider: false }).code, "AIPI_HOST_MODEL_UNQUALIFIED_ALLOWED");
+assert.equal(aipiHostModelReadiness("gpt-5.5", { requireProvider: false }).code, "AIPI_HOST_MODEL_UNSUPPORTED");
 
 const { buildModelCandidates, resolveModelCandidate } = jiti(
   "../extensions/aipi/runtime/vendor/pi-subagents/src/runs/shared/model-fallback.ts",
