@@ -782,6 +782,146 @@ try {
   );
   assert.ok(!teleActivity.some((a) => /99 tools/.test(a)), "host tool_call_count must be ignored for forked workers");
 
+  // Rich-UI host: because notify() is transient, the live worker stream is rendered as a persistent
+  // activity WIDGET (setActivity -> setWidget) showing the worker's recent thinking + file/graph ops.
+  const richAgentId = "implementer:rich01";
+  const richSessionDir = path.join(tempRoot, ".aipi", "runtime", "subagents", "sessions", richAgentId.replaceAll(":", "-"));
+  await fs.mkdir(richSessionDir, { recursive: true });
+  await fs.writeFile(
+    path.join(richSessionDir, "2026-06-22T19-30-00-000Z_sess.jsonl"),
+    msg([{ type: "thinking", thinking: "Applying the fix to gestores-tipo.ts and updating index.tsx." }]) +
+      msg([{ type: "toolCall", id: "r1", name: "read", arguments: { path: "frontend/src/index.tsx" } }]) +
+      msg([{ type: "toolCall", id: "r2", name: "write", arguments: { path: "frontend/src/lib/gestores-tipo.ts" } }]),
+  );
+  let richPolls = 0;
+  const richCoordinator = {
+    spawn: () => ({ agent_id: richAgentId }),
+    status: () => ({ tool_call_count: 0 }),
+    collect: () => {
+      richPolls += 1;
+      if (richPolls < 2) return { agent_id: richAgentId, ready: false, state: "running" };
+      return { agent_id: richAgentId, ready: true, step_result: { schema: "aipi.step-result.v1", step_id: "triage", agent_ids: [richAgentId], verdict: "PASS", evidence: [{ rung: "ran", source: "w", ref: richAgentId, result: "ok" }], artifacts: [] }, artifacts: [] };
+    },
+  };
+  const richWidget = [];
+  const richSink = () => {};
+  richSink.supportsWidgets = true;
+  richSink.setActivity = (lines) => richWidget.push(lines);
+  richSink.updateActivity = () => {};
+  const richAdapter = createSubagentWorkflowAdapter(richCoordinator, {
+    pollIntervalMs: 1,
+    collectTimeoutMs: 2_000,
+    modelResolver: async () => ({ model_class: "code-strong", model: { provider: "anthropic", id: "x" }, thinking_level: "medium", source: "t" }),
+  });
+  await richAdapter.executeStep({ root: tempRoot, state: bugParamRun.state, workflow: bugParamWorkflow, step: triageStep, context: {}, contract: {}, notify: richSink });
+  const richSnapshot = richWidget.find((lines) => Array.isArray(lines) && lines.some((l) => /write gestores-tipo\.ts/.test(l)));
+  assert.ok(richSnapshot, `live activity widget must render the worker's file ops; got: ${JSON.stringify(richWidget)}`);
+  assert.ok(richSnapshot.some((l) => /💭/.test(l) && /Applying the fix/.test(l)), "activity widget shows thinking");
+  assert.ok(richSnapshot.some((l) => /read index\.tsx/.test(l)), "activity widget shows file reads");
+  assert.ok(/\b2 tools\b/.test(richSnapshot[0]), "activity widget header shows the jsonl-derived tool count (2)");
+  // The live panel is cleared (setActivity(undefined)) when the worker finishes so it doesn't linger.
+  assert.equal(richWidget.at(-1), undefined, "activity widget cleared when the worker ends");
+
+  // ADV review: the activity widget must be cleared even if coordinator.collect() THROWS mid-poll
+  // (e.g. "unknown agent" if the job was pruned) — otherwise a stale panel lingers until the run unwinds.
+  const wtAgentId = "implementer:throw01";
+  const wtSessionDir = path.join(tempRoot, ".aipi", "runtime", "subagents", "sessions", wtAgentId.replaceAll(":", "-"));
+  await fs.mkdir(wtSessionDir, { recursive: true });
+  await fs.writeFile(path.join(wtSessionDir, "2026-06-22T19-40-00-000Z_sess.jsonl"), msg([{ type: "toolCall", id: "x", name: "read", arguments: { path: "a.ts" } }]));
+  let wtPolls = 0;
+  const wtCoordinator = {
+    spawn: () => ({ agent_id: wtAgentId }),
+    status: () => ({ tool_call_count: 0 }),
+    collect: () => {
+      wtPolls += 1;
+      if (wtPolls < 2) return { agent_id: wtAgentId, ready: false, state: "running" };
+      throw new Error(`unknown agent ${wtAgentId}`);
+    },
+  };
+  const wtWidget = [];
+  const wtSink = () => {};
+  wtSink.supportsWidgets = true;
+  wtSink.setActivity = (lines) => wtWidget.push(lines);
+  wtSink.updateActivity = () => {};
+  const wtAdapter = createSubagentWorkflowAdapter(wtCoordinator, {
+    pollIntervalMs: 1,
+    collectTimeoutMs: 2_000,
+    modelResolver: async () => ({ model_class: "code-strong", model: { provider: "anthropic", id: "x" }, thinking_level: "medium", source: "t" }),
+  });
+  await assert.rejects(
+    () => wtAdapter.executeStep({ root: tempRoot, state: bugParamRun.state, workflow: bugParamWorkflow, step: triageStep, context: {}, contract: {}, notify: wtSink }),
+    /unknown agent/,
+  );
+  assert.ok(wtWidget.length >= 2, "activity widget was rendered then cleared");
+  assert.equal(wtWidget.at(-1), undefined, "activity widget cleared even when collect() throws mid-poll");
+
+  // ADV review: the worker's spoken text/narration is surfaced too — including a string-content message —
+  // so a tools-free, text-only turn isn't a blank panel; non-assistant (toolResult) text is NOT echoed.
+  const textAgentId = "implementer:text01";
+  const textSessionDir = path.join(tempRoot, ".aipi", "runtime", "subagents", "sessions", textAgentId.replaceAll(":", "-"));
+  await fs.mkdir(textSessionDir, { recursive: true });
+  await fs.writeFile(
+    path.join(textSessionDir, "2026-06-22T19-45-00-000Z_sess.jsonl"),
+    `${JSON.stringify({ type: "message", message: { role: "assistant", content: "Root cause confirmed; the fix lives in gestores-tipo.ts." } })}\n` +
+      `${JSON.stringify({ type: "message", message: { role: "toolResult", content: [{ type: "text", text: "tool output noise that must not show" }] } })}\n`,
+  );
+  let textPolls = 0;
+  const textCoordinator = {
+    spawn: () => ({ agent_id: textAgentId }),
+    status: () => ({ tool_call_count: 0 }),
+    collect: () => {
+      textPolls += 1;
+      if (textPolls < 2) return { agent_id: textAgentId, ready: false, state: "running" };
+      return { agent_id: textAgentId, ready: true, step_result: { schema: "aipi.step-result.v1", step_id: "triage", agent_ids: [textAgentId], verdict: "PASS", evidence: [{ rung: "ran", source: "w", ref: textAgentId, result: "ok" }], artifacts: [] }, artifacts: [] };
+    },
+  };
+  const textStream = [];
+  const textSink = (m) => textStream.push(m);
+  textSink.updateActivity = () => {};
+  const textAdapter = createSubagentWorkflowAdapter(textCoordinator, {
+    pollIntervalMs: 1,
+    collectTimeoutMs: 2_000,
+    modelResolver: async () => ({ model_class: "code-strong", model: { provider: "anthropic", id: "x" }, thinking_level: "medium", source: "t" }),
+  });
+  await textAdapter.executeStep({ root: tempRoot, state: bugParamRun.state, workflow: bugParamWorkflow, step: triageStep, context: {}, contract: {}, notify: textSink });
+  assert.ok(textStream.some((m) => /💬/.test(m) && /Root cause confirmed/.test(m)), `worker text must be surfaced; got: ${JSON.stringify(textStream)}`);
+  assert.ok(!textStream.some((m) => /tool output noise/.test(m)), "non-assistant (toolResult) text must NOT be echoed");
+
+  // ADV review #8: formatToolActivity must cover the producer's real path keys (filename/cwd) and never
+  // render "[object Object]" for a structured/object tool argument.
+  const fmtAgentId = "implementer:fmt01";
+  const fmtSessionDir = path.join(tempRoot, ".aipi", "runtime", "subagents", "sessions", fmtAgentId.replaceAll(":", "-"));
+  await fs.mkdir(fmtSessionDir, { recursive: true });
+  await fs.writeFile(
+    path.join(fmtSessionDir, "2026-06-22T19-50-00-000Z_sess.jsonl"),
+    msg([{ type: "toolCall", id: "f1", name: "ls", arguments: { cwd: "frontend/src/components" } }]) +
+      msg([{ type: "toolCall", id: "f2", name: "read", arguments: { filename: "frontend/src/App.tsx" } }]) +
+      msg([{ type: "toolCall", id: "f3", name: "todo_write", arguments: { items: [{ a: 1 }] } }]),
+  );
+  let fmtPolls = 0;
+  const fmtCoordinator = {
+    spawn: () => ({ agent_id: fmtAgentId }),
+    status: () => ({ tool_call_count: 0 }),
+    collect: () => {
+      fmtPolls += 1;
+      if (fmtPolls < 2) return { agent_id: fmtAgentId, ready: false, state: "running" };
+      return { agent_id: fmtAgentId, ready: true, step_result: { schema: "aipi.step-result.v1", step_id: "triage", agent_ids: [fmtAgentId], verdict: "PASS", evidence: [{ rung: "ran", source: "w", ref: fmtAgentId, result: "ok" }], artifacts: [] }, artifacts: [] };
+    },
+  };
+  const fmtStream = [];
+  const fmtSink = (m) => fmtStream.push(m);
+  fmtSink.updateActivity = () => {};
+  const fmtAdapter = createSubagentWorkflowAdapter(fmtCoordinator, {
+    pollIntervalMs: 1,
+    collectTimeoutMs: 2_000,
+    modelResolver: async () => ({ model_class: "code-strong", model: { provider: "anthropic", id: "x" }, thinking_level: "medium", source: "t" }),
+  });
+  await fmtAdapter.executeStep({ root: tempRoot, state: bugParamRun.state, workflow: bugParamWorkflow, step: triageStep, context: {}, contract: {}, notify: fmtSink });
+  assert.ok(fmtStream.some((m) => /ls frontend\/src\/components/.test(m)), `ls {cwd} must render its path; got ${JSON.stringify(fmtStream)}`);
+  assert.ok(fmtStream.some((m) => /read App\.tsx/.test(m)), "read {filename} must render its basename");
+  assert.ok(fmtStream.some((m) => /todo_write/.test(m)), "object-arg tool renders its bare name");
+  assert.ok(!fmtStream.some((m) => /\[object Object\]/.test(m)), "no [object Object] leaks for object args");
+
   // collect-timeout (real-path mechanism): a real agentic worker takes minutes; the 120s spike default
   // timed it out mid-step (BLOCKED "did not finish: timeout") even though it would succeed. Prove the
   // collect timeout governs this: a worker that becomes ready AFTER a short timeout times out, but with
@@ -1186,12 +1326,12 @@ try {
     ["passed", "skipped", "blocked"].includes(event.type),
   );
   assert.ok(executedStepTransitions.length >= 1, "executor produced at least one step transition");
-  // Every executed step must have a "running…" start notification and a terminal-phase line.
+  // Every executed step must have a "running…" start notification and a terminal-phase line. The label is
+  // now `${stepId} (${visits})` — the per-step run count — not a positional `n/total` index.
   for (const event of executedStepTransitions) {
-    const n = progressExecution.state.steps.findIndex((step) => step.id === event.step_id) + 1;
     assert.ok(
       progressNotifications.some((note) =>
-        note.message.includes(`feature: ${event.step_id} (${n}/`) && note.message.includes("running…"),
+        note.message.includes(`feature: ${event.step_id} (`) && note.message.includes("running…"),
       ),
       `progress notified running… for ${event.step_id}`,
     );
@@ -1203,6 +1343,11 @@ try {
       `progress notified ${event.type} for ${event.step_id}`,
     );
   }
+  // The progress label no longer uses a positional n/total counter (the user asked for `fix (n)`).
+  assert.ok(
+    !progressNotifications.some((note) => /\bfeature: \w+ \(\d+\/\d+\)/.test(note.message)),
+    "progress label must not use the positional n/total counter",
+  );
   // At least one user-visible progress notification per executed step transition.
   assert.ok(
     progressNotifications.length >= executedStepTransitions.length,
@@ -1245,6 +1390,9 @@ try {
   assert.ok(sinkCalls.plan.length >= 1, "progress sink received planner snapshots");
   const fullPlan = sinkCalls.plan.find((lines) => lines.length === planExecution.state.steps.length);
   assert.ok(fullPlan, "a planner snapshot has one line per workflow step");
+  // The planner shows a per-step run count `(n)`, not the positional `n/total` index.
+  assert.ok(fullPlan.some((line) => /\(\d+\)\s*$/.test(line)), "planner shows per-step run count (n)");
+  assert.ok(!fullPlan.some((line) => /\d+\/\d+/.test(line)), "planner no longer shows the positional n/total index");
   // The final planner snapshot shows every step done (no lingering running/pending glyph) — and the
   // run-end clear() (mirroring the real sink) removes the live widget so it does not linger.
   const lastPlan = sinkCalls.plan.at(-1);
@@ -1254,6 +1402,54 @@ try {
   // The spinner was started (for the in-step gap) and stopped.
   assert.ok(sinkCalls.spinner.some((entry) => entry.start), "spinner started for a running step");
   assert.ok(sinkCalls.spinner.some((entry) => entry.stop), "spinner stopped");
+
+  // Iteration count (user request): a step the gate loops back to shows (n) = times visited. Compose the
+  // pass-adapter but FAIL the bugfix `fix` step on its first visit so the FAIL->fix gate re-enters it.
+  const loopRun = await startWorkflowRun({
+    projectRoot: tempRoot,
+    workflow: "bugfix",
+    params: { bug: "loop count repro" },
+    now: () => fixedDate,
+    randomBytes: fixedRandom,
+  });
+  const loopPassAdapter = createTestPassWorkflowAdapter();
+  let loopFixVisits = 0;
+  const loopAdapter = {
+    async executeStep(args) {
+      const result = await loopPassAdapter.executeStep(args); // writes the step's artifacts so the gate sees them
+      if (args.step.id === "fix") {
+        loopFixVisits += 1;
+        if (loopFixVisits < 2) return { ...result, verdict: "FAIL" }; // first fix FAILs -> gate loops to fix
+      }
+      return result;
+    },
+  };
+  const loopPlans = [];
+  const loopNotifies = [];
+  const loopSink = (message) => loopNotifies.push(message);
+  loopSink.setPlan = (lines) => loopPlans.push(lines);
+  await executeWorkflowRun({
+    projectRoot: tempRoot,
+    runId: loopRun.runId,
+    now: () => fixedDate,
+    adapter: loopAdapter,
+    notify: loopSink,
+  });
+  assert.ok(loopFixVisits >= 2, "the fix step looped at least twice");
+  assert.ok(
+    loopPlans.some((lines) => lines.some((line) => /(^|\s)fix \((?:[2-9]|\d\d)\)/.test(line))),
+    `planner must show the fix step's loop count (>=2); fix lines: ${JSON.stringify(loopPlans.flat().filter((l) => /\bfix\b/.test(l)))}`,
+  );
+  // The FAILED attempt must be surfaced (a "failed" line + a ✗ glyph) so the incrementing count reads as
+  // retries, not silent forward progress (adversarial review finding).
+  assert.ok(
+    loopNotifies.some((m) => /\bfix \(\d+\) failed/.test(m)),
+    `a failed fix attempt must emit a "failed" progress line; got: ${JSON.stringify(loopNotifies.filter((m) => /fix/.test(m)))}`,
+  );
+  assert.ok(
+    loopPlans.some((lines) => lines.some((line) => /^✗ fix/.test(line))),
+    "planner renders ✗ for the failed fix attempt before it loops",
+  );
 
   // Regression (ADV-61-3 self-review): a step that THROWS after arming the spinner must still tear it
   // down (clearProgress in the try/finally), or the unref'd setInterval animates the TUI forever for a

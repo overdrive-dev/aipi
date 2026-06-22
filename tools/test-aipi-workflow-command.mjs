@@ -87,6 +87,11 @@ try {
   assert.deepEqual(uiCalls.notify.at(-1), { message: "hello", kind: "info" });
   richSink.setPlan(["○ 1/2 triage", "○ 2/2 fix"]);
   assert.deepEqual(uiCalls.widget.at(-1).content, ["○ 1/2 triage", "○ 2/2 fix"]);
+  // The live worker stream is a PERSISTENT activity widget (notify is transient on the real host).
+  assert.equal(richSink.supportsWidgets, true);
+  richSink.setActivity(["live · implementer · 2 tools · 5s", "  💭 applying fix", "  write gestores-tipo.ts"]);
+  assert.equal(uiCalls.widget.at(-1).key, "aipi.workflow.activity");
+  assert.deepEqual(uiCalls.widget.at(-1).content, ["live · implementer · 2 tools · 5s", "  💭 applying fix", "  write gestores-tipo.ts"]);
   richSink.startSpinner("bugfix: triage");
   assert.ok(uiCalls.status.some((call) => /bugfix: triage/.test(call.text ?? "")), "spinner writes an animated status line");
   // Live worker activity is folded into the spinner line (ADV-63): updateActivity then a tick renders it.
@@ -98,13 +103,23 @@ try {
   );
   richSink.clear();
   richSink.stopSpinner();
-  assert.equal(uiCalls.widget.at(-1).content, undefined, "clear removes the planner widget");
+  assert.equal(uiCalls.widget.at(-1).content, undefined, "clear removes a widget");
+  assert.ok(
+    uiCalls.widget.some((call) => call.key === "aipi.workflow.activity" && call.content === undefined),
+    "clear removes the live activity widget",
+  );
+  assert.ok(
+    uiCalls.widget.some((call) => call.key === "aipi.workflow.plan" && call.content === undefined),
+    "clear removes the planner widget",
+  );
   assert.equal(uiCalls.status.at(-1).text, undefined, "clear removes the status line");
 
   // A notify-only host (no setWidget/setStatus): the richer methods are safe no-ops, notify still works.
   const plainCalls = [];
   const plainSink = makeProgressNotifier({ ui: { notify: (m, k) => plainCalls.push({ m, k }) } });
+  assert.equal(plainSink.supportsWidgets, false);
   plainSink.setPlan(["x"]);
+  plainSink.setActivity(["a", "b"]); // safe no-op when the host has no setWidget
   plainSink.startSpinner("y");
   plainSink.stopSpinner();
   plainSink.clear();

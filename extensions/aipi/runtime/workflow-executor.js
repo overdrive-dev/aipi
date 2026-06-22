@@ -19,6 +19,8 @@ const PROGRESS_PHASE_LABELS = {
   passed: "passed",
   skipped: "skipped",
   blocked: "blocked",
+  failed: "failed",
+  approval_required: "needs approval",
 };
 
 // Glyphs for the live per-step planner checklist surfaced via the progress sink's setPlan().
@@ -29,6 +31,7 @@ const PROGRESS_PLAN_GLYPHS = {
   failed: "✗",
   abandoned: "✗",
   cancelled: "✗",
+  approval_required: "✗",
   running: "▶",
   active: "▶",
   pending: "○",
@@ -66,27 +69,33 @@ export async function executeWorkflowRun({
   const maxConsecutiveFailures = runLimits.maxConsecutiveFailures ?? Number.POSITIVE_INFINITY;
   const events = [];
   // ADV-58-3: surface per-step progress to the terminal so a long run does not look frozen.
-  const totalSteps = workflow.steps.length;
-  const stepNumberById = new Map(workflow.steps.map((step, index) => [step.id, index + 1]));
+  // Per-step run count: with FAIL / BLOCKED_TO_PLANNING gates a workflow can revisit a step (e.g. the
+  // fix -> verify -> review -> fix loop). state.step_visits[id] is how many times the step has run, so the
+  // planner shows `fix (3)` — the times the run entered that step — instead of a positional `4/7` index
+  // that is misleading once steps loop. Unvisited steps show just their name.
+  const stepLabel = (stepId) => {
+    const visits = state.step_visits?.[stepId] ?? 0;
+    return visits >= 1 ? `${stepId} (${visits})` : stepId;
+  };
   // A planner/checklist: one line per workflow step with a status glyph, re-rendered as the run
   // advances. The active step is shown as running even before it is marked terminal.
   const buildPlanLines = (activeStepId, activePhase) =>
-    workflow.steps.map((step, index) => {
+    workflow.steps.map((step) => {
       let status = state.steps?.find((entry) => entry.id === step.id)?.status ?? "pending";
       if (step.id === activeStepId && activePhase === "running") status = "running";
       const glyph = PROGRESS_PLAN_GLYPHS[status] ?? "○";
-      return `${glyph} ${index + 1}/${totalSteps} ${step.id}`;
+      return `${glyph} ${stepLabel(step.id)}`;
     });
   const emitProgress = (stepId, phase) => {
     if (typeof notify !== "function") return;
-    const n = stepNumberById.get(stepId) ?? "?";
     const verb = PROGRESS_PHASE_LABELS[phase] ?? phase;
+    const label = stepLabel(stepId);
     try {
-      // Legacy one-line notify (kept byte-for-byte for back-compat + the CLI/notify-only path).
-      notify(`AIPI ${state.workflow}: ${stepId} (${n}/${totalSteps}) ${verb}`, "info");
+      // Legacy one-line notify (kept for the CLI/notify-only path).
+      notify(`AIPI ${state.workflow}: ${label} ${verb}`, "info");
       // Richer, feature-detected surfaces (no-ops when notify is a plain function or the host lacks them).
       notify.setPlan?.(buildPlanLines(stepId, phase));
-      if (phase === "running") notify.startSpinner?.(`${state.workflow}: ${stepId} (${n}/${totalSteps})`);
+      if (phase === "running") notify.startSpinner?.(`${state.workflow}: ${label}`);
       else notify.stopSpinner?.();
     } catch {
       /* progress is best-effort and must never break execution */
@@ -300,6 +309,9 @@ export async function executeWorkflowRun({
     }
 
     if (target && !terminalActions.has(target)) {
+      // Surface the failure + loop in the planner: the step renders ✗ and its run-count makes the retry
+      // visible, instead of a silently-incrementing `running…` that reads as forward progress.
+      emitProgress(step.id, failedStatus);
       state.current_step = target;
       state.awaiting_user_input = null;
       await persistRunState(root, state);
@@ -621,15 +633,33 @@ async function collectSubagentResult(coordinator, agentId, {
   let lastActivityAt = 0;
   // Live worker telemetry: a forked worker runs for minutes; surface what it is actually DOING so the
   // terminal isn't a silent spinner. The worker streams its real session to a jsonl; we tail NEW events
-  // and (a) print each thinking note + file/graph/tool action into the scrollback as it happens, and
-  // (b) fold a one-line summary into the spinner. The feed keeps a byte cursor so each event prints once.
+  // and show each thinking note + file/graph/tool action live. The host's notify() is a TRANSIENT
+  // notification (only the latest shows), so on a rich host we render a persistent, scrolling activity
+  // WIDGET (setWidget — the same reliable surface as the planner). On a plain/CLI host (no widgets) we
+  // fall back to one notify line per event. The feed keeps a byte cursor so each event is seen once.
   const canStream = typeof notify === "function" && Boolean(root);
-  const feed = canStream ? createWorkerActivityFeed(root, agentId, stepId) : null;
+  const feed = canStream ? createWorkerActivityFeed(root, agentId) : null;
+  const tag = String(agentId).split(":")[0] || stepId || "worker";
+  const richUI = canStream && notify.supportsWidgets === true && typeof notify.setActivity === "function";
+  const recent = []; // rolling window of recent lines for the live widget
+  const RECENT_CAP = 14;
   const pump = async () => {
     if (!feed) return;
     try {
       const { events, toolCount, latestAction } = await feed.poll();
-      for (const line of events) notify(line, "info");
+      for (const event of events) {
+        const glyph = event.kind === "think" ? "💭 " : event.kind === "text" ? "💬 " : "";
+        if (richUI) {
+          recent.push(`  ${glyph}${event.detail}`);
+          if (recent.length > RECENT_CAP) recent.shift();
+        } else {
+          notify(`  ↳ ${tag} ${glyph}${event.detail}`, "info");
+        }
+      }
+      if (richUI && recent.length) {
+        const elapsed = Math.round((Date.now() - startedAt) / 1000);
+        notify.setActivity([`live · ${tag} · ${toolCount} tool${toolCount === 1 ? "" : "s"} · ${elapsed}s`, ...recent]);
+      }
       if (typeof notify.updateActivity === "function") {
         const parts = [`${toolCount} tool${toolCount === 1 ? "" : "s"}`];
         if (latestAction) parts.push(latestAction);
@@ -639,30 +669,40 @@ async function collectSubagentResult(coordinator, agentId, {
       /* telemetry is best-effort and must never break the run */
     }
   };
-  while (Date.now() - startedAt <= collectTimeoutMs) {
-    const collect = coordinator.collect(agentId);
-    if (collect.ready || ["failed", "cancelled", "interrupted"].includes(collect.state)) {
-      await pump(); // flush any final events the worker wrote just before finishing
-      return collect;
+  const clearLivePanel = () => {
+    try { notify?.setActivity?.(undefined); } catch { /* best-effort */ }
+  };
+  // try/finally so the live activity panel is removed on EVERY exit — including a thrown
+  // coordinator.collect() (e.g. "unknown agent" if the job was pruned mid-poll). Otherwise the stale
+  // panel would linger until the whole run unwinds. Mirrors executeWorkflowRun's own progress guard.
+  try {
+    while (Date.now() - startedAt <= collectTimeoutMs) {
+      const collect = coordinator.collect(agentId);
+      if (collect.ready || ["failed", "cancelled", "interrupted"].includes(collect.state)) {
+        await pump(); // flush any final events the worker wrote just before finishing
+        return collect;
+      }
+      if (feed && Date.now() - lastActivityAt >= 1000) {
+        lastActivityAt = Date.now();
+        await pump();
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
     }
-    if (feed && Date.now() - lastActivityAt >= 1000) {
-      lastActivityAt = Date.now();
-      await pump();
-    }
-    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    return { agent_id: agentId, ready: false, state: "timeout" };
+  } finally {
+    clearLivePanel(); // the planner shows the step's terminal state; never leave a stale live panel
   }
-  return { agent_id: agentId, ready: false, state: "timeout" };
 }
 
 // Forward, cursor-based reader of a forked worker's live session jsonl. Each worker logs
 // `{type:"message", message:{role, content:[ {type:"thinking",thinking}, {type:"toolCall",name,arguments} ]}}`
 // events (NOT the top-level tool_use/input shape an in-process SDK uses). poll() reads only bytes appended
-// since the last call, returns one formatted scrollback line per new thinking/tool event, the running
-// tool count (derived from the jsonl, since host tool_call hooks observe zero forked-worker calls), and
-// the latest action for the spinner. Best-effort: never throws; a partial trailing line is left for next poll.
-function createWorkerActivityFeed(root, agentId, stepId = null) {
+// since the last call, returns one structured {kind:"tool"|"think", detail} event per new thinking/tool
+// block, the running tool count (derived from the jsonl, since host tool_call hooks observe zero
+// forked-worker calls), and the latest action for the spinner. Best-effort: never throws; a partial
+// trailing line is left for the next poll.
+function createWorkerActivityFeed(root, agentId) {
   const dir = path.join(root, ".aipi", "runtime", "subagents", "sessions", String(agentId).replaceAll(":", "-"));
-  const tag = String(agentId).split(":")[0] || stepId || "worker";
   let file = null;
   let offset = 0;
   let toolCount = 0;
@@ -704,16 +744,19 @@ function createWorkerActivityFeed(root, agentId, stepId = null) {
           } catch {
             continue;
           }
-          const content = event?.message?.content;
-          if (!Array.isArray(content)) continue;
-          for (const part of content) {
+          const message = event?.message;
+          const content = message?.content;
+          // A message's content can be a string (not an array) — handle that real shape too.
+          const parts = typeof content === "string" ? [{ type: "text", text: content }] : Array.isArray(content) ? content : [];
+          const isAssistant = message?.role === "assistant" || message?.role === undefined;
+          for (const part of parts) {
             if (part?.type === "toolCall" || part?.type === "tool_use") {
               toolCount += 1;
               const detail = formatToolActivity(part.name, part.arguments ?? part.input ?? {});
               out.latestAction = detail;
               if (streamed < STREAM_CAP) {
                 streamed += 1;
-                out.events.push(`  ↳ ${tag}: ${detail}`);
+                out.events.push({ kind: "tool", detail });
               }
             } else if (part?.type === "thinking") {
               const summary = summarizeThinking(part.thinking ?? part.text ?? "");
@@ -721,7 +764,18 @@ function createWorkerActivityFeed(root, agentId, stepId = null) {
                 out.latestAction = "thinking…";
                 if (streamed < STREAM_CAP) {
                   streamed += 1;
-                  out.events.push(`  ↳ ${tag} 💭 ${summary}`);
+                  out.events.push({ kind: "think", detail: summary });
+                }
+              }
+            } else if (part?.type === "text" && isAssistant) {
+              // The worker's spoken narration/answer — show it too (a tools-free, text-only turn would
+              // otherwise render a blank live panel). Skip user/toolResult echoes (non-assistant roles).
+              const summary = summarizeThinking(part.text ?? "");
+              if (summary) {
+                out.latestAction = summary;
+                if (streamed < STREAM_CAP) {
+                  streamed += 1;
+                  out.events.push({ kind: "text", detail: summary });
                 }
               }
             }
@@ -742,6 +796,7 @@ function truncateActivity(value, max) {
 }
 
 function baseName(value) {
+  if (value !== null && typeof value === "object") return ""; // never render "[object Object]"
   const s = String(value ?? "").replaceAll("\\", "/");
   return s.split("/").filter(Boolean).pop() || s;
 }
@@ -750,7 +805,9 @@ function baseName(value) {
 // aipi_* graph/memory/retrieval tools the user specifically wanted to see ("files/graph + thinking").
 function formatToolActivity(name, args = {}) {
   const a = args && typeof args === "object" ? args : {};
-  const p = a.path ?? a.file ?? a.file_path ?? a.filePath ?? a.target ?? a.dir;
+  // Cover the path keys the real worker/producer actually emits (resolveCurrentPath uses
+  // path/file/filename/target/cwd) plus a few defensive aliases, so `ls {cwd}` / `read {filename}` render.
+  const p = a.path ?? a.file ?? a.filename ?? a.target ?? a.cwd ?? a.dir ?? a.file_path ?? a.filePath;
   switch (name) {
     case "read":
     case "open":

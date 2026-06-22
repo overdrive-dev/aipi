@@ -9,9 +9,12 @@ import { SUBAGENT_STATE_ENTRY } from "../extensions/aipi/runtime/subagents.js";
 import {
   applyProviderPayloadPolicy,
   buildProviderBudgetReport,
+  buildRecentRunSummary,
   classifyAipiCodePipeline,
   classifyAipiInputRoute,
   createAipiLifecycleHandlers,
+  handleBeforeAgentStart,
+  renderRecentRunSummary,
   estimateProviderUsageCost,
   normalizeProviderUsage,
   pruneAipiContextMessages,
@@ -1256,6 +1259,66 @@ try {
   assert.equal(budgetReport.state, "over_budget");
   assert.equal(budgetReport.scope_ref, "anthropic:claude-estimated");
   assert.equal(normalizeProviderUsage({ status: 200 }), null);
+
+  // Recent-run awareness: after a run goes terminal (no active pointer), the assistant must still be able
+  // to answer "did you run tests / check the kanban" instead of acting like the conversation just started.
+  const recentRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-recent-run-"));
+  try {
+    const runId = "20260622T200133Z-260314";
+    const runDir = path.join(recentRoot, ".aipi", "runtime", "runs", runId);
+    await fs.mkdir(runDir, { recursive: true });
+    await fs.writeFile(
+      path.join(runDir, "state.json"),
+      JSON.stringify({
+        workflow: "bugfix",
+        status: "escalated_to_human",
+        step_visits: { triage: 1, regression_test: 1, fix: 4, verify: 3, review: 3 },
+        steps: [
+          { id: "triage", status: "passed", verdict: "PASS" },
+          { id: "regression_test", status: "passed", verdict: "PASS" },
+          { id: "fix", status: "passed", verdict: "PASS" },
+          { id: "review", status: "failed", verdict: "FAIL" },
+          { id: "memory_promotion", status: "pending" },
+        ],
+      }),
+    );
+    const recent = await buildRecentRunSummary(recentRoot);
+    assert.ok(recent, "buildRecentRunSummary finds the most recent terminal run");
+    assert.equal(recent.run_id, runId);
+    assert.equal(recent.status, "escalated_to_human");
+    assert.ok(recent.steps.some((s) => s.id === "regression_test" && s.status === "passed"), "tests step is captured");
+    const rendered = renderRecentRunSummary(recent);
+    assert.match(rendered, /regression_test/);
+    assert.match(rendered, /escalated_to_human/);
+    assert.match(rendered, /✗ review/);
+    assert.match(rendered, /fix \(4\)/, "loop count is shown in the recent-run summary");
+    assert.match(rendered, /Do NOT claim this is the first message/);
+    // Integration (#7): handleBeforeAgentStart injects the recent-run pointer when NO run is active.
+    const hbas = await handleBeforeAgentStart({
+      event: { type: "before_agent_start", prompt: "did you run tests?" },
+      ctx: { model: { provider: "anthropic", id: "claude-opus-4-8" }, ui: { notify() {} } },
+      pi: { appendEntry() {} },
+      projectRoot: recentRoot,
+      coordinator: { setHostModel() {}, getHostModel: () => null },
+    });
+    assert.ok(hbas?.message, "handleBeforeAgentStart returns a message when a recent run exists with no active run");
+    assert.equal(hbas.message.customType, "aipi.recent-run-pointer");
+    assert.equal(hbas.message.display, false);
+    assert.match(hbas.message.content, /regression_test/);
+    assert.match(hbas.message.content, /Do NOT claim this is the first message/);
+    // The header is status-aware (#4): an escalated run is NOT mislabeled "completed".
+    assert.doesNotMatch(hbas.message.content, /a COMPLETED run/);
+    assert.match(hbas.message.content, /STOPPED for human review/);
+    // A run older than the recency window is not surfaced.
+    const aged = await buildRecentRunSummary(recentRoot, { maxAgeMs: 1, now: () => Date.now() + 10_000 });
+    assert.equal(aged, null, "a stale run beyond the recency window is not surfaced");
+    // No runs at all -> null.
+    const emptyRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-no-run-"));
+    assert.equal(await buildRecentRunSummary(emptyRoot), null);
+    await fs.rm(emptyRoot, { recursive: true, force: true });
+  } finally {
+    await fs.rm(recentRoot, { recursive: true, force: true });
+  }
 
   console.log("AIPI_LIFECYCLE_HOOKS_TEST_OK");
 } finally {

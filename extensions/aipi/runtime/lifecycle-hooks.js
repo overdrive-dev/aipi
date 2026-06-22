@@ -1698,7 +1698,22 @@ export async function handleBeforeAgentStart({ event, ctx, pi, projectRoot, coor
     },
     snapshot,
   });
-  if (!snapshot.active) return undefined;
+  if (!snapshot.active) {
+    // No active run, but a workflow may have JUST finished — surface it so the assistant can answer
+    // follow-ups ("did you run tests?", "check the kanban") instead of acting like nothing happened.
+    const recent = await buildRecentRunSummary(projectRoot).catch(() => null);
+    if (!recent) return undefined;
+    const recentDetails = { schema: "aipi.recent-run-pointer.v1", recent };
+    safeAppendEntry(pi, "aipi.context.recent-run", recentDetails);
+    return {
+      message: {
+        customType: "aipi.recent-run-pointer",
+        display: false,
+        content: renderRecentRunSummary(recent),
+        details: recentDetails,
+      },
+    };
+  }
 
   const activeDisciplines = await loadAndRecordActiveDisciplines({
     projectRoot,
@@ -2433,6 +2448,91 @@ export async function buildRunSnapshot(projectRoot) {
   };
 }
 
+// When NO run is active, the assistant otherwise has zero awareness of a workflow that just finished — so a
+// follow-up like "did you run tests?" gets answered as if nothing happened ("first message in our
+// conversation"). This surfaces the most-recent run (terminal included, within a recency window) so the
+// assistant can answer about it and read its step artifacts. Returns null if there is no recent run.
+export async function buildRecentRunSummary(projectRoot, { maxAgeMs = 24 * 60 * 60 * 1000, now = Date.now } = {}) {
+  try {
+    const runsDir = path.join(projectRoot, ".aipi", "runtime", "runs");
+    const entries = await fs.readdir(runsDir, { withFileTypes: true }).catch(() => []);
+    // Collect every in-window run by state.json mtime (id order and mtime order can disagree, so a stale
+    // lexically-newest run must NOT hide a genuinely recent older-id run). stat is cheap; we only read the
+    // candidates' state.json, newest-modified first, until one parses.
+    const candidates = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !/^\d{8}T\d{6}Z-/.test(entry.name)) continue;
+      const statePath = path.join(runsDir, entry.name, "state.json");
+      const stat = await fs.stat(statePath).catch(() => null);
+      if (!stat) continue;
+      if (maxAgeMs && now() - stat.mtimeMs > maxAgeMs) continue; // skip stale — don't abort the whole scan
+      candidates.push({ runId: entry.name, mtimeMs: stat.mtimeMs, statePath });
+    }
+    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    for (const candidate of candidates) {
+      let state;
+      try {
+        state = JSON.parse(await fs.readFile(candidate.statePath, "utf8"));
+      } catch {
+        continue; // corrupt/partially-flushed state.json — fall through to the next most-recent run
+      }
+      return {
+        schema: "aipi.recent-run.v1",
+        run_id: candidate.runId,
+        workflow: state.workflow ?? null,
+        status: state.status ?? null,
+        steps: (state.steps ?? []).map((entry) => ({ id: entry.id, status: entry.status ?? null, verdict: entry.verdict ?? null })),
+        step_visits: state.step_visits ?? {},
+        run_rel_dir: state.run_rel_dir ?? path.posix.join(".aipi/runtime/runs", candidate.runId),
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function recentRunStatusNote(status) {
+  switch (status) {
+    case "completed":
+      return "a COMPLETED run";
+    case "escalated_to_human":
+      return "a run that STOPPED for human review";
+    case "blocked":
+      return "a BLOCKED run awaiting input";
+    case "running":
+    case "active":
+      return "a run still IN PROGRESS";
+    case "abandoned":
+    case "cancelled":
+      return "an ABANDONED run";
+    default:
+      return `a run with status ${status ?? "unknown"}`;
+  }
+}
+
+export function renderRecentRunSummary(summary) {
+  const glyphFor = (status) =>
+    status === "passed" ? "✓" : status === "failed" ? "✗" : status === "skipped" ? "⊘" : status === "pending" ? "○" : "·";
+  const stepLine = (summary.steps ?? [])
+    .map((step) => {
+      const visits = summary.step_visits?.[step.id];
+      const count = visits && visits > 1 ? ` (${visits})` : "";
+      return `${glyphFor(step.status)} ${step.id}${count}${step.verdict ? ` ${step.verdict}` : ""}`;
+    })
+    .join("   ");
+  return [
+    `AIPI most recent run (${recentRunStatusNote(summary.status)} on disk — NOT a fresh, empty conversation):`,
+    `- run_id: ${summary.run_id}`,
+    `- workflow: ${summary.workflow}`,
+    `- status: ${summary.status}`,
+    `- steps: ${stepLine || "(none)"}`,
+    `- artifacts: read ${summary.run_rel_dir}/steps/<step>/ for detail (e.g. regression_test, fix, review).`,
+    "If the user asks what was done, whether tests/regression ran, why it stopped, or to \"check the kanban\",",
+    "answer from this summary and the step artifacts. Do NOT claim this is the first message or that nothing was done.",
+  ].join("\n");
+}
+
 export function pruneAipiContextMessages(messages = [], {
   snapshot = { active: false },
   activeDisciplines = [],
@@ -3135,8 +3235,11 @@ function serializeRuntimeError(error) {
 
 function isAipiContextPointer(message) {
   return message?.customType === "aipi.context-pointer" ||
+    message?.customType === "aipi.recent-run-pointer" ||
     message?.details?.schema === "aipi.context-pointer.v1" ||
-    (typeof message?.content === "string" && message.content.startsWith("AIPI active run context:"));
+    message?.details?.schema === "aipi.recent-run-pointer.v1" ||
+    (typeof message?.content === "string" &&
+      (message.content.startsWith("AIPI active run context:") || message.content.startsWith("AIPI most recent run")));
 }
 
 function isAipiToolResultMessage(message) {
@@ -3740,6 +3843,7 @@ export function makeProgressNotifier(ctx) {
   const ui = ctx.ui;
   const PLAN_KEY = "aipi.workflow.plan";
   const STATUS_KEY = "aipi.workflow.status";
+  const ACTIVITY_KEY = "aipi.workflow.activity";
   let spinnerTimer = null;
   let spinnerFrame = 0;
   let spinnerStartedAt = 0;
@@ -3748,12 +3852,27 @@ export function makeProgressNotifier(ctx) {
 
   const sink = (message, kind = "info") => safeNotify(ctx, message, kind);
   sink.notify = sink;
+  // Whether this host can render persistent multi-line widgets. The executor uses this to choose the
+  // live-worker surface: a scrolling activity WIDGET on a rich host, or one notify line per event on a
+  // plain/CLI host (where notify() is the only channel).
+  sink.supportsWidgets = typeof ui.setWidget === "function";
   sink.setPlan = (lines) => {
     if (typeof ui.setWidget !== "function") return;
     try {
       ui.setWidget(PLAN_KEY, Array.isArray(lines) && lines.length ? lines : undefined);
     } catch {
       /* progress is best-effort and must never break execution */
+    }
+  };
+  // Live worker activity panel: a persistent, scrolling list of the worker's recent thinking notes and
+  // file/graph/tool operations, rendered above the editor like the planner. This is the "watch the agent
+  // work" surface — notify() can't be used for it because the host shows notifications transiently.
+  sink.setActivity = (lines) => {
+    if (typeof ui.setWidget !== "function") return;
+    try {
+      ui.setWidget(ACTIVITY_KEY, Array.isArray(lines) && lines.length ? lines : undefined, { placement: "aboveEditor" });
+    } catch {
+      /* best-effort */
     }
   };
   sink.setStatus = (text) => {
@@ -3800,6 +3919,11 @@ export function makeProgressNotifier(ctx) {
     if (typeof ui.setWidget === "function") {
       try {
         ui.setWidget(PLAN_KEY, undefined);
+      } catch {
+        /* best-effort */
+      }
+      try {
+        ui.setWidget(ACTIVITY_KEY, undefined);
       } catch {
         /* best-effort */
       }
