@@ -94,8 +94,15 @@ export async function executeWorkflowRun({
   };
   const clearProgress = () => {
     try {
+      // Prefer the sink's richer clear() (stops spinner + clears the status line AND the planner widget)
+      // so a thrown/failed run does not leave the planner stuck showing the failed step as "▶ running".
+      if (typeof notify?.clear === "function") {
+        notify.clear();
+        return;
+      }
       notify?.stopSpinner?.();
       notify?.setStatus?.(undefined);
+      notify?.setPlan?.([]); // fallback for a sink without clear(): empty the planner widget
     } catch {
       /* best-effort */
     }

@@ -939,12 +939,15 @@ try {
     now: () => fixedDate,
     randomBytes: fixedRandom,
   });
-  const sinkCalls = { notify: [], plan: [], status: [], spinner: [] };
+  const sinkCalls = { notify: [], plan: [], status: [], spinner: [], clear: 0 };
   const progressSink = (message, kind) => sinkCalls.notify.push({ message, kind });
   progressSink.setPlan = (lines) => sinkCalls.plan.push(lines);
   progressSink.setStatus = (text) => sinkCalls.status.push(text);
   progressSink.startSpinner = (label) => sinkCalls.spinner.push({ start: label });
   progressSink.stopSpinner = () => sinkCalls.spinner.push({ stop: true });
+  progressSink.clear = () => {
+    sinkCalls.clear += 1;
+  };
   const planExecution = await executeWorkflowRun({
     projectRoot: tempRoot,
     runId: planRun.runId,
@@ -959,10 +962,12 @@ try {
   assert.ok(sinkCalls.plan.length >= 1, "progress sink received planner snapshots");
   const fullPlan = sinkCalls.plan.find((lines) => lines.length === planExecution.state.steps.length);
   assert.ok(fullPlan, "a planner snapshot has one line per workflow step");
-  // The final planner snapshot shows every step done (no lingering running/pending glyph).
+  // The final planner snapshot shows every step done (no lingering running/pending glyph) — and the
+  // run-end clear() (mirroring the real sink) removes the live widget so it does not linger.
   const lastPlan = sinkCalls.plan.at(-1);
   assert.equal(lastPlan.length, planExecution.state.steps.length);
   assert.ok(lastPlan.every((line) => /^[✓⊘]/.test(line)), "final plan marks every step passed/skipped");
+  assert.equal(sinkCalls.clear, 1, "the live progress surfaces are cleared once when the run ends");
   // The spinner was started (for the in-step gap) and stopped.
   assert.ok(sinkCalls.spinner.some((entry) => entry.start), "spinner started for a running step");
   assert.ok(sinkCalls.spinner.some((entry) => entry.stop), "spinner stopped");
@@ -970,35 +975,55 @@ try {
   // Regression (ADV-61-3 self-review): a step that THROWS after arming the spinner must still tear it
   // down (clearProgress in the try/finally), or the unref'd setInterval animates the TUI forever for a
   // failed run. Assert the spinner is stopped even though executeWorkflowRun rejects.
+  const throwAdapter = {
+    async executeStep() {
+      throw new Error("boom mid-step");
+    },
+  };
+  // (a) A sink WITH clear() (like the real makeProgressNotifier): clearProgress delegates to it, so the
+  // planner widget + status + spinner are ALL torn down (ADV-61-4 — not just the spinner).
   const throwRun = await startWorkflowRun({
     projectRoot: tempRoot,
     workflow: "feature",
     now: () => fixedDate,
     randomBytes: fixedRandom,
   });
-  const throwSpinner = [];
-  const throwSink = () => {};
-  throwSink.setPlan = () => {};
-  throwSink.setStatus = () => {};
-  throwSink.startSpinner = () => throwSpinner.push("start");
-  throwSink.stopSpinner = () => throwSpinner.push("stop");
+  const clearSinkCalls = { spinner: [], clear: 0 };
+  const clearSink = () => {};
+  clearSink.setPlan = () => {};
+  clearSink.setStatus = () => {};
+  clearSink.startSpinner = () => clearSinkCalls.spinner.push("start");
+  clearSink.stopSpinner = () => clearSinkCalls.spinner.push("stop");
+  clearSink.clear = () => {
+    clearSinkCalls.clear += 1;
+  };
   await assert.rejects(
-    () =>
-      executeWorkflowRun({
-        projectRoot: tempRoot,
-        runId: throwRun.runId,
-        now: () => fixedDate,
-        adapter: {
-          async executeStep() {
-            throw new Error("boom mid-step");
-          },
-        },
-        notify: throwSink,
-      }),
+    () => executeWorkflowRun({ projectRoot: tempRoot, runId: throwRun.runId, now: () => fixedDate, adapter: throwAdapter, notify: clearSink }),
     /boom mid-step/,
   );
-  assert.ok(throwSpinner.includes("start"), "spinner was armed before the throw");
-  assert.ok(throwSpinner.includes("stop"), "spinner is torn down despite the throw (clearProgress in finally)");
+  assert.ok(clearSinkCalls.spinner.includes("start"), "spinner was armed before the throw");
+  assert.equal(clearSinkCalls.clear, 1, "clearProgress invokes the richer clear() (planner+status+spinner) on throw");
+
+  // (b) A sink WITHOUT clear() (only setPlan/setStatus/spinner): the planner is still emptied via a final
+  // setPlan([]) and the spinner stopped, so a failed step is not left stuck on "running".
+  const fallbackRun = await startWorkflowRun({
+    projectRoot: tempRoot,
+    workflow: "feature",
+    now: () => fixedDate,
+    randomBytes: fixedRandom,
+  });
+  const fallbackCalls = { plan: [], spinner: [] };
+  const fallbackSink = () => {};
+  fallbackSink.setPlan = (lines) => fallbackCalls.plan.push(lines);
+  fallbackSink.setStatus = () => {};
+  fallbackSink.startSpinner = () => fallbackCalls.spinner.push("start");
+  fallbackSink.stopSpinner = () => fallbackCalls.spinner.push("stop");
+  await assert.rejects(
+    () => executeWorkflowRun({ projectRoot: tempRoot, runId: fallbackRun.runId, now: () => fixedDate, adapter: throwAdapter, notify: fallbackSink }),
+    /boom mid-step/,
+  );
+  assert.ok(fallbackCalls.spinner.includes("stop"), "spinner stopped on throw (no-clear fallback)");
+  assert.deepEqual(fallbackCalls.plan.at(-1), [], "planner emptied via a final setPlan([]) on throw (no-clear fallback)");
 
   const policyStep = quick.steps[0];
   const policyState = {
