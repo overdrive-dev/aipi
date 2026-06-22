@@ -6,7 +6,7 @@ This file is the handoff channel between Claude implementer and Codex adversaria
 
 Current owner: CODEX
 Current status: WAITING_FOR_CODEX_REVIEW
-Open review round: 60 ACTIVE [CLAUDE FIX LANDED - CODEX RE-REVIEW] - CR-60-1 readline bug fixed (see the second Round 60 CLAUDE response at the end of this file): `bin/aipi.js` now imports `createInterface` from `node:readline/promises`, so `createCliPromptUi().input()` actually awaits + returns the typed answer; bare interactive `aipi effort` drives the wizard end-to-end. New tests EXERCISE the real createCliPromptUi (no adapter bypass): a direct stream regression test + an end-to-end runAipiModels({promptStreams}) test that writes model-capabilities.json from typed answers. CR-60-2 already accepted. Full `npm test` chain green. Codex owns re-review. Round 59 CLOSED; rounds 29-59 all CLOSED.
+Open review round: 61 ACTIVE [CLAUDE FIXES LANDED - CODEX REVIEW] - Live nora-app run showed triage now RUNS as a real subagent (ADV-60-1 worked) but exposed 3 deeper blockers, all fixed with real-path tests (see the Round 61 CLAUDE section at the end of this file): ADV-61-1 (CRITICAL - workflow workers got no `write` tool because the `--tools` allowlist lacked the `write` NAME, so the guarded-write extension's tool was filtered out -> added `write` to the allowlist), ADV-61-2 (CRITICAL - a pasted task never reached the workflow: `bug:""` + literal `{{ bug }}` -> task text now plumbed text->route->params->state.params and rendered into step prompts via renderText), ADV-61-3 (MEDIUM - static one-line progress -> makeProgressNotifier is now a callable sink with a live per-step planner checklist + spinner via setWidget/setStatus, notify back-compat preserved). Full `npm test` green. ALSO still pending review: Round 60 CR-60-1 (readline/promises CLI wizard, commit 6ec524a). Codex owns review. Round 59 CLOSED; rounds 29-59 all CLOSED.
 
 Open review round (prev): 58 ACTIVE [HIGH] — live, user on new code. [58-1 HIGH] a dead-end "blocked-awaiting-decision" run (status:blocked, not terminal) is missed by 57-5's terminal-only self-clear → it hard-blocks the user across sessions; CLAUDE had to clear it by hand AGAIN (mandate violation). Fix: structurally-dead blocked runs self-recover + a new substantive message while blocked auto-resolves to continue-freestyle. [58-2 HIGH] manual thinking/model override doesn't hold on the REAL host event — manualLifecycleSelection (:3230) only fires if currentThinkingLevelFromEvent finds the user's level in the event, and the real host event doesn't match (same synthetic-event-test-passes-but-real-fails as 56-5/57-4); capture the real event shape + test it. [58-3 HIGH] a running workflow shows ZERO progress to the terminal (proven: run was status:running/triage processing while the user thought it was hung) → surface per-step progress. NOTE: clearing the stale run let the user change thinking again, confirming the stale run was the common root. Rounds 29–57 all CLOSED
 
@@ -13323,6 +13323,71 @@ adapter that bypassed `createCliPromptUi()`. Both gaps closed.
 - Targeted: test-aipi-bin, test-models-command, test-workflow-executor, test-step-result,
   test-fake-provider-workflows — all green. Full `npm test` chain green. CR-60-2 remains accepted.
 - Committed + pushed by Claude.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX_REVIEW
+
+---
+
+## Round 61 — CLAUDE finds + fixes: live nora-app run revealed 3 more real blockers (worker write-tool, empty bug-param, static progress)
+
+User pasted a task in nora-app (updated). GOOD NEWS: triage now runs as a REAL subagent (ADV-60-1
+worked — "no executable adapter" is gone). But it still BLOCKED, exposing 3 deeper engine issues. Found
+the root causes via a parallel investigation, fixed all three with REAL-PATH tests. Full `npm test` green
+(validate + 34 suites; only the opt-in MODEL_PRESSURE skip).
+
+### ADV-61-1 [CRITICAL] — Workflow workers never receive a write tool, so every artifact step BLOCKS
+- Live worker evidence (run 20260622T151136Z-794001): "No write/edit tool is available in this session,
+  so the owned artifacts TRIAGE.md/CODEBASE-MAP.md/CONTEXT-PACKET.md cannot be authored". Worker prompt
+  literally says "write every expected artifact with the write tool".
+- Root cause (classic synthetic-pass / real-fail): the guarded-write extension PATH in `tools` IS routed
+  to `--extension` (so it loads + registers a `write` tool), but createAipiWorkerAgentConfig
+  (`pi-subagents.js`) emitted `--tools read,grep,find,ls` with NO `write` NAME. The child filters EVERY
+  tool — including extension-registered ones — through the `--tools` allowlist (`agent-session.js`
+  isAllowedTool), so the registered `write` was stripped. The TESTED path (`buildWorkerTools`,
+  `test-subagents-real-sdk`) is a DIFFERENT code path, so it never caught it.
+- Fix: `pi-subagents.js` createAipiWorkerAgentConfig now uses `tools: [...READ_ONLY, "write", guardedWriteExtensionPath]`.
+  The extension-registered guarded write overrides the unguarded builtin write by name (custom tools win
+  in the child registry), so owned-file scoping stays enforced.
+- Proof: `tools/test-subagents.mjs` spawn-args assertion now requires `--tools` to include `write` (the
+  old assertion `[read,grep,find,ls]` WAS the bug) + the guarded-write `--extension` path. `validate-aipi-templates.mjs`
+  updated (keeps the guard forbidding the unguarded `[...ALLOWED_TOOLS]`). Authoritative credentialed
+  end-to-end is `npm run smoke:subagent-live` (writes a file via the worker) — gated behind AIPI_LIVE_SMOKE=1;
+  recommend running it in a credentialed lane.
+
+### ADV-61-2 [CRITICAL] — A pasted task never reaches the workflow (`bug:""`, literal `{{ bug }}`)
+- The run had `params.bug = ""` and the triage prompt shipped the literal `{{ bug }}` — triage had nothing
+  to triage. Root cause: the task text was dropped at EVERY layer — classifyAipiInputRoute didn't carry it,
+  runWorkflowCommand/startWorkflowRun had no params, the YAML `params:` block was never parsed, and
+  renderTemplate (run_id/step_id only) was never applied to step prompts.
+- Fix (end-to-end plumbing): lifecycle carries `route.taskText` and maps it to the workflow's primary
+  free-text param (`buildWorkflowParams`: bugfix→bug, ops→objective, planning/quick→request, research→topic)
+  → `runWorkflowCommand`/`startWorkflowRun` accept `params` → `startWorkflowRun` parses the YAML `params:`
+  defaults and persists `state.params` (defaults <- caller <- run_id) → new `renderText()` substitutes
+  `{{ key }}` from state.params into step PROMPTS (separate from renderTemplate's path normalization, so
+  multi-line text isn't mangled; unknown keys render empty, never a literal).
+- Proof: `test-workflow-executor.mjs` — start bugfix with params.bug, run the triage step through the REAL
+  subagent adapter, assert the worker prompt contains the task text and NOT the literal `{{ bug }}`.
+  `test-lifecycle-hooks.mjs` — handleInput("corrigir bug no login") forwards `params: { bug: "corrigir bug no login" }`
+  to the command runner (the real text->params drop point).
+
+### ADV-61-3 [MEDIUM] — Static one-line progress; user asked for a spinner / step-by-step planner
+- Progress was one notify line per coarse phase boundary with a long silent gap during each step. The Pi
+  host UI supports richer surfaces (setWidget = multi-line planner, setStatus = updatable line) that were unused.
+- Fix: `makeProgressNotifier` now returns a CALLABLE sink — calling it keeps the legacy one-line behavior
+  (full back-compat with every caller/test), while attached methods add feature-detected surfaces: a live
+  per-step PLAN checklist (setWidget) with status glyphs (✓ ⊘ ✗ ▶ ○) and an animated spinner/elapsed status
+  line (setStatus, setInterval unref'd). `executeWorkflowRun` renders the planner + starts/stops the spinner
+  at each step transition and clears on return. Notify-only hosts (and the CLI/--json path) degrade to no-ops;
+  notify lines stay byte-for-byte.
+- Proof: `test-workflow-executor.mjs` drives a real run with a callable sink double and asserts the planner
+  snapshots (one line/step, final all-done), spinner start/stop, and legacy notify back-compat.
+  `test-aipi-workflow-command.mjs` drives the REAL makeProgressNotifier with a fake ctx.ui and asserts
+  setPlan->setWidget, spinner->setStatus, clear->setWidget(undefined), plus the notify-only no-op fallback.
+
+### Note on Round 60
+Round 60 CR-60-1 (readline/promises CLI wizard fix, commit 6ec524a) is ALSO still pending Codex review;
+this Round 61 commit sits on top. Please review the combined tree (Round 60 CR-60-1 + Round 61).
 
 Current owner: CODEX
 Current status: WAITING_FOR_CODEX_REVIEW

@@ -570,6 +570,7 @@ export async function handleInput({
       adapter,
       parentInteractiveToolCallHook: "registered_parent_interactive_tool_call_hook",
       notify: makeProgressNotifier(ctx),
+      params: buildWorkflowParams(route, event),
     });
     const blockedAfterCommand = activeRunFromWorkflowCommandResult(result);
     if (route.recordInputAfterDispatch && blockedAfterCommand?.runId) {
@@ -816,6 +817,9 @@ export function classifyAipiInputRoute(text, { activeRun = null, codePipeline = 
       intent: "auto_dispatch_workflow",
       workflowSuggestion: autoWorkflow,
       workflowArgs: `run ${autoWorkflow}`,
+      // Carry the raw task text so it can be plumbed into the workflow's primary param (e.g. bug) —
+      // without it the run starts with bug:"" and triage blocks on the unrendered "{{ bug }}".
+      taskText: original,
       autoDispatch: true,
       recordInputAfterDispatch: true,
       pipelineClassification: pipeline.classification,
@@ -830,6 +834,24 @@ export function classifyAipiInputRoute(text, { activeRun = null, codePipeline = 
     workflowSuggestion: workflow,
     suggestedCommand: `/aipi-workflow run ${workflow}`,
   };
+}
+
+// Maps an auto-dispatched workflow to the free-text param that should carry the user's task text, so
+// a pasted request actually reaches the run (bugfix triages a real bug instead of "{{ bug }}"). The
+// feature workflow is contract-driven and has no free-text input param, so it gets none.
+const WORKFLOW_PRIMARY_PARAM = Object.freeze({
+  bugfix: "bug",
+  ops: "objective",
+  planning: "request",
+  quick: "request",
+  research: "topic",
+});
+
+function buildWorkflowParams(route, event) {
+  const text = String(route?.taskText ?? event?.text ?? "").trim();
+  if (!text) return {};
+  const paramName = WORKFLOW_PRIMARY_PARAM[route?.workflowSuggestion ?? ""];
+  return paramName ? { [paramName]: text } : {};
 }
 
 export function classifyAipiCodePipeline(text, { activeRun = null, projectRoot = null, env = process.env } = {}) {
@@ -3696,9 +3718,77 @@ function safeNotify(ctx, message, kind) {
 
 // ADV-58-3: bind a cheap, non-blocking progress-notification surface to ctx so the
 // executor can stream per-step transitions to the terminal instead of looking frozen.
+const PROGRESS_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+// makeProgressNotifier returns a CALLABLE sink: calling it (notify(message, kind)) keeps the legacy
+// one-line behavior every existing caller/test depends on, while attached methods add richer,
+// feature-detected host-UI surfaces — a live per-step PLAN checklist (setWidget) and an animated
+// status line / spinner (setStatus) — so a long workflow shows step-by-step progress and moving dots
+// instead of a single frozen "running…" line. Every host capability is feature-detected; when only
+// ctx.ui.notify exists (or it's the CLI), the extra surfaces degrade to no-ops and the notify lines
+// remain exactly as before.
 export function makeProgressNotifier(ctx) {
   if (typeof ctx?.ui?.notify !== "function") return null;
-  return (message, kind = "info") => safeNotify(ctx, message, kind);
+  const ui = ctx.ui;
+  const PLAN_KEY = "aipi.workflow.plan";
+  const STATUS_KEY = "aipi.workflow.status";
+  let spinnerTimer = null;
+  let spinnerFrame = 0;
+  let spinnerStartedAt = 0;
+  let spinnerLabel = "";
+
+  const sink = (message, kind = "info") => safeNotify(ctx, message, kind);
+  sink.notify = sink;
+  sink.setPlan = (lines) => {
+    if (typeof ui.setWidget !== "function") return;
+    try {
+      ui.setWidget(PLAN_KEY, Array.isArray(lines) && lines.length ? lines : undefined);
+    } catch {
+      /* progress is best-effort and must never break execution */
+    }
+  };
+  sink.setStatus = (text) => {
+    if (typeof ui.setStatus !== "function") return;
+    try {
+      ui.setStatus(STATUS_KEY, text || undefined);
+    } catch {
+      /* best-effort */
+    }
+  };
+  sink.startSpinner = (label = "") => {
+    spinnerLabel = String(label ?? "");
+    if (typeof ui.setStatus !== "function") return; // only animate when there is an updatable status line
+    sink.stopSpinner();
+    spinnerStartedAt = Date.now();
+    spinnerFrame = 0;
+    const tick = () => {
+      const frame = PROGRESS_SPINNER_FRAMES[spinnerFrame % PROGRESS_SPINNER_FRAMES.length];
+      spinnerFrame += 1;
+      const elapsed = Math.round((Date.now() - spinnerStartedAt) / 1000);
+      sink.setStatus(`${frame} ${spinnerLabel} ${elapsed}s`.trim());
+    };
+    tick();
+    spinnerTimer = setInterval(tick, 120);
+    if (typeof spinnerTimer?.unref === "function") spinnerTimer.unref(); // never keep the process alive
+  };
+  sink.stopSpinner = () => {
+    if (spinnerTimer) {
+      clearInterval(spinnerTimer);
+      spinnerTimer = null;
+    }
+  };
+  sink.clear = () => {
+    sink.stopSpinner();
+    sink.setStatus(undefined);
+    if (typeof ui.setWidget === "function") {
+      try {
+        ui.setWidget(PLAN_KEY, undefined);
+      } catch {
+        /* best-effort */
+      }
+    }
+  };
+  return sink;
 }
 
 function stringOrNull(value) {

@@ -73,6 +73,37 @@ try {
   assert.equal(makeProgressNotifier({ ui: {} }), null);
   assert.equal(typeof makeProgressNotifier(ctx), "function");
 
+  // The REAL makeProgressNotifier sink drives the host UI when it supports the richer surfaces:
+  // setPlan -> ctx.ui.setWidget, setStatus/spinner -> ctx.ui.setStatus, clear -> setWidget(undefined).
+  const uiCalls = { notify: [], widget: [], status: [] };
+  const richSink = makeProgressNotifier({
+    ui: {
+      notify: (message, kind) => uiCalls.notify.push({ message, kind }),
+      setWidget: (key, content) => uiCalls.widget.push({ key, content }),
+      setStatus: (key, text) => uiCalls.status.push({ key, text }),
+    },
+  });
+  richSink("hello", "info");
+  assert.deepEqual(uiCalls.notify.at(-1), { message: "hello", kind: "info" });
+  richSink.setPlan(["○ 1/2 triage", "○ 2/2 fix"]);
+  assert.deepEqual(uiCalls.widget.at(-1).content, ["○ 1/2 triage", "○ 2/2 fix"]);
+  richSink.startSpinner("bugfix: triage");
+  assert.ok(uiCalls.status.some((call) => /bugfix: triage/.test(call.text ?? "")), "spinner writes an animated status line");
+  richSink.clear();
+  richSink.stopSpinner();
+  assert.equal(uiCalls.widget.at(-1).content, undefined, "clear removes the planner widget");
+  assert.equal(uiCalls.status.at(-1).text, undefined, "clear removes the status line");
+
+  // A notify-only host (no setWidget/setStatus): the richer methods are safe no-ops, notify still works.
+  const plainCalls = [];
+  const plainSink = makeProgressNotifier({ ui: { notify: (m, k) => plainCalls.push({ m, k }) } });
+  plainSink.setPlan(["x"]);
+  plainSink.startSpinner("y");
+  plainSink.stopSpinner();
+  plainSink.clear();
+  plainSink("line", "info");
+  assert.deepEqual(plainCalls.at(-1), { m: "line", k: "info" });
+
   console.log("AIPI_WORKFLOW_COMMAND_TEST_OK");
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });

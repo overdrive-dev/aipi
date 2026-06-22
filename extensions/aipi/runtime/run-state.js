@@ -75,6 +75,7 @@ export async function runWorkflowCommand({
   adapter = undefined,
   parentInteractiveToolCallHook = "registered_parent_interactive_tool_call_hook",
   notify = null,
+  params = {},
 } = {}) {
   if (!projectRoot) throw new Error("projectRoot is required");
   const command = parseWorkflowArgs(args);
@@ -99,6 +100,7 @@ export async function runWorkflowCommand({
     workflow: command.workflow,
     contractPath: command.contractPath,
     dryRun: command.dryRun,
+    params,
   });
 
   if (command.action === "run" && !command.dryRun) {
@@ -135,6 +137,7 @@ export async function startWorkflowRun({
   workflow,
   contractPath = null,
   dryRun = false,
+  params = {},
   now = () => new Date(),
   randomBytes = (size) => crypto.randomBytes(size),
 } = {}) {
@@ -153,6 +156,15 @@ export async function startWorkflowRun({
   const resolvedContractPath =
     contractPath ?? path.join(runRelDir, "BDD-CONTRACT.md").replaceAll("\\", "/");
 
+  // Resolve run params: declared workflow defaults (bug: "") <- caller overrides (bug: <task text>)
+  // <- run_id bound to the actual run. These render into step prompts via the executor's renderText,
+  // so a pasted task actually reaches triage instead of leaving the literal "{{ bug }}".
+  const resolvedParams = {
+    ...(workflowDefinition.params ?? {}),
+    ...(params && typeof params === "object" ? params : {}),
+    run_id: runId,
+  };
+
   const state = {
     schema: "aipi.run-state.v1",
     run_id: runId,
@@ -164,6 +176,7 @@ export async function startWorkflowRun({
     source_workflow: workflowRelPath.replaceAll("\\", "/"),
     run_rel_dir: runRelDir.replaceAll("\\", "/"),
     contract_path: resolvedContractPath,
+    params: resolvedParams,
     current_step: workflowDefinition.steps[0]?.id ?? null,
     steps: workflowDefinition.steps.map((step) => ({
       id: step.id,
@@ -460,7 +473,37 @@ async function readWorkflowDefinition(workflowAbsPath, workflowName) {
   }
 
   if (!steps.length) throw new Error(`AIPI workflow has no steps: ${workflowName}`);
-  return { name, mode, steps };
+  return { name, mode, steps, params: parseWorkflowParams(text) };
+}
+
+// Parse a workflow's top-level `params:` block into { key: defaultValue }. Declared defaults (e.g.
+// bug: "") seed the run's params so a caller-supplied value (the user's pasted task) overrides them,
+// and any {{ key }} in step prompts that has no value renders empty instead of leaking the literal.
+function parseWorkflowParams(text) {
+  const params = {};
+  let inParams = false;
+  for (const line of String(text ?? "").split(/\r?\n/)) {
+    if (/^params:\s*$/.test(line)) {
+      inParams = true;
+      continue;
+    }
+    if (!inParams) continue;
+    if (line.trim() === "") continue;
+    const match = line.match(/^  ([A-Za-z0-9_-]+):\s*(.*)$/);
+    if (match) {
+      let value = match[2].trim();
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+      params[match[1]] = value;
+      continue;
+    }
+    if (/^\S/.test(line)) break; // dedent to the next top-level key ends the params block
+  }
+  return params;
 }
 
 function generateRunId(now, randomBytes) {

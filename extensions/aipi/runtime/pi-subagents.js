@@ -336,7 +336,13 @@ function createAipiWorkerAgentConfig({ thinking = undefined } = {}) {
     name: AIPI_SUBAGENTS_AGENT_NAME,
     package: "aipi",
     description: "AIPI-owned worker runtime forked from pi-subagents.",
-    tools: [...AIPI_SUBAGENTS_READ_ONLY_TOOLS, guardedWriteExtensionPath],
+    // The guarded-write extension (the .js path) loads and registers a tool named "write", but the
+    // child pi process filters every tool — including extension-registered ones — through the
+    // `--tools` ALLOWLIST. Without the "write" NAME in the allowlist the registered write tool is
+    // stripped, leaving workers unable to author their owned artifacts (every step BLOCKED). Listing
+    // "write" activates it; the extension's guarded write overrides the unguarded builtin write by
+    // name (custom tools win in the child registry), so owned-file scoping is still enforced.
+    tools: [...AIPI_SUBAGENTS_READ_ONLY_TOOLS, "write", guardedWriteExtensionPath],
     extensions: [],
     fallbackModels: [],
     thinking,

@@ -668,6 +668,55 @@ try {
     );
   }
 
+  // bug-param (real-path): a task passed via params.bug must be RENDERED into the worker's prompt so
+  // triage has a real defect to triage — the literal "{{ bug }}" placeholder must be gone. Previously
+  // params were never plumbed/rendered, so triage blocked on the unrendered "{{ bug }}".
+  const bugText = "login button throws TypeError on null user when session expired";
+  const bugParamRun = await startWorkflowRun({
+    projectRoot: tempRoot,
+    workflow: "bugfix",
+    params: { bug: bugText },
+    now: () => fixedDate,
+    randomBytes: fixedRandom,
+  });
+  assert.equal(bugParamRun.state.params.bug, bugText, "startWorkflowRun must persist caller params.bug");
+  const bugParamWorkflow = parseWorkflowDefinition(
+    await fs.readFile(path.join(tempRoot, ".aipi", "workflows", "bugfix.yaml"), "utf8"),
+    "bugfix",
+  );
+  const triageStep = bugParamWorkflow.steps.find((step) => step.id === "triage");
+  assert.match(triageStep.prompt, /\{\{\s*bug\s*\}\}/, "raw triage prompt should contain the {{ bug }} placeholder");
+  const bugParamCalls = [];
+  const bugParamCoordinator = new SubagentCoordinator(
+    { appendEntry() {} },
+    {
+      root: tempRoot,
+      maxConcurrent: 2,
+      piSubagentsRunner: fakeWorkflowRunner({ calls: bugParamCalls, rawWrites: [], root: tempRoot }),
+    },
+  );
+  const bugParamAdapter = createSubagentWorkflowAdapter(bugParamCoordinator, {
+    pollIntervalMs: 1,
+    collectTimeoutMs: 1_000,
+    modelResolver: async () => ({
+      model_class: "code-strong",
+      model: { provider: "anthropic", id: "claude-test" },
+      thinking_level: "medium",
+      source: "test",
+    }),
+  });
+  await bugParamAdapter.executeStep({
+    root: tempRoot,
+    state: bugParamRun.state,
+    workflow: bugParamWorkflow,
+    step: triageStep,
+    context: {},
+    contract: {},
+  });
+  const workerTask = bugParamCalls[0]?.params?.task ?? "";
+  assert.doesNotMatch(workerTask, /\{\{\s*bug\s*\}\}/, "rendered worker prompt must not contain the literal {{ bug }}");
+  assert.ok(workerTask.includes(bugText), "rendered worker prompt must contain the user's task text");
+
   const contradictoryReviewRun = await startWorkflowRun({
     projectRoot: tempRoot,
     workflow: "quick",
@@ -880,6 +929,43 @@ try {
     progressNotifications.every((note) => note.kind === "info"),
     "progress notifications are info-level and non-blocking",
   );
+
+  // Live planner checklist: a CALLABLE progress sink (function + setPlan/setStatus/spinner methods,
+  // like makeProgressNotifier returns) receives a per-step status checklist that updates as the run
+  // advances — so the terminal shows a step-by-step planner, not one frozen "running…" line.
+  const planRun = await startWorkflowRun({
+    projectRoot: tempRoot,
+    workflow: "feature",
+    now: () => fixedDate,
+    randomBytes: fixedRandom,
+  });
+  const sinkCalls = { notify: [], plan: [], status: [], spinner: [] };
+  const progressSink = (message, kind) => sinkCalls.notify.push({ message, kind });
+  progressSink.setPlan = (lines) => sinkCalls.plan.push(lines);
+  progressSink.setStatus = (text) => sinkCalls.status.push(text);
+  progressSink.startSpinner = (label) => sinkCalls.spinner.push({ start: label });
+  progressSink.stopSpinner = () => sinkCalls.spinner.push({ stop: true });
+  const planExecution = await executeWorkflowRun({
+    projectRoot: tempRoot,
+    runId: planRun.runId,
+    now: () => fixedDate,
+    adapter: createTestPassWorkflowAdapter(),
+    notify: progressSink,
+  });
+  assert.equal(planExecution.status, "completed");
+  // Back-compat: the legacy notify lines are still emitted through the same callable sink.
+  assert.ok(sinkCalls.notify.some((note) => note.message.includes("running…")), "sink still gets legacy notify lines");
+  // The planner was rendered: at least one plan snapshot with one line per workflow step.
+  assert.ok(sinkCalls.plan.length >= 1, "progress sink received planner snapshots");
+  const fullPlan = sinkCalls.plan.find((lines) => lines.length === planExecution.state.steps.length);
+  assert.ok(fullPlan, "a planner snapshot has one line per workflow step");
+  // The final planner snapshot shows every step done (no lingering running/pending glyph).
+  const lastPlan = sinkCalls.plan.at(-1);
+  assert.equal(lastPlan.length, planExecution.state.steps.length);
+  assert.ok(lastPlan.every((line) => /^[✓⊘]/.test(line)), "final plan marks every step passed/skipped");
+  // The spinner was started (for the in-step gap) and stopped.
+  assert.ok(sinkCalls.spinner.some((entry) => entry.start), "spinner started for a running step");
+  assert.ok(sinkCalls.spinner.some((entry) => entry.stop), "spinner stopped");
 
   const policyStep = quick.steps[0];
   const policyState = {

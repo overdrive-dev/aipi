@@ -21,6 +21,19 @@ const PROGRESS_PHASE_LABELS = {
   blocked: "blocked",
 };
 
+// Glyphs for the live per-step planner checklist surfaced via the progress sink's setPlan().
+const PROGRESS_PLAN_GLYPHS = {
+  passed: "✓",
+  skipped: "⊘",
+  blocked: "✗",
+  failed: "✗",
+  abandoned: "✗",
+  cancelled: "✗",
+  running: "▶",
+  active: "▶",
+  pending: "○",
+};
+
 const DEFAULT_TRANSIENT_PROVIDER_RETRY = {
   maxAttempts: 3,
   baseDelayMs: 250,
@@ -55,14 +68,36 @@ export async function executeWorkflowRun({
   // ADV-58-3: surface per-step progress to the terminal so a long run does not look frozen.
   const totalSteps = workflow.steps.length;
   const stepNumberById = new Map(workflow.steps.map((step, index) => [step.id, index + 1]));
+  // A planner/checklist: one line per workflow step with a status glyph, re-rendered as the run
+  // advances. The active step is shown as running even before it is marked terminal.
+  const buildPlanLines = (activeStepId, activePhase) =>
+    workflow.steps.map((step, index) => {
+      let status = state.steps?.find((entry) => entry.id === step.id)?.status ?? "pending";
+      if (step.id === activeStepId && activePhase === "running") status = "running";
+      const glyph = PROGRESS_PLAN_GLYPHS[status] ?? "○";
+      return `${glyph} ${index + 1}/${totalSteps} ${step.id}`;
+    });
   const emitProgress = (stepId, phase) => {
     if (typeof notify !== "function") return;
     const n = stepNumberById.get(stepId) ?? "?";
     const verb = PROGRESS_PHASE_LABELS[phase] ?? phase;
     try {
+      // Legacy one-line notify (kept byte-for-byte for back-compat + the CLI/notify-only path).
       notify(`AIPI ${state.workflow}: ${stepId} (${n}/${totalSteps}) ${verb}`, "info");
+      // Richer, feature-detected surfaces (no-ops when notify is a plain function or the host lacks them).
+      notify.setPlan?.(buildPlanLines(stepId, phase));
+      if (phase === "running") notify.startSpinner?.(`${state.workflow}: ${stepId} (${n}/${totalSteps})`);
+      else notify.stopSpinner?.();
     } catch {
       /* progress is best-effort and must never break execution */
+    }
+  };
+  const clearProgress = () => {
+    try {
+      notify?.stopSpinner?.();
+      notify?.setStatus?.(undefined);
+    } catch {
+      /* best-effort */
     }
   };
 
@@ -282,6 +317,7 @@ export async function executeWorkflowRun({
   if (isTerminalActiveStatus(state.status)) {
     await clearActiveRunPointer(root, activeRunId);
   }
+  clearProgress(); // stop the spinner + clear the animated status line before returning
   return { runId: activeRunId, status: state.status, state, events };
 }
 
@@ -431,7 +467,7 @@ async function executeFanoutSubagentStep({
           workflow: workflow.name,
           step_id: step.id,
           step_name: step.name ?? null,
-          step_prompt: step.prompt ?? null,
+          step_prompt: step.prompt ? renderText(step.prompt, state, step) : null,
           run_id: state.run_id,
           contract_path: state.contract_path,
           fanout_index: index,
@@ -523,7 +559,7 @@ async function executeSubagentStep({
         workflow: workflow.name,
         step_id: step.id,
         step_name: step.name ?? null,
-        step_prompt: step.prompt ?? null,
+        step_prompt: step.prompt ? renderText(step.prompt, state, step) : null,
         run_id: state.run_id,
         contract_path: state.contract_path,
         expected_artifacts: artifacts,
@@ -1020,7 +1056,7 @@ function renderLocalArtifact({ state, step, context, relPath }) {
     "",
     "## Prompt",
     "",
-    step.prompt ?? "(no prompt)",
+    step.prompt ? renderText(step.prompt, state, step) : "(no prompt)",
     "",
     "## Provenance",
     "",
@@ -1105,6 +1141,19 @@ function renderTemplate(template, state, step) {
       .replaceAll("{{ run_id }}", state.run_id)
       .replaceAll("{{ step_id }}", step.id),
   );
+}
+
+// renderText substitutes {{ key }} placeholders from the run's resolved params (plus run_id/step_id)
+// into FREE TEXT (step prompts) — WITHOUT path normalization, so multi-line/free-text values like the
+// user's bug description are not mangled. An unknown placeholder renders to empty string (never left
+// as a literal "{{ bug }}", matching the declared default of bug:""). This is what carries a pasted
+// task into the worker so triage actually has a defect to triage instead of blocking on "{{ bug }}".
+function renderText(template, state, step = null) {
+  const values = { run_id: state?.run_id, step_id: step?.id, ...(state?.params ?? {}) };
+  return String(template ?? "").replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (_match, key) => {
+    const value = values[key];
+    return value === undefined || value === null ? "" : String(value);
+  });
 }
 
 function normalizeRelPath(relPath) {

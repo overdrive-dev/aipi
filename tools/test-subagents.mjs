@@ -187,7 +187,9 @@ try {
   const spawnedArgs = realRuntimeCalls[0].args;
   assert.equal(spawnedArgs.includes("--model"), true);
   assert.equal(spawnedArgs[spawnedArgs.indexOf("--model") + 1], "anthropic/claude-opus-4-8");
-  assert.deepEqual(spawnedTools(spawnedArgs), ["read", "grep", "find", "ls"]);
+  // The production --tools allowlist MUST include "write" so the guarded-write extension's registered
+  // write tool survives the child's tool allowlist filter (without it, every artifact step BLOCKs).
+  assert.deepEqual(spawnedTools(spawnedArgs), ["read", "grep", "find", "ls", "write"]);
   assert.equal(spawnedTools(spawnedArgs).some((tool) => /^(bash|shell|exec)$/i.test(tool)), false);
   assert.equal(spawnedArgs.includes("--no-extensions"), true);
   assert.equal(

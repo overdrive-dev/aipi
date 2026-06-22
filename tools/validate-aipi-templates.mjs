@@ -1952,8 +1952,8 @@ for (const requiredText of [
 if (piSubagentsRuntime.includes("tools: [...AIPI_SUBAGENTS_ALLOWED_TOOLS]")) {
   errors.push("runtime/pi-subagents.js must not pass the unguarded builtin write to forked workers");
 }
-if (!piSubagentsRuntime.includes("tools: [...AIPI_SUBAGENTS_READ_ONLY_TOOLS, guardedWriteExtensionPath]")) {
-  errors.push("runtime/pi-subagents.js must expose read-only builtins plus the guarded write extension to forked workers");
+if (!piSubagentsRuntime.includes("tools: [...AIPI_SUBAGENTS_READ_ONLY_TOOLS, \"write\", guardedWriteExtensionPath]")) {
+  errors.push("runtime/pi-subagents.js must expose read-only builtins plus the \"write\" allow-name and the guarded write extension to forked workers");
 }
 if (!piSubagentsRuntime.includes("extensions: []")) {
   errors.push("runtime/pi-subagents.js must disable ambient child extensions and explicitly load only runtime/tool extensions");

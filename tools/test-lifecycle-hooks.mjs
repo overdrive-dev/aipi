@@ -638,6 +638,9 @@ try {
       { action: "handled" },
     );
     assert.equal(fallbackRunnerCalls.at(-1).args, "run bugfix");
+    // bug-param plumbing (real drop point): the user's task text is forwarded to the workflow command
+    // as params.bug (bugfix's primary free-text param) so the run actually has a defect to triage.
+    assert.deepEqual(fallbackRunnerCalls.at(-1).params, { bug: "corrigir bug no login" });
     const fallbackEntry = fallbackEntries.find((entry) => entry.type === "aipi.input.route" && entry.data.workflow_args === "run bugfix");
     assert.equal(fallbackEntry.data.classifier_source, "regex-fallback");
     assert.match(fallbackEntry.data.classifier_reason, /classifier auth unavailable/);
