@@ -154,7 +154,7 @@ export async function resolveModelClass({
   };
 }
 
-const ADVERSARIAL_IN_SCOPE_PROVIDERS = new Set(["anthropic", "openai", "codex"]);
+const ADVERSARIAL_IN_SCOPE_PROVIDERS = new Set(["anthropic", "openai", "codex", "openai-codex"]);
 const ADVERSARIAL_OUT_OF_SCOPE_PROVIDERS = new Set(["bedrock", "deepseek", "glm", "zai"]);
 
 export async function resolveCrossModelAdversarialRoute({

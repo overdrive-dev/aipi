@@ -123,7 +123,8 @@ export async function executeWorkflowRun({
     }
 
     const result = await adapter.executeStep({ root, state, workflow, step, context, contract });
-    const validation = validateStepResult(result, { step, contract });
+    const artifactContents = await readStepArtifactContents({ root, result });
+    const validation = validateStepResult(result, { step, contract, artifactContents });
     recordPolicyDecision({ state, step, result, validation, now });
     const missingArtifacts = validation.gatePassed
       ? await missingRequiredArtifacts({ root, state, step, result })
@@ -809,6 +810,21 @@ async function missingRequiredArtifacts({ root, state, step, result }) {
     }
   }
   return missing;
+}
+
+async function readStepArtifactContents({ root, result }) {
+  if (!Array.isArray(result?.artifacts) || result.verdict !== "PASS") return {};
+  const out = {};
+  for (const artifact of result.artifacts) {
+    if (typeof artifact !== "string" || !artifact.trim()) continue;
+    const relPath = normalizeRelPath(artifact);
+    try {
+      out[relPath] = await fs.readFile(path.join(root, relPath), "utf8");
+    } catch (error) {
+      if (error.code !== "ENOENT" && error.code !== "EISDIR") throw error;
+    }
+  }
+  return out;
 }
 
 function renderLocalArtifact({ state, step, context, relPath }) {

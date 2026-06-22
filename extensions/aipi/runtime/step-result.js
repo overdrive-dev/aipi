@@ -40,7 +40,13 @@ const nonExecutingEvidenceSources = new Set([
   "aipi-subagent-fanout",
 ]);
 
-export function validateStepResult(result, { step = null, contract = defaultContract } = {}) {
+const reviewArtifactNamePattern = /(^|[/\\])(?:CODE-REVIEW|SECURITY|DEV-REVIEW|HUMAN-REVIEW|COMPLEXITY-REVIEW|INTEGRATION|BLAST-RADIUS|PLAN-REVIEW)(?:\.[A-Za-z0-9_-]+)?$/i;
+const reviewAgentPattern = /\b(review|reviewer|auditor|adversarial|contrarian|security|blast-radius|integration-checker|complexity-reviewer)\b/i;
+const actionableFindingPattern = /\b(?:CRITICAL|HIGH|BLOCKER|P0|P1)\b\s*(?:[:\]-]|finding|issue|risk|vulnerability|bug)/i;
+const findingLabelPattern = /\b(?:severity|impact|priority)\s*[:=]\s*(?:CRITICAL|HIGH|BLOCKER|P0|P1)\b/i;
+const resolvedFindingPattern = /\b(?:resolved|fixed|mitigated|closed|not\s+applicable|none|no)\b.*\b(?:CRITICAL|HIGH|BLOCKER|P0|P1)\b|\b(?:CRITICAL|HIGH|BLOCKER|P0|P1)\b.*\b(?:resolved|fixed|mitigated|closed|none|0)\b/i;
+
+export function validateStepResult(result, { step = null, contract = defaultContract, artifactContents = null } = {}) {
   const errors = [];
   const warnings = [];
   const schema = contract.stepResultSchema ?? defaultContract.stepResultSchema;
@@ -85,6 +91,7 @@ export function validateStepResult(result, { step = null, contract = defaultCont
 
   validateModelProvenance(result, errors);
   validateBlockerQuestion(result, errors);
+  validateReviewArtifacts(result, step, artifactContents, errors);
 
   const policyDecision = result.policy_decision ?? null;
   if (!policyDecision && stepRequiresPolicyDecision(step)) {
@@ -110,6 +117,20 @@ export function validateStepResult(result, { step = null, contract = defaultCont
     errors,
     warnings,
   };
+}
+
+export function reviewArtifactFindings(result, { step = null, artifactContents = null } = {}) {
+  if (result?.verdict !== "PASS") return [];
+  if (!isReviewGateStep(step, result)) return [];
+  if (!artifactContents || typeof artifactContents !== "object") return [];
+
+  const findings = [];
+  for (const [artifact, content] of Object.entries(artifactContents)) {
+    if (!isReviewArtifactPath(artifact)) continue;
+    const finding = firstUnresolvedHighSeverityFinding(content);
+    if (finding) findings.push({ artifact, ...finding });
+  }
+  return findings;
 }
 
 export function strongestEvidenceRung(evidence = []) {
@@ -145,6 +166,47 @@ function validateEvidence(evidence, contract, errors) {
     if (!item.ref) errors.push(`evidence[${index}] missing ref`);
     if (!item.result) errors.push(`evidence[${index}] missing result`);
   }
+}
+
+function validateReviewArtifacts(result, step, artifactContents, errors) {
+  const findings = reviewArtifactFindings(result, { step, artifactContents });
+  for (const finding of findings) {
+    errors.push(`PASS contradicts unresolved ${finding.severity} finding in review artifact ${finding.artifact}: ${finding.preview}`);
+  }
+}
+
+function isReviewGateStep(step, result) {
+  if (String(step?.stage ?? "").toLowerCase() === "review") return true;
+  if (/\breview\b/i.test(String(step?.id ?? ""))) return true;
+  if ((step?.agents ?? result?.agent_ids ?? []).some((agentId) => reviewAgentPattern.test(String(agentId)))) return true;
+  return (result?.artifacts ?? []).some(isReviewArtifactPath);
+}
+
+function isReviewArtifactPath(artifact) {
+  return reviewArtifactNamePattern.test(String(artifact ?? ""));
+}
+
+function firstUnresolvedHighSeverityFinding(content) {
+  const lines = String(content ?? "").split(/\r?\n/);
+  for (const [index, line] of lines.entries()) {
+    const severity = findingSeverity(line);
+    if (!severity) continue;
+    const windowText = lines.slice(Math.max(0, index - 1), Math.min(lines.length, index + 3)).join(" ");
+    if (resolvedFindingPattern.test(windowText)) continue;
+    return {
+      severity,
+      line: index + 1,
+      preview: line.trim().slice(0, 180),
+    };
+  }
+  return null;
+}
+
+function findingSeverity(line) {
+  const text = String(line ?? "");
+  if (!actionableFindingPattern.test(text) && !findingLabelPattern.test(text)) return null;
+  const match = text.match(/\b(CRITICAL|HIGH|BLOCKER|P0|P1)\b/i);
+  return match ? match[1].toUpperCase() : null;
 }
 
 function verdictPasses(result, step, contract, errors, warnings) {

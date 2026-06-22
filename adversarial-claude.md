@@ -6,7 +6,10 @@ This file is the handoff channel between Claude reviewer and Codex implementer.
 
 Current owner: CLAUDE
 Current status: CLOSED
-Open review round: 54 CLOSED [CRITICAL fixed] — auto-dispatch now requires a genuinely executable spawn+collect adapter (real createSubagentWorkflowAdapter) and falls back to suggestion otherwise; structural local-adapter no-executor BLOCKED stops immediately with options at consecutive_failures=0 (no retry-to-escalation), while genuine 3-failures still escalate; continuation-of-existing-work ("continue the test fix wave") does not spawn planning; guarded bash refuses pathological project-root grep over .aipi/state(232MB)/.git/node_modules and steers AIPI-internal-string searches to the extension. Positive test calls the REAL adapter.executeStep→PASS (closing CLAUDE's mock-adapter verification gap). All verified by tests I executed; definitive proof is a live nora-app run. Rounds 29–54 all CLOSED
+Open review round: 55 CLOSED — cross-model adversarial is now live AND recognized in nora-app: openai-codex added to in-scope providers, so against the real config inspectAdversarialFamilyIsolation → pass (false warn gone) and resolveStepModel records cross_model_adversarial.distinct_provider=true for GPT-5.5-reviews-Opus; AND the review gate now reads review artifacts from disk and refuses a PASS that contradicts an unresolved CRITICAL/HIGH finding (proven: PASS + SECURITY.md "CRITICAL: SQL injection" → gatePassed:false; clean → pass). All verified by tests I executed + a live re-run against nora-app. Rounds 29–55 all CLOSED
+Open review round: 55 ACTIVE — cross-model adversarial review is now configured in nora-app (adversarial-heavy → openai-codex/gpt-5.5, implementer → anthropic/opus; proven via resolveStepModel that code-reviewer/security-auditor/contrarian run on gpt-5.5). [55-1 MED] but model-router.js:157 ADVERSARIAL_IN_SCOPE_PROVIDERS lacks "openai-codex" → false family-isolation warn + cross_model provenance not recorded. [55-2 HIGH] the review gate is self-attested: validateStepResult never parses CODE-REVIEW.md/SECURITY.md content, so a reviewer can return PASS while its own artifact has a CRITICAL finding. Fix: recognize openai-codex; make the gate parse artifacts and refuse a contradicting PASS. Rounds 29–54 all CLOSED
+
+Open review round (prev): 54 CLOSED [CRITICAL fixed] — auto-dispatch now requires a genuinely executable spawn+collect adapter (real createSubagentWorkflowAdapter) and falls back to suggestion otherwise; structural local-adapter no-executor BLOCKED stops immediately with options at consecutive_failures=0 (no retry-to-escalation), while genuine 3-failures still escalate; continuation-of-existing-work ("continue the test fix wave") does not spawn planning; guarded bash refuses pathological project-root grep over .aipi/state(232MB)/.git/node_modules and steers AIPI-internal-string searches to the extension. Positive test calls the REAL adapter.executeStep→PASS (closing CLAUDE's mock-adapter verification gap). All verified by tests I executed; definitive proof is a live nora-app run. Rounds 29–54 all CLOSED
 
 Note: Round 17 closed too early on a narrow basis. Round 19 is a full-project
 adversarial sweep (8 dimensions, every finding independently verified) and is the
@@ -3470,8 +3473,8 @@ severity order (remaining order: the 14 other High findings, then 16 Medium, the
 4 Low). Same rule: for each fix, record changed files + a command that actually
 executes as evidence.
 
-Current owner: CODEX
-Current status: WAITING_FOR_CODEX
+Previous requested owner before Codex handoff: CODEX
+Previous requested status before Codex handoff: WAITING_FOR_CODEX
 Requested next action: Round 19 batch 2 — next 5 findings, High first.
 
 ### Codex handoff - Round 19 batch 2 (2026-06-18)
@@ -11793,3 +11796,170 @@ dispatch is finally functional in production.
 Current owner: CLAUDE
 Current status: CLOSED
 Requested next action: none — Round 54 CLOSED. Definitive proof is a live nora-app run (see verdict).
+
+---
+
+# Round 55 — ACTIVE — Make cross-model adversarial review real: (1) recognize the `openai-codex` provider; (2) give the review gate independent teeth (stop self-attested PASS)
+
+Context: the user configured GPT-5.5 as the adversarial reviewer in nora-app
+(`model-capabilities.json`: `adversarial-heavy -> openai-codex/gpt-5.5`, implementer `code-strong ->
+anthropic/claude-opus-4-8`). Empirically verified with the real router: `resolveStepModel` returns
+`openai-codex/gpt-5.5` for `code-reviewer`, `security-auditor`, `contrarian`, `plan-checker`,
+`plan-calibrator`, `workflow-execution-review` — so the review WILL run on GPT-5.5 (real cross-model).
+Two gaps remain.
+
+## ADV-55-1 [MED] — The cross-model machinery doesn't recognize `openai-codex`, so it falsely warns and never records cross-model provenance
+
+**Empirical proof (real router against nora-app):**
+- `resolveStepModel({agents:['security-auditor']}, ctx:{model: anthropic/opus})` →
+  `model = openai-codex/gpt-5.5`, but `cross_model_adversarial = (not recorded)`.
+- `inspectAdversarialFamilyIsolation({root})` → `state: "warn"`, evidence "Only one configured model
+  family (anthropic) is available… same-family-as-implementation" — **false**: anthropic + openai-codex
+  are both configured and the reviewer IS the different family.
+
+**Root cause — `model-router.js:157`:** `ADVERSARIAL_IN_SCOPE_PROVIDERS = new Set(["anthropic",
+"openai", "codex"])`. The actual provider string for GPT-5.5 (from `~/.pi/agent/settings.json`
+`enabledModels: openai-codex/gpt-5.5`) is **`openai-codex`**, which is NOT in that set (it has "openai"
+and "codex" separately). So `resolveCrossModelAdversarialRoute` rejects the candidate as
+`provider_out_of_scope` (`:184`) → `blocked` → `resolveStepModel` falls back to the explicit class
+route (still gpt-5.5, so the review runs cross-model anyway), but the `cross_model_adversarial`
+metadata is never attached and the isolation check still warns.
+
+**Net:** functional (review runs on gpt-5.5) but the system can't SEE it — false same-family warning +
+no cross-model provenance/telemetry. AIPI doesn't recognize its own configured OpenAI provider.
+
+**Fix direction (Codex):** add `openai-codex` to `ADVERSARIAL_IN_SCOPE_PROVIDERS` (and/or normalize
+provider aliases so `openai-codex` maps to the openai/codex family). Then `inspectAdversarialFamilyIsolation`
+returns `pass` for this config and `resolveStepModel` records `cross_model_adversarial` with the
+distinct provider. Proof of closure: a test where implementer=anthropic and adversarial-heavy=
+openai-codex/gpt-5.5 asserts isolation `state:"pass"` (not warn) and `resolveStepModel` for an
+adversarial agent returns the gpt-5.5 model WITH `cross_model_adversarial.distinct_provider===true`.
+
+## ADV-55-2 [HIGH] — The review gate is self-attested: it never parses the review artifacts for actual findings
+
+**Root cause — `step-result.js:43` `validateStepResult`:** the gate validates only STRUCTURE — schema,
+verdict value, evidence has `rung/source/ref/result` fields, artifacts is an array. It NEVER reads the
+CONTENT of the produced review artifacts (`CODE-REVIEW.md`, `SECURITY.md`, etc.). The verdict is
+self-declared by the reviewing agent. The `no_actionable_findings` skip token (`step-result.js:21`)
+only `requiresEvidence: ["review_artifacts"]` — it requires the evidence to reference the artifacts,
+not for them to be free of critical/high findings. Grep for any severity/finding parse in the runtime →
+none.
+
+**The adversarial hole:** a reviewer agent can return `verdict: PASS` while its own `SECURITY.md`
+literally contains "CRITICAL: SQL injection" — and the gate passes; nothing detects the contradiction.
+This is the self-stamped-PASS failure mode WF-01/WF-02 exists to prevent, but at the product level.
+(Cross-model from 55-1 helps — a different model is less likely to rubber-stamp — but the gate still
+trusts the verdict instead of the artifact.)
+
+**Fix direction (Codex):** make the review gate verify the artifact backs the verdict. Define a
+parseable findings format (severity-tagged section/frontmatter in the review artifacts) and have the
+runtime SCAN the produced review artifacts; if any unresolved critical/high/actionable finding is
+present, the gate must NOT accept a PASS verdict — downgrade to FAIL/BLOCKED routing to fix. Proof of
+closure: a test where a review step returns `verdict: PASS` but its SECURITY.md contains a CRITICAL
+finding → the gate does NOT pass (independent of the self-declared verdict); and a clean artifact →
+passes.
+
+## Notes for Codex
+- 55-1 is small (provider-allowlist/alias) and unblocks honest cross-model telemetry for the user's
+  live GPT-5.5 setup. 55-2 is the structural one — it's what makes the adversarial review trustworthy
+  enough to eventually self-host (the user's dogfooding goal).
+- Optional/related (not requested yet): the user may later also bind `verifier-fast` to a non-anthropic
+  family for cross-model verification; leave as-is unless asked.
+- Run `node tools/test-model-router.mjs`, `node tools/test-aipi-tools.mjs` (+ any step-result/workflow
+  test), `npm.cmd run validate`, `npm.cmd test`, and paste real output.
+
+Previous requested owner before Codex handoff: CODEX
+Previous requested status before Codex handoff: WAITING_FOR_CODEX
+Previous requested action before Codex handoff: implement ADV-55-1 (recognize openai-codex as an in-scope adversarial provider →
+isolation pass + cross_model provenance recorded) and ADV-55-2 (review gate parses artifacts for
+critical/high findings and refuses a contradicting PASS), each with executing-proof tests, then hand
+back to CLAUDE.
+
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE
+Requested next action: Claude verify Round 55 fixes for ADV-55-1 and ADV-55-2 against code and tests.
+
+### Codex handoff - Round 55 ADV-55-1/ADV-55-2 (2026-06-21)
+
+Implemented ADV-55-1:
+
+- `extensions/aipi/runtime/model-router.js` now treats `openai-codex` as an in-scope adversarial provider.
+- `tools/test-model-router.mjs` now proves the user's live shape: `code-strong -> anthropic/claude-code`, `adversarial-heavy -> openai-codex/gpt-5.5`.
+- The test asserts `inspectAdversarialFamilyIsolation({ root })` returns `state: "pass"` and `resolveStepModel` for `code-reviewer` returns `openai-codex/gpt-5.5` with `cross_model_adversarial.distinct_provider === true`.
+
+Implemented ADV-55-2:
+
+- `extensions/aipi/runtime/step-result.js` now accepts optional `artifactContents` and scans review artifacts when a review step self-declares `PASS`.
+- Review artifacts named `CODE-REVIEW.md`, `SECURITY.md`, `DEV-REVIEW.md`, `HUMAN-REVIEW.md`, `COMPLEXITY-REVIEW.md`, `INTEGRATION.md`, `BLAST-RADIUS.md`, or `PLAN-REVIEW.md` are checked for unresolved high-severity/actionable markers (`CRITICAL`, `HIGH`, `BLOCKER`, `P0`, `P1`).
+- If a review artifact contains an unresolved high/critical finding, `validateStepResult` adds an error and the gate does not pass, even when the reviewer returned `verdict: "PASS"`.
+- `extensions/aipi/runtime/workflow-executor.js` now reads result artifacts after the adapter returns and before validating the step result, so the gate decision is based on the produced files, not only the self-attested JSON.
+- `tools/test-step-result.mjs` covers both cases: `PASS` + `SECURITY.md` containing `CRITICAL: SQL injection` is rejected; a clean review artifact passes.
+- `tools/test-workflow-executor.mjs` adds an integration proof: a quick review adapter writes `CODE-REVIEW.md` with a `CRITICAL` finding while returning `PASS`; the executor blocks on `quick_review` and records the contradiction in the step error.
+
+Changed files:
+
+- `extensions/aipi/runtime/model-router.js`
+- `extensions/aipi/runtime/step-result.js`
+- `extensions/aipi/runtime/workflow-executor.js`
+- `tools/test-model-router.mjs`
+- `tools/test-step-result.mjs`
+- `tools/test-workflow-executor.mjs`
+- `adversarial-claude.md`
+
+Validation run:
+
+- `node --check extensions/aipi/runtime/model-router.js` -> passed.
+- `node --check extensions/aipi/runtime/step-result.js` -> passed.
+- `node --check extensions/aipi/runtime/workflow-executor.js` -> passed.
+- `node --check tools/test-model-router.mjs` -> passed.
+- `node --check tools/test-step-result.mjs` -> passed.
+- `node --check tools/test-workflow-executor.mjs` -> passed.
+- `node tools/test-model-router.mjs` -> `AIPI_MODEL_ROUTER_TEST_OK`.
+- `node tools/test-step-result.mjs` -> `AIPI_STEP_RESULT_TEST_OK`.
+- `node tools/test-workflow-executor.mjs` -> `AIPI_WORKFLOW_EXECUTOR_TEST_OK`.
+- `node tools/test-aipi-tools.mjs` -> `AIPI_TOOLS_TEST_OK`.
+- `npm.cmd run validate` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`.
+- `npm.cmd test` -> full suite passed through `AIPI_STEP_RESULT_TEST_OK`; `test:model-pressure-evals` remained the existing opt-in skip (`set AIPI_MODEL_PRESSURE=1 and AIPI_MODEL_PRESSURE_COMMAND`).
+- `git diff --check` -> passed; only LF/CRLF normalization warnings from Git on Windows.
+
+Residual risks:
+
+- The artifact parser is intentionally conservative and format-tolerant rather than a full findings schema. It blocks explicit unresolved high/critical markers now; a future round can formalize a structured findings format if Claude wants a stricter contract.
+
+## Claude verdict — Round 55 CLOSED (2026-06-21)
+
+Verified against real code + tests I executed myself, AND re-run against the user's LIVE nora-app config
+(not just a fixture).
+
+- **ADV-55-1 [Med] FIXED — cross-model is now recognized.** `model-router.js` treats `openai-codex` as
+  an in-scope adversarial provider. **Decisive live check (real nora-app config):**
+  `inspectAdversarialFamilyIsolation({root})` → `state: "pass"` ("Adversarial review classes resolve to a
+  distinct configured model family") — the false warn is GONE; and `resolveStepModel` for
+  `security-auditor` → `openai-codex/gpt-5.5` WITH `cross_model_adversarial.distinct_provider === true`
+  (provenance now recorded). So GPT-5.5-reviews-Opus is both functional AND visible/auditable.
+- **ADV-55-2 [High] FIXED — the review gate now has independent teeth.** `validateStepResult`
+  (`step-result.js`) now READS the produced review artifacts from disk (`fs.readFile`) and scans them
+  via `reviewArtifactFindings` for unresolved `CRITICAL/HIGH/BLOCKER/P0/P1` markers (skipping
+  resolved/mitigated ones). If a PASS verdict coexists with an unresolved high-severity finding, it
+  pushes `PASS contradicts unresolved <sev> finding…` → `gatePassed = false`. **Proven** in
+  `test-step-result.mjs`: verdict PASS + a `SECURITY.md` containing `CRITICAL: SQL injection` →
+  `gatePassed: false` (independent of the self-declared verdict); a clean artifact → `gatePassed: true`.
+  The review can no longer rubber-stamp a PASS over its own critical finding.
+
+Tests I executed: `test-model-router` → `AIPI_MODEL_ROUTER_TEST_OK`, `test-step-result` →
+`AIPI_STEP_RESULT_TEST_OK`, `test-workflow-executor` → `AIPI_WORKFLOW_EXECUTOR_TEST_OK`,
+`test-aipi-tools` → `AIPI_TOOLS_TEST_OK`; `npm run validate` → `AIPI_TEMPLATE_VALIDATION_OK`;
+`npm test` → full suite exit 0.
+
+**Zero open findings. Round 55 CLOSED (55-1, 55-2 verified). Rounds 29–55 all CLOSED.**
+
+Net: the user's cross-model adversarial (GPT-5.5 reviewing Opus) is now wired, recognized, and — with
+55-2 — has teeth: a different model critiques the implementer AND the gate independently refuses a PASS
+that contradicts a critical/high finding in the review artifact. Together these are the two pieces that
+make the adversarial review trustworthy enough to consider self-hosting (the dogfooding goal). Residual
+(Codex-noted, acceptable): the artifact parser is conservative/format-tolerant, not yet a strict
+findings schema — a future round can formalize that if desired.
+
+Current owner: CLAUDE
+Current status: CLOSED
+Requested next action: none — Round 55 CLOSED. Live cross-model adversarial active in nora-app.

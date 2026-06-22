@@ -145,6 +145,57 @@ const allowPolicyDecision = validateStepResult(
 assert.equal(allowPolicyDecision.ok, true);
 assert.equal(allowPolicyDecision.gatePassed, true);
 
+const contradictoryReviewPass = validateStepResult(
+  {
+    ...baseResult,
+    step_id: "review_swarm",
+    agent_ids: ["security-auditor"],
+    evidence: [
+      {
+        rung: "ran",
+        source: "security-auditor",
+        ref: ".aipi/runtime/runs/run/steps/review_swarm/SECURITY.md",
+        result: "review_artifacts produced",
+      },
+    ],
+    artifacts: [".aipi/runtime/runs/run/steps/review_swarm/SECURITY.md"],
+  },
+  {
+    step: { id: "review_swarm", stage: "review", agents: ["security-auditor"], gate: { pass_verdicts: ["PASS"] } },
+    artifactContents: {
+      ".aipi/runtime/runs/run/steps/review_swarm/SECURITY.md": "## Findings\n\nCRITICAL: SQL injection in login query\n",
+    },
+  },
+);
+assert.equal(contradictoryReviewPass.ok, false);
+assert.equal(contradictoryReviewPass.gatePassed, false);
+assert.match(contradictoryReviewPass.errors.join("\n"), /PASS contradicts unresolved CRITICAL finding/);
+
+const cleanReviewPass = validateStepResult(
+  {
+    ...baseResult,
+    step_id: "review_swarm",
+    agent_ids: ["security-auditor"],
+    evidence: [
+      {
+        rung: "ran",
+        source: "security-auditor",
+        ref: ".aipi/runtime/runs/run/steps/review_swarm/SECURITY.md",
+        result: "review_artifacts produced",
+      },
+    ],
+    artifacts: [".aipi/runtime/runs/run/steps/review_swarm/SECURITY.md"],
+  },
+  {
+    step: { id: "review_swarm", stage: "review", agents: ["security-auditor"], gate: { pass_verdicts: ["PASS"] } },
+    artifactContents: {
+      ".aipi/runtime/runs/run/steps/review_swarm/SECURITY.md": "## Findings\n\nNo critical or high findings.\n",
+    },
+  },
+);
+assert.equal(cleanReviewPass.ok, true);
+assert.equal(cleanReviewPass.gatePassed, true);
+
 const validBlockerQuestion = validateStepResult({
   ...baseResult,
   verdict: "BLOCKED_TO_PLANNING",

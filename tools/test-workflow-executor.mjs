@@ -537,6 +537,24 @@ try {
     true,
   );
 
+  const contradictoryReviewRun = await startWorkflowRun({
+    projectRoot: tempRoot,
+    workflow: "quick",
+    now: () => fixedDate,
+    randomBytes: fixedRandom,
+  });
+  const contradictoryReviewExecution = await executeWorkflowRun({
+    projectRoot: tempRoot,
+    runId: contradictoryReviewRun.runId,
+    now: () => fixedDate,
+    adapter: createContradictoryReviewPassAdapter(),
+  });
+  assert.equal(contradictoryReviewExecution.status, "blocked");
+  const contradictoryReviewStep = contradictoryReviewExecution.state.steps.find((step) => step.id === "quick_review");
+  assert.equal(contradictoryReviewStep.status, "failed");
+  assert.match(contradictoryReviewStep.error, /PASS contradicts unresolved CRITICAL finding/);
+  assert.equal(contradictoryReviewExecution.state.current_step, "quick_review");
+
   const started = await startWorkflowRun({
     projectRoot: tempRoot,
     workflow: "quick",
@@ -737,6 +755,45 @@ function createMemoryPromotionWorkflowAdapter(promotionsByStep = {}) {
         ],
         artifacts,
         memory_promotions: promotions,
+      };
+    },
+  };
+}
+
+function createContradictoryReviewPassAdapter() {
+  const pass = createTestPassWorkflowAdapter();
+  return {
+    async executeStep(args) {
+      if (args.step.id !== "quick_review") return pass.executeStep(args);
+      const artifacts = [];
+      for (const template of args.step.produces) {
+        const relPath = renderTestTemplate(template, args.state, args.step);
+        const isCodeReview = relPath.endsWith("/CODE-REVIEW.md");
+        await writeControllerArtifact({
+          root: args.root,
+          state: args.state,
+          step: args.step,
+          relPath,
+          content: isCodeReview
+            ? "## Findings\n\nCRITICAL: SQL injection reaches the changed code path.\n"
+            : "## Findings\n\nNo complexity blockers.\n",
+        });
+        artifacts.push(relPath);
+      }
+      return {
+        schema: "aipi.step-result.v1",
+        step_id: args.step.id,
+        agent_ids: args.step.agents,
+        verdict: "PASS",
+        evidence: [
+          {
+            rung: "ran",
+            source: "test-review-adapter",
+            ref: artifacts.join(", "),
+            result: "review_artifacts produced",
+          },
+        ],
+        artifacts,
       };
     },
   };

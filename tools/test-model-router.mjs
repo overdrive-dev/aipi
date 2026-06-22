@@ -322,6 +322,34 @@ try {
   assert.equal(crossModelReviewer.provider, "anthropic");
   assert.equal(crossModelReviewer.distinct_provider, true);
 
+  await fs.writeFile(
+    path.join(tempRoot, ".aipi", "model-capabilities.json"),
+    `${JSON.stringify({
+      schema: "aipi.model-capabilities.v1",
+      classes: {
+        "code-strong": "anthropic/claude-code",
+        "adversarial-heavy": "openai-codex/gpt-5.5",
+        "verifier-fast": "anthropic/claude-verify",
+      },
+      models: {
+        "anthropic:claude-code": { capabilities: {}, evidence: ["unit-test"] },
+        "anthropic:claude-verify": { capabilities: {}, evidence: ["unit-test"] },
+        "openai-codex:gpt-5.5": { capabilities: {}, evidence: ["unit-test"] },
+      },
+    }, null, 2)}\n`,
+  );
+  const openaiCodexIsolation = await inspectAdversarialFamilyIsolation({ root: tempRoot });
+  assert.equal(openaiCodexIsolation.state, "pass");
+  assert.equal(openaiCodexIsolation.configured_families.includes("openai-codex"), true);
+  const openaiCodexReviewer = await resolveStepModel({
+    root: tempRoot,
+    step: { agents: ["code-reviewer"] },
+    ctx: { model: { provider: "anthropic", id: "claude-code" } },
+  });
+  assert.deepEqual(openaiCodexReviewer.model, { provider: "openai-codex", id: "gpt-5.5" });
+  assert.equal(openaiCodexReviewer.cross_model_adversarial.provider, "openai-codex");
+  assert.equal(openaiCodexReviewer.cross_model_adversarial.distinct_provider, true);
+
   const crossModelBlocked = await resolveCrossModelAdversarialRoute({
     root: tempRoot,
     role: "contrarian",
