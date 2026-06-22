@@ -619,79 +619,175 @@ async function collectSubagentResult(coordinator, agentId, {
 }) {
   const startedAt = Date.now();
   let lastActivityAt = 0;
+  // Live worker telemetry: a forked worker runs for minutes; surface what it is actually DOING so the
+  // terminal isn't a silent spinner. The worker streams its real session to a jsonl; we tail NEW events
+  // and (a) print each thinking note + file/graph/tool action into the scrollback as it happens, and
+  // (b) fold a one-line summary into the spinner. The feed keeps a byte cursor so each event prints once.
+  const canStream = typeof notify === "function" && Boolean(root);
+  const feed = canStream ? createWorkerActivityFeed(root, agentId, stepId) : null;
+  const pump = async () => {
+    if (!feed) return;
+    try {
+      const { events, toolCount, latestAction } = await feed.poll();
+      for (const line of events) notify(line, "info");
+      if (typeof notify.updateActivity === "function") {
+        const parts = [`${toolCount} tool${toolCount === 1 ? "" : "s"}`];
+        if (latestAction) parts.push(latestAction);
+        notify.updateActivity(parts.join(" · "));
+      }
+    } catch {
+      /* telemetry is best-effort and must never break the run */
+    }
+  };
   while (Date.now() - startedAt <= collectTimeoutMs) {
     const collect = coordinator.collect(agentId);
-    if (collect.ready || ["failed", "cancelled", "interrupted"].includes(collect.state)) return collect;
-    // Live worker telemetry: while the worker runs (which is the minutes-long part of a step), surface
-    // what it's actually doing — tool-call count + the file it's reading + thinking — into the spinner's
-    // status line so the terminal isn't silent. Throttled, best-effort, never blocks the poll.
-    if (typeof notify?.updateActivity === "function" && Date.now() - lastActivityAt >= 1200) {
+    if (collect.ready || ["failed", "cancelled", "interrupted"].includes(collect.state)) {
+      await pump(); // flush any final events the worker wrote just before finishing
+      return collect;
+    }
+    if (feed && Date.now() - lastActivityAt >= 1000) {
       lastActivityAt = Date.now();
-      try {
-        const status = coordinator.status?.(agentId) ?? {};
-        const tools = status.tool_call_count ?? 0;
-        const action = root ? await readWorkerLiveAction(root, agentId) : null;
-        const parts = [`${tools} tool${tools === 1 ? "" : "s"}`];
-        if (action) parts.push(action);
-        notify.updateActivity(parts.join(" · "));
-      } catch {
-        /* telemetry is best-effort and must never break the run */
-      }
+      await pump();
     }
     await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
   }
   return { agent_id: agentId, ready: false, state: "timeout" };
 }
 
-// Best-effort live read of what the forked worker is currently doing, from the tail of its session
-// jsonl: the latest tool call (e.g. "read AdminSidebar.ts", "grep useUser") or "thinking…". Reads only
-// the last 32KB (the newest events) so it stays cheap on a growing multi-MB session. Never throws.
-async function readWorkerLiveAction(root, agentId) {
-  try {
-    const dir = path.join(root, ".aipi", "runtime", "subagents", "sessions", String(agentId).replaceAll(":", "-"));
-    const entries = await fs.readdir(dir).catch(() => []);
-    const jsonl = entries.filter((name) => name.endsWith(".jsonl")).sort().at(-1);
-    if (!jsonl) return null;
-    const filePath = path.join(dir, jsonl);
-    const stat = await fs.stat(filePath).catch(() => null);
-    if (!stat || !stat.size) return null;
-    const start = Math.max(0, stat.size - 32 * 1024);
-    const handle = await fs.open(filePath, "r");
-    let text;
-    try {
-      const buf = Buffer.alloc(stat.size - start);
-      await handle.read(buf, 0, buf.length, start);
-      text = buf.toString("utf8");
-    } finally {
-      await handle.close();
-    }
-    const lines = text.split(/\r?\n/);
-    if (start > 0 && lines.length) lines.shift(); // drop a possibly-partial first line
-    for (let i = lines.length - 1; i >= 0; i -= 1) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      let event;
+// Forward, cursor-based reader of a forked worker's live session jsonl. Each worker logs
+// `{type:"message", message:{role, content:[ {type:"thinking",thinking}, {type:"toolCall",name,arguments} ]}}`
+// events (NOT the top-level tool_use/input shape an in-process SDK uses). poll() reads only bytes appended
+// since the last call, returns one formatted scrollback line per new thinking/tool event, the running
+// tool count (derived from the jsonl, since host tool_call hooks observe zero forked-worker calls), and
+// the latest action for the spinner. Best-effort: never throws; a partial trailing line is left for next poll.
+function createWorkerActivityFeed(root, agentId, stepId = null) {
+  const dir = path.join(root, ".aipi", "runtime", "subagents", "sessions", String(agentId).replaceAll(":", "-"));
+  const tag = String(agentId).split(":")[0] || stepId || "worker";
+  let file = null;
+  let offset = 0;
+  let toolCount = 0;
+  let streamed = 0;
+  const STREAM_CAP = 1000; // runaway backstop, far above any real worker's event count
+  return {
+    async poll() {
+      const out = { events: [], toolCount, latestAction: null };
       try {
-        event = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      const content = event?.message?.content;
-      if (!Array.isArray(content)) continue;
-      for (let j = content.length - 1; j >= 0; j -= 1) {
-        const part = content[j];
-        if (part?.type === "tool_use") {
-          const target = part.input?.path ?? part.input?.pattern ?? part.input?.file ?? part.input?.query ?? "";
-          const short = target ? String(target).replaceAll("\\", "/").split("/").pop() : "";
-          return `${part.name}${short ? ` ${short}` : ""}`.trim();
+        const entries = await fs.readdir(dir).catch(() => []);
+        const jsonl = entries.filter((name) => name.endsWith(".jsonl")).sort().at(-1);
+        if (!jsonl) return out;
+        if (jsonl !== file) {
+          file = jsonl;
+          offset = 0;
         }
-        if (part?.type === "thinking") return "thinking…";
+        const filePath = path.join(dir, jsonl);
+        const stat = await fs.stat(filePath).catch(() => null);
+        if (!stat || stat.size <= offset) return out;
+        const handle = await fs.open(filePath, "r");
+        let text;
+        try {
+          const buf = Buffer.alloc(stat.size - offset);
+          await handle.read(buf, 0, buf.length, offset);
+          text = buf.toString("utf8");
+        } finally {
+          await handle.close();
+        }
+        const lastNewline = text.lastIndexOf("\n");
+        if (lastNewline === -1) return out; // no complete line appended yet; wait for the rest
+        const complete = text.slice(0, lastNewline + 1);
+        offset += Buffer.byteLength(complete, "utf8"); // resume after the last whole line next poll
+        for (const rawLine of complete.split(/\r?\n/)) {
+          const line = rawLine.trim();
+          if (!line) continue;
+          let event;
+          try {
+            event = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          const content = event?.message?.content;
+          if (!Array.isArray(content)) continue;
+          for (const part of content) {
+            if (part?.type === "toolCall" || part?.type === "tool_use") {
+              toolCount += 1;
+              const detail = formatToolActivity(part.name, part.arguments ?? part.input ?? {});
+              out.latestAction = detail;
+              if (streamed < STREAM_CAP) {
+                streamed += 1;
+                out.events.push(`  ↳ ${tag}: ${detail}`);
+              }
+            } else if (part?.type === "thinking") {
+              const summary = summarizeThinking(part.thinking ?? part.text ?? "");
+              if (summary) {
+                out.latestAction = "thinking…";
+                if (streamed < STREAM_CAP) {
+                  streamed += 1;
+                  out.events.push(`  ↳ ${tag} 💭 ${summary}`);
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        /* best-effort; leave cursor/count as-is */
       }
+      out.toolCount = toolCount;
+      return out;
+    },
+  };
+}
+
+function truncateActivity(value, max) {
+  const s = String(value ?? "").replace(/\s+/g, " ").trim();
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
+function baseName(value) {
+  const s = String(value ?? "").replaceAll("\\", "/");
+  return s.split("/").filter(Boolean).pop() || s;
+}
+
+// Turn a worker tool call into a short, human "what it's doing" line: file reads/greps/listings and the
+// aipi_* graph/memory/retrieval tools the user specifically wanted to see ("files/graph + thinking").
+function formatToolActivity(name, args = {}) {
+  const a = args && typeof args === "object" ? args : {};
+  const p = a.path ?? a.file ?? a.file_path ?? a.filePath ?? a.target ?? a.dir;
+  switch (name) {
+    case "read":
+    case "open":
+      return `read ${p ? baseName(p) : ""}`.trim();
+    case "ls":
+      return `ls ${truncateActivity(p ?? "", 60)}`.trim();
+    case "grep":
+      return `grep ${a.pattern ? `"${truncateActivity(a.pattern, 48)}"` : p ? baseName(p) : ""}`.trim();
+    case "find":
+      return `find ${truncateActivity(a.pattern ?? a.query ?? p ?? "", 48)}`.trim();
+    case "write":
+      return `write ${p ? baseName(p) : ""}`.trim();
+    case "aipi_retrieve":
+      return `retrieve "${truncateActivity(a.query ?? a.q ?? "", 48)}"`;
+    case "aipi_rule_lookup":
+      return `rule lookup "${truncateActivity(a.query ?? a.rule ?? "", 48)}"`;
+    case "aipi_rule_gap":
+      return `rule gap "${truncateActivity(a.query ?? "", 48)}"`;
+    case "aipi_memory_query":
+      return `memory "${truncateActivity(a.query ?? "", 48)}"`;
+    case "aipi_callers":
+      return `callers ${truncateActivity(a.symbol ?? a.name ?? p ?? "", 48)}`.trim();
+    case "aipi_impact":
+      return `impact ${truncateActivity(a.symbol ?? a.name ?? p ?? "", 48)}`.trim();
+    default: {
+      const first = p ?? a.query ?? a.pattern ?? a.symbol ?? a.name ?? Object.values(a)[0];
+      return `${name}${first ? ` ${truncateActivity(baseName(first), 50)}` : ""}`.trim();
     }
-    return null;
-  } catch {
-    return null;
   }
+}
+
+function summarizeThinking(text) {
+  const first = String(text ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+  return first ? truncateActivity(first, 150) : null;
 }
 
 function blockedStepResult({ step, agentId, reason }) {
@@ -807,6 +903,15 @@ export function parseWorkflowDefinition(text, workflowName = "workflow") {
       if (key === "agents") current.agents = parseInlineList(value);
       if (key === "requires") current.requires = parseInlineList(value);
       if (key === "context_from") current.context_from = parseInlineList(value);
+      if (key === "write_scope") {
+        const scope = value.trim();
+        if (scope !== "project" && scope !== "artifacts") {
+          throw new Error(
+            `workflow ${workflowName} step ${current.id}: write_scope must be "project" or "artifacts", got "${scope}"`,
+          );
+        }
+        current.write_scope = scope;
+      }
       continue;
     }
 

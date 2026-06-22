@@ -718,21 +718,27 @@ try {
   assert.doesNotMatch(workerTask, /\{\{\s*bug\s*\}\}/, "rendered worker prompt must not contain the literal {{ bug }}");
   assert.ok(workerTask.includes(bugText), "rendered worker prompt must contain the user's task text");
 
-  // Live worker telemetry (ADV-63): while a worker runs (the minutes-long part of a step), the executor
-  // surfaces what it is DOING — tool-call count + the file it's reading — into the progress sink's
-  // updateActivity channel (which feeds the spinner status line), so the terminal isn't silent.
+  // Live worker telemetry (ADV-63 + the real-path fix): a forked worker logs its REAL session jsonl using
+  // `{type:"message", message:{content:[{type:"thinking",thinking}, {type:"toolCall",name,arguments}]}}`
+  // events. The executor must (a) STREAM each new thinking note + file/graph op into the scrollback as it
+  // happens, and (b) fold a one-line summary into the spinner — with the tool count derived from the jsonl,
+  // NOT from coordinator.status() (host tool_call hooks observe zero forked-worker calls).
   const teleAgentId = "orchestration-reasoner:tele01";
   const teleSessionDir = path.join(tempRoot, ".aipi", "runtime", "subagents", "sessions", teleAgentId.replaceAll(":", "-"));
   await fs.mkdir(teleSessionDir, { recursive: true });
+  const msg = (content) => `${JSON.stringify({ type: "message", message: { role: "assistant", content } })}\n`;
   await fs.writeFile(
     path.join(teleSessionDir, "2026-06-22T19-00-00-000Z_sess.jsonl"),
-    `${JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "thinking", thinking: "…" }] } })}\n` +
-      `${JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "tool_use", name: "read", input: { path: "frontend/src/components/admin/AdminSidebar.tsx" } }] } })}\n`,
+    msg([{ type: "thinking", thinking: "I need to locate the AdminSidebar component and how it routes gestores.\nSecond line." }]) +
+      msg([{ type: "toolCall", id: "t1", name: "ls", arguments: { path: "frontend/app/(app)/(admin)" } }]) +
+      msg([{ type: "toolCall", id: "t2", name: "read", arguments: { path: "frontend/src/components/admin/AdminSidebar.tsx" } }]) +
+      msg([{ type: "toolCall", id: "t3", name: "aipi_retrieve", arguments: { query: "gestores tipo coordenador" } }]),
   );
   let telePolls = 0;
   const teleCoordinator = {
     spawn: () => ({ agent_id: teleAgentId }),
-    status: () => ({ tool_call_count: 7, elapsed_ms: 4000 }),
+    // Deliberately misleading host count: the fix must IGNORE this and count the jsonl's 3 toolCalls.
+    status: () => ({ tool_call_count: 99, elapsed_ms: 4000 }),
     collect: () => {
       telePolls += 1;
       if (telePolls < 3) return { agent_id: teleAgentId, ready: false, state: "running" };
@@ -744,8 +750,9 @@ try {
       };
     },
   };
+  const teleStream = [];
   const teleActivity = [];
-  const teleSink = () => {};
+  const teleSink = (message) => teleStream.push(message);
   teleSink.updateActivity = (text) => teleActivity.push(text);
   const teleAdapter = createSubagentWorkflowAdapter(teleCoordinator, {
     pollIntervalMs: 1,
@@ -753,10 +760,27 @@ try {
     modelResolver: async () => ({ model_class: "code-strong", model: { provider: "anthropic", id: "x" }, thinking_level: "medium", source: "t" }),
   });
   await teleAdapter.executeStep({ root: tempRoot, state: bugParamRun.state, workflow: bugParamWorkflow, step: triageStep, context: {}, contract: {}, notify: teleSink });
+  // (a) Each thinking note + file/graph op is streamed into the scrollback (this is what the user wanted to SEE).
   assert.ok(
-    teleActivity.some((a) => /\b7 tools\b/.test(a) && /read AdminSidebar\.tsx/.test(a)),
-    `live worker telemetry must surface tool count + current file; got: ${JSON.stringify(teleActivity)}`,
+    teleStream.some((line) => /💭/.test(line) && /locate the AdminSidebar/.test(line)),
+    `worker thinking must stream to the terminal; got: ${JSON.stringify(teleStream)}`,
   );
+  assert.ok(
+    teleStream.some((line) => /read AdminSidebar\.tsx/.test(line)),
+    `file reads must stream to the terminal; got: ${JSON.stringify(teleStream)}`,
+  );
+  assert.ok(
+    teleStream.some((line) => /retrieve "gestores tipo coordenador"/.test(line)),
+    `graph/retrieval ops must stream to the terminal; got: ${JSON.stringify(teleStream)}`,
+  );
+  // A multi-line thinking block is summarized to its first line only (no scrollback flooding).
+  assert.ok(!teleStream.some((line) => /Second line/.test(line)), "thinking is summarized to one line");
+  // (b) The spinner summary shows the jsonl-derived tool count (3), NOT the misleading host count (99).
+  assert.ok(
+    teleActivity.some((a) => /\b3 tools\b/.test(a) && /retrieve/.test(a)),
+    `spinner summary must show jsonl tool count + latest action; got: ${JSON.stringify(teleActivity)}`,
+  );
+  assert.ok(!teleActivity.some((a) => /99 tools/.test(a)), "host tool_call_count must be ignored for forked workers");
 
   // collect-timeout (real-path mechanism): a real agentic worker takes minutes; the 120s spike default
   // timed it out mid-step (BLOCKED "did not finish: timeout") even though it would succeed. Prove the
@@ -826,6 +850,62 @@ try {
   assert.equal(resolveWriteScope({ stage: "review" }), "artifacts");
   assert.equal(resolveWriteScope({ stage: "implementation", write_scope: "artifacts" }), "artifacts");
   assert.equal(resolveWriteScope({ stage: "requirements", write_scope: "project" }), "project");
+
+  // ADV-62-4: an explicit `write_scope:` in the workflow YAML must be PARSED onto the step (not ignored),
+  // so the advertised override actually works on the real parse path.
+  const scopeYaml = parseWorkflowDefinition(
+    [
+      "name: scopecheck",
+      "steps:",
+      "  - id: fix",
+      "    stage: implementation",
+      "    write_scope: artifacts",
+      "    agents: [worker]",
+      "    produces: []",
+      "  - id: note",
+      "    stage: requirements",
+      "    write_scope: project",
+      "    agents: [worker]",
+      "    produces: []",
+    ].join("\n"),
+    "scopecheck",
+  );
+  assert.equal(scopeYaml.steps[0].write_scope, "artifacts", "YAML write_scope must be parsed onto the step");
+  assert.equal(resolveWriteScope(scopeYaml.steps[0]), "artifacts", "implementation step forced to artifacts via YAML");
+  assert.equal(resolveWriteScope(scopeYaml.steps[1]), "project", "requirements step opted into project via YAML");
+  assert.throws(
+    () => parseWorkflowDefinition("name: bad\nsteps:\n  - id: x\n    stage: implementation\n    write_scope: nonsense\n    agents: [w]\n    produces: []\n", "bad"),
+    /write_scope must be/,
+    "invalid write_scope value is rejected",
+  );
+  // The parsed override reaches the dispatched descriptor: the artifacts-forced fix step dispatches artifacts.
+  const scopeRun = await startWorkflowRun({
+    projectRoot: tempRoot,
+    workflow: "bugfix",
+    params: { bug: "scope override repro" },
+    now: () => fixedDate,
+    randomBytes: fixedRandom,
+  });
+  const scopeDescriptors = [];
+  const scopeCoordinator = {
+    spawn(descriptor) {
+      scopeDescriptors.push(descriptor);
+      return { agent_id: descriptor.agent_id };
+    },
+    collect: (agentId) => ({
+      agent_id: agentId,
+      ready: true,
+      step_result: { schema: "aipi.step-result.v1", step_id: "fix", agent_ids: [agentId], verdict: "PASS", evidence: [{ rung: "ran", source: "s", ref: agentId, result: "ok" }], artifacts: [] },
+      artifacts: [],
+    }),
+  };
+  const scopeAdapter = createSubagentWorkflowAdapter(scopeCoordinator, {
+    pollIntervalMs: 1,
+    collectTimeoutMs: 2_000,
+    modelResolver: async () => ({ model_class: "code-strong", model: { provider: "anthropic", id: "x" }, thinking_level: "medium", source: "t" }),
+  });
+  await scopeAdapter.executeStep({ root: tempRoot, state: scopeRun.state, workflow: scopeYaml, step: scopeYaml.steps[0], context: {}, contract: {} });
+  assert.equal(scopeDescriptors.at(-1)?.write_scope, "artifacts", "YAML write_scope: artifacts must reach the dispatched descriptor");
 
   const capturedDescriptors = [];
   const captureCoordinator = {

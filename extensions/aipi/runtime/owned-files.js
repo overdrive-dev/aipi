@@ -234,6 +234,10 @@ function blockedToolResult(reason) {
 
 export function isControllerOwnedPath(relPath) {
   const normalized = String(relPath ?? "").replaceAll("\\", "/").replace(/^\.\/+/, "");
+  // The git directory is never worker-writable, under any scope. Enforced centrally here (not only in the
+  // child's private normalizer) so OwnedFileRegistry.owns/isProtectedWritePath, makeOwnedFileGuard, and
+  // wrapWriteToolWithOwnership all fail closed for a project-scoped worker. (ADV-62-3)
+  if (normalized === ".git" || normalized.startsWith(".git/")) return true;
   if (normalized === MEMORY_PREFIX.slice(0, -1) || normalized.startsWith(MEMORY_PREFIX)) return true;
   if (normalized === RUNTIME_RUNS_PREFIX.slice(0, -1)) return true;
   if (!normalized.startsWith(RUNTIME_RUNS_PREFIX)) return false;

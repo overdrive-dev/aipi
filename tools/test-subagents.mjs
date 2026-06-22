@@ -361,6 +361,11 @@ try {
     (await projectWrite.execute("runtime", { path: ".aipi/runtime/runs/run-1/state.json", content: "x" })).isError,
     true,
   );
+  // ADV-62-3: .git stays blocked under project scope in the child guarded-write extension too.
+  await assert.rejects(
+    () => projectWrite.execute("git", { path: ".git/config", content: "x" }),
+    /targets \.git/,
+  );
   await assert.rejects(
     () => projectWrite.execute("escape", { path: "../outside.js", content: "x" }),
     /escapes project root/,

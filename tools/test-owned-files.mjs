@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { OwnedFileRegistry, classifyToolCall, makeOwnedFileGuard } from "../extensions/aipi/runtime/owned-files.js";
+import {
+  OwnedFileRegistry,
+  classifyToolCall,
+  isControllerOwnedPath,
+  makeOwnedFileGuard,
+  wrapWriteToolWithOwnership,
+} from "../extensions/aipi/runtime/owned-files.js";
 
 const registry = new OwnedFileRegistry(process.cwd());
 registry.allocate("implementer:1", ["src/a.js"]);
@@ -68,6 +74,31 @@ assert.equal(registry.owns("implementer:step-artifact", "frontend/src/lib/gestor
 scoped.release("fixer:1");
 assert.equal(scoped.hasProjectScope("fixer:1"), false);
 assert.equal(scoped.owns("fixer:1", "frontend/src/lib/gestores-tipo.ts"), false);
+
+// ADV-62-3: .git is centrally protected — a project-scoped worker is fail-closed against .git writes
+// across EVERY shared guard surface (not just the child extension's private normalizer).
+assert.equal(isControllerOwnedPath(".git/config"), true);
+assert.equal(isControllerOwnedPath(".git"), true);
+const gitScoped = new OwnedFileRegistry(process.cwd());
+gitScoped.grantProjectScope("fixer:git");
+assert.equal(gitScoped.owns("fixer:git", ".git/config"), false);
+assert.equal(gitScoped.isProtectedWritePath(".git/config"), true);
+assert.throws(() => gitScoped.allocate("fixer:git2", [".git/config"]), /owned-file protected path/);
+const gitGuard = makeOwnedFileGuard(gitScoped, "fixer:git");
+assert.match(gitGuard({ name: "write", input: { path: ".git/config" } })?.reason, /controller-owned/);
+// wrapWriteToolWithOwnership must refuse .git before delegating to the underlying write.
+let innerRan = false;
+const wrapped = wrapWriteToolWithOwnership(
+  { name: "write", execute: async () => { innerRan = true; return { content: [{ type: "text", text: "wrote" }] }; } },
+  { registry: gitScoped, agentId: "fixer:git" },
+);
+const wrappedResult = await wrapped.execute("c1", { path: ".git/config" });
+assert.equal(wrappedResult.isError, true);
+assert.equal(innerRan, false, "wrapped write must not delegate to the inner write for .git");
+// ...but a real source file under project scope still delegates.
+const wrappedOk = await wrapped.execute("c2", { path: "frontend/src/app.ts" });
+assert.equal(innerRan, true);
+assert.match(wrappedOk.content?.[0]?.text ?? "", /wrote/);
 
 // snapshot/restore round-trips the project-scope grant.
 const snapSource = new OwnedFileRegistry(process.cwd());
