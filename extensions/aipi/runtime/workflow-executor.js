@@ -641,24 +641,24 @@ async function collectSubagentResult(coordinator, agentId, {
   const feed = canStream ? createWorkerActivityFeed(root, agentId) : null;
   const tag = String(agentId).split(":")[0] || stepId || "worker";
   const richUI = canStream && notify.supportsWidgets === true && typeof notify.setActivity === "function";
-  const recent = []; // rolling window of recent lines for the live widget
+  const recent = []; // rolling window of {kind, detail} the live widget renders natively
   const RECENT_CAP = 14;
   const pump = async () => {
     if (!feed) return;
     try {
       const { events, toolCount, latestAction } = await feed.poll();
       for (const event of events) {
-        const glyph = event.kind === "think" ? "💭 " : event.kind === "text" ? "💬 " : "";
         if (richUI) {
-          recent.push(`  ${glyph}${event.detail}`);
+          recent.push(event); // {kind, detail} — styled (italic thinking, muted tools) by the host theme
           if (recent.length > RECENT_CAP) recent.shift();
         } else {
+          const glyph = event.kind === "think" ? "💭 " : event.kind === "text" ? "💬 " : "";
           notify(`  ↳ ${tag} ${glyph}${event.detail}`, "info");
         }
       }
       if (richUI && recent.length) {
         const elapsed = Math.round((Date.now() - startedAt) / 1000);
-        notify.setActivity([`live · ${tag} · ${toolCount} tool${toolCount === 1 ? "" : "s"} · ${elapsed}s`, ...recent]);
+        notify.setActivity({ tag, tools: toolCount, elapsed_s: elapsed, items: recent.slice() });
       }
       if (typeof notify.updateActivity === "function") {
         const parts = [`${toolCount} tool${toolCount === 1 ? "" : "s"}`];

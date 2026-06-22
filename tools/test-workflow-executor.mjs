@@ -806,7 +806,7 @@ try {
   const richWidget = [];
   const richSink = () => {};
   richSink.supportsWidgets = true;
-  richSink.setActivity = (lines) => richWidget.push(lines);
+  richSink.setActivity = (payload) => richWidget.push(payload);
   richSink.updateActivity = () => {};
   const richAdapter = createSubagentWorkflowAdapter(richCoordinator, {
     pollIntervalMs: 1,
@@ -814,11 +814,13 @@ try {
     modelResolver: async () => ({ model_class: "code-strong", model: { provider: "anthropic", id: "x" }, thinking_level: "medium", source: "t" }),
   });
   await richAdapter.executeStep({ root: tempRoot, state: bugParamRun.state, workflow: bugParamWorkflow, step: triageStep, context: {}, contract: {}, notify: richSink });
-  const richSnapshot = richWidget.find((lines) => Array.isArray(lines) && lines.some((l) => /write gestores-tipo\.ts/.test(l)));
-  assert.ok(richSnapshot, `live activity widget must render the worker's file ops; got: ${JSON.stringify(richWidget)}`);
-  assert.ok(richSnapshot.some((l) => /💭/.test(l) && /Applying the fix/.test(l)), "activity widget shows thinking");
-  assert.ok(richSnapshot.some((l) => /read index\.tsx/.test(l)), "activity widget shows file reads");
-  assert.ok(/\b2 tools\b/.test(richSnapshot[0]), "activity widget header shows the jsonl-derived tool count (2)");
+  // The rich path passes a STRUCTURED payload {tag,tools,elapsed_s,items:[{kind,detail}]}; the host theme
+  // styles it (italic thinking / muted tools) — see test-aipi-workflow-command for the native rendering.
+  const richSnapshot = richWidget.find((p) => p && Array.isArray(p.items) && p.items.some((it) => /write gestores-tipo\.ts/.test(it.detail)));
+  assert.ok(richSnapshot, `live activity payload must include the worker's file ops; got: ${JSON.stringify(richWidget)}`);
+  assert.ok(richSnapshot.items.some((it) => it.kind === "think" && /Applying the fix/.test(it.detail)), "activity payload includes thinking (kind=think)");
+  assert.ok(richSnapshot.items.some((it) => it.kind === "tool" && /read index\.tsx/.test(it.detail)), "activity payload includes file reads");
+  assert.equal(richSnapshot.tools, 2, "activity payload carries the jsonl-derived tool count (2)");
   // The live panel is cleared (setActivity(undefined)) when the worker finishes so it doesn't linger.
   assert.equal(richWidget.at(-1), undefined, "activity widget cleared when the worker ends");
 

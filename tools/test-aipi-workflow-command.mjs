@@ -87,11 +87,30 @@ try {
   assert.deepEqual(uiCalls.notify.at(-1), { message: "hello", kind: "info" });
   richSink.setPlan(["○ 1/2 triage", "○ 2/2 fix"]);
   assert.deepEqual(uiCalls.widget.at(-1).content, ["○ 1/2 triage", "○ 2/2 fix"]);
-  // The live worker stream is a PERSISTENT activity widget (notify is transient on the real host).
+  // The live worker stream is a PERSISTENT activity widget (notify is transient on the real host), rendered
+  // via the setWidget COMPONENT-FACTORY so it matches Pi's native styling (italic thinking in the host
+  // thinkingText color, muted tools, dim header) using the Theme the host passes in.
   assert.equal(richSink.supportsWidgets, true);
-  richSink.setActivity(["live · implementer · 2 tools · 5s", "  💭 applying fix", "  write gestores-tipo.ts"]);
-  assert.equal(uiCalls.widget.at(-1).key, "aipi.workflow.activity");
-  assert.deepEqual(uiCalls.widget.at(-1).content, ["live · implementer · 2 tools · 5s", "  💭 applying fix", "  write gestores-tipo.ts"]);
+  richSink.setActivity({ tag: "implementer", tools: 2, elapsed_s: 5, items: [{ kind: "think", detail: "applying fix to gestores" }, { kind: "tool", detail: "write gestores-tipo.ts" }] });
+  const actCall = uiCalls.widget.at(-1);
+  assert.equal(actCall.key, "aipi.workflow.activity");
+  assert.equal(typeof actCall.content, "function", "activity uses the setWidget component-factory form");
+  const themeUse = { fg: [], italic: 0 };
+  const fakeTheme = {
+    fg: (color, text) => { themeUse.fg.push(color); return `<${color}>${text}</>`; },
+    italic: (text) => { themeUse.italic += 1; return `<i>${text}</i>`; },
+  };
+  const comp = actCall.content({}, fakeTheme);
+  assert.equal(typeof comp.render, "function");
+  assert.equal(typeof comp.invalidate, "function");
+  const actLines = comp.render(80);
+  assert.ok(actLines.some((l) => /applying fix to gestores/.test(l)), "activity renders the thinking detail");
+  assert.ok(actLines.some((l) => /write gestores-tipo\.ts/.test(l)), "activity renders the tool detail");
+  assert.ok(actLines.some((l) => /2 tools/.test(l)), "activity header shows the tool count");
+  assert.ok(themeUse.italic >= 1, "thinking is rendered italic (native style)");
+  assert.ok(themeUse.fg.includes("thinkingText"), "thinking uses the host thinkingText color");
+  assert.ok(themeUse.fg.includes("dim"), "header uses the dim color");
+  assert.ok(themeUse.fg.includes("muted"), "tool/file ops use the muted color");
   richSink.startSpinner("bugfix: triage");
   assert.ok(uiCalls.status.some((call) => /bugfix: triage/.test(call.text ?? "")), "spinner writes an animated status line");
   // Live worker activity is folded into the spinner line (ADV-63): updateActivity then a tick renders it.
@@ -119,7 +138,7 @@ try {
   const plainSink = makeProgressNotifier({ ui: { notify: (m, k) => plainCalls.push({ m, k }) } });
   assert.equal(plainSink.supportsWidgets, false);
   plainSink.setPlan(["x"]);
-  plainSink.setActivity(["a", "b"]); // safe no-op when the host has no setWidget
+  plainSink.setActivity({ tag: "w", tools: 1, elapsed_s: 1, items: [{ kind: "tool", detail: "x" }] }); // safe no-op without setWidget
   plainSink.startSpinner("y");
   plainSink.stopSpinner();
   plainSink.clear();

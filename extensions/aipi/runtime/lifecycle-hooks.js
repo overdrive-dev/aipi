@@ -3827,6 +3827,43 @@ function safeNotify(ctx, message, kind) {
   }
 }
 
+// Render the live worker-activity panel to match Pi's native message styling: thinking traces italic in the
+// host's thinkingText color (exactly how AssistantMessageComponent renders them), tool/file ops muted, a dim
+// header line. Uses ONLY the Theme.fg/italic helpers the host passes to the setWidget factory, with graceful
+// fallback to plain text when a theme/helper is absent (tests, odd hosts).
+export function renderActivityLines(payload, theme, width = 80) {
+  const fg = (color, text) => (typeof theme?.fg === "function" ? theme.fg(color, text) : text);
+  const italic = (text) => (typeof theme?.italic === "function" ? theme.italic(text) : text);
+  const maxLen = Math.max(24, Math.min(Number.isFinite(width) ? width : 80, 120) - 2);
+  const clip = (value) => {
+    const text = String(value ?? "").replace(/\s+/g, " ").trim();
+    return text.length > maxLen ? `${text.slice(0, maxLen - 1)}…` : text;
+  };
+  const tools = Number(payload?.tools ?? 0);
+  const header = `${payload?.tag ?? "worker"} · ${tools} tool${tools === 1 ? "" : "s"} · ${payload?.elapsed_s ?? 0}s`;
+  const lines = [fg("dim", clip(header))];
+  for (const item of payload?.items ?? []) {
+    const text = clip(item?.detail);
+    if (!text) continue;
+    if (item?.kind === "think") lines.push(italic(fg("thinkingText", `  ${text}`)));
+    else lines.push(fg("muted", `  ${text}`)); // tool + assistant text
+  }
+  return lines;
+}
+
+export function buildActivityComponent(payload, theme) {
+  return {
+    render(width) {
+      try {
+        return renderActivityLines(payload, theme, width);
+      } catch {
+        return [];
+      }
+    },
+    invalidate() {},
+  };
+}
+
 // ADV-58-3: bind a cheap, non-blocking progress-notification surface to ctx so the
 // executor can stream per-step transitions to the terminal instead of looking frozen.
 const PROGRESS_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -3866,11 +3903,19 @@ export function makeProgressNotifier(ctx) {
   };
   // Live worker activity panel: a persistent, scrolling list of the worker's recent thinking notes and
   // file/graph/tool operations, rendered above the editor like the planner. This is the "watch the agent
-  // work" surface — notify() can't be used for it because the host shows notifications transiently.
-  sink.setActivity = (lines) => {
+  // work" surface — notify() can't be used for it because the host shows notifications transiently. We render
+  // via the setWidget COMPONENT-FACTORY form so the panel matches Pi's native look: thinking is italic in the
+  // host's thinkingText color, tool/file ops are muted, the header is dim — using the real Theme the host
+  // passes in (no pi-tui import; Component is just { render(width), invalidate() }). `payload` is
+  // { tag, tools, elapsed_s, items:[{kind:"think"|"tool"|"text", detail}] }.
+  sink.setActivity = (payload) => {
     if (typeof ui.setWidget !== "function") return;
     try {
-      ui.setWidget(ACTIVITY_KEY, Array.isArray(lines) && lines.length ? lines : undefined, { placement: "aboveEditor" });
+      if (!payload || !Array.isArray(payload.items) || !payload.items.length) {
+        ui.setWidget(ACTIVITY_KEY, undefined, { placement: "aboveEditor" });
+        return;
+      }
+      ui.setWidget(ACTIVITY_KEY, (_tui, theme) => buildActivityComponent(payload, theme), { placement: "aboveEditor" });
     } catch {
       /* best-effort */
     }
