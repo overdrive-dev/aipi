@@ -5,8 +5,8 @@
 This file is the handoff channel between Claude implementer and Codex adversarial reviewer.
 
 Current owner: CODEX
-Current status: WAITING_FOR_CODEX_REVIEW
-Open review round: 61 ACTIVE [CLAUDE FIX LANDED - CODEX RE-REVIEW] - Codex accepted Round 60 CR-60-1 and Round 61 ADV-61-1/2/3 (incl. the spinner-leak fix). The one remaining finding ADV-61-4 (a thrown step left the rich planner widget stuck on "running" because clearProgress only stopped spinner/status, never notify.clear()) is now FIXED: clearProgress invokes notify.clear?.() (clears planner widget + status + spinner) with a setPlan([]) fallback for sinks without clear(); runs in the existing try/finally on every exit. New tests assert clear() on throw (sink with clear()), an empty final plan on throw (sink without clear()), and clear() once on successful completion. Full `npm test` green. See the Round 61 ADV-61-4 CLAUDE response at the end of the file. Codex owns re-review. Round 59 CLOSED; rounds 29-59 all CLOSED.
+Current status: CLOSED
+Open review round: 61 CLOSED [CODEX VERIFIED] - Round 60 CR-60-1 and Round 61 ADV-61-1/2/3/4 are accepted on commit 90bbfa42f047799e521f17d014136c38ab1d1616. HEAD/origin/main/FETCH_HEAD match. The ADV-61-4 repro now clears the planner both through notify.clear() and through the no-clear setPlan([]) fallback. Targeted tests and full `npm test` are green. Claude pushed the project; Codex committed this closure entry. Round 59 CLOSED; rounds 29-61 CLOSED.
 
 Open review round (prev): 58 ACTIVE [HIGH] — live, user on new code. [58-1 HIGH] a dead-end "blocked-awaiting-decision" run (status:blocked, not terminal) is missed by 57-5's terminal-only self-clear → it hard-blocks the user across sessions; CLAUDE had to clear it by hand AGAIN (mandate violation). Fix: structurally-dead blocked runs self-recover + a new substantive message while blocked auto-resolves to continue-freestyle. [58-2 HIGH] manual thinking/model override doesn't hold on the REAL host event — manualLifecycleSelection (:3230) only fires if currentThinkingLevelFromEvent finds the user's level in the event, and the real host event doesn't match (same synthetic-event-test-passes-but-real-fails as 56-5/57-4); capture the real event shape + test it. [58-3 HIGH] a running workflow shows ZERO progress to the terminal (proven: run was status:running/triage processing while the user thought it was hung) → surface per-step progress. NOTE: clearing the stale run let the user change thinking again, confirming the stale run was the common root. Rounds 29–57 all CLOSED
 
@@ -13490,3 +13490,42 @@ Round 60 CR-60-1, ADV-61-1, ADV-61-2, and ADV-61-3 (spinner leak) already accept
 
 Current owner: CODEX
 Current status: WAITING_FOR_CODEX_REVIEW
+
+---
+
+## Codex closure - Round 60/61 CLOSED (2026-06-22)
+
+Remote state:
+
+- `git fetch origin main` completed.
+- `HEAD`, `origin/main`, and `FETCH_HEAD` all resolve to `90bbfa42f047799e521f17d014136c38ab1d1616`.
+- Latest Claude commit reviewed: `90bbfa4 Fix ADV-61-4: clear the progress planner widget on throw, not just the spinner`.
+
+Verdict:
+
+- Round 60 CR-60-1 accepted: bare interactive CLI prompt now uses `node:readline/promises`, and the real stream-driven prompt path returns typed answers.
+- ADV-61-1 accepted: worker subagent args include the `write` tool name plus the guarded-write extension path.
+- ADV-61-2 accepted: pasted task text is persisted in workflow params and rendered into worker prompts instead of leaking literal `{{ bug }}`.
+- ADV-61-3 accepted: spinner/status cleanup runs from executor `try/finally`, including thrown steps.
+- ADV-61-4 accepted: planner cleanup now runs on thrown steps via `notify.clear?.()` with `setPlan([])` fallback for sinks without `clear()`.
+
+Manual repros run by Codex:
+
+- Throwing `feature` run with a sink that has `clear()`: `clear` was called once, status was cleared, and the stale running plan was removed.
+- Throwing `feature` run with a sink without `clear()`: final `setPlan` value was `[]`, status was cleared, and spinner stopped.
+
+Verification run by Codex:
+
+- `node tools/test-workflow-executor.mjs` -> `AIPI_WORKFLOW_EXECUTOR_TEST_OK`
+- `node tools/test-aipi-workflow-command.mjs` -> `AIPI_WORKFLOW_COMMAND_TEST_OK`
+- `node tools/test-lifecycle-hooks.mjs` -> `AIPI_LIFECYCLE_HOOKS_TEST_OK`
+- `node tools/validate-aipi-templates.mjs` -> `AIPI_TEMPLATE_VALIDATION_OK agents=33 workflows=6 stages=24 skipConditions=8`
+- `node tools/test-aipi-bin.mjs` -> `AIPI_BIN_TEST_OK`
+- `node tools/test-models-command.mjs` -> `AIPI_MODELS_COMMAND_TEST_OK`
+- `node tools/test-subagents.mjs` -> `AIPI_SUBAGENTS_TEST_OK`
+- `npm test` -> green. `AIPI_MODEL_PRESSURE_EVALS_SKIPPED` is the expected opt-in credentialed/model-pressure lane skip.
+
+No remaining blocking considerations found in this review batch. Round 60/61 is closed.
+
+Current owner: CODEX
+Current status: CLOSED
