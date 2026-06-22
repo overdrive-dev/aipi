@@ -14,6 +14,13 @@ const terminalActions = new Set([
   "escalate_to_planning",
 ]);
 
+const PROGRESS_PHASE_LABELS = {
+  running: "running…",
+  passed: "passed",
+  skipped: "skipped",
+  blocked: "blocked",
+};
+
 const DEFAULT_TRANSIENT_PROVIDER_RETRY = {
   maxAttempts: 3,
   baseDelayMs: 250,
@@ -27,6 +34,7 @@ export async function executeWorkflowRun({
   adapter = createLocalWorkflowAdapter(),
   now = () => new Date(),
   parentInteractiveToolCallHook = "registered_parent_interactive_tool_call_hook",
+  notify = null,
 } = {}) {
   if (!projectRoot) throw new Error("projectRoot is required");
   const root = path.resolve(projectRoot);
@@ -44,6 +52,19 @@ export async function executeWorkflowRun({
   const maxVisitsPerStep = runLimits.maxVisitsPerStep ?? Number.POSITIVE_INFINITY;
   const maxConsecutiveFailures = runLimits.maxConsecutiveFailures ?? Number.POSITIVE_INFINITY;
   const events = [];
+  // ADV-58-3: surface per-step progress to the terminal so a long run does not look frozen.
+  const totalSteps = workflow.steps.length;
+  const stepNumberById = new Map(workflow.steps.map((step, index) => [step.id, index + 1]));
+  const emitProgress = (stepId, phase) => {
+    if (typeof notify !== "function") return;
+    const n = stepNumberById.get(stepId) ?? "?";
+    const verb = PROGRESS_PHASE_LABELS[phase] ?? phase;
+    try {
+      notify(`AIPI ${state.workflow}: ${stepId} (${n}/${totalSteps}) ${verb}`, "info");
+    } catch {
+      /* progress is best-effort and must never break execution */
+    }
+  };
 
   state.status = "running";
   state.execution_mode = state.workflow === "quick" ? "local-quick-slice-v1" : "local-workflow-slice-v1";
@@ -96,12 +117,14 @@ export async function executeWorkflowRun({
         createdAt: blockedAt,
       });
       events.push({ type: "blocked", step_id: blockedStep.id, reason, blocked_dependency: step.id });
+      emitProgress(blockedStep.id, "blocked");
       break;
     }
 
     state.step_visits[step.id] = (state.step_visits[step.id] ?? 0) + 1;
     markStep(state, step.id, { status: "running", started_at: now().toISOString() });
     state.current_step = step.id;
+    emitProgress(step.id, "running");
     await persistRunState(root, state);
 
     let context = null;
@@ -125,6 +148,7 @@ export async function executeWorkflowRun({
         createdAt: blockedAt,
       });
       events.push({ type: "blocked", step_id: step.id, reason: error.message });
+      emitProgress(step.id, "blocked");
       await persistRunState(root, state);
       break;
     }
@@ -156,6 +180,7 @@ export async function executeWorkflowRun({
         skip_condition: result.skip_condition ?? null,
       });
       events.push({ type: status, step_id: step.id, verdict: result.verdict });
+      emitProgress(step.id, status);
       state.consecutive_failures = 0;
       if (state.awaiting_user_input?.step_id === step.id) state.awaiting_user_input = null;
       state.current_step = nextStepId(workflow, step);
@@ -206,6 +231,7 @@ export async function executeWorkflowRun({
         step_id: step.id,
         reason: error,
       });
+      emitProgress(step.id, "blocked");
       await persistRunState(root, state);
       break;
     }
@@ -247,6 +273,7 @@ export async function executeWorkflowRun({
           createdAt: blockedAt,
         })
       : null;
+    if (awaitingUserInput || state.status === "blocked") emitProgress(step.id, "blocked");
     await persistRunState(root, state);
   }
 
@@ -1185,17 +1212,54 @@ function awaitingUserDecisionForBlockedGate({ step, result = null, reason = "", 
       result?.user_question ||
       result?.question,
   );
-  return awaitingUserInputFromStepResult({
+  const resolvedResult = hasQuestion
+    ? result
+    : {
+        ...(result ?? {}),
+        blocker_question: defaultBlockedGateQuestion({ step, reason }),
+      };
+  const awaiting = awaitingUserInputFromStepResult({
     step,
-    result: hasQuestion
-      ? result
-      : {
-          ...(result ?? {}),
-          blocker_question: defaultBlockedGateQuestion({ step, reason }),
-        },
+    result: resolvedResult,
     reason,
     createdAt,
   });
+  // ADV-58-1: tag the freestyle/retry/cancel META-decision so it can self-recover.
+  // This is the run-level "how do you want to proceed" picker (default blocked gate or
+  // transient-provider block), NOT a real business blocker_question. We detect it by the
+  // options matching the workflow meta set so a substantive new message can auto-detach
+  // instead of trapping the user.
+  if (isWorkflowBlockedDecisionOptions(awaiting.options)) {
+    awaiting.kind = WORKFLOW_BLOCKED_DECISION_KIND;
+  }
+  return awaiting;
+}
+
+export const WORKFLOW_BLOCKED_DECISION_KIND = "workflow_blocked_decision";
+
+const WORKFLOW_BLOCKED_DECISION_OPTION_TOKENS = [
+  "continuar fora do workflow automatico",
+  "tentar executar este workflow novamente",
+  "cancelar este run",
+];
+
+export function isWorkflowBlockedDecisionOptions(options) {
+  if (!Array.isArray(options) || options.length < 2) return false;
+  const normalized = options.map((option) =>
+    String(option ?? "")
+      .normalize("NFD")
+      .replace(/[̀-ͯ]/g, "")
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
+  const matched = WORKFLOW_BLOCKED_DECISION_OPTION_TOKENS.filter((token) =>
+    normalized.some((option) => option.includes(token)),
+  );
+  // Require at least the continue-freestyle and one of retry/cancel to be present so a
+  // genuine business blocker that happens to reuse one phrase is not misclassified.
+  return matched.length >= 2 &&
+    normalized.some((option) => option.includes("continuar fora do workflow automatico"));
 }
 
 function defaultBlockedGateQuestion({ step, reason = "" } = {}) {

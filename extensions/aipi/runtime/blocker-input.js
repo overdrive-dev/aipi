@@ -47,12 +47,13 @@ export function awaitingUserInputFromStepResult({
   result,
   reason = "",
   createdAt,
+  kind = null,
 } = {}) {
   const blocker = blockerQuestionFromStepResult(result, {
     fallbackQuestion: reason,
     fallbackReason: reason,
   });
-  return {
+  const awaiting = {
     step_id: step?.id ?? result?.step_id ?? null,
     reason,
     created_at: createdAt ?? new Date().toISOString(),
@@ -60,6 +61,8 @@ export function awaitingUserInputFromStepResult({
     options: blocker.options,
     allow_free_text: true,
   };
+  if (kind) awaiting.kind = kind;
+  return awaiting;
 }
 
 export function formatAwaitingUserInputPrompt(awaiting = {}) {

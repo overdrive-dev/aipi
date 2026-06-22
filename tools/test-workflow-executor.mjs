@@ -20,6 +20,8 @@ import {
 } from "../extensions/aipi/runtime/run-state.js";
 import { rebuildCodeGraph } from "../extensions/aipi/runtime/aipi-tools.js";
 
+const PROGRESS_TERMINAL_VERBS = { passed: "passed", skipped: "skipped", blocked: "blocked" };
+
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-workflow-executor-"));
 const sourceRoot = path.resolve("templates/.aipi");
 const fixedDate = new Date("2026-06-16T12:34:56.789Z");
@@ -702,6 +704,53 @@ try {
   assert.equal(perStepLimit.status, "escalated_to_human");
   assert.equal(perStepLimit.state.step_visits.quick_change, 2);
   assert.match(perStepLimit.state.blocked_reason, /maxVisitsPerStep exhausted for quick_change/);
+
+  // ADV-58-3: a running workflow surfaces per-step progress to the terminal.
+  const progressRun = await startWorkflowRun({
+    projectRoot: tempRoot,
+    workflow: "feature",
+    now: () => fixedDate,
+    randomBytes: fixedRandom,
+  });
+  const progressNotifications = [];
+  const progressExecution = await executeWorkflowRun({
+    projectRoot: tempRoot,
+    runId: progressRun.runId,
+    now: () => fixedDate,
+    adapter: createTestPassWorkflowAdapter(),
+    notify: (message, kind) => progressNotifications.push({ message, kind }),
+  });
+  assert.equal(progressExecution.status, "completed");
+  const executedStepTransitions = progressExecution.events.filter((event) =>
+    ["passed", "skipped", "blocked"].includes(event.type),
+  );
+  assert.ok(executedStepTransitions.length >= 1, "executor produced at least one step transition");
+  // Every executed step must have a "running…" start notification and a terminal-phase line.
+  for (const event of executedStepTransitions) {
+    const n = progressExecution.state.steps.findIndex((step) => step.id === event.step_id) + 1;
+    assert.ok(
+      progressNotifications.some((note) =>
+        note.message.includes(`feature: ${event.step_id} (${n}/`) && note.message.includes("running…"),
+      ),
+      `progress notified running… for ${event.step_id}`,
+    );
+    assert.ok(
+      progressNotifications.some((note) =>
+        note.message.includes(`feature: ${event.step_id} (`) &&
+        new RegExp(`\\b(${PROGRESS_TERMINAL_VERBS[event.type]})$`).test(note.message),
+      ),
+      `progress notified ${event.type} for ${event.step_id}`,
+    );
+  }
+  // At least one user-visible progress notification per executed step transition.
+  assert.ok(
+    progressNotifications.length >= executedStepTransitions.length,
+    "at least one progress notification per executed step transition",
+  );
+  assert.ok(
+    progressNotifications.every((note) => note.kind === "info"),
+    "progress notifications are info-level and non-blocking",
+  );
 
   const policyStep = quick.steps[0];
   const policyState = {

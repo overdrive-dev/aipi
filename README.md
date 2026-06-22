@@ -17,7 +17,7 @@ Alpha. What exists today:
   memory, model classes) and a machine-readable `runtime-contract.json`, all
   enforced by a structured validator + CI.
 - A Pi extension with working commands: `/aipi-init`, `/aipi-status`,
-  `/aipi-workflow`, `/aipi-memory`, `/aipi-models`, `/aipi-mcp`, `/aipi-probe-a`,
+  `/aipi-workflow`, `/aipi-memory`, `/aipi-effort` (alias `/aipi-models`), `/aipi-mcp`, `/aipi-probe-a`,
   `/aipi-probe-a-prime`.
 - An optional MCP bridge extension. When a project has `.aipi/mcp.json`, the
   `aipi` wrapper starts configured stdio MCP servers and exposes their tools to
@@ -91,8 +91,9 @@ aipi workflow list
 aipi workflow status
 aipi memory status
 aipi memory query business rules
-aipi models status
-aipi models setup --class context-fast=anthropic/<cheap-fast-model>
+aipi effort status
+aipi effort setup --planner openai-codex/gpt-5.5:high --adversarial anthropic/claude-opus-4-8:high --doer openai-codex/gpt-5.5:medium --mover anthropic/claude-haiku-4-5:low
+aipi models status   # alias of aipi effort
 aipi "/aipi-status"
 aipi "/aipi-mcp"
 ```
@@ -105,12 +106,16 @@ starting a Pi session. `aipi workflow
 [--target <dir>] [--json] ...` exposes workflow list/status/start/run/execute
 from the console using the same run-state runtime as `/aipi-workflow`. `aipi memory
 [--target <dir>] [--json] ...` exposes read-only memory status/refs/query using
-the same Markdown memory query runtime as `aipi_memory_query`. `aipi models setup`
-runs an interactive terminal fallback when no flags are provided and can bind each
-model class with `--class <class>=<provider/model>` or the per-class prompts.
-Until the host adapter supports non-Anthropic providers, GPT/Codex models should
-be configured as adversarial reviewers or worker classes, not as the interactive
-host/orchestrator model. `aipi --version`
+the same Markdown memory query runtime as `aipi_memory_query`. `aipi effort setup`
+(aliased as `aipi models setup`) configures 4 provider-agnostic buckets —
+`--planner`, `--adversarial`, `--doer`, `--mover` — each taking a
+`provider/model[:level]` spec (level = low|medium|high|xhigh). Each bucket fans its
+model out to its capability classes and its thinking level out to a persisted
+per-class `class_thinking` map that the router reads at resolve time. It runs an
+interactive terminal fallback (prompting the 4 buckets) when no flags are provided,
+and keeps `--class <class>=<provider/model[:level]>` as a power-user override. Any
+provider is allowed per bucket; setting the adversarial bucket to the same family as
+the doer/planner bucket emits a cross-model-independence warning. `aipi --version`
 reports both the AIPI package and wrapped Pi versions; use `aipi --pi-help` for
 the raw Pi flag reference. Point at a specific Pi with `AIPI_PI_CLI_JS` or
 `AIPI_PI_BIN`. See

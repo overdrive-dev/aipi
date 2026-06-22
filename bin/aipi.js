@@ -455,7 +455,7 @@ export function classifyAipiInvocation(userArgs = []) {
   if (first === "status" || first === "doctor") return { kind: "aipi-status", args: userArgs.slice(1) };
   if (first === "workflow" || first === "workflows") return { kind: "aipi-workflow", args: userArgs.slice(1) };
   if (first === "memory" || first === "memories") return { kind: "aipi-memory", args: userArgs.slice(1) };
-  if (first === "models" || first === "model") return { kind: "aipi-models", args: userArgs.slice(1) };
+  if (first === "effort" || first === "models" || first === "model") return { kind: "aipi-models", args: userArgs.slice(1) };
   if (first === "onboard" || first === "onboarding") return { kind: "aipi-onboard", args: userArgs.slice(1) };
   if (first === "diagnose" || first === "diagnostics") return { kind: "aipi-diagnose", args: userArgs.slice(1) };
   if (first === "update") return { kind: "aipi-update", args: userArgs.slice(1) };
@@ -624,9 +624,17 @@ export async function runAipiWorkflow({
 
   try {
     const fns = workflowFns ?? await import("../extensions/aipi/runtime/run-state.js");
+    // CR-59-3 / ADV-58-3: surface per-step progress on the CLI workflow surface so a long
+    // `run`/`execute` is not a silent black box. Progress goes to STDERR (errorLog) so it never
+    // corrupts the stdout result, and is suppressed entirely under --json to keep machine output
+    // a single clean JSON document (`aipi workflow ... --json | jq` stays parseable).
+    const notify = options.json
+      ? null
+      : (message) => errorLog(`aipi workflow: ${message}`);
     const result = await fns.runWorkflowCommand({
       args: options.workflowArgs.join(" "),
       projectRoot: options.target,
+      notify,
     });
     log(options.json ? JSON.stringify(result, null, 2) : fns.formatWorkflowCommandResult(result));
     return result;
@@ -785,7 +793,9 @@ export function formatAipiHelp({ aipiVersion }) {
     "  /aipi-status",
     "  /aipi-workflow [list | status | start <name> | run <name> | execute]",
     "  /aipi-memory [status | refs | query <terms>]",
-    "  /aipi-models [setup | status | check] [--host <provider/model>] [--adversarial <provider/model>] [--class <class>=<provider/model>]",
+    "  /aipi-effort [setup | status | check] [--planner <spec>] [--adversarial <spec>] [--doer <spec>] [--mover <spec>] [--class <class>=<spec>]",
+    "                  spec = provider/model[:level] (level = low|medium|high|xhigh); 4 provider-agnostic buckets",
+    "  /aipi-models [setup | status | check]  (alias of /aipi-effort)",
     "  /aipi-diagnose [<run_id>] [--share] [--json]",
     "  /aipi-mcp",
     "  /aipi-probe-a",
@@ -800,8 +810,9 @@ export function formatAipiHelp({ aipiVersion }) {
     "                  Inspect or drive AIPI workflow state outside a Pi session",
     "  aipi memory [--target <dir>] [--json] [status|refs|query <terms>]",
     "                  Inspect AIPI Markdown memory and code graph state outside a Pi session",
-    "  aipi models [--target <dir>] [--json] [setup|status|check] [--host <provider/model>] [--adversarial <provider/model>] [--class <class>=<provider/model>]",
-    "                  Configure and validate host/adversarial/per-class model topology",
+    "  aipi effort [--target <dir>] [--json] [setup|status|check] [--planner <spec>] [--adversarial <spec>] [--doer <spec>] [--mover <spec>] [--class <class>=<spec>]",
+    "                  Configure the 4-bucket (planner/adversarial/doer/mover) provider-agnostic model topology; each bucket = (model, thinking level)",
+    "  aipi models [--target <dir>] [--json] ...   Alias of aipi effort",
     "  aipi onboard [--target <dir>] [--json] [--no-questions] [--no-pull-embeddings]",
     "                  Inventory a project and seed AIPI project memory outside a Pi session",
     "  aipi diagnose [<run_id>] [--target <dir>] [--share] [--json]",

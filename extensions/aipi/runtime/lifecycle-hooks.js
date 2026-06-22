@@ -14,7 +14,12 @@ import {
   runWorkflowCommand,
 } from "./run-state.js";
 import { latestSubagentStateFromEntries } from "./subagents.js";
-import { createSubagentWorkflowAdapter, parseWorkflowDefinition } from "./workflow-executor.js";
+import {
+  createSubagentWorkflowAdapter,
+  isWorkflowBlockedDecisionOptions,
+  parseWorkflowDefinition,
+  WORKFLOW_BLOCKED_DECISION_KIND,
+} from "./workflow-executor.js";
 import { describeModel, resolveModelClass, resolveStepModel } from "./model-router.js";
 import { aipiImpact } from "./aipi-tools.js";
 import { aipiHostModelReadiness } from "./pi-subagents.js";
@@ -311,7 +316,11 @@ export async function handleInput({
 } = {}) {
   if (routingDisabled(event, ctx)) return { action: "continue" };
   if (!(await isAipiInstalled(projectRoot))) return { action: "continue" };
-  const active = await readActiveRun(projectRoot).catch(() => null);
+  // keepBlockedDecision: handleInput owns the EXPLICIT auto-detach of a workflow-blocked-decision
+  // run (notify + audit + abandon, see the auto-detach branch below). Let it see that run rather
+  // than have readActiveRun silently auto-clear it from under us (CR-59-2 central recovery still
+  // covers every OTHER hook that consults the active run).
+  const active = await readActiveRun(projectRoot, { keepBlockedDecision: true }).catch(() => null);
   const codePipeline = classifyAipiCodePipeline(event?.text ?? "", { activeRun: active, projectRoot });
   const hostBlock = await blockUnsupportedHostTurn({
     hook: "input",
@@ -452,6 +461,38 @@ export async function handleInput({
           source: event?.source ?? "blocked_text",
         });
       }
+      // ADV-58-1: a dead-end run blocked on the freestyle/retry/cancel meta-decision must
+      // self-recover. A NEW substantive message (not a picker selection) means the user
+      // moved on, so auto-detach (abandon + clear runs/active) and reprocess the input as a
+      // FRESH turn. The user must NEVER be trapped re-prompted across sessions.
+      if (isWorkflowBlockedDecisionRun(active) && isFreshSubstantiveBlockedInput(event?.text)) {
+        await applyBlockedRunTerminalAction({
+          ctx,
+          pi,
+          projectRoot,
+          active,
+          answer: event?.text,
+          terminalAction: {
+            status: "abandoned",
+            code: "blocked_run_auto_detached",
+            message:
+              "AIPI destacou o run bloqueado automaticamente; tratando sua nova mensagem fora do workflow automatico.",
+          },
+          source: event?.source ?? "blocked_auto_detach",
+        });
+        // Reprocess as a fresh turn now that runs/active is cleared.
+        return handleInput({
+          event,
+          ctx,
+          pi,
+          projectRoot,
+          coordinator,
+          workflowCommandRunner,
+          userInputRecorder,
+          intentClassifier,
+          intentClassifierTimeoutMs,
+        });
+      }
       safeAppendEntry(pi, "aipi.input.route", {
         schema: "aipi.input-route.v1",
         routed_at: new Date().toISOString(),
@@ -528,6 +569,7 @@ export async function handleInput({
       projectRoot,
       adapter,
       parentInteractiveToolCallHook: "registered_parent_interactive_tool_call_hook",
+      notify: makeProgressNotifier(ctx),
     });
     const blockedAfterCommand = activeRunFromWorkflowCommandResult(result);
     if (route.recordInputAfterDispatch && blockedAfterCommand?.runId) {
@@ -706,6 +748,7 @@ export async function handleBlockedRunPicker({
       projectRoot,
       adapter,
       parentInteractiveToolCallHook: "registered_parent_interactive_tool_call_hook",
+      notify: makeProgressNotifier(ctx),
     });
     safeAppendEntry(pi, "aipi.input.route", {
       schema: "aipi.input-route.v1",
@@ -1457,6 +1500,33 @@ function isAwaitingUserInput(activeRun) {
       activeRun?.state?.status === "blocked" &&
       activeRun?.state?.awaiting_user_input?.step_id,
   );
+}
+
+// ADV-58-1: a run blocked on the run-level freestyle/retry/cancel META-decision (NOT a
+// real business blocker_question). Detection is exact: the executor stamps
+// awaiting_user_input.kind = "workflow_blocked_decision" for these, and we also accept
+// the meta option-set as a robust fallback for runs persisted before the kind marker.
+function isWorkflowBlockedDecisionRun(activeRun) {
+  if (!isAwaitingUserInput(activeRun)) return false;
+  const awaiting = activeRun.state.awaiting_user_input;
+  if (awaiting?.kind === WORKFLOW_BLOCKED_DECISION_KIND) return true;
+  return isWorkflowBlockedDecisionOptions(awaiting?.options);
+}
+
+// A new substantive message is one that is NOT selecting one of the meta options and NOT
+// a bare picker token (1/2/3/retry/cancel/continue/continuar). Such a message means the
+// user moved on; we auto-resolve to "continue outside the workflow".
+function isFreshSubstantiveBlockedInput(text) {
+  const raw = String(text ?? "").trim();
+  if (!raw) return false;
+  if (raw.startsWith("/") || raw.startsWith("@")) return false;
+  if (blockerTerminalAction(raw)) return false;
+  const normalized = normalizeInputText(raw);
+  if (/^[1-3]$/.test(normalized)) return false;
+  if (/^(ok\s+)?(retry|tentar|tentar novamente|novamente|cancel|cancelar|continue|continuar|continua|seguir|segue|prossiga|prosseguir)$/.test(normalized)) {
+    return false;
+  }
+  return true;
 }
 
 function blockerTerminalAction(value) {
@@ -3210,7 +3280,11 @@ function currentModelFromEvent(event, ctx) {
 
 function currentThinkingLevelFromEvent(event, ctx) {
   return stringOrNull(
-    event?.selected_thinking_level ??
+    // The real Pi ThinkingLevelSelectEvent carries the user's chosen level in `event.level`
+    // (see @earendil-works/pi-coding-agent dist/core/extensions/types.d.ts ThinkingLevelSelectEvent).
+    // Earlier field names below were never populated by the host, so manual selection was lost (ADV-58-2).
+    event?.level ??
+      event?.selected_thinking_level ??
       event?.selectedThinkingLevel ??
       event?.current_thinking_level ??
       event?.currentThinkingLevel ??
@@ -3618,6 +3692,13 @@ function safeNotify(ctx, message, kind) {
   } catch {
     /* best-effort UI signal */
   }
+}
+
+// ADV-58-3: bind a cheap, non-blocking progress-notification surface to ctx so the
+// executor can stream per-step transitions to the terminal instead of looking frozen.
+export function makeProgressNotifier(ctx) {
+  if (typeof ctx?.ui?.notify !== "function") return null;
+  return (message, kind = "info") => safeNotify(ctx, message, kind);
 }
 
 function stringOrNull(value) {

@@ -749,8 +749,16 @@ try {
 
     const explicit = await runWorkflowCommand({ args: "run bugfix", projectRoot: routerRoot });
     assert.equal(explicit.action, "run");
-    const activeAfterExplicit = await readActiveRun(routerRoot);
+    // routerRoot has no executable adapter, so `run bugfix` dead-ends on the workflow
+    // freestyle/retry/cancel meta-decision (status:blocked, kind:workflow_blocked_decision).
+    // Inspect with keepBlockedDecision to confirm the explicit command set the active run to
+    // bugfix WITHOUT triggering CR-59-2 central recovery (the same "look, don't auto-detach"
+    // path handleInput uses to run its explicit notify+audit detach).
+    const activeAfterExplicit = await readActiveRun(routerRoot, { keepBlockedDecision: true });
     assert.equal(activeAfterExplicit.state.workflow, "bugfix");
+    // A plain default read self-recovers the structurally-dead meta-decision run (CR-59-2): it
+    // clears runs/active and persists the run as abandoned, so no later hook re-traps the user.
+    assert.equal(await readActiveRun(routerRoot), null);
   } finally {
     await fs.rm(routerRoot, { recursive: true, force: true });
   }
@@ -878,10 +886,12 @@ try {
   assert.equal(notifications.at(-1).kind, "error");
 
   const manualModelSelectionCount = modelSelections.length;
+  // ADV-58-2: real Pi ModelSelectEvent shape (model/previousModel/source), not synthetic current_model.
   const manualModelRoute = await handlers.model_select({
     type: "model_select",
-    current_model: { provider: "anthropic", id: "manual" },
-    source: "interactive",
+    model: { provider: "anthropic", id: "manual" },
+    previousModel: { provider: "anthropic", id: "claude-opus-4-8" },
+    source: "set",
     env: { AIPI_MODEL_CLASS_PLANNER_HEAVY: "anthropic/claude-planner:high" },
   }, ctx);
   assert.equal(manualModelRoute, undefined);
@@ -889,8 +899,9 @@ try {
 
   const unsupportedManualModelRoute = await handlers.model_select({
     type: "model_select",
-    current_model: { provider: "openai-codex", id: "gpt-5.5" },
-    source: "interactive",
+    model: { provider: "openai-codex", id: "gpt-5.5" },
+    previousModel: { provider: "anthropic", id: "claude-opus-4-8" },
+    source: "set",
   }, ctx);
   assert.equal(unsupportedManualModelRoute.blocked, true);
   assert.equal(unsupportedManualModelRoute.status, "unsupported_host_model");
@@ -898,10 +909,12 @@ try {
   assert.equal(modelSelections.length, manualModelSelectionCount);
 
   const manualThinkingSelectionCount = thinkingSelections.length;
+  // ADV-58-2: use the REAL Pi ThinkingLevelSelectEvent shape (level/previousLevel), not a synthetic
+  // selected_thinking_level field the host never sends — proves the manual level is actually preserved.
   const manualThinkingRoute = await handlers.thinking_level_select({
     type: "thinking_level_select",
-    selected_thinking_level: "medium",
-    source: "interactive",
+    level: "medium",
+    previousLevel: "low",
     env: { AIPI_THINKING_PLANNER_HEAVY: "low" },
   }, ctx);
   assert.equal(manualThinkingRoute, undefined);

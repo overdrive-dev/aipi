@@ -74,6 +74,7 @@ export async function runWorkflowCommand({
   projectRoot,
   adapter = undefined,
   parentInteractiveToolCallHook = "registered_parent_interactive_tool_call_hook",
+  notify = null,
 } = {}) {
   if (!projectRoot) throw new Error("projectRoot is required");
   const command = parseWorkflowArgs(args);
@@ -89,7 +90,7 @@ export async function runWorkflowCommand({
   if (command.action === "execute") {
     return {
       action: "execute",
-      execution: await executeWorkflowRun({ projectRoot, adapter, parentInteractiveToolCallHook }),
+      execution: await executeWorkflowRun({ projectRoot, adapter, parentInteractiveToolCallHook, notify }),
     };
   }
 
@@ -104,7 +105,7 @@ export async function runWorkflowCommand({
     return {
       action: "run",
       run: started,
-      execution: await executeWorkflowRun({ projectRoot, runId: started.runId, adapter, parentInteractiveToolCallHook }),
+      execution: await executeWorkflowRun({ projectRoot, runId: started.runId, adapter, parentInteractiveToolCallHook, notify }),
     };
   }
 
@@ -189,7 +190,7 @@ export async function startWorkflowRun({
   };
 }
 
-export async function readActiveRun(projectRoot, { includeTerminal = false } = {}) {
+export async function readActiveRun(projectRoot, { includeTerminal = false, keepBlockedDecision = false } = {}) {
   const root = path.resolve(projectRoot);
   const activePath = path.join(root, ".aipi", "runtime", "runs", "active");
   const runId = (await fs.readFile(activePath, "utf8").catch((error) => {
@@ -205,7 +206,31 @@ export async function readActiveRun(projectRoot, { includeTerminal = false } = {
     await clearActiveRun(root, runId);
     return null;
   }
+  // CR-59-2 / ADV-58-1: a structurally-dead run that is `blocked` only on the workflow
+  // freestyle/retry/cancel META-decision is NOT a terminal status, so the terminal self-clear above
+  // misses it — and it would otherwise stay `active` forever, re-trapping the user on every read /
+  // fresh session. Auto-detach it centrally here (abandon + clear active) so no one resurrects it.
+  // `keepBlockedDecision` is the ONE opt-out: handleInput passes it so its explicit auto-detach path
+  // (which also notifies + audits the user) runs instead of this silent central clear.
+  if (!includeTerminal && !keepBlockedDecision && isRecoverableBlockedDecision(state)) {
+    const at = new Date().toISOString();
+    state.status = "abandoned";
+    state.awaiting_user_input = null;
+    state.current_step = null;
+    state.abandoned_at = at;
+    state.abandon_reason = state.abandon_reason || "auto-detached stale workflow-blocked decision run";
+    state.closed_by = "system_auto_recover";
+    state.closed_at = at;
+    await persistRunState(root, state);
+    await clearActiveRun(root, runId);
+    return null;
+  }
   return { runId, state };
+}
+
+function isRecoverableBlockedDecision(state) {
+  return String(state?.status ?? "").toLowerCase() === "blocked" &&
+    state?.awaiting_user_input?.kind === "workflow_blocked_decision";
 }
 
 export async function clearActiveRun(projectRoot, runId = null) {

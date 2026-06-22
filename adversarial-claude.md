@@ -2,11 +2,15 @@
 
 ## Coordination protocol
 
-This file is the handoff channel between Claude reviewer and Codex implementer.
+This file is the handoff channel between Claude implementer and Codex adversarial reviewer.
 
-Current owner: CLAUDE
-Current status: CLOSED
-Open review round: 57 CLOSED — model-topology control, all 5 items verified (4 first pass + 57-4 on second). User now needs ZERO manual intervention (★ system mandate): thinking/model selections respected (57-1/57-3), `aipi models` interactive+per-class from CLI (57-2), stuck runs self-recover + "Cancelar este run" clears active (57-5), and a non-Anthropic host turn is BLOCKED with a clear message + persisted stack instead of the .includes crash (57-4, proven by repro that handleInput/before_agent_start now return action:blocked for gpt-5.5 host while opus continues and the gpt-5.5 reviewer path is unaffected). Rounds 29–57 all CLOSED
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX_REVIEW
+Open review round: 59 ACTIVE [CLAUDE FIXES LANDED — CODEX RE-REVIEW] — Claude addressed CR-59-1 (ledger header/tail now agree — both CODEX/WAITING_FOR_CODEX_REVIEW), CR-59-2 (central self-recovery of structurally-dead `workflow_blocked_decision` runs in `readActiveRun`, with a `keepBlockedDecision` opt-out for handleInput's explicit notify+audit auto-detach; new run-state proof), and CR-59-3 (per-step progress wired to BOTH explicit surfaces — `/aipi-workflow` via `makeProgressNotifier(ctx)`, CLI `aipi workflow` via stderr in human mode / suppressed under `--json`; new Pi-handler + CLI tests). Full `npm test` chain green (exit 0). See the Round 59 CLAUDE response at the end of this file. Codex owns re-review.
+
+Open review round (prev): 58 ACTIVE [HIGH] — live, user on new code. [58-1 HIGH] a dead-end "blocked-awaiting-decision" run (status:blocked, not terminal) is missed by 57-5's terminal-only self-clear → it hard-blocks the user across sessions; CLAUDE had to clear it by hand AGAIN (mandate violation). Fix: structurally-dead blocked runs self-recover + a new substantive message while blocked auto-resolves to continue-freestyle. [58-2 HIGH] manual thinking/model override doesn't hold on the REAL host event — manualLifecycleSelection (:3230) only fires if currentThinkingLevelFromEvent finds the user's level in the event, and the real host event doesn't match (same synthetic-event-test-passes-but-real-fails as 56-5/57-4); capture the real event shape + test it. [58-3 HIGH] a running workflow shows ZERO progress to the terminal (proven: run was status:running/triage processing while the user thought it was hung) → surface per-step progress. NOTE: clearing the stale run let the user change thinking again, confirming the stale run was the common root. Rounds 29–57 all CLOSED
+
+Open review round (prev): 57 CLOSED — model-topology control, all 5 items verified (4 first pass + 57-4 on second). User now needs ZERO manual intervention (★ system mandate): thinking/model selections respected (57-1/57-3), `aipi models` interactive+per-class from CLI (57-2), stuck runs self-recover + "Cancelar este run" clears active (57-5), and a non-Anthropic host turn is BLOCKED with a clear message + persisted stack instead of the .includes crash (57-4, proven by repro that handleInput/before_agent_start now return action:blocked for gpt-5.5 host while opus continues and the gpt-5.5 reviewer path is unaffected). Rounds 29–57 all CLOSED
 
 Open review round (prev): 57 ACTIVE [HIGH] — model-topology control. CLAUDE verified (6 component tests + validate + npm test green + direct repros): 4 of 5 ACCEPTED — 57-1/57-3 (explicit user model/thinking selection now preserved, manual_*_preserved proven), 57-2 (aipi models setup interactive + PER-CLASS from CLI, context-fast≠host written+resolves), 57-5 (★ system-mandate: "Cancelar este run" → readActiveRun===null, run cancelled, no executor re-entry; stale-active self-clear). HANDED BACK 57-4 [CRITICAL]: the unsupported-host guard fires ONLY on workflow dispatch (lifecycle-hooks.js:338,356); proven by repro that handleInput/before_agent_start with host=gpt-5.5 are NOT intercepted ({action:continue}), so the plain-turn .includes crash persists, and the error-recorder wraps hooks that don't throw → won't capture it. Must block a non-Anthropic host on EVERY turn (before_agent_start OR loud model_select-time block) + reproduce the real stack. ★ SYSTEM-LEVEL MANDATE stands. Rounds 29–56 all CLOSED
 
@@ -24,12 +28,13 @@ by a command that actually executes (self-stamped PASS is not evidence - see WF-
 
 Rules:
 
-- Claude writes a new review round and sets `Current owner: CODEX` plus `Current status: WAITING_FOR_CODEX`.
-- Codex implements the actionable fixes, records the changed files, validation run, and residual risks, then sets `Current owner: CLAUDE` plus `Current status: WAITING_FOR_CLAUDE`.
-- Claude only starts the next review when the status is `WAITING_FOR_CLAUDE`.
-- Codex only starts implementation when the status is `WAITING_FOR_CODEX`, unless the user explicitly asks to continue.
-- Codex works in batches of up to 5 findings per implementation handoff, ordered by severity: Critical, High, Medium, then Low.
-- The loop ends only when Claude writes an approval/closure round and sets `Current status: CLOSED`.
+- Claude implements the requested code changes and sets `Current owner: CODEX` plus `Current status: WAITING_FOR_CODEX_REVIEW` when ready for adversarial review.
+- Codex reviews Claude's implementation adversarially, records blocking findings and required proof tests, then sets `Current owner: CLAUDE` plus `Current status: WAITING_FOR_CLAUDE_FIXES` when changes are required.
+- If Codex finds no blocking issues, Codex records the closure evidence and sets `Current status: CLOSED`.
+- Claude only starts another implementation pass when the status is `WAITING_FOR_CLAUDE_IMPLEMENTATION` or `WAITING_FOR_CLAUDE_FIXES`.
+- Codex only starts adversarial review when the status is `WAITING_FOR_CODEX_REVIEW`, unless the user explicitly asks to continue.
+- Codex reviews in batches of up to 5 findings, ordered by severity: Critical, High, Medium, then Low.
+- The loop ends only when Codex writes an approval/closure round and sets `Current status: CLOSED`.
 
 ---
 
@@ -12775,3 +12780,262 @@ Residual risk / honesty:
 - I still did not run a live credentialed Pi SDK turn in this terminal. The interceptable AIPI hook surfaces now block before the plain host turn reaches the unsupported provider layer; if Pi has an earlier provider crash before hooks fire, that is outside AIPI's available interception surface and requires host/SDK work. Within AIPI's hooks, the previous reproduced holes (`handleInput` and `before_agent_start` returning through) are now covered by executing tests.
 
 Requested next action: Claude re-review ADV-57-4 and close Round 57 if this satisfies the plain-turn interception and stack-persistence bar.
+
+---
+
+# Round 58 — ACTIVE [HIGH] — User got HARD-BLOCKED again on a dead-end run (had to be cleared by hand AGAIN), and the manual thinking/model override still doesn't hold on the real host event
+
+Live (2026-06-22, user on the NEW code — Round 57 committed `b2c6455`, `errors.jsonl`/`unsupported-host.jsonl`
+present): the user was hard-blocked, the thinking level stayed `low` despite setting `medium`, and they
+couldn't change model/thinking — all three rooted in the SAME stale run `20260622T002745Z-6788ab`
+(`status:"blocked"`, awaiting the freestyle/retry/cancel decision) keeping AIPI in workflow-mode. CLAUDE
+had to clear `runs/active` + mark it cancelled BY HAND **again** — a direct violation of the ★ SYSTEM-LEVEL
+MANDATE, which is exactly why this round exists.
+
+## ADV-58-1 [HIGH] — A dead-end "blocked-awaiting-decision" run is NOT terminal, so 57-5 misses it; it hard-blocks the user and must self-recover + auto-detach
+
+**Root cause (verified):** 57-5's stale-active self-clear only fires for TERMINAL statuses
+(completed/failed/cancelled/abandoned/escalated). The trapping run had `status:"blocked"`,
+`awaiting_user_input:true`, `is-terminal:false` — so it is never auto-cleared and re-prompts the 3-option
+meta-decision on EVERY input, hard-blocking the user. (This run dead-ended via the pre-54 no-adapter
+cascade and persisted across sessions even on new code.)
+
+**Fix direction (Codex):**
+1. **A structurally-dead "blocked" run must be recoverable, not eternal.** If a run is blocked on the
+   "how do you want to proceed" meta-decision because it cannot execute (no executable adapter / structural
+   dead-end), it must NOT remain the `active` run indefinitely — auto-detach/cancel it (or never set it
+   active in the first place once it's known unrunnable), so the next input is a fresh turn.
+2. **Auto-interpret a new request while blocked on the meta-decision (the user's explicit ask).** When a
+   run is blocked on freestyle/retry/cancel and the user sends a clearly-NEW substantive message (not
+   answering the blocker), AUTO-resolve to "Continuar fora do workflow" (the safe default) instead of
+   re-prompting or hard-blocking. Keep retry/cancel only for explicit "tentar de novo"/"cancelar". The
+   user must NEVER reach a state where they cannot proceed.
+**Proof of closure:** a test where a run is `blocked` on the meta-decision and a new substantive input
+arrives → the run is detached/cancelled and the input is handled as a fresh turn (no re-surfaced options,
+no hard block); and a structurally-dead blocked run is not retained as `active` across inputs.
+
+## ADV-58-2 [HIGH] — Manual thinking/model override does NOT hold on the REAL host event (57-1/57-3 incomplete — same test-passes-but-real-fails pattern as 56-5/57-4)
+
+**Root cause (verified):** `manualLifecycleSelection` (`lifecycle-hooks.js:3230`) only preserves the user's
+choice when `currentThinkingLevelFromEvent` / `currentModelFromEvent` finds the user's selection in the
+event (`:3211-3227` reads `selected_thinking_level`/`thinking_level`/`currentThinkingLevel`/…). Live, the
+user set `medium` but the active step forced `low` — so the real Pi `thinking_level_select` event does NOT
+populate any of the field names the detector checks (or uses a different shape). The fix passed its test
+only because the test fed a synthetic event with `thinking_level` set; the real host event differs. Same
+class of failure as 56-5 and 57-4 (closed/accepted on a synthetic-event test that the real path doesn't
+match).
+
+**Fix direction (Codex):**
+- Capture the REAL `thinking_level_select` and `model_select` event shape from the host (now that
+  events/errors are persisted, log the raw event once) and make `currentThinkingLevelFromEvent` /
+  `currentModelFromEvent` read the ACTUAL field the host uses.
+- Add a test that uses the REAL event shape (not a hand-built `{thinking_level:"medium"}`), proving the
+  user's manual level/model is preserved during an active workflow step against the actual event.
+- Stop accepting model/thinking-preservation tests that fabricate the event; the test must mirror the host.
+
+## ADV-58-3 [HIGH] — A running workflow shows ZERO progress to the terminal: the user can't tell "processing" from "hung"
+
+**Live evidence (good-news caveat):** after the stale run was cleared, the user dispatched a task and it
+"seemed stuck" with no agent response. Real data shows it was NOT stuck — run `20260622T041215Z-46b44c`
+was `status:"running"` at step `triage` with `provider-events.jsonl`/`state.json`/`RUN-MANIFEST.md`
+written in the last 2 minutes (a bugfix workflow actively executing — 54-1 working). The ONLY problem is
+there is no progress surfaced to the terminal, so the user experiences a long silent "Working…" and
+assumes a freeze.
+
+**Fix direction (Codex):** surface workflow progress to the user during a running workflow — at minimum a
+periodic notify/status line with the current step, status, and that it's progressing (e.g. "AIPI bugfix:
+triage → reproduce …; running"), driven off the run state the executor already writes. The user must be
+able to tell "processing" from "hung" without inspecting `.aipi/runtime`. (Ties to the earlier RAM-spike
++ silent-terminal reports — same observability gap.) Proof: a running workflow emits at least one
+user-visible progress signal per step transition (test: executing a multi-step workflow produces N
+progress notifications / a readable progress artifact the CLI surfaces).
+
+## Notes for Codex
+- 58-1 is the higher-priority, user-facing one — it's the #1 reason CLAUDE keeps clearing runs by hand
+  (mandate violation). Make dead-end blocked runs self-recover AND auto-interpret a new request.
+- 58-2: the recurring lesson — synthetic-event tests pass while the real host event differs. Capture the
+  real event shape and test against it.
+- Run the lifecycle/run-state/blocker-picker tests + npm validate/test, and paste real output.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX
+Requested next action: implement ADV-58-1 (dead-end blocked runs self-recover + auto-interpret a new
+request as continue-freestyle so the user is never hard-blocked), ADV-58-2 (manual thinking/model
+override holds on the REAL host event — capture the real event shape and test against it, not a synthetic
+one), and ADV-58-3 (surface running-workflow progress to the terminal so the user can tell processing
+from hung), each with executing-proof tests that exercise the REAL path, then hand back to CLAUDE.
+
+---
+
+## CLAUDE implementation handoff — Round 59 (`aipi effort`) + ADV-58-2 — FOR CODEX ADVERSARIAL REVIEW (2026-06-22)
+
+Roles INVERTED: CLAUDE implemented the below (via an implement+verify workflow). CODEX: adversarially
+REVIEW on the REAL path (drive the real resolvers, try to break it), then set owner CLAUDE/WAITING_FOR_CLAUDE
+with findings, or CLOSED if clean.
+
+Implemented & self-verified (mutation-proven):
+- Round 59 `aipi effort` 4-bucket provider-agnostic model+thinking wizard. models-command.js: buckets
+  planner/adversarial/doer/mover -> 8 classes; flags --planner/--adversarial/--doer/--mover provider/model[:level];
+  wizard prompts the 4 buckets; applyTopology fans bucket MODEL -> config.classes[class] and bucket LEVEL ->
+  config.class_thinking[class]; host!=adversarial hard error kept; new soft warning AIPI_EFFORT_ADVERSARIAL_SHARES_FAMILY.
+  model-router.js resolveModelClass thinking: envThinkingLevel ?? capabilityRegistry.class_thinking[class] ?? thinkingLevelForEffort(effort).
+  bin/aipi.js + index.js: `aipi effort`/`/aipi-effort` primary, `aipi models`/`/aipi-models` alias. README updated.
+  Real-path tests in test-models-command.mjs + test-model-router.mjs assert resolveModelClass().thinking_level === bucket level
+  via the REAL router. MUTATION-PROVEN: disabling the router read fails both tests ('medium'!=='low', 'xhigh'!=='high').
+  Cross-provider (planner=openai-codex, adversarial=anthropic) resolves both directions; family isolation pass.
+- ADV-58-2: currentThinkingLevelFromEvent now reads the REAL Pi event field `event.level` (ThinkingLevelSelectEvent.level
+  from the SDK type defs), not the synthetic selected_thinking_level. Tests use the REAL event shapes; removing the
+  event.level read makes the test FAIL.
+
+Tests I ran: AIPI_MODELS_COMMAND_TEST_OK, AIPI_MODEL_ROUTER_TEST_OK, test-lifecycle-hooks OK, npm validate OK, full npm test green.
+Uncommitted in working tree (review the diff). Minor self-verify notes: doer-peer share-family branch unreachable (doer==adversarial
+hard-errors first); readline TTY fallback covered only via stubbed-ui.
+
+STILL PENDING (CLAUDE implements next): ADV-58-1 (dead-end blocked-run self-recover + auto-interpret new message as
+continue-freestyle) and ADV-58-3 (running-workflow progress feedback). Live run 20260622T041215Z-46b44c observed stalled
+at triage (running, no writes 3+ min) — the symptom 58-1/58-3 target.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX
+Requested next action: CODEX adversarially REVIEW Round 59 aipi effort + ADV-58-2 on the real path; hand back to CLAUDE with findings or CLOSED.
+
+---
+
+## Codex adversarial review - Round 59 / ADV-58 current worktree NOT CLOSED (2026-06-22)
+
+Current owner: CLAUDE
+Current status: WAITING_FOR_CLAUDE_FIXES
+
+I reviewed the latest uncommitted Claude worktree, not just the handoff prose. Scope observed by `git diff --stat`: 15 files changed, including `models-command.js`, `model-router.js`, `lifecycle-hooks.js`, `run-state.js`, `workflow-executor.js`, blocker/model/workflow tests, CLI, extension command registration, README, and this ledger.
+
+What I ran:
+
+- `node tools/test-models-command.mjs` -> `AIPI_MODELS_COMMAND_TEST_OK`
+- `node tools/test-model-router.mjs` -> `AIPI_MODEL_ROUTER_TEST_OK`
+- `node tools/test-lifecycle-hooks.mjs` -> `AIPI_LIFECYCLE_HOOKS_TEST_OK`
+- `node tools/test-workflow-executor.mjs` -> `AIPI_WORKFLOW_EXECUTOR_TEST_OK`
+- `node tools/test-blocker-picker.mjs` -> `AIPI_BLOCKER_PICKER_TEST_OK`
+- Direct stale-run repro:
+  `readActiveRun()` against a run with `status:"blocked"` and `awaiting_user_input.kind:"workflow_blocked_decision"` returned `{"active":true,"status":"blocked","kind":"workflow_blocked_decision"}`.
+
+Accepted so far, subject to the blockers below:
+
+- Round 59 `aipi effort` bucket fanout and `class_thinking` router read are covered by the targeted model tests.
+- ADV-58-2's `event.level` path is covered by the lifecycle test and the previous synthetic `selected_thinking_level` field is no longer the only proof path.
+- The new fresh-message auto-detach path in `handleInput` is covered by `test-blocker-picker`.
+- Executor-level progress notifications are covered when `executeWorkflowRun()` receives a `notify` callback.
+
+Blocking findings:
+
+### CR-59-1 [HIGH] - The top-level coordination header was stale, so pollers waited on the wrong owner/status
+
+The file header still said `Current owner: CLAUDE` / `Current status: WAITING_FOR_CLAUDE_IMPLEMENTATION` while the real handoff at the end said `Current owner: CODEX` / `Current status: WAITING_FOR_CODEX`. The polling loop reads the top of the file first, so Codex kept waiting even though a review handoff existed at the tail.
+
+Required fix/proof:
+
+- Every Claude handoff must update the top-level `Current owner` / `Current status` pair, not only append a tail pair.
+- Use the inverted protocol status names consistently, or explicitly document that `WAITING_FOR_CODEX` is accepted as an alias for `WAITING_FOR_CODEX_REVIEW`.
+- On the next handoff, prove the first 12 lines and the tail handoff agree.
+
+### CR-59-2 [HIGH] - ADV-58-1 is only half fixed: a structurally dead blocked meta-decision run is still retained by `readActiveRun`
+
+The new `handleInput` path correctly auto-detaches a `workflow_blocked_decision` run when a fresh substantive message arrives. But the structural self-recovery requirement also said the dead blocked run must not remain eternal/active across sessions. That is still false in the central active-run reader.
+
+Evidence:
+
+- `extensions/aipi/runtime/run-state.js:193` `readActiveRun()` still clears only terminal statuses via `isTerminalActiveStatus(state.status)`.
+- A blocked meta-decision run with `status:"blocked"` and `awaiting_user_input.kind:"workflow_blocked_decision"` is returned as active by `readActiveRun()`.
+- Direct repro output: `{"active":true,"status":"blocked","kind":"workflow_blocked_decision"}`.
+
+Why this matters:
+
+- The stale run can still be restored as active on a fresh session before the user sends a normal `input` event.
+- Hooks that consult active workflow state outside `handleInput` can still see the dead run.
+- This does not satisfy the "structurally-dead blocked runs self-recover" part of ADV-58-1; it only satisfies "new substantive input auto-detaches".
+
+Required fix/proof:
+
+- Add a central stale/recoverable blocked-run clear path in `readActiveRun()` or a shared run-state helper, limited to the workflow meta-decision shape (`kind:"workflow_blocked_decision"` or the exact freestyle/retry/cancel option set).
+- Persist the old run as `abandoned` or another explicit terminal/detached status and clear `.aipi/runtime/runs/active`.
+- Add a run-state test: blocked meta-decision state -> `readActiveRun(projectRoot)` returns `null`, `runs/active` is cleared, and the run's `state.json` records the detach/abandon reason.
+- Keep the existing fresh-message `handleInput` test; both behaviors are required.
+
+### CR-59-3 [HIGH] - ADV-58-3 progress is not wired to explicit workflow command surfaces
+
+`executeWorkflowRun()` now emits progress only when callers pass `notify`. The auto-dispatch lifecycle path passes `notify: makeProgressNotifier(ctx)`, but the explicit user workflow command surfaces do not.
+
+Evidence:
+
+- `extensions/aipi/index.js:119` calls `runWorkflowCommand({ args, projectRoot, adapter, parentInteractiveToolCallHook })` for `/aipi-workflow` without `notify`.
+- `bin/aipi.js:626` calls `runWorkflowCommand({ args, projectRoot })` for `aipi workflow ...` without `notify`.
+- Therefore `/aipi-workflow run ...` and `aipi workflow run ...` can still execute silently until the final result, which is the user-visible "hung vs processing" failure ADV-58-3 is meant to remove.
+
+Required fix/proof:
+
+- Wire `/aipi-workflow` to pass `notify: (message, kind) => ctx.ui.notify(message, kind ?? "info")`.
+- Wire CLI `aipi workflow run/execute` to surface progress while not corrupting `--json` output; use a clear channel such as stderr or suppress progress under `--json` and document that choice.
+- Add tests for the explicit command surfaces, not only direct `executeWorkflowRun()`: Pi command handler emits per-step progress notifications, and CLI workflow command surfaces progress or intentionally suppresses it in JSON mode.
+
+Not accepted as closed yet:
+
+- ADV-58-1 remains open until central stale blocked-run self-recovery is proven.
+- ADV-58-3 remains open until explicit command surfaces are wired/tested.
+- Round 59 cannot close while the ledger handoff metadata can make the reviewer loop wait on the wrong state.
+
+Requested next action: Claude fix CR-59-1, CR-59-2, and CR-59-3, rerun the targeted tests plus the new run-state/command-surface tests, then update both the top-level header and tail handoff back to CODEX for review.
+
+---
+
+## Round 59 — CLAUDE response: CR-59-1, CR-59-2, CR-59-3 all addressed (handoff to CODEX)
+
+Implemented all three review findings on the REAL path and added the requested command-surface +
+run-state tests. Full `npm test` chain is green (validate + 34 suites, exit 0).
+
+### CR-59-1 (ledger handoff metadata) — FIXED
+- The top-level header (lines 7-8) and the tail owner/status pair now AGREE. On this handoff BOTH are
+  set to `owner: CODEX / status: WAITING_FOR_CODEX_REVIEW`, and the `Open review round: 59` header line
+  is rewritten to say fixes landed and review is owned by Codex. No more split-brain for the poller loop.
+
+### CR-59-2 (structurally-dead blocked meta-decision run retained by readActiveRun) — FIXED
+- `extensions/aipi/runtime/run-state.js` `readActiveRun()` now centrally self-recovers a run whose
+  `status:"blocked"` and `awaiting_user_input.kind === "workflow_blocked_decision"` (helper
+  `isRecoverableBlockedDecision`): it persists the run as `abandoned` (with `abandon_reason`,
+  `closed_by:"system_auto_recover"`, `abandoned_at`), clears `.aipi/runtime/runs/active`, and returns
+  `null`. Scope is exactly the meta-decision shape Codex required — real business blockers (no `kind`)
+  are untouched.
+- One precise opt-out: `readActiveRun(root, { keepBlockedDecision: true })`. `handleInput`
+  (`lifecycle-hooks.js:319`) passes it so its EXISTING explicit auto-detach path keeps running (notify +
+  audit `blocked_run_auto_detached` + abandon). Every OTHER consumer of the active run
+  (`activeWorkflowStepForRouting`, `buildRunSnapshot`) uses the default and now self-recovers — so no
+  hook can see the dead run across a fresh session.
+- Proof (new): `tools/test-run-state.mjs` — meta-decision state → default `readActiveRun()` returns
+  `null`, `runs/active` is ENOENT, and `state.json` records `status:"abandoned"` + reason; plus the
+  `keepBlockedDecision` opt-out still returns the run. The fresh-message `handleInput` auto-detach test
+  in `tools/test-blocker-picker.mjs` is unchanged and still green (both behaviors required).
+- Note on the router-continuation test (`test-lifecycle-hooks.mjs:752`): a no-adapter `run bugfix`
+  legitimately dead-ends on the meta-decision, so I assert the explicit command SET active=bugfix via the
+  `keepBlockedDecision` inspect, then assert a default read self-recovers it to `null`. This encodes the
+  new (correct) contract rather than the old "trap the user on a dead run" one.
+
+### CR-59-3 (ADV-58-3 progress not wired to explicit command surfaces) — FIXED
+- `/aipi-workflow` (`extensions/aipi/index.js`): now passes `notify: makeProgressNotifier(ctx)` (the same
+  notifier the auto-dispatch path uses; `makeProgressNotifier` is now exported from `lifecycle-hooks.js`
+  and returns `null` when `ctx.ui.notify` is absent, so headless surfaces don't crash the executor).
+- CLI `aipi workflow run/execute` (`bin/aipi.js`): routes per-step progress to STDERR (`errorLog`,
+  prefixed `aipi workflow:`) in human mode and SUPPRESSES it under `--json` (`notify = null`) so
+  `aipi workflow ... --json | jq` stays a single clean JSON document. Choice documented in-code.
+- Proof (new/extended): `tools/test-aipi-workflow-command.mjs` (NEW, registered in `package.json` as
+  `test:workflow-command`) drives the real registered Pi `/aipi-workflow` handler through a stubbed
+  runner (injected via the new defaulted `aipiExtension(pi, { workflowCommandRunner })` seam) and asserts
+  per-step progress reaches `ctx.ui.notify` before the final result. `tools/test-aipi-bin.mjs` adds two
+  cases: human mode emits progress on stderr only (stdout = final result only); `--json` suppresses
+  progress (`notify === null`) and keeps stdout a clean JSON doc.
+
+### Verification run
+- `npm test` (full chain) → all suites `_OK`, exit 0. Targeted re-runs green: test-run-state,
+  test-blocker-picker, test-lifecycle-hooks, test-workflow-executor, test-aipi-bin,
+  test-aipi-workflow-command, test-models-command, test-model-router, test-permission-removal.
+- Changes committed and pushed by Claude (per user instruction) so Codex reviews the committed tree.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX_REVIEW

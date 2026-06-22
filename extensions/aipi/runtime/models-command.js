@@ -17,17 +17,26 @@ const packageRoot = path.resolve(currentDir, "../../..");
 const templateModelClassesPath = path.join(packageRoot, "templates", ".aipi", "model-classes.yaml");
 const MODEL_CLASSES_REL_PATH = ".aipi/model-classes.yaml";
 const PROVIDER_BUDGET_REL_PATH = ".aipi/provider-budget.json";
-const HOST_CLASS_IDS = [
-  "orchestrator-heavy",
-  "planner-heavy",
-  "research-heavy",
-  "code-strong",
-  "test-strong",
-  "context-fast",
-];
-const ADVERSARIAL_CLASS_ID = "adversarial-heavy";
 const VERIFIER_CLASS_ID = "verifier-fast";
 const HIGH_FREQUENCY_CLASSES = new Set(["context-fast", "verifier-fast"]);
+
+// Provider-agnostic 4-bucket model topology. Each bucket binds ONE (model, thinking
+// level) pair that fans out across its capability classes. Any provider is allowed per
+// bucket; nothing forces Anthropic. The bucket->class map below is the authoritative
+// mapping between the user-facing buckets and the internal capability classes.
+export const EFFORT_BUCKETS = Object.freeze(["planner", "adversarial", "doer", "mover"]);
+export const BUCKET_CLASS_MAP = Object.freeze({
+  planner: ["orchestrator-heavy", "planner-heavy", "research-heavy"],
+  adversarial: ["adversarial-heavy", "verifier-fast"],
+  doer: ["code-strong", "test-strong"],
+  mover: ["context-fast"],
+});
+const BUCKET_LABELS = Object.freeze({
+  planner: "Planner (orchestration, planning, research)",
+  adversarial: "Adversarial (contrarian review, verification)",
+  doer: "Doer (implementation, tests)",
+  mover: "Mover (retrieval, context packaging)",
+});
 
 export function parseModelsArgs(args = [], { cwd = process.cwd() } = {}) {
   const tokens = Array.isArray(args)
@@ -42,6 +51,7 @@ export function parseModelsArgs(args = [], { cwd = process.cwd() } = {}) {
     adversarialModel: null,
     verifierModel: null,
     models: [],
+    buckets: {},
     classBindings: {},
     budgetNotes: {},
   };
@@ -70,13 +80,23 @@ export function parseModelsArgs(args = [], { cwd = process.cwd() } = {}) {
       options.target = resolveOptionPath(nextValue(tokens, ++index, token), cwd);
       continue;
     }
+    if (token === "--planner" || token === "--doer" || token === "--mover") {
+      const bucket = token.slice(2);
+      options.buckets[bucket] = nextValue(tokens, ++index, token);
+      options.action = "setup";
+      continue;
+    }
     if (token === "--host") {
+      // Legacy alias: --host maps the "doer" bucket (implementation/host classes).
       options.hostModel = nextValue(tokens, ++index, token);
       options.action = "setup";
       continue;
     }
     if (token === "--adversarial" || token === "--reviewer") {
-      options.adversarialModel = nextValue(tokens, ++index, token);
+      // Both the new "adversarial" bucket and the legacy adversarial topology slot.
+      const value = nextValue(tokens, ++index, token);
+      options.adversarialModel = value;
+      options.buckets.adversarial = value;
       options.action = "setup";
       continue;
     }
@@ -134,26 +154,40 @@ export async function runModelsCommand({
   const root = path.resolve(projectRoot ?? parsed.target);
   await ensureModelClassesFile(root);
 
+  let setupWarnings = [];
   if (parsed.action === "setup") {
     await fillInteractiveOptions(parsed, { root, ui });
-    if (!parsed.hostModel) throw new Error("aipi models setup requires --host <provider/model>");
-    if (!parsed.adversarialModel) throw new Error("aipi models setup requires --adversarial <provider/model>");
-    const host = parseProviderModelSpec(parsed.hostModel, "--host");
-    const adversarial = parseProviderModelSpec(parsed.adversarialModel, "--adversarial");
-    const verifier = parsed.verifierModel ? parseProviderModelSpec(parsed.verifierModel, "--verifier") : adversarial;
-    if (host.provider === adversarial.provider) {
-      throw new Error("aipi models setup requires adversarial provider/family to differ from the host provider/family");
+    // Each bucket maps to ONE (model, thinking level) pair. Legacy --host/--adversarial/
+    // --verifier feed the doer/adversarial buckets (and the verifier-fast override below)
+    // so old invocations keep working without the new --planner/--mover flags.
+    const buckets = resolveBucketSpecs(parsed);
+    if (!buckets.doer) throw new Error("aipi effort setup requires --doer <provider/model[:level]> (or legacy --host)");
+    if (!buckets.adversarial) throw new Error("aipi effort setup requires --adversarial <provider/model[:level]>");
+    if (!buckets.planner) buckets.planner = buckets.doer;
+    if (!buckets.mover) buckets.mover = buckets.doer;
+
+    // Hard error preserved: the doer/implementation family must differ from the adversarial
+    // bucket so cross-model review stays independent.
+    if (buckets.doer.provider === buckets.adversarial.provider) {
+      throw new Error("aipi effort setup requires adversarial provider/family to differ from the host provider/family");
+    }
+    setupWarnings = bucketSetupWarnings(buckets);
+
+    // Legacy --verifier binds verifier-fast independently of the adversarial bucket.
+    const explicitBindings = { ...(parsed.classBindings ?? {}) };
+    if (parsed.verifierModel && !explicitBindings[VERIFIER_CLASS_ID]) {
+      explicitBindings[VERIFIER_CLASS_ID] = parsed.verifierModel;
     }
 
     const config = await readModelCapabilities(root);
     const classIds = await readModelClassIds(root);
-    applyTopology(config, { host, adversarial, verifier, classIds, explicitBindings: parsed.classBindings, now });
+    applyTopology(config, { buckets, classIds, explicitBindings, now });
     for (const spec of parsed.models) registerModel(config, parseProviderModelSpec(spec, "--model"), { now });
     await writeModelCapabilities(root, config);
     await writeBudgetNotes(root, parsed.budgetNotes, { now });
   }
 
-  return buildModelsReport(root, { action: parsed.action, now });
+  return buildModelsReport(root, { action: parsed.action, now, extraWarnings: setupWarnings });
 }
 
 export function formatModelsCommandResult(report) {
@@ -174,7 +208,7 @@ export function formatModelsCommandResult(report) {
   ].join("\n");
 }
 
-async function buildModelsReport(root, { action = "status", now = () => new Date() } = {}) {
+async function buildModelsReport(root, { action = "status", now = () => new Date(), extraWarnings = [] } = {}) {
   const [classIds, capabilityFloors, familyIsolation] = await Promise.all([
     readModelClassIds(root),
     inspectModelCapabilityFloors({ root }),
@@ -197,7 +231,7 @@ async function buildModelsReport(root, { action = "status", now = () => new Date
     step: { agents: ["code-reviewer"] },
     ctx: { model: hostRoute.model },
   }).catch(() => null);
-  const warnings = governanceWarnings({ classes, familyIsolation });
+  const warnings = [...governanceWarnings({ classes, familyIsolation }), ...(extraWarnings ?? [])];
   return {
     schema: "aipi.models-command.v1",
     action,
@@ -216,26 +250,76 @@ async function buildModelsReport(root, { action = "status", now = () => new Date
   };
 }
 
-function applyTopology(config, { host, adversarial, verifier, classIds, explicitBindings, now }) {
+// Resolve the 4 buckets into parsed { provider, model, thinking_level } specs. Legacy
+// flags (--host -> doer, --adversarial -> adversarial, --verifier folds into adversarial)
+// are honored so existing invocations and the wizard fallbacks keep working.
+function resolveBucketSpecs(parsed) {
+  const out = {};
+  for (const bucket of EFFORT_BUCKETS) {
+    const spec = parsed.buckets?.[bucket];
+    if (spec) out[bucket] = parseProviderModelSpec(spec, `--${bucket}`);
+  }
+  if (!out.doer && parsed.hostModel) out.doer = parseProviderModelSpec(parsed.hostModel, "--host");
+  if (!out.adversarial && parsed.adversarialModel) {
+    out.adversarial = parseProviderModelSpec(parsed.adversarialModel, "--adversarial");
+  }
+  return out;
+}
+
+// Soft WARNING (not a hard error): if the adversarial bucket shares a provider/family with
+// the doer or planner bucket, cross-model independence is degraded.
+function bucketSetupWarnings(buckets) {
+  const warnings = [];
+  const advProvider = buckets.adversarial?.provider;
+  for (const peer of ["doer", "planner"]) {
+    if (advProvider && buckets[peer]?.provider === advProvider) {
+      warnings.push({
+        code: "AIPI_EFFORT_ADVERSARIAL_SHARES_FAMILY",
+        severity: "warning",
+        bucket: "adversarial",
+        peer_bucket: peer,
+        provider: advProvider,
+        message:
+          `adversarial bucket provider/family "${advProvider}" equals the ${peer} bucket; ` +
+          `this loses cross-model adversarial independence (correlated blind spots).`,
+      });
+    }
+  }
+  return warnings;
+}
+
+// Fan each bucket's MODEL across its classes in config.classes, and each bucket's LEVEL
+// across config.class_thinking[<class>]. The per-class thinking map is what the router
+// reads back at resolve time (see model-router.js capabilities.class_thinking).
+function applyTopology(config, { buckets, classIds, explicitBindings, now }) {
   config.classes ??= {};
   config.models ??= {};
-  for (const modelClass of classIds) {
-    if (HOST_CLASS_IDS.includes(modelClass)) config.classes[modelClass] = toModelSpec(host);
+  config.class_thinking ??= {};
+
+  for (const [bucket, classes] of Object.entries(BUCKET_CLASS_MAP)) {
+    const spec = buckets[bucket];
+    if (!spec) continue;
+    for (const modelClass of classes) {
+      if (!classIds.includes(modelClass)) continue;
+      config.classes[modelClass] = toModelSpec(spec);
+      if (spec.thinking_level) config.class_thinking[modelClass] = spec.thinking_level;
+      else delete config.class_thinking[modelClass];
+    }
   }
-  if (classIds.includes(ADVERSARIAL_CLASS_ID)) config.classes[ADVERSARIAL_CLASS_ID] = toModelSpec(adversarial);
-  if (classIds.includes(VERIFIER_CLASS_ID)) config.classes[VERIFIER_CLASS_ID] = toModelSpec(verifier);
 
   for (const [modelClass, spec] of Object.entries(explicitBindings ?? {})) {
-    config.classes[modelClass] = toModelSpec(parseProviderModelSpec(spec, `--class ${modelClass}`));
+    const parsed = parseProviderModelSpec(spec, `--class ${modelClass}`);
+    config.classes[modelClass] = toModelSpec(parsed);
+    if (parsed.thinking_level) config.class_thinking[modelClass] = parsed.thinking_level;
   }
 
+  if (!Object.keys(config.class_thinking).length) delete config.class_thinking;
+
   const configuredModels = new Set(Object.values(config.classes).map(classBindingToModelSpec).filter(Boolean));
-  configuredModels.add(toModelSpec(host));
-  configuredModels.add(toModelSpec(adversarial));
-  configuredModels.add(toModelSpec(verifier));
+  for (const spec of Object.values(buckets)) configuredModels.add(toModelSpec(spec));
   for (const modelSpec of configuredModels) registerModel(config, parseProviderModelSpec(modelSpec, "class binding"), { now });
   config.rule ??=
-    "Classes must bind to concrete provider/model selections and models must carry capability evidence. Use `aipi models setup` to update provider topology.";
+    "Classes must bind to concrete provider/model selections and models must carry capability evidence. Use `aipi effort setup` to update the 4-bucket provider topology.";
 }
 
 function registerModel(config, model, { now = () => new Date() } = {}) {
@@ -272,56 +356,56 @@ function looksExpensiveFrontier(model) {
   return /\b(opus|frontier|gpt-5\.5|claude-opus)\b/i.test(String(model ?? ""));
 }
 
+// Interactive wizard: prompt the 4 provider-agnostic BUCKETS (model + thinking level each)
+// instead of looping the 8 capability classes. Each bucket's (model, level) fans out to
+// its classes in applyTopology. `--class <class>=<spec>` remains a power-user override.
 async function fillInteractiveOptions(options, { root, ui }) {
   if (!options.interactive) return options;
   const promptUi = createPromptUi(ui);
   if (!promptUi) return options;
   try {
-    const classIds = await readModelClassIds(root);
     let candidates = await configuredModelCandidates(root);
-    if (!options.hostModel) {
-      options.hostModel = await promptModelSpec(promptUi, "Host model", candidates);
-    }
-    candidates = mergeModelCandidates(candidates, [
-      options.hostModel,
-      options.adversarialModel,
-      options.verifierModel,
-      ...options.models,
-      ...Object.values(options.classBindings ?? {}),
-    ]);
-    if (!options.adversarialModel) {
-      options.adversarialModel = await promptModelSpec(
-        promptUi,
-        "Adversarial model",
-        candidates.filter((candidate) => providerOfSpec(candidate) !== providerOfSpec(options.hostModel)),
-      );
-    }
-    if (!options.verifierModel && options.adversarialModel) {
-      options.verifierModel = await promptModelSpec(promptUi, "Verifier model", candidates, {
-        defaultValue: options.adversarialModel,
-      });
-    }
-    if (!options.verifierModel && options.adversarialModel) options.verifierModel = options.adversarialModel;
-    candidates = mergeModelCandidates(candidates, [
-      options.hostModel,
-      options.adversarialModel,
-      options.verifierModel,
-      ...options.models,
-      ...Object.values(options.classBindings ?? {}),
-    ]);
-    for (const modelClass of classIds) {
-      if (options.classBindings[modelClass]) continue;
-      const defaultValue = defaultModelForClass(modelClass, options);
-      const selected = await promptModelSpec(promptUi, `Model for ${modelClass}`, candidates, { defaultValue });
-      if (selected) {
-        options.classBindings[modelClass] = selected;
-        candidates = mergeModelCandidates(candidates, [selected]);
+    options.buckets ??= {};
+    for (const bucket of EFFORT_BUCKETS) {
+      if (options.buckets[bucket]) {
+        candidates = mergeModelCandidates(candidates, [options.buckets[bucket]]);
+        continue;
       }
+      const label = BUCKET_LABELS[bucket] ?? bucket;
+      const filtered = bucket === "adversarial"
+        ? candidates.filter((candidate) => providerOfSpec(candidate) !== providerOfSpec(options.buckets.doer))
+        : candidates;
+      const modelSpec = await promptModelSpec(promptUi, `${label} model`, filtered);
+      if (!modelSpec) continue;
+      const level = await promptThinkingLevel(promptUi, `${label} thinking level`, modelSpec);
+      const combined = applyThinkingLevel(modelSpec, level);
+      options.buckets[bucket] = combined;
+      candidates = mergeModelCandidates(candidates, [stripThinkingLevel(combined)]);
     }
   } finally {
     await promptUi.close?.();
   }
   return options;
+}
+
+async function promptThinkingLevel(ui, label, modelSpec) {
+  const embedded = parseProviderModelSpec(modelSpec, label).thinking_level;
+  const input = ui?.input ?? ui?.prompt;
+  if (typeof input !== "function") return embedded ?? null;
+  const value = await input(`${label} (low|medium|high|xhigh)${embedded ? ` [${embedded}]` : ""}`);
+  if (typeof value === "string" && value.trim()) return value.trim().toLowerCase();
+  return embedded ?? null;
+}
+
+function applyThinkingLevel(modelSpec, level) {
+  const base = stripThinkingLevel(modelSpec);
+  return level ? `${base}:${level}` : base;
+}
+
+function stripThinkingLevel(modelSpec) {
+  const text = String(modelSpec ?? "").trim();
+  const colon = text.lastIndexOf(":");
+  return colon > text.indexOf("/") && colon > 0 ? text.slice(0, colon) : text;
 }
 
 function createPromptUi(ui) {
@@ -367,13 +451,6 @@ async function promptModelSpec(ui, label, candidates = [], { defaultValue = null
   return defaultValue ?? null;
 }
 
-function defaultModelForClass(modelClass, options) {
-  if (modelClass === ADVERSARIAL_CLASS_ID) return options.adversarialModel;
-  if (modelClass === VERIFIER_CLASS_ID) return options.verifierModel ?? options.adversarialModel;
-  if (HOST_CLASS_IDS.includes(modelClass)) return options.hostModel;
-  return options.hostModel ?? options.adversarialModel ?? options.verifierModel;
-}
-
 function mergeModelCandidates(...groups) {
   return [...new Set(groups.flat()
     .map((item) => String(item ?? "").trim())
@@ -411,6 +488,7 @@ async function readModelCapabilities(root) {
       return {
         schema: "aipi.model-capabilities.v1",
         classes: parsed.classes ?? {},
+        class_thinking: parsed.class_thinking ?? {},
         models: parsed.models ?? {},
         rule: parsed.rule ?? null,
       };
@@ -421,8 +499,9 @@ async function readModelCapabilities(root) {
   return {
     schema: "aipi.model-capabilities.v1",
     classes: {},
+    class_thinking: {},
     models: {},
-    rule: "Generated by aipi models.",
+    rule: "Generated by aipi effort.",
   };
 }
 

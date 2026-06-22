@@ -39,7 +39,7 @@ import {
   formatPiSubagentsLiveSpike,
   runPiSubagentsLiveSpike,
 } from "./runtime/pi-subagents.js";
-import { registerAipiLifecycleHooks } from "./runtime/lifecycle-hooks.js";
+import { makeProgressNotifier, registerAipiLifecycleHooks } from "./runtime/lifecycle-hooks.js";
 import {
   formatProbeAResult,
   ProbeAController,
@@ -49,7 +49,7 @@ import {
   runProbeAPrime,
 } from "./runtime/probe-a-prime.js";
 
-export default function aipiExtension(pi) {
+export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowCommand } = {}) {
   const coordinator = new SubagentCoordinator(pi);
   const probeA = new ProbeAController(pi);
 
@@ -116,11 +116,15 @@ export default function aipiExtension(pi) {
         const adapter = createSubagentWorkflowAdapter(coordinator, {
           modelResolver: (modelArgs) => resolveStepModel({ ...modelArgs, ctx }),
         });
-        const result = await runWorkflowCommand({
+        const result = await workflowCommandRunner({
           args: args ?? "",
           projectRoot,
           adapter,
           parentInteractiveToolCallHook: "registered_parent_interactive_tool_call_hook",
+          // CR-59-3 / ADV-58-3: surface per-step progress on the explicit /aipi-workflow surface
+          // (not only the auto-dispatch path) so a long `run`/`execute` is never a silent "hung vs
+          // processing" black box. Reuses the same notifier the lifecycle auto-dispatch path uses.
+          notify: makeProgressNotifier(ctx),
         });
         ctx.ui.notify(formatWorkflowCommandResult(result), "info");
       } catch (error) {
@@ -142,17 +146,24 @@ export default function aipiExtension(pi) {
     },
   });
 
+  // `aipi effort` configures the 4-bucket (planner/adversarial/doer/mover) provider-agnostic
+  // model topology. `aipi models` is kept as an alias to the same handler.
+  const effortCommandHandler = async (args, ctx) => {
+    try {
+      const projectRoot = resolveProjectRoot(ctx);
+      const result = await runModelsCommand({ args: args ?? "", projectRoot, ui: ctx?.ui });
+      ctx.ui.notify(formatModelsCommandResult(result), result.state === "ready" ? "info" : "warning");
+    } catch (error) {
+      ctx.ui.notify(`AIPI effort failed: ${error.message}`, "error");
+    }
+  };
+  pi.registerCommand("aipi-effort", {
+    description: "Configure the AIPI 4-bucket (planner/adversarial/doer/mover) provider-agnostic model topology.",
+    handler: effortCommandHandler,
+  });
   pi.registerCommand("aipi-models", {
-    description: "Configure and validate AIPI host/adversarial model topology.",
-    handler: async (args, ctx) => {
-      try {
-        const projectRoot = resolveProjectRoot(ctx);
-        const result = await runModelsCommand({ args: args ?? "", projectRoot, ui: ctx?.ui });
-        ctx.ui.notify(formatModelsCommandResult(result), result.state === "ready" ? "info" : "warning");
-      } catch (error) {
-        ctx.ui.notify(`AIPI models failed: ${error.message}`, "error");
-      }
-    },
+    description: "Alias of /aipi-effort: configure the AIPI 4-bucket model topology.",
+    handler: effortCommandHandler,
   });
 
   pi.registerCommand("aipi-diagnose", {

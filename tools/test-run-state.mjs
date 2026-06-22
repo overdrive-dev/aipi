@@ -111,6 +111,57 @@ try {
     /ENOENT/,
   );
 
+  // CR-59-2 / ADV-58-1: a structurally-dead run blocked only on the workflow freestyle/retry/cancel
+  // META-decision (status:blocked, awaiting_user_input.kind:workflow_blocked_decision) is NOT a
+  // terminal status, so the terminal self-clear above misses it. readActiveRun must centrally
+  // self-recover it so it cannot remain active across sessions or be seen by other hooks.
+  const activePath = path.join(tempRoot, ".aipi", "runtime", "runs", "active");
+  const decisionState = JSON.parse(await fs.readFile(statePath, "utf8"));
+  decisionState.status = "blocked";
+  decisionState.current_step = "load_contract";
+  decisionState.blocked_reason = "no executable adapter is configured for load_contract";
+  decisionState.awaiting_user_input = {
+    step_id: "load_contract",
+    reason: "no executable adapter is configured for load_contract",
+    created_at: fixedDate.toISOString(),
+    question: "AIPI parou em load_contract: o gate nao passou. Como voce quer seguir?",
+    options: [
+      "Continuar fora do workflow automatico nesta conversa",
+      "Tentar executar este workflow novamente",
+      "Cancelar este run",
+    ],
+    allow_free_text: true,
+    kind: "workflow_blocked_decision",
+  };
+  delete decisionState.abandoned_at;
+  delete decisionState.abandon_reason;
+  delete decisionState.closed_by;
+  delete decisionState.closed_at;
+  await fs.writeFile(statePath, `${JSON.stringify(decisionState, null, 2)}\n`);
+  await fs.writeFile(activePath, `${started.runId}\n`);
+
+  // keepBlockedDecision opt-out: handleInput still sees the run to run its explicit notify+audit
+  // auto-detach (the central silent recovery must NOT fire on this path).
+  const keptDecision = await readActiveRun(tempRoot, { keepBlockedDecision: true });
+  assert.equal(keptDecision.runId, started.runId);
+  assert.equal(keptDecision.state.status, "blocked");
+  assert.equal(keptDecision.state.awaiting_user_input.kind, "workflow_blocked_decision");
+  // Re-arm the active pointer the keep-read intentionally left in place, then prove the default
+  // read self-recovers: returns null, clears runs/active, and records the detach on state.json.
+  await fs.writeFile(activePath, `${started.runId}\n`);
+  assert.equal(await readActiveRun(tempRoot), null);
+  await assert.rejects(
+    () => fs.readFile(activePath, "utf8"),
+    /ENOENT/,
+  );
+  const recoveredState = JSON.parse(await fs.readFile(statePath, "utf8"));
+  assert.equal(recoveredState.status, "abandoned");
+  assert.equal(recoveredState.awaiting_user_input, null);
+  assert.equal(recoveredState.current_step, null);
+  assert.equal(recoveredState.closed_by, "system_auto_recover");
+  assert.match(recoveredState.abandon_reason, /auto-detached stale workflow-blocked decision run/);
+  assert.equal(typeof recoveredState.abandoned_at, "string");
+
   console.log("AIPI_RUN_STATE_TEST_OK");
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });

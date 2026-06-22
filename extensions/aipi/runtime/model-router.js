@@ -46,10 +46,12 @@ export async function resolveModelClass({
 } = {}) {
   const modelClasses = await readModelClasses(root);
   const classMeta = modelClasses.get(modelClass) ?? {};
-  const thinkingLevel = envThinkingLevel(modelClass, env) ?? thinkingLevelForEffort(classMeta.effort);
-  const preferredFamilies = classMeta.preferred_families ?? [];
   const registry = ctx?.modelRegistry ?? null;
   const capabilityRegistry = ctx?.modelCapabilities ?? await readModelCapabilities(root);
+  const thinkingLevel = envThinkingLevel(modelClass, env)
+    ?? capabilityRegistry?.class_thinking?.[modelClass]
+    ?? thinkingLevelForEffort(classMeta.effort);
+  const preferredFamilies = classMeta.preferred_families ?? [];
   const envModel = resolveEnvModel({ modelClass, env, registry });
   if (envModel) {
     const crossFamilyModel = resolveCrossFamilyConfiguredModel({
@@ -697,6 +699,7 @@ async function readModelCapabilities(root) {
       valid: true,
       exists: true,
       classes: parsed.classes ?? {},
+      class_thinking: parsed.class_thinking ?? {},
       models: parsed.models ?? {},
       rule: parsed.rule ?? null,
     };

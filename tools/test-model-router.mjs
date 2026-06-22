@@ -203,6 +203,53 @@ try {
   assert.deepEqual(configuredRoute.model, { provider: "anthropic", id: "claude-test" });
   assert.equal(configuredRoute.thinking_level, "medium");
 
+  // class_thinking persisted in model-capabilities.json is READ by the router and
+  // overrides the effort-derived default (code-strong effort=medium -> "low" here).
+  await fs.writeFile(
+    path.join(tempRoot, ".aipi", "model-capabilities.json"),
+    `${JSON.stringify({
+      schema: "aipi.model-capabilities.v1",
+      classes: {
+        "code-strong": "anthropic/claude-test",
+        "adversarial-heavy": "anthropic/claude-review",
+      },
+      class_thinking: {
+        "code-strong": "low",
+        "adversarial-heavy": "xhigh",
+      },
+      models: {
+        "anthropic:claude-test": { capabilities: {}, evidence: ["unit-test"] },
+        "anthropic:claude-review": { capabilities: {}, evidence: ["unit-test"] },
+      },
+    }, null, 2)}\n`,
+  );
+  const classThinkingRoute = await resolveModelClass({ root: tempRoot, modelClass: "code-strong" });
+  assert.equal(classThinkingRoute.thinking_level, "low");
+  const advClassThinkingRoute = await resolveModelClass({ root: tempRoot, modelClass: "adversarial-heavy" });
+  assert.equal(advClassThinkingRoute.thinking_level, "xhigh");
+  // Env override still wins over the persisted class_thinking.
+  const envOverThinking = await resolveModelClass({
+    root: tempRoot,
+    modelClass: "code-strong",
+    env: { AIPI_THINKING_CODE_STRONG: "high" },
+  });
+  assert.equal(envOverThinking.thinking_level, "high");
+  // Restore the original capabilities file for the assertions that follow.
+  await fs.writeFile(
+    path.join(tempRoot, ".aipi", "model-capabilities.json"),
+    `${JSON.stringify({
+      schema: "aipi.model-capabilities.v1",
+      classes: {
+        "code-strong": "anthropic/claude-test",
+        "adversarial-heavy": "anthropic/claude-review",
+      },
+      models: {
+        "anthropic:claude-test": { capabilities: {}, evidence: ["unit-test"] },
+        "anthropic:claude-review": { capabilities: {}, evidence: ["unit-test"] },
+      },
+    }, null, 2)}\n`,
+  );
+
   const envResolved = await resolveStepModel({
     root: tempRoot,
     step: { agents: ["implementer"] },

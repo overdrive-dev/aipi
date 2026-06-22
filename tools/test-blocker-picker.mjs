@@ -156,6 +156,67 @@ try {
   assert.match(notifications.at(-1).message, /Qual regra fiscal devemos aplicar\?/);
   assert.equal(piEntries.some((entry) => entry.data?.input === "blocked_text_prompt"), true);
 
+  // ADV-58-1: a run dead-ended on the freestyle/retry/cancel META-decision must
+  // self-recover when the user sends a NEW substantive message instead of selecting an
+  // option. Without auto-detach the input is trapped and re-prompts every turn.
+  await writeWorkflowBlockedDecisionState(tempRoot, started.runId);
+  const fresh = await fs.readFile(path.join(tempRoot, ".aipi", "runtime", "runs", started.runId, "state.json"), "utf8");
+  assert.equal(JSON.parse(fresh).awaiting_user_input.kind, "workflow_blocked_decision");
+
+  const runnerCallsBeforeDetach = runnerCalls.length;
+  const notifyCountBeforeDetach = notifications.length;
+  const detachCtx = {
+    cwd: tempRoot,
+    hasUI: true,
+    ui: {
+      select() {
+        throw new Error("auto-detach must not re-surface the blocker picker");
+      },
+      input() {
+        throw new Error("auto-detach must not prompt for free text");
+      },
+      notify(message, kind) {
+        notifications.push({ message, kind });
+      },
+    },
+  };
+  const detachResult = await handlers.input(
+    { type: "input", text: "Na verdade, me explique como funciona o cache de sessao.", source: "interactive" },
+    detachCtx,
+  );
+  // The new input was processed as a FRESH turn (not trapped). With routing it resolves
+  // to a read-only check / continue; either way it is NOT a re-surfaced blocker prompt.
+  assert.notEqual(detachResult, undefined);
+  assert.notEqual(detachResult.action, undefined);
+  // runs/active is cleared.
+  assert.equal(await readActiveRun(tempRoot), null);
+  // The run is marked abandoned (detached from the automatic workflow).
+  const detachedState = JSON.parse(await fs.readFile(
+    path.join(tempRoot, ".aipi", "runtime", "runs", started.runId, "state.json"),
+    "utf8",
+  ));
+  assert.equal(detachedState.status, "abandoned");
+  assert.equal(detachedState.awaiting_user_input, null);
+  // No re-surfaced awaiting_user_input prompt was shown for the meta-decision.
+  const newNotifications = notifications.slice(notifyCountBeforeDetach);
+  assert.equal(
+    newNotifications.some((note) => /Como voce quer seguir|aguardando decisão|aguardando resposta/.test(note.message)),
+    false,
+    "auto-detach must not re-surface the meta-decision prompt",
+  );
+  assert.equal(
+    newNotifications.some((note) => /destacou o run bloqueado automaticamente|fora do workflow automatico/.test(note.message)),
+    true,
+    "auto-detach notifies the user the run was detached",
+  );
+  // No blocker workflow runner was invoked for the detach (the picker did not execute).
+  assert.equal(runnerCalls.length, runnerCallsBeforeDetach);
+  assert.equal(
+    piEntries.some((entry) => entry.data?.input === "blocked_run_auto_detached"),
+    true,
+    "auto-detach is audited",
+  );
+
   console.log("AIPI_BLOCKER_PICKER_TEST_OK");
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });
@@ -179,6 +240,38 @@ async function writeBlockedState(projectRoot, runId) {
     if (step.id === "business_rule_check") {
       step.status = "blocked";
       step.verdict = "BLOCKED_TO_PLANNING";
+    } else if (step.status === "blocked") {
+      step.status = "pending";
+      delete step.verdict;
+    }
+  }
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`);
+  await fs.writeFile(path.join(projectRoot, ".aipi", "runtime", "runs", "active"), `${runId}\n`);
+}
+
+async function writeWorkflowBlockedDecisionState(projectRoot, runId) {
+  const statePath = path.join(projectRoot, ".aipi", "runtime", "runs", runId, "state.json");
+  const state = JSON.parse(await fs.readFile(statePath, "utf8"));
+  state.status = "blocked";
+  state.current_step = "load_contract";
+  state.blocked_reason = "no executable adapter is configured for load_contract";
+  state.awaiting_user_input = {
+    step_id: "load_contract",
+    reason: "no executable adapter is configured for load_contract",
+    created_at: fixedDate.toISOString(),
+    question: "AIPI parou em load_contract: o gate nao passou. Como voce quer seguir?",
+    options: [
+      "Continuar fora do workflow automatico nesta conversa",
+      "Tentar executar este workflow novamente",
+      "Cancelar este run",
+    ],
+    allow_free_text: true,
+    kind: "workflow_blocked_decision",
+  };
+  for (const step of state.steps) {
+    if (step.id === "load_contract") {
+      step.status = "blocked";
+      step.verdict = "BLOCKED";
     } else if (step.status === "blocked") {
       step.status = "pending";
       delete step.verdict;

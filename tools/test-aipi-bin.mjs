@@ -357,6 +357,52 @@ await runAipiWorkflow({
 });
 assert.deepEqual(JSON.parse(jsonWorkflowOutput[0]), { action: "status", active: null });
 
+// CR-59-3 / ADV-58-3: the CLI workflow surface forwards a `notify` that routes per-step progress
+// to STDERR (errorLog) in human mode, keeping STDOUT (log) reserved for the final result.
+const progressStdout = [];
+const progressStderr = [];
+let humanNotifySeen = null;
+await runAipiWorkflow({
+  userArgs: ["--target", "project", "run", "bugfix"],
+  cwd: path.join("C:", "repo"),
+  log: (line) => progressStdout.push(line),
+  errorLog: (line) => progressStderr.push(line),
+  workflowFns: {
+    async runWorkflowCommand({ args, notify }) {
+      assert.equal(args, "run bugfix");
+      assert.equal(typeof notify, "function");
+      humanNotifySeen = notify;
+      notify("step 1/3 implement: running", "info");
+      return { action: "run", run: { runId: "r1", workflow: "bugfix" } };
+    },
+    formatWorkflowCommandResult: () => "AIPI workflow run: bugfix",
+  },
+});
+assert.equal(typeof humanNotifySeen, "function");
+// Progress lands on stderr (prefixed), never on stdout; stdout holds only the final result.
+assert.deepEqual(progressStdout, ["AIPI workflow run: bugfix"]);
+assert.deepEqual(progressStderr, ["aipi workflow: step 1/3 implement: running"]);
+
+// Under --json the surface SUPPRESSES progress (notify === null) so stdout stays a single clean
+// JSON document — `aipi workflow ... --json | jq` must not be corrupted by interleaved progress.
+const jsonProgressStdout = [];
+const jsonProgressStderr = [];
+await runAipiWorkflow({
+  userArgs: ["--json", "--target", "project", "run", "bugfix"],
+  cwd: path.join("C:", "repo"),
+  log: (line) => jsonProgressStdout.push(line),
+  errorLog: (line) => jsonProgressStderr.push(line),
+  workflowFns: {
+    async runWorkflowCommand({ notify }) {
+      assert.equal(notify, null);
+      return { action: "run", run: { runId: "r2", workflow: "bugfix" } };
+    },
+    formatWorkflowCommandResult: () => "unused",
+  },
+});
+assert.equal(jsonProgressStderr.length, 0);
+assert.deepEqual(JSON.parse(jsonProgressStdout[0]), { action: "run", run: { runId: "r2", workflow: "bugfix" } });
+
 const memoryOutput = [];
 const memoryResult = {
   action: "status",
