@@ -211,7 +211,14 @@ function findingSeverity(line) {
 
 function verdictPasses(result, step, contract, errors, warnings) {
   const declaredPassVerdicts = passVerdictsForStep(step);
-  if (!declaredPassVerdicts.has(result.verdict)) {
+  // Verdict-ALLOWANCE (is this verdict accepted by THIS step's pass_verdicts / allow_skip) is a
+  // STEP-GATE decision. The subagent coordinator validates a worker result for well-formedness
+  // WITHOUT a step (the workflow executor re-validates with the real step + gate at the next stage),
+  // so when there is no step we check only structural quality — PASS still needs evidence — and DEFER
+  // gate allowance to the executor. Otherwise a worker legitimately returning SKIPPED / FAIL / BLOCKED
+  // would be rejected as "invalid" by the coordinator and collapse into a spurious BLOCKED step,
+  // which would re-trap the user the moment any real step skips or fails.
+  if (step && !declaredPassVerdicts.has(result.verdict)) {
     errors.push(`verdict ${result.verdict} is not allowed by pass_verdicts: ${[...declaredPassVerdicts].join(", ")}`);
     return false;
   }
@@ -221,7 +228,10 @@ function verdictPasses(result, step, contract, errors, warnings) {
   }
 
   if (result.verdict === "SKIPPED") {
-    if (step?.gate?.allow_skip !== true) {
+    // No step gate context (coordinator well-formedness pass): accept the skip shape and let the
+    // executor enforce allow_skip / skip_requires against the real step.
+    if (!step) return true;
+    if (step.gate?.allow_skip !== true) {
       errors.push("SKIPPED is allowed only when the step gate declares allow_skip: true");
       return false;
     }
@@ -234,6 +244,9 @@ function verdictPasses(result, step, contract, errors, warnings) {
     return evidenceOk;
   }
 
+  // FAIL / BLOCKED / BLOCKED_TO_PLANNING are well-formed verdicts that simply do not PASS the gate;
+  // without a step there is no gate to fail here, so defer the routing decision to the executor.
+  if (!step) return true;
   errors.push(`verdict ${result.verdict} is listed in pass_verdicts but cannot pass this runtime gate`);
   return false;
 }

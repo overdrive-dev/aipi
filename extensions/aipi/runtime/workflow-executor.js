@@ -339,7 +339,15 @@ function localSkipEvidence({ state, step, contract, skipCondition }) {
 
 export function createSubagentWorkflowAdapter(coordinator, {
   fallback = createLocalWorkflowAdapter(),
-  workerStepIds = ["quick_change"],
+  // `workerStepIds = null` (default) means EVERY step that has agents executes as a real subagent
+  // worker (lead = agents[0], which produces the step's artifacts) — NOT only the spike step
+  // `quick_change`. This is what makes real multi-step workflows (bugfix/feature/planning/…) actually
+  // run: previously every step except `quick_change`/`review_swarm` fell through to the local fallback
+  // and stamped BLOCKED ("no executable adapter is configured"), trapping the user in an unrunnable
+  // workflow. Pass an explicit `workerStepIds` array to RESTRICT worker execution to named steps
+  // (legacy spike/tests). `fanoutStepIds` still fan out to parallel independent subagents (review
+  // swarms); the local fallback is reserved for steps with NO agents (skip-condition / policy-only).
+  workerStepIds = null,
   fanoutStepIds = ["review_swarm"],
   pollIntervalMs = 50,
   collectTimeoutMs = 120_000,
@@ -348,27 +356,19 @@ export function createSubagentWorkflowAdapter(coordinator, {
   if (!coordinator?.spawn || !coordinator?.collect) {
     throw new Error("createSubagentWorkflowAdapter requires a SubagentCoordinator-like object");
   }
-  const workerSteps = new Set(workerStepIds);
-  const fanoutSteps = new Set(fanoutStepIds);
+  const workerRestrict = workerStepIds != null;
+  const workerSteps = new Set(workerStepIds ?? []);
+  const fanoutSteps = new Set(fanoutStepIds ?? []);
+  const runFanout = (args) => executeFanoutSubagentStep({ ...args, coordinator, pollIntervalMs, collectTimeoutMs, modelResolver });
+  const runWorker = (args) => executeSubagentStep({ ...args, coordinator, pollIntervalMs, collectTimeoutMs, modelResolver });
   return {
     async executeStep(args) {
-      if (fanoutSteps.has(args.step.id) && args.step.agents.length > 1) {
-        return executeFanoutSubagentStep({
-          ...args,
-          coordinator,
-          pollIntervalMs,
-          collectTimeoutMs,
-          modelResolver,
-        });
-      }
-      if (!workerSteps.has(args.step.id)) return fallback.executeStep(args);
-      return executeSubagentStep({
-        ...args,
-        coordinator,
-        pollIntervalMs,
-        collectTimeoutMs,
-        modelResolver,
-      });
+      const agentCount = args.step.agents?.length ?? 0;
+      if (fanoutSteps.has(args.step.id) && agentCount > 1) return runFanout(args);
+      if (agentCount === 0) return fallback.executeStep(args);
+      // Restrict mode (explicit workerStepIds): only the named steps run as workers; others fall back.
+      if (workerRestrict && !workerSteps.has(args.step.id)) return fallback.executeStep(args);
+      return runWorker(args);
     },
   };
 }

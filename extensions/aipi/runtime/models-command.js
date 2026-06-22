@@ -44,6 +44,7 @@ export function parseModelsArgs(args = [], { cwd = process.cwd() } = {}) {
     : String(args).trim().split(/\s+/).filter(Boolean);
   const options = {
     action: "status",
+    actionExplicit: false,
     target: cwd,
     json: false,
     interactive: true,
@@ -59,17 +60,21 @@ export function parseModelsArgs(args = [], { cwd = process.cwd() } = {}) {
   let index = 0;
   if (tokens[0] && !tokens[0].startsWith("-")) {
     const action = tokens[0];
-    if (!["setup", "status", "check", "validate"].includes(action)) {
-      throw new Error(`unknown aipi models action: ${action}`);
+    if (!["setup", "status", "check", "validate", "wizard", "configure"].includes(action)) {
+      throw new Error(
+        `unknown aipi effort action: ${action} (expected: setup | status | check; run with no arguments to launch the setup wizard)`,
+      );
     }
-    options.action = action === "validate" ? "check" : action;
+    options.action = action === "validate" ? "check" : action === "wizard" || action === "configure" ? "setup" : action;
+    options.actionExplicit = true;
     index = 1;
   }
 
   for (; index < tokens.length; index += 1) {
     const token = tokens[index];
-    if (!token.startsWith("-") && ["setup", "status", "check", "validate"].includes(token)) {
-      options.action = token === "validate" ? "check" : token;
+    if (!token.startsWith("-") && ["setup", "status", "check", "validate", "wizard", "configure"].includes(token)) {
+      options.action = token === "validate" ? "check" : token === "wizard" || token === "configure" ? "setup" : token;
+      options.actionExplicit = true;
       continue;
     }
     if (token === "--json") {
@@ -153,6 +158,15 @@ export async function runModelsCommand({
   const parsed = parseModelsArgs(args, { cwd: projectRoot ?? cwd });
   const root = path.resolve(projectRoot ?? parsed.target);
   await ensureModelClassesFile(root);
+
+  // `aipi effort` / `/aipi-effort` with NO explicit action launches the interactive setup WIZARD when
+  // an interactive UI is available — that is what the command is for (configure the 4 buckets). Status
+  // remains available via an explicit `status` action, and non-interactive/JSON callers still default
+  // to status (the wizard needs a UI to prompt). Without this, a bare invocation only printed status
+  // and never offered the wizard.
+  if (parsed.action === "status" && !parsed.actionExplicit && !parsed.json && hasInteractivePromptUi(ui)) {
+    parsed.action = "setup";
+  }
 
   let setupWarnings = [];
   if (parsed.action === "setup") {
@@ -406,6 +420,12 @@ function stripThinkingLevel(modelSpec) {
   const text = String(modelSpec ?? "").trim();
   const colon = text.lastIndexOf(":");
   return colon > text.indexOf("/") && colon > 0 ? text.slice(0, colon) : text;
+}
+
+// True when the host UI can drive the interactive wizard (a select menu or a free-text prompt).
+// Used to decide whether a bare `aipi effort` should open the wizard rather than print status.
+function hasInteractivePromptUi(ui) {
+  return typeof ui?.select === "function" || typeof ui?.input === "function" || typeof ui?.prompt === "function";
 }
 
 function createPromptUi(ui) {

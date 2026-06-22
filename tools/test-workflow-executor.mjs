@@ -405,6 +405,11 @@ try {
     now: () => fixedDate,
     adapter: createSubagentWorkflowAdapter(coordinator, {
       fallback: createTestPassWorkflowAdapter(),
+      // Restrict to the single worker step under test; the other quick steps PASS via the fallback so
+      // this case stays a focused proof of "a worker step dispatches to the coordinator with the
+      // resolved model + writes its artifacts". The default (no workerStepIds) running ALL steps as
+      // subagents is exercised separately in test-workflow-subagent-default.mjs.
+      workerStepIds: ["quick_change"],
       pollIntervalMs: 1,
       collectTimeoutMs: 1_000,
       modelResolver: async () => ({
@@ -475,6 +480,8 @@ try {
     runId: redispatchRun.runId,
     now: () => fixedDate,
     adapter: createSubagentWorkflowAdapter(redispatchCoordinator, {
+      // Restrict to the redispatched worker step under test; other quick steps PASS via the fallback.
+      workerStepIds: ["quick_change"],
       fallback: createTestPassWorkflowAdapter(),
       pollIntervalMs: 1,
       collectTimeoutMs: 1_000,
@@ -538,6 +545,67 @@ try {
     fanoutRawWrites.some((item) => item.path.endsWith("/steps/review_swarm/SECURITY.md")),
     true,
   );
+
+  // REGRESSION (real-path): with the DEFAULT adapter (no workerStepIds allow-list), EVERY
+  // agent-bearing step of a real multi-step workflow must execute as a subagent and the run must
+  // COMPLETE. Previously only `quick_change`/`review_swarm` were allow-listed, so steps like
+  // quick_scope/quick_verify/quick_review/quick_memory fell through to the local fallback and stamped
+  // BLOCKED "no executable adapter is configured" — trapping the user in an unrunnable workflow loop.
+  const defaultRun = await startWorkflowRun({
+    projectRoot: tempRoot,
+    workflow: "quick",
+    now: () => fixedDate,
+    randomBytes: fixedRandom,
+  });
+  const defaultRunnerCalls = [];
+  const defaultRawWrites = [];
+  const defaultCoordinator = new SubagentCoordinator(
+    { appendEntry() {} },
+    {
+      root: tempRoot,
+      maxConcurrent: 2,
+      // Like fakeWorkflowRunner but quick_memory returns the realistic no-signal SKIPPED (its
+      // memory-promotion gate rejects a bare PASS that has no memory_promotions). This exercises BOTH
+      // fixes end-to-end: every step runs as a subagent (adapter) AND a worker SKIPPED is not collapsed
+      // into a spurious BLOCKED by the coordinator (verdict-gate-without-step fix).
+      piSubagentsRunner: quickWorkflowRunner({ calls: defaultRunnerCalls, rawWrites: defaultRawWrites, root: tempRoot }),
+    },
+  );
+  const defaultExecution = await executeWorkflowRun({
+    projectRoot: tempRoot,
+    runId: defaultRun.runId,
+    now: () => fixedDate,
+    // NO workerStepIds / fanoutStepIds override -> production default: all agent-bearing steps run.
+    adapter: createSubagentWorkflowAdapter(defaultCoordinator, {
+      pollIntervalMs: 1,
+      collectTimeoutMs: 1_000,
+      modelResolver: async () => ({
+        model_class: "code-strong",
+        model: { provider: "anthropic", id: "claude-test" },
+        thinking_level: "medium",
+        source: "test",
+      }),
+    }),
+  });
+  // The whole multi-step workflow COMPLETES end-to-end. Before the fix it could never get past the
+  // first step (triage/quick_scope) because the local fallback stamped BLOCKED "no executable adapter".
+  assert.equal(defaultExecution.status, "completed");
+  // Every one of the five quick steps dispatched a REAL worker — not just the legacy `quick_change`
+  // spike step.
+  assert.equal(defaultRunnerCalls.length, 5);
+  const defaultStepStatus = new Map(defaultExecution.state.steps.map((s) => [s.id, s]));
+  for (const stepId of ["quick_scope", "quick_change", "quick_verify", "quick_review"]) {
+    assert.equal(defaultStepStatus.get(stepId)?.status, "passed", `step ${stepId} must run + pass as a real subagent`);
+  }
+  // The worker SKIPPED survived the coordinator and the executor gate (not downgraded to BLOCKED).
+  assert.equal(defaultStepStatus.get("quick_memory")?.status, "skipped");
+  assert.equal(defaultStepStatus.get("quick_memory")?.verdict, "SKIPPED");
+  // No executed step may carry the local-executor "no executable adapter" / self-stamp-refusal evidence.
+  for (const stepId of ["quick_scope", "quick_change", "quick_verify", "quick_review", "quick_memory"]) {
+    const resultPath = path.join(tempRoot, ".aipi", "runtime", "runs", defaultRun.runId, "steps", stepId, "RESULT.json");
+    const resultText = await fs.readFile(resultPath, "utf8").catch(() => "{}");
+    assert.doesNotMatch(resultText, /no executable adapter|refusing to self-stamp|aipi-local-executor/);
+  }
 
   const contradictoryReviewRun = await startWorkflowRun({
     projectRoot: tempRoot,
@@ -1035,6 +1103,67 @@ function testSkipEvidence({ step, contract, skipCondition }) {
     result: `test fixture skip evidence ${token} for ${skipCondition}`,
     evidence_token: token,
   }));
+}
+
+// Like fakeWorkflowRunner, but quick_memory returns the realistic no-signal SKIPPED (its
+// memory-promotion gate rejects a bare PASS with no memory_promotions). Lets the "default adapter runs
+// every step as a subagent" regression complete the whole quick workflow end-to-end.
+function quickWorkflowRunner({ calls = [], rawWrites = [], root } = {}) {
+  return {
+    async spawn(params) {
+      calls.push({ params });
+      const text = params.task ?? "";
+      const agentId = text.match(/AIPI worker id: ([^\n]+)/)?.[1] ?? "worker";
+      const stepId = text.match(/"step_id": "([^"]+)"/)?.[1] ?? "quick_change";
+      const artifacts = expectedArtifactsFromPrompt(text);
+      for (const artifact of artifacts) {
+        const content = `# fake S0 worker wrote ${stepId}\n\nartifact: ${artifact}\n`;
+        rawWrites.push({ path: artifact, content });
+        const target = path.join(root, artifact);
+        await fs.mkdir(path.dirname(target), { recursive: true });
+        await fs.writeFile(target, content);
+      }
+      const skip = stepId === "quick_memory";
+      const stepResult = skip
+        ? {
+            schema: "aipi.step-result.v1",
+            step_id: stepId,
+            agent_ids: [agentId],
+            verdict: "SKIPPED",
+            skip_condition: "no_durable_memory_signal",
+            evidence: [
+              {
+                rung: "written",
+                source: "fake-s0-worker",
+                ref: artifacts.join(", "),
+                result: "no durable memory signal",
+                evidence_token: "memory_candidate_scan",
+              },
+            ],
+            artifacts,
+          }
+        : {
+            schema: "aipi.step-result.v1",
+            step_id: stepId,
+            agent_ids: [agentId],
+            verdict: "PASS",
+            evidence: [
+              {
+                rung: "ran",
+                source: "fake-s0-worker",
+                ref: artifacts.join(", "),
+                result: "worker wrote all owned artifacts",
+              },
+            ],
+            artifacts,
+          };
+      return {
+        content: [{ type: "text", text: JSON.stringify(stepResult) }],
+        tool_call_count: artifacts.length,
+        run_id: "fake-workflow-run",
+      };
+    },
+  };
 }
 
 function fakeWorkflowRunner({ calls = [], rawWrites = [], root } = {}) {

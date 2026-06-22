@@ -27,6 +27,7 @@ assert.deepEqual(
   ], { cwd: path.join("C:", "repo") }),
   {
     action: "setup",
+    actionExplicit: true,
     target: path.resolve(path.join("C:", "repo"), "project"),
     json: true,
     interactive: true,
@@ -226,6 +227,81 @@ try {
     assert.equal((await inspectAdversarialFamilyIsolation({ root: interactiveRoot })).state, "pass");
   } finally {
     await fs.rm(interactiveRoot, { recursive: true, force: true });
+  }
+
+  // ===================================================================
+  // BARE INVOCATION launches the wizard. `aipi effort` / `/aipi-effort` with NO action and an
+  // interactive UI must open the 4-bucket setup wizard (the command's whole purpose) instead of
+  // only printing status. Status stays reachable via an explicit `status` action, and --json /
+  // non-interactive callers still default to status.
+  // ===================================================================
+  // Parse: a bare action is NOT explicit; an explicit action token is.
+  assert.equal(parseModelsArgs([]).actionExplicit, false);
+  assert.equal(parseModelsArgs([]).action, "status");
+  assert.equal(parseModelsArgs(["status"]).actionExplicit, true);
+  assert.equal(parseModelsArgs(["wizard"]).action, "setup");
+  assert.equal(parseModelsArgs(["configure"]).action, "setup");
+  assert.throws(() => parseModelsArgs(["i"]), /unknown aipi effort action: i/);
+
+  const bareWizardRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-effort-bare-"));
+  try {
+    await initProject({ sourceRoot: path.resolve("templates/.aipi"), targetRoot: bareWizardRoot });
+    const barePrompts = [];
+    const bareAnswers = {
+      planner: { model: "openai-codex/gpt-5.5", level: "high" },
+      adversarial: { model: "anthropic/claude-opus-4-8", level: "high" },
+      doer: { model: "openai-codex/gpt-5.5", level: "medium" },
+      mover: { model: "anthropic/claude-haiku-4-5", level: "low" },
+    };
+    const bareAnswerFor = (question) => {
+      for (const [bucket, answer] of Object.entries(bareAnswers)) {
+        if (new RegExp(`^${bucket}`, "i").test(question)) {
+          return /thinking level/i.test(question) ? answer.level : answer.model;
+        }
+      }
+      return "";
+    };
+    // NO action arg at all + an interactive UI -> the wizard runs and writes the config.
+    const bareReport = await runModelsCommand({
+      projectRoot: bareWizardRoot,
+      args: [],
+      ui: {
+        async input(question) {
+          barePrompts.push(question);
+          return bareAnswerFor(question);
+        },
+      },
+      now: () => new Date("2026-06-22T03:30:00.000Z"),
+    });
+    assert.equal(bareReport.action, "setup", "bare invocation with an interactive UI must run the setup wizard");
+    assert.equal(bareReport.state, "ready");
+    assert.equal(barePrompts.some((prompt) => /^Planner.*model/i.test(prompt)), true);
+    assert.equal(barePrompts.some((prompt) => /^Doer.*model/i.test(prompt)), true);
+    const bareConfig = JSON.parse(await fs.readFile(path.join(bareWizardRoot, ".aipi", "model-capabilities.json"), "utf8"));
+    assert.equal(bareConfig.classes["code-strong"], "openai-codex/gpt-5.5");
+
+    // --json (machine) callers do NOT get hijacked into the wizard: status is returned and the UI
+    // is never prompted.
+    const jsonPrompts = [];
+    const jsonReport = await runModelsCommand({
+      projectRoot: bareWizardRoot,
+      args: ["--json"],
+      ui: { async input(question) { jsonPrompts.push(question); return ""; } },
+      now: () => new Date("2026-06-22T03:31:00.000Z"),
+    });
+    assert.equal(jsonReport.action, "status");
+    assert.equal(jsonPrompts.length, 0);
+
+    // An explicit `status` action is honored even with an interactive UI (no wizard).
+    const statusReport = await runModelsCommand({
+      projectRoot: bareWizardRoot,
+      args: ["status"],
+      ui: { async input() { throw new Error("explicit status must not prompt"); } },
+      now: () => new Date("2026-06-22T03:32:00.000Z"),
+    });
+    assert.equal(statusReport.action, "status");
+  } finally {
+    await fs.rm(bareWizardRoot, { recursive: true, force: true });
   }
 
   // ===================================================================

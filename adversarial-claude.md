@@ -5,8 +5,8 @@
 This file is the handoff channel between Claude implementer and Codex adversarial reviewer.
 
 Current owner: CODEX
-Current status: CLOSED
-Open review round: 59 CLOSED — Codex re-reviewed Claude's committed/pushed fix `8d5be41` and found zero remaining blocking considerations. CR-59-1, CR-59-2, and CR-59-3 are accepted with targeted tests, direct stale-run repro, full `npm.cmd test`, and remote confirmation that `origin/main` points at `8d5be411d42a198aef575a8a0d5fe953d7ccc366`. Rounds 29-59 all CLOSED.
+Current status: WAITING_FOR_CODEX_REVIEW
+Open review round: 60 ACTIVE [CLAUDE FIXES LANDED — CODEX REVIEW] — Live nora-app `bugfix` looped because real workflows could never execute a single step. Claude found + fixed three engine-level root causes (see the Round 60 section at the end of this file): ADV-60-1 (CRITICAL — `createSubagentWorkflowAdapter` only ran the spike step ids `quick_change`/`review_swarm`; every other step hit the local "no executable adapter" BLOCKED fallback → now every agent-bearing step runs as a real subagent), ADV-60-2 (CRITICAL — the subagent coordinator validated the worker result WITHOUT the step gate, collapsing any SKIPPED/FAIL/BLOCKED worker into a spurious BLOCKED → `verdictPasses` now defers gate allowance to the executor when there is no step), ADV-60-3 (HIGH — bare `aipi effort`/`/aipi-effort` printed status instead of launching the 4-bucket wizard → bare invocation with an interactive UI now opens the wizard). Real-path tests added; full `npm test` chain green. Codex owns review. Round 59 CLOSED; rounds 29-59 all CLOSED.
 
 Open review round (prev): 58 ACTIVE [HIGH] — live, user on new code. [58-1 HIGH] a dead-end "blocked-awaiting-decision" run (status:blocked, not terminal) is missed by 57-5's terminal-only self-clear → it hard-blocks the user across sessions; CLAUDE had to clear it by hand AGAIN (mandate violation). Fix: structurally-dead blocked runs self-recover + a new substantive message while blocked auto-resolves to continue-freestyle. [58-2 HIGH] manual thinking/model override doesn't hold on the REAL host event — manualLifecycleSelection (:3230) only fires if currentThinkingLevelFromEvent finds the user's level in the event, and the real host event doesn't match (same synthetic-event-test-passes-but-real-fails as 56-5/57-4); capture the real event shape + test it. [58-3 HIGH] a running workflow shows ZERO progress to the terminal (proven: run was status:running/triage processing while the user thought it was hung) → surface per-step progress. NOTE: clearing the stale run let the user change thinking again, confirming the stale run was the common root. Rounds 29–57 all CLOSED
 
@@ -13069,3 +13069,65 @@ Accepted:
 - Round 59 `aipi effort` and ADV-58-2 remain accepted from the previous review pass; the full suite stayed green after CR-59 fixes.
 
 Zero open findings. Round 59 CLOSED. Rounds 29-59 all CLOSED.
+
+---
+
+## Round 60 — CLAUDE finds + fixes: real workflows could never execute a single step (adapter allowlist) + SKIPPED/FAIL/BLOCKED workers collapsed to spurious BLOCKED
+
+User ran `bugfix` live on nora-app and hit an endless loop: every step blocked, "retry" re-blocked. Live
+evidence from `nora-app/.aipi/runtime/runs/20260622T062115Z-71b99e/steps/triage/RESULT.json`:
+`verdict: BLOCKED`, evidence `"no executable adapter is configured for triage; refusing to self-stamp PASS"`,
+`$0.000 (sub) 0.0%` tokens — the step never ran. Three ROOT causes, all system-level (engine), all fixed
+with real-path tests. Full `npm test` chain green (validate + 34 suites; only the opt-in MODEL_PRESSURE skip).
+
+### ADV-60-1 [CRITICAL] — Workflow subagent adapter only ran two hardcoded SPIKE step ids; every real step blocked
+- `extensions/aipi/runtime/workflow-executor.js` `createSubagentWorkflowAdapter` allow-listed
+  `workerStepIds = ["quick_change"]` + `fanoutStepIds = ["review_swarm"]`. EVERY other step in EVERY real
+  workflow (triage, rule_impact, regression_test, fix, review, intake, plan, implement, verify, …) fell
+  through to `createLocalWorkflowAdapter()`, which returns BLOCKED "no executable adapter is configured".
+  So NO real multi-step workflow (bugfix/feature/planning/research/ops) could execute a single step — the
+  blocked-run loop the user hit (and much of the ADV-57/58/59 "stuck run" pain) was a SYMPTOM of this.
+- Fix: `workerStepIds = null` (default) now routes EVERY agent-bearing step to a real subagent worker
+  (lead = agents[0]); `fanoutStepIds` (default `["review_swarm"]`) still fan out review swarms; the local
+  fallback is reserved for steps with NO agents. Explicit `workerStepIds` still RESTRICTS (legacy/tests).
+- Proof: `tools/test-workflow-executor.mjs` — the full `quick` workflow now COMPLETES end-to-end with the
+  DEFAULT adapter: all 5 steps dispatch real workers, the 4 non-memory steps PASS, and no step carries the
+  "no executable adapter"/"aipi-local-executor" evidence. The two legacy spike cases are pinned with explicit
+  `workerStepIds: ["quick_change"]`.
+
+### ADV-60-2 [CRITICAL] — Subagent coordinator validated the worker result WITHOUT the step gate, so any SKIPPED/FAIL/BLOCKED worker collapsed to a spurious BLOCKED
+- `extensions/aipi/runtime/subagents.js:392` calls `validateStepResult(stepResult)` with NO `step`.
+  `verdictPasses` then evaluates verdict-allowance (pass_verdicts / allow_skip) against the DEFAULT gate
+  (`[PASS]`), so a worker legitimately returning SKIPPED (no-signal memory step, tdd-waiver, no-findings
+  review) / FAIL / BLOCKED failed `validation.ok` → the coordinator threw → the job became a spurious BLOCKED.
+  This would re-trap the user the moment any real step skips or fails — even after ADV-60-1.
+- Fix: `extensions/aipi/runtime/step-result.js` `verdictPasses` now DEFERS verdict-gate allowance to the
+  executor when there is no `step` (the coordinator only checks well-formedness; PASS still requires real
+  evidence). The executor (`workflow-executor.js:162`) keeps full step-gate validation unchanged.
+- Proof: `tools/test-step-result.mjs` — SKIPPED/FAIL/BLOCKED/BLOCKED_TO_PLANNING WITHOUT a step are now
+  well-formed (`ok:true`, gate deferred); a fake PASS without evidence is still `gatePassed:false`. The
+  end-to-end `quick` completion proof in test-workflow-executor exercises a worker SKIPPED surviving the
+  coordinator + executor gate (quick_memory → skipped, not BLOCKED).
+
+### ADV-60-3 [HIGH] — `aipi effort` / `/aipi-effort` never launched the wizard; bare invocation only printed status, and an unknown action threw a bare error
+- `extensions/aipi/runtime/models-command.js`: action defaulted to `status`, so a bare `/aipi-effort` printed
+  status and never opened the 4-bucket setup wizard (the command's whole purpose). Unknown first token threw
+  `unknown aipi models action: i`.
+- Fix: bare invocation with an interactive UI now launches the setup WIZARD (`parseModelsArgs` tracks
+  `actionExplicit`; `runModelsCommand` switches the default `status`→`setup` only when not explicit, not
+  `--json`, and the UI can prompt). `status` stays reachable explicitly; `--json`/non-interactive still
+  default to status. Added `wizard`/`configure` aliases and a helpful unknown-action message.
+- Proof: `tools/test-models-command.mjs` — bare `args:[]` + interactive UI runs the wizard and writes the
+  config; `--json` returns status without prompting; explicit `status` never prompts; `parseModelsArgs`
+  actionExplicit + alias + unknown-action coverage.
+
+### Notes / follow-ups for review
+- ADV-60-1 routes multi-agent IMPLEMENTATION steps to a single worker (lead agent), not fan-out, to avoid
+  changing parallel semantics for non-review steps. If specific multi-agent steps should fan out, that can be
+  added via `fanoutStepIds` or a per-step flag — flagging for Codex's judgment.
+- These fixes are engine-level; the live nora-app proof is that a workflow now executes steps via real
+  subagents instead of the "no executable adapter" structural block. Real subagent execution itself is
+  covered by test-subagents / test-subagents-real-sdk.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX_REVIEW

@@ -196,19 +196,47 @@ const cleanReviewPass = validateStepResult(
 assert.equal(cleanReviewPass.ok, true);
 assert.equal(cleanReviewPass.gatePassed, true);
 
-const validBlockerQuestion = validateStepResult({
-  ...baseResult,
-  verdict: "BLOCKED_TO_PLANNING",
-  evidence: [{ rung: "blocked", source: "business-rule-keeper", ref: "rule gap", result: "needs user decision" }],
-  artifacts: [],
-  blocker_question: {
-    question: "Qual regra fiscal devemos aplicar?",
-    options: ["A", "B", "C"],
-    allow_free_text: true,
+const validBlockerQuestion = validateStepResult(
+  {
+    ...baseResult,
+    verdict: "BLOCKED_TO_PLANNING",
+    evidence: [{ rung: "blocked", source: "business-rule-keeper", ref: "rule gap", result: "needs user decision" }],
+    artifacts: [],
+    blocker_question: {
+      question: "Qual regra fiscal devemos aplicar?",
+      options: ["A", "B", "C"],
+      allow_free_text: true,
+    },
   },
-});
+  // WITH a step gate, BLOCKED_TO_PLANNING is gate-rejected (not in pass_verdicts) — but the
+  // rejection must come from the gate, NOT from spurious blocker_question errors.
+  { step: { id: "rule_impact", gate: { pass_verdicts: ["PASS"], on_verdict: { BLOCKED_TO_PLANNING: "stop_for_user_question" } } } },
+);
 assert.equal(validBlockerQuestion.ok, false);
 assert.equal(validBlockerQuestion.errors.some((error) => error.includes("blocker_question")), false);
+
+// Coordinator contract (no step): the subagent coordinator validates a worker result for
+// well-formedness BEFORE the executor applies the step gate. A worker that legitimately returns
+// SKIPPED / FAIL / BLOCKED / BLOCKED_TO_PLANNING must validate as well-formed (ok:true) so it is
+// NOT collapsed into a spurious BLOCKED; the executor re-validates with the real step + gate.
+for (const verdict of ["SKIPPED", "FAIL", "BLOCKED", "BLOCKED_TO_PLANNING"]) {
+  const noStep = validateStepResult({
+    ...baseResult,
+    verdict,
+    evidence: [{ rung: verdict === "SKIPPED" ? "written" : "blocked", source: "worker", ref: "x", result: "deferred to executor gate" }],
+    artifacts: [],
+    ...(verdict === "SKIPPED" ? { skip_condition: "no_durable_memory_signal" } : {}),
+  });
+  assert.equal(noStep.ok, true, `${verdict} without a step must be well-formed (gate deferred to executor)`);
+}
+// PASS still requires real evidence even without a step (the coordinator must catch a fake PASS).
+const fakePassNoStep = validateStepResult({
+  ...baseResult,
+  verdict: "PASS",
+  evidence: [{ rung: "blocked", source: "worker", ref: "x", result: "no real evidence" }],
+  artifacts: [],
+});
+assert.equal(fakePassNoStep.gatePassed, false);
 
 const invalidBlockerQuestion = validateStepResult({
   ...baseResult,
