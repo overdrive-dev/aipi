@@ -3,6 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
 const currentFile = fileURLToPath(import.meta.url);
@@ -676,12 +677,33 @@ export async function runAipiMemory({
   }
 }
 
+// CR-60-1: a readline-backed prompt UI so a bare interactive `aipi effort` can drive the setup wizard
+// from the terminal. Built only when the CLI is interactive and not in --json mode.
+function createCliPromptUi() {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  return {
+    async input(question) {
+      return rl.question(`${question}: `);
+    },
+    async prompt(question) {
+      return rl.question(`${question}: `);
+    },
+    close() {
+      rl.close();
+    },
+  };
+}
+
 export async function runAipiModels({
   cwd = process.cwd(),
   userArgs = [],
   log = console.log,
   errorLog = console.error,
   modelsFns = null,
+  // CR-60-1: an interactive terminal (TTY) opens the wizard on a bare `aipi effort`; --json and
+  // non-interactive (piped/CI) callers stay status-only so stdout remains machine-safe.
+  isInteractive = process.stdin?.isTTY === true,
+  promptAdapter = null,
 } = {}) {
   let options;
   try {
@@ -694,13 +716,21 @@ export async function runAipiModels({
 
   try {
     const fns = modelsFns ?? await import("../extensions/aipi/runtime/models-command.js");
-    const result = await fns.runModelsCommand({
-      args: options.modelsArgs,
-      projectRoot: options.target,
-      cwd,
-    });
-    log(options.json ? JSON.stringify(result, null, 2) : fns.formatModelsCommandResult(result));
-    return result;
+    // Pass a prompt UI ONLY for an interactive, non-JSON invocation. runModelsCommand then opens the
+    // 4-bucket wizard for a bare action; explicit `status`/`setup ...` flags keep their behavior.
+    const ui = options.json ? null : (promptAdapter ?? (isInteractive ? createCliPromptUi() : null));
+    try {
+      const result = await fns.runModelsCommand({
+        args: options.modelsArgs,
+        projectRoot: options.target,
+        cwd,
+        ui,
+      });
+      log(options.json ? JSON.stringify(result, null, 2) : fns.formatModelsCommandResult(result));
+      return result;
+    } finally {
+      ui?.close?.();
+    }
   } catch (error) {
     errorLog(`aipi models failed: ${error.message}`);
     process.exitCode = 1;

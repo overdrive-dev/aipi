@@ -339,14 +339,23 @@ function localSkipEvidence({ state, step, contract, skipCondition }) {
 
 export function createSubagentWorkflowAdapter(coordinator, {
   fallback = createLocalWorkflowAdapter(),
-  // `workerStepIds = null` (default) means EVERY step that has agents executes as a real subagent
-  // worker (lead = agents[0], which produces the step's artifacts) — NOT only the spike step
-  // `quick_change`. This is what makes real multi-step workflows (bugfix/feature/planning/…) actually
-  // run: previously every step except `quick_change`/`review_swarm` fell through to the local fallback
-  // and stamped BLOCKED ("no executable adapter is configured"), trapping the user in an unrunnable
-  // workflow. Pass an explicit `workerStepIds` array to RESTRICT worker execution to named steps
-  // (legacy spike/tests). `fanoutStepIds` still fan out to parallel independent subagents (review
-  // swarms); the local fallback is reserved for steps with NO agents (skip-condition / policy-only).
+  // `workerStepIds = null` (default) means EVERY step that has agents executes as a real subagent —
+  // NOT only the spike step `quick_change`. This is what makes real multi-step workflows
+  // (bugfix/feature/planning/…) actually run: previously every step except `quick_change`/`review_swarm`
+  // fell through to the local fallback and stamped BLOCKED ("no executable adapter is configured"),
+  // trapping the user in an unrunnable workflow.
+  //
+  // Routing in auto mode (default):
+  //   - REVIEW-stage multi-agent step  -> FAN OUT to one subagent per declared review agent, so the
+  //     workflow's specialized reviewers (security, blast-radius, complexity, integration, …) ALL run
+  //     and produce their declared artifacts — not just the lead agent (ADV-60-1 originally regressed
+  //     this for any review step not literally named `review_swarm`).
+  //   - any other agent-bearing step   -> single lead worker (agents[0] produces the step's artifacts);
+  //     implementation/planning steps intentionally collaborate through one lead, not independent fan-out.
+  //   - no-agent step                  -> local fallback (skip-condition / policy-only).
+  //
+  // Pass an explicit `workerStepIds` array to RESTRICT execution to named steps (legacy spike/tests);
+  // in restrict mode the review-stage auto fan-out is disabled and only `fanoutStepIds` fan out.
   workerStepIds = null,
   fanoutStepIds = ["review_swarm"],
   pollIntervalMs = 50,
@@ -361,10 +370,17 @@ export function createSubagentWorkflowAdapter(coordinator, {
   const fanoutSteps = new Set(fanoutStepIds ?? []);
   const runFanout = (args) => executeFanoutSubagentStep({ ...args, coordinator, pollIntervalMs, collectTimeoutMs, modelResolver });
   const runWorker = (args) => executeSubagentStep({ ...args, coordinator, pollIntervalMs, collectTimeoutMs, modelResolver });
+  const shouldFanout = (step) => {
+    const agentCount = step.agents?.length ?? 0;
+    if (agentCount <= 1) return false;
+    if (fanoutSteps.has(step.id)) return true;
+    // Default policy: a multi-agent REVIEW-stage step fans out to its specialized reviewers.
+    return !workerRestrict && step.stage === "review";
+  };
   return {
     async executeStep(args) {
       const agentCount = args.step.agents?.length ?? 0;
-      if (fanoutSteps.has(args.step.id) && agentCount > 1) return runFanout(args);
+      if (shouldFanout(args.step)) return runFanout(args);
       if (agentCount === 0) return fallback.executeStep(args);
       // Restrict mode (explicit workerStepIds): only the named steps run as workers; others fall back.
       if (workerRestrict && !workerSteps.has(args.step.id)) return fallback.executeStep(args);

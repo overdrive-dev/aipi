@@ -13,6 +13,7 @@ import {
   resolveModelClass,
   resolveStepModel,
 } from "../extensions/aipi/runtime/model-router.js";
+import { runAipiModels } from "../bin/aipi.js";
 
 assert.deepEqual(
   parseModelsArgs([
@@ -347,6 +348,50 @@ try {
   }
 } finally {
   await fs.rm(root, { recursive: true, force: true });
+}
+
+// ===================================================================
+// CR-60-1 end-to-end CLI surface: a bare, interactive `aipi effort` (via runAipiModels) drives the
+// real setup wizard from the terminal and writes the config — not just the Pi command surface.
+// ===================================================================
+const cliRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-effort-cli-"));
+try {
+  await initProject({ sourceRoot: path.resolve("templates/.aipi"), targetRoot: cliRoot });
+  const cliAnswers = {
+    planner: { model: "openai-codex/gpt-5.5", level: "high" },
+    adversarial: { model: "anthropic/claude-opus-4-8", level: "high" },
+    doer: { model: "openai-codex/gpt-5.5", level: "medium" },
+    mover: { model: "anthropic/claude-haiku-4-5", level: "low" },
+  };
+  const cliPrompts = [];
+  const cliPromptAdapter = {
+    async input(question) {
+      cliPrompts.push(question);
+      for (const [bucket, answer] of Object.entries(cliAnswers)) {
+        if (new RegExp(`^${bucket}`, "i").test(question)) {
+          return /thinking level/i.test(question) ? answer.level : answer.model;
+        }
+      }
+      return "";
+    },
+  };
+  const cliOut = [];
+  // Bare CLI `aipi effort` (classifyAipiInvocation strips the "effort" token) + interactive TTY.
+  const cliResult = await runAipiModels({
+    cwd: cliRoot,
+    userArgs: ["--target", cliRoot],
+    isInteractive: true,
+    promptAdapter: cliPromptAdapter,
+    log: (line) => cliOut.push(line),
+  });
+  assert.equal(cliResult.action, "setup", "bare interactive CLI `aipi effort` must run the wizard");
+  assert.equal(cliResult.state, "ready");
+  assert.equal(cliPrompts.some((prompt) => /^Doer.*model/i.test(prompt)), true);
+  const cliConfig = JSON.parse(await fs.readFile(path.join(cliRoot, ".aipi", "model-capabilities.json"), "utf8"));
+  assert.equal(cliConfig.classes["code-strong"], "openai-codex/gpt-5.5");
+  assert.equal(cliConfig.classes["adversarial-heavy"], "anthropic/claude-opus-4-8");
+} finally {
+  await fs.rm(cliRoot, { recursive: true, force: true });
 }
 
 console.log("AIPI_MODELS_COMMAND_TEST_OK");

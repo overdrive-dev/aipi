@@ -590,13 +590,18 @@ try {
   // The whole multi-step workflow COMPLETES end-to-end. Before the fix it could never get past the
   // first step (triage/quick_scope) because the local fallback stamped BLOCKED "no executable adapter".
   assert.equal(defaultExecution.status, "completed");
-  // Every one of the five quick steps dispatched a REAL worker — not just the legacy `quick_change`
-  // spike step.
-  assert.equal(defaultRunnerCalls.length, 5);
+  // Six worker dispatches: the four single-lead steps (quick_scope/quick_change/quick_verify/quick_memory)
+  // each dispatch one, and the REVIEW-stage `quick_review` (2 agents) FANS OUT to two — proving the
+  // default policy runs declared review agents instead of only the lead (CR-60-2).
+  assert.equal(defaultRunnerCalls.length, 6);
   const defaultStepStatus = new Map(defaultExecution.state.steps.map((s) => [s.id, s]));
   for (const stepId of ["quick_scope", "quick_change", "quick_verify", "quick_review"]) {
     assert.equal(defaultStepStatus.get(stepId)?.status, "passed", `step ${stepId} must run + pass as a real subagent`);
   }
+  // quick_review fanned out: BOTH declared review artifacts were produced by separate review agents.
+  const quickReviewWrites = defaultRawWrites.map((item) => item.path).filter((p) => p.includes("/steps/quick_review/"));
+  assert.equal(quickReviewWrites.some((p) => p.endsWith("/CODE-REVIEW.md")), true);
+  assert.equal(quickReviewWrites.some((p) => p.endsWith("/COMPLEXITY-REVIEW.md")), true);
   // The worker SKIPPED survived the coordinator and the executor gate (not downgraded to BLOCKED).
   assert.equal(defaultStepStatus.get("quick_memory")?.status, "skipped");
   assert.equal(defaultStepStatus.get("quick_memory")?.verdict, "SKIPPED");
@@ -605,6 +610,62 @@ try {
     const resultPath = path.join(tempRoot, ".aipi", "runtime", "runs", defaultRun.runId, "steps", stepId, "RESULT.json");
     const resultText = await fs.readFile(resultPath, "utf8").catch(() => "{}");
     assert.doesNotMatch(resultText, /no executable adapter|refusing to self-stamp|aipi-local-executor/);
+  }
+
+  // CR-60-2 (real-path): the bugfix `review` step (id: review, stage: review, 4 specialized agents)
+  // must FAN OUT under the DEFAULT adapter — even though it is NOT named `review_swarm` — so every
+  // declared reviewer runs and produces its artifact, not just the lead code-reviewer.
+  const bugfixReviewRun = await startWorkflowRun({
+    projectRoot: tempRoot,
+    workflow: "bugfix",
+    now: () => fixedDate,
+    randomBytes: fixedRandom,
+  });
+  const bugfixWorkflow = parseWorkflowDefinition(
+    await fs.readFile(path.join(tempRoot, ".aipi", "workflows", "bugfix.yaml"), "utf8"),
+    "bugfix",
+  );
+  const bugfixReviewStep = bugfixWorkflow.steps.find((step) => step.id === "review");
+  assert.equal(bugfixReviewStep.stage, "review");
+  assert.equal(bugfixReviewStep.agents.length, 4);
+  const reviewFanoutCalls = [];
+  const reviewFanoutWrites = [];
+  const reviewFanoutCoordinator = new SubagentCoordinator(
+    { appendEntry() {} },
+    {
+      root: tempRoot,
+      maxConcurrent: 4,
+      piSubagentsRunner: fakeWorkflowRunner({ calls: reviewFanoutCalls, rawWrites: reviewFanoutWrites, root: tempRoot }),
+    },
+  );
+  const reviewFanoutAdapter = createSubagentWorkflowAdapter(reviewFanoutCoordinator, {
+    pollIntervalMs: 1,
+    collectTimeoutMs: 1_000,
+    modelResolver: async ({ step }) => ({
+      model_class: "adversarial-heavy",
+      model: { provider: "anthropic", id: `claude-${step.agents[0]}` },
+      thinking_level: "medium",
+      source: "test",
+    }),
+  });
+  const bugfixReviewResult = await reviewFanoutAdapter.executeStep({
+    root: tempRoot,
+    state: bugfixReviewRun.state,
+    workflow: bugfixWorkflow,
+    step: bugfixReviewStep,
+    context: {},
+    contract: {},
+  });
+  assert.equal(bugfixReviewResult.verdict, "PASS");
+  // All four review agents were spawned (not just the lead), and all four review artifacts produced.
+  assert.equal(reviewFanoutCalls.length, 4);
+  const reviewArtifactNames = reviewFanoutWrites.map((item) => item.path);
+  for (const name of ["CODE-REVIEW.md", "COMPLEXITY-REVIEW.md", "BLAST-RADIUS.md", "SECURITY.md"]) {
+    assert.equal(
+      reviewArtifactNames.some((p) => p.endsWith(`/steps/review/${name}`)),
+      true,
+      `bugfix review fan-out must produce ${name}`,
+    );
   }
 
   const contradictoryReviewRun = await startWorkflowRun({

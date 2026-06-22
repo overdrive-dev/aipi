@@ -522,6 +522,35 @@ await runAipiModels({
 });
 assert.deepEqual(JSON.parse(jsonModelsOutput[0]), modelsResult);
 
+// CR-60-1: the CLI `aipi effort` surface forwards a prompt UI to runModelsCommand ONLY for an
+// interactive, non-JSON invocation (so a bare `aipi effort` opens the setup wizard); --json and
+// non-interactive (piped/CI) callers get no UI so they stay status-only and stdout stays machine-safe.
+const captureModelsFns = {
+  results: [],
+  async runModelsCommand({ ui }) {
+    captureModelsFns.results.push(ui);
+    return { action: "setup", state: "ready" };
+  },
+  formatModelsCommandResult: () => "AIPI models setup: ready",
+};
+// Interactive terminal with no injected adapter -> runAipiModels builds + forwards a prompt UI.
+await runAipiModels({ userArgs: [], isInteractive: true, log: () => {}, modelsFns: captureModelsFns });
+const builtUi = captureModelsFns.results.at(-1);
+assert.notEqual(builtUi, null);
+assert.equal(typeof builtUi?.input, "function");
+// An explicitly injected prompt adapter is forwarded as-is.
+const injectedAdapter = { input: async () => "" };
+await runAipiModels({ userArgs: [], isInteractive: true, promptAdapter: injectedAdapter, log: () => {}, modelsFns: captureModelsFns });
+assert.equal(captureModelsFns.results.at(-1), injectedAdapter);
+// --json -> no UI; stdout is the JSON result only.
+const jsonUiOut = [];
+await runAipiModels({ userArgs: ["--json"], isInteractive: true, log: (line) => jsonUiOut.push(line), modelsFns: captureModelsFns });
+assert.equal(captureModelsFns.results.at(-1), null);
+assert.deepEqual(JSON.parse(jsonUiOut[0]), { action: "setup", state: "ready" });
+// Non-interactive (piped/CI) -> no UI (status-only, never opens the wizard).
+await runAipiModels({ userArgs: [], isInteractive: false, log: () => {}, modelsFns: captureModelsFns });
+assert.equal(captureModelsFns.results.at(-1), null);
+
 const diagnoseOutput = [];
 const diagnoseResult = {
   schema: "aipi.diagnose-result.v1",
