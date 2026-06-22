@@ -69,27 +69,28 @@ export async function executeWorkflowRun({
   const maxConsecutiveFailures = runLimits.maxConsecutiveFailures ?? Number.POSITIVE_INFINITY;
   const events = [];
   // ADV-58-3: surface per-step progress to the terminal so a long run does not look frozen.
-  // Per-step run count: with FAIL / BLOCKED_TO_PLANNING gates a workflow can revisit a step (e.g. the
-  // fix -> verify -> review -> fix loop). state.step_visits[id] is how many times the step has run, so the
-  // planner shows `fix (3)` — the times the run entered that step — instead of a positional `4/7` index
-  // that is misleading once steps loop. Unvisited steps show just their name.
-  const stepLabel = (stepId) => {
-    const visits = state.step_visits?.[stepId] ?? 0;
-    return visits >= 1 ? `${stepId} (${visits})` : stepId;
+  // Per-step run count = COMPLETED executions IN THIS DISPATCH (each time the step produced a result),
+  // plus 1 while the step is actively running. An attempt interrupted by a session restart/resume leaves
+  // no result, so it does NOT inflate the count — `triage (1)` stays (1) on resume — while a real gate loop
+  // (fix -> verify -> review -> fix) shows (2), (3)…. Unvisited steps show just their name.
+  const stepLabel = (stepId, running = false) => {
+    const runs = (state.step_runs?.[stepId] ?? 0) + (running ? 1 : 0);
+    return runs >= 1 ? `${stepId} (${runs})` : stepId;
   };
   // A planner/checklist: one line per workflow step with a status glyph, re-rendered as the run
   // advances. The active step is shown as running even before it is marked terminal.
   const buildPlanLines = (activeStepId, activePhase) =>
     workflow.steps.map((step) => {
       let status = state.steps?.find((entry) => entry.id === step.id)?.status ?? "pending";
-      if (step.id === activeStepId && activePhase === "running") status = "running";
+      const running = step.id === activeStepId && activePhase === "running";
+      if (running) status = "running";
       const glyph = PROGRESS_PLAN_GLYPHS[status] ?? "○";
-      return `${glyph} ${stepLabel(step.id)}`;
+      return `${glyph} ${stepLabel(step.id, running)}`;
     });
   const emitProgress = (stepId, phase) => {
     if (typeof notify !== "function") return;
     const verb = PROGRESS_PHASE_LABELS[phase] ?? phase;
-    const label = stepLabel(stepId);
+    const label = stepLabel(stepId, phase === "running");
     try {
       // Legacy one-line notify (kept for the CLI/notify-only path).
       notify(`AIPI ${state.workflow}: ${label} ${verb}`, "info");
@@ -124,7 +125,8 @@ export async function executeWorkflowRun({
     controller_write_scope: "declared_step_artifacts_only",
     parent_interactive_tool_call_hook: parentInteractiveToolCallHook,
   };
-  state.step_visits ??= {};
+  state.step_visits ??= {}; // entries (incl. resume re-entries) — used for run limits
+  state.step_runs ??= {}; // COMPLETED executions per step in this dispatch — used for the planner label
   state.consecutive_failures ??= 0;
   state.policy_decisions ??= [];
 
@@ -213,6 +215,9 @@ export async function executeWorkflowRun({
       args: { root, state, workflow, step, context, contract, notify },
       retry: transientProviderRetryConfig(contract),
     });
+    // The step produced a result (a real, completed execution — transient retries are internal and don't
+    // count). This drives the planner's `(n)` label so an interrupted/resumed attempt doesn't inflate it.
+    state.step_runs[step.id] = (state.step_runs[step.id] ?? 0) + 1;
     const artifactContents = await readStepArtifactContents({ root, result });
     const validation = validateStepResult(result, { step, contract, artifactContents });
     recordPolicyDecision({ state, step, result, validation, now });
