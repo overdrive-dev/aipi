@@ -967,6 +967,39 @@ try {
   assert.ok(sinkCalls.spinner.some((entry) => entry.start), "spinner started for a running step");
   assert.ok(sinkCalls.spinner.some((entry) => entry.stop), "spinner stopped");
 
+  // Regression (ADV-61-3 self-review): a step that THROWS after arming the spinner must still tear it
+  // down (clearProgress in the try/finally), or the unref'd setInterval animates the TUI forever for a
+  // failed run. Assert the spinner is stopped even though executeWorkflowRun rejects.
+  const throwRun = await startWorkflowRun({
+    projectRoot: tempRoot,
+    workflow: "feature",
+    now: () => fixedDate,
+    randomBytes: fixedRandom,
+  });
+  const throwSpinner = [];
+  const throwSink = () => {};
+  throwSink.setPlan = () => {};
+  throwSink.setStatus = () => {};
+  throwSink.startSpinner = () => throwSpinner.push("start");
+  throwSink.stopSpinner = () => throwSpinner.push("stop");
+  await assert.rejects(
+    () =>
+      executeWorkflowRun({
+        projectRoot: tempRoot,
+        runId: throwRun.runId,
+        now: () => fixedDate,
+        adapter: {
+          async executeStep() {
+            throw new Error("boom mid-step");
+          },
+        },
+        notify: throwSink,
+      }),
+    /boom mid-step/,
+  );
+  assert.ok(throwSpinner.includes("start"), "spinner was armed before the throw");
+  assert.ok(throwSpinner.includes("stop"), "spinner is torn down despite the throw (clearProgress in finally)");
+
   const policyStep = quick.steps[0];
   const policyState = {
     run_id: "run-policy",

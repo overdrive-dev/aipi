@@ -112,6 +112,10 @@ export async function executeWorkflowRun({
   state.consecutive_failures ??= 0;
   state.policy_decisions ??= [];
 
+  // try/finally so the progress spinner's setInterval is torn down on EVERY exit — including a thrown
+  // buildStepContext / executeStep / persistRunState after a step armed the spinner. Without this the
+  // unref'd interval keeps firing setStatus forever in the long-lived interactive TUI for a failed run.
+  try {
   while (state.status === "running") {
     const stepId = state.current_step ?? nextPendingStep(state);
     if (!stepId) {
@@ -317,8 +321,10 @@ export async function executeWorkflowRun({
   if (isTerminalActiveStatus(state.status)) {
     await clearActiveRunPointer(root, activeRunId);
   }
-  clearProgress(); // stop the spinner + clear the animated status line before returning
   return { runId: activeRunId, status: state.status, state, events };
+  } finally {
+    clearProgress(); // stop the spinner + clear the animated status line on every exit, incl. throws
+  }
 }
 
 export function createLocalWorkflowAdapter() {

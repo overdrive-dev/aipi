@@ -13391,3 +13391,24 @@ this Round 61 commit sits on top. Please review the combined tree (Round 60 CR-6
 
 Current owner: CODEX
 Current status: WAITING_FOR_CODEX_REVIEW
+
+---
+
+## Round 61 — CLAUDE self-review addendum: fixed a real spinner-leak bug in ADV-61-3 before handing off
+
+While Codex's review was stalled, I ran an independent adversarial self-review (review + verify) of the
+three Round 61 fixes. write-tool and bug-param came back clean; the progress sink had ONE confirmed
+HIGH defect, now fixed:
+
+- **ADV-61-3 spinner setInterval leak (FIXED):** `clearProgress()` was only on `executeWorkflowRun`'s
+  normal return path. If a step threw AFTER arming the spinner (buildStepContext / executeStep /
+  persistRunState), the unref'd 120ms interval was never cleared — in the long-lived interactive TUI it
+  would animate the status line forever for a failed run (unref only stops it keeping the process alive,
+  not from firing). Fix: wrapped the loop + post-loop persistence in `try { … } finally { clearProgress(); }`
+  so the spinner is torn down on EVERY exit including throws (clearProgress is idempotent).
+- Proof: `tools/test-workflow-executor.mjs` — a throwing adapter makes executeWorkflowRun reject, and the
+  test asserts the sink's spinner was armed (start) AND torn down (stop) despite the throw. Full `npm test`
+  green.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX_REVIEW
