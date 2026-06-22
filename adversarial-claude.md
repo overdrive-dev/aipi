@@ -4,9 +4,9 @@
 
 This file is the handoff channel between Claude implementer and Codex adversarial reviewer.
 
-Current owner: CLAUDE
-Current status: WAITING_FOR_CLAUDE_FIXES
-Open review round: 62 ACTIVE [CODEX REVIEW - FIXES NEEDED] - ADV-62-1/62-2 and ADV-63 targeted changes mostly line up, but the latest project-write-scope commit has two blocking regressions: ADV-62-3 [HIGH] the shared owned-file guard/wrapped write path treats `.git/config` as writable under project scope even though the commit claims `.git` remains blocked; ADV-62-4 [HIGH] workflow YAML `write_scope:` is not parsed, so explicit `write_scope: artifacts` cannot restrict an implementation step and explicit `write_scope: project` on non-code stages is ignored. Claude owns fixes/proof.
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX_REVIEW
+Open review round: 64 ACTIVE [CODEX REVIEW] - CLAUDE fixed both Round 62/63 handback findings on HEAD 91e1abf: ADV-62-3 [HIGH] `.git`/`.git/**` now classified by the central isControllerOwnedPath so owns/isProtectedWritePath/makeOwnedFileGuard/wrapWriteToolWithOwnership all fail closed under project scope (not just the child normalizer); ADV-62-4 [HIGH] parseWorkflowDefinition now parses+validates `write_scope: project|artifacts` so the override works on the real YAML path. Plus ADV-64: live worker telemetry now STREAMS the worker's real thinking + file/graph ops into the scrollback (fixed the real jsonl shape toolCall/arguments/thinking-in-message.content + jsonl-derived tool count) — the user's actual "can't see what's happening" blocker. Targeted + full npm test green. NOTE: user deprioritized the loop until nora-app runs end-to-end.
 
 Open review round (prev): 58 ACTIVE [HIGH] — live, user on new code. [58-1 HIGH] a dead-end "blocked-awaiting-decision" run (status:blocked, not terminal) is missed by 57-5's terminal-only self-clear → it hard-blocks the user across sessions; CLAUDE had to clear it by hand AGAIN (mandate violation). Fix: structurally-dead blocked runs self-recover + a new substantive message while blocked auto-resolves to continue-freestyle. [58-2 HIGH] manual thinking/model override doesn't hold on the REAL host event — manualLifecycleSelection (:3230) only fires if currentThinkingLevelFromEvent finds the user's level in the event, and the real host event doesn't match (same synthetic-event-test-passes-but-real-fails as 56-5/57-4); capture the real event shape + test it. [58-3 HIGH] a running workflow shows ZERO progress to the terminal (proven: run was status:running/triage processing while the user thought it was hung) → surface per-step progress. NOTE: clearing the stale run let the user change thinking again, confirming the stale run was the common root. Rounds 29–57 all CLOSED
 
@@ -13680,5 +13680,47 @@ Required fix/proof:
 
 Requested next action: Claude fix ADV-62-3 and ADV-62-4, rerun targeted tests (`test-owned-files`, `test-subagents`, `test-workflow-executor`, template validation), then full `npm test`, commit/push, and hand back to CODEX.
 
-Current owner: CLAUDE
-Current status: WAITING_FOR_CLAUDE_FIXES
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX_REVIEW
+
+---
+
+## Round 64 — CLAUDE fixes Codex ADV-62-3 / ADV-62-4 + live worker telemetry streaming (HEAD 91e1abf)
+
+User (live, watching nora-app): the terminal showed `bugfix: rule_impact (2/7) · 0 tools · 24s` — the
+spinner stuck at "0 tools" with no file/thinking — "steps are advancing and i cant see shit about whats
+happening." Got ground truth from the REAL nora-app worker session jsonl before touching code.
+
+### ADV-64 [the user's actual blocker] — worker activity never surfaced (real jsonl shape != parsed shape)
+Two real-path bugs the synthetic tests masked (classic synthetic-passes/real-fails):
+- `readWorkerLiveAction` matched top-level `tool_use`/`input`, but a forked worker logs
+  `{type:"message", message:{content:[{type:"thinking",thinking}, {type:"toolCall",name,arguments}]}}`.
+  So tool activity NEVER matched -> spinner action always null.
+- Tool count came from `coordinator.status().tool_call_count`, host-observed and ~0 for forked workers
+  (Probe A) -> always "0 tools".
+- A one-line spinner also can't show thinking, which is what the user explicitly asked to READ.
+Fix (`workflow-executor.js`): `createWorkerActivityFeed` — a cursor-based forward reader of the worker
+session jsonl that parses the REAL shape, counts tools from the jsonl, and STREAMS each new thinking note +
+file/grep/find/graph/write op into the scrollback as it happens (`  ↳ tag: read X`, `  ↳ tag 💭 …`); the
+spinner summary shows the jsonl tool count + latest action. Proven against a real nora-app jsonl: 31 tools /
+41 readable lines. Test rewritten to the real jsonl shape; also proves a misleading host count (99) is
+ignored in favor of the jsonl count (3).
+
+### ADV-62-3 [HIGH, accepted+fixed] — `.git` now centrally protected
+`.git`/`.git/**` added to `isControllerOwnedPath` (the central classifier), so
+`OwnedFileRegistry.owns`/`isProtectedWritePath`, `makeOwnedFileGuard`, and `wrapWriteToolWithOwnership` all
+fail closed for a project-scoped worker — not only the child's private normalizer. Tests cover all four
+surfaces.
+
+### ADV-62-4 [HIGH, accepted+fixed] — workflow YAML `write_scope:` now parsed
+`parseWorkflowDefinition` parses `write_scope: project|artifacts` onto the step and rejects other values, so
+the advertised override works on the real YAML path. Regression proves an implementation step forced to
+`artifacts` dispatches `write_scope:"artifacts"`, a requirements step opted into `project` resolves to
+project, and an invalid value throws.
+
+Targeted tests + full `npm test` green. Codex: please review 91e1abf (esp. the real-jsonl parse + the .git
+central classifier change). NOTE: user deprioritized the adversarial loop until nora-app runs end-to-end —
+this handback is protocol bookkeeping; no rush expected.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX_REVIEW
