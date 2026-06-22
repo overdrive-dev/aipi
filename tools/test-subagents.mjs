@@ -591,6 +591,123 @@ assert.throws(() => coordinator.status(agentId), /unknown agent/);
 assert.equal(piEntries.some((entry) => entry.name === SUBAGENT_EVENT_ENTRY && entry.value.event === "cleanup"), true);
 await fs.rm(coordinatorRoot, { recursive: true, force: true });
 
+// Owned-file conflict regression — the live nora-app `fix (4/7)` block:
+// "owned-file conflict for implementer:...: .../steps/fix/FIXES.md, IMPLEMENTATION.md".
+const conflictRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-owned-conflict-"));
+try {
+  const fixFiles = [
+    ".aipi/runtime/runs/run-1/steps/fix/FIXES.md",
+    ".aipi/runtime/runs/run-1/steps/fix/IMPLEMENTATION.md",
+  ];
+  const makeFixCoordinator = (entries = []) =>
+    new SubagentCoordinator(
+      { appendEntry(name, value) { entries.push({ name, value }); } },
+      {
+        root: conflictRoot,
+        maxConcurrent: 1,
+        env: {},
+        piSubagentsRunner: {
+          async spawn(params, options = {}) {
+            const aid = params.task.match(/AIPI worker id: ([^\n]+)/)?.[1] ?? "x";
+            for (const f of params.owned_files ?? []) await writeEvidenceFile(options.ctx?.project_root ?? conflictRoot, f, "fix evidence");
+            return {
+              content: [{ type: "text", text: JSON.stringify({ ...stepResult, step_id: "fix", agent_ids: [aid], artifacts: params.owned_files ?? fixFiles }) }],
+              artifacts: params.owned_files ?? fixFiles,
+              tool_call_count: 1,
+              exit_code: 0,
+              run_id: "fix-run",
+            };
+          },
+        },
+      },
+    );
+  const fixDescriptor = () => ({
+    agent_id: "implementer",
+    model_class: "code-strong",
+    model: { provider: "anthropic", id: "claude-opus-4-8" },
+    step_id: "fix",
+    write_scope: "project",
+    owned_files: fixFiles,
+  });
+
+  // (A) A worker that reaches DONE (e.g. returned a FAIL verdict) releases its owned files, so the gate's
+  // fix->fix loop can re-dispatch the SAME artifacts without an owned-file conflict.
+  const fixCoordinator = makeFixCoordinator();
+  const { agent_id: fixA } = fixCoordinator.spawn(fixDescriptor());
+  await waitFor(() => fixCoordinator.status(fixA).state === "done");
+  let fixB;
+  assert.doesNotThrow(() => { fixB = fixCoordinator.spawn(fixDescriptor()).agent_id; }, "DONE worker must release its owned files for the next fix attempt");
+  await waitFor(() => fixCoordinator.status(fixB).state === "done");
+  assert.notEqual(fixA, fixB);
+
+  // (B/C) Resume regression: a restored INTERRUPTED worker's stale allocation must not block re-dispatch.
+  // Persisting step_id lets #findInterruptedJob match -> dispatch redispatches and frees the old claim;
+  // even if it didn't match, #allocateOrReclaim frees a non-live owner. Either way: no hard conflict.
+  const resumeCoordinator = makeFixCoordinator();
+  resumeCoordinator.restore({
+    jobs: [
+      {
+        agentId: "implementer:old12345",
+        state: "running", // a killed run -> restored as INTERRUPTED
+        descriptor: { agent_id: "implementer", step_id: "fix", write_scope: "project", owned_files: fixFiles },
+      },
+    ],
+    ownedFiles: [
+      { agentId: "implementer:old12345", files: fixFiles.map((f) => path.join(conflictRoot, f)), projectScope: true },
+    ],
+  });
+  let resumeNew;
+  assert.doesNotThrow(() => { resumeNew = resumeCoordinator.dispatch(fixDescriptor()); }, "restored stale fix allocation must not block re-dispatch");
+  assert.ok(resumeNew.agent_id && resumeNew.agent_id !== "implementer:old12345");
+  await waitFor(() => resumeCoordinator.status(resumeNew.agent_id).state === "done");
+
+  // (C) #allocateOrReclaim frees a NON-LIVE owner directly on spawn (no interrupted-match required).
+  const reclaimCoordinator = makeFixCoordinator();
+  reclaimCoordinator.restore({
+    jobs: [{ agentId: "implementer:done5555", state: "done", descriptor: { agent_id: "implementer", step_id: "fix", owned_files: fixFiles } }],
+    ownedFiles: [{ agentId: "implementer:done5555", files: fixFiles.map((f) => path.join(conflictRoot, f)) }],
+  });
+  let reclaimNew;
+  assert.doesNotThrow(() => { reclaimNew = reclaimCoordinator.spawn(fixDescriptor()).agent_id; }, "a terminal owner's stale allocation must be reclaimed on spawn");
+  await waitFor(() => reclaimCoordinator.status(reclaimNew).state === "done");
+
+  // (C) A genuinely LIVE concurrent writer still fails loud — reclaim never steals from a RUNNING worker.
+  let releaseLive;
+  const liveBlock = new Promise((resolve) => { releaseLive = resolve; });
+  const liveCoordinator = new SubagentCoordinator(
+    { appendEntry() {} },
+    {
+      root: conflictRoot,
+      maxConcurrent: 2,
+      env: {},
+      piSubagentsRunner: {
+        async spawn(params) {
+          await liveBlock; // hold the worker in RUNNING until released
+          const aid = params.task.match(/AIPI worker id: ([^\n]+)/)?.[1] ?? "x";
+          return {
+            content: [{ type: "text", text: JSON.stringify({ ...stepResult, step_id: "fix", agent_ids: [aid], artifacts: params.owned_files }) }],
+            artifacts: params.owned_files,
+            tool_call_count: 1,
+            exit_code: 0,
+            run_id: "live-run",
+          };
+        },
+      },
+    },
+  );
+  const { agent_id: liveA } = liveCoordinator.spawn({ ...fixDescriptor(), step_id: "fix", owned_files: ["src/live.js"] });
+  await waitFor(() => liveCoordinator.status(liveA).state === "running");
+  assert.throws(
+    () => liveCoordinator.spawn({ ...fixDescriptor(), step_id: "fix2", owned_files: ["src/live.js"] }),
+    /owned-file conflict/,
+    "a RUNNING worker's owned file must NOT be reclaimable by a concurrent writer",
+  );
+  releaseLive();
+  await waitFor(() => liveCoordinator.status(liveA).state === "done");
+} finally {
+  await fs.rm(conflictRoot, { recursive: true, force: true });
+}
+
 const weakEvidenceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-subagents-weak-pass-"));
 try {
   const weakEvidenceCoordinator = new SubagentCoordinator(

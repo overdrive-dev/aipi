@@ -159,7 +159,7 @@ export class SubagentCoordinator {
     const base = descriptor.agent_id ?? "agent";
     const agentId = `${base}:${randomUUID().slice(0, 8)}`;
     if (Array.isArray(descriptor.owned_files) && descriptor.owned_files.length) {
-      this.#registry.allocate(agentId, descriptor.owned_files); // throws on overlap
+      this.#allocateOrReclaim(agentId, descriptor.owned_files); // throws only on a LIVE conflict
     }
     // Code-writing steps (implementation/fix/tdd) get a project-write scope so the worker can
     // apply its fix to the real source files, not just document a patch in its run-dir artifacts.
@@ -386,12 +386,14 @@ export class SubagentCoordinator {
         job.error ??= String(err?.message ?? err);
         this.#trace("cancelled", job, { reason: job.abortReason, error: job.error });
       }
-      // Release the failed/cancelled worker's owned-file allocation immediately so a transient-retry
-      // re-spawn of the same step can re-allocate those files instead of hitting an owned-file conflict.
-      this.#registry.release(job.agentId);
     } finally {
       if (budgetTimer) clearTimeout(budgetTimer);
       job.finishedAt = Date.now();
+      // Release the worker's owned-file allocation as soon as it is terminal — DONE included, not only
+      // FAILED/CANCELLED. A worker that returns a FAIL *verdict* finishes DONE; the gate then loops the
+      // step (e.g. `fix` -> `fix`) and the re-dispatched worker must be able to re-allocate the same
+      // artifacts instead of hitting an owned-file conflict with the prior (now terminal) attempt.
+      this.#registry.release(job.agentId);
       this.#trace("worker_cleanup", job, finishTraceData(job));
       this.#runningCount -= 1;
       this.#persist();
@@ -461,6 +463,31 @@ export class SubagentCoordinator {
     return job;
   }
 
+  // Allocate the worker's owned files, reclaiming any allocation still held by a NON-LIVE prior worker
+  // (a DONE/FAILED/CANCELLED/INTERRUPTED/REDISPATCHED attempt of the same step whose allocation lingered,
+  // e.g. a restored run or a FAIL->retry loop). A genuinely LIVE writer (QUEUED/RUNNING) still fails loud,
+  // so this never lets two concurrent workers share a file — it only frees a dead worker's stale claim.
+  #allocateOrReclaim(agentId, ownedFiles) {
+    try {
+      this.#registry.allocate(agentId, ownedFiles);
+      return;
+    } catch (err) {
+      if (!/owned-file conflict/.test(String(err?.message ?? err))) throw err;
+      const owners = this.#registry.ownersOf?.(ownedFiles) ?? [];
+      const live = owners.filter((id) => {
+        const state = this.#jobs.get(id)?.state;
+        return state === JobState.QUEUED || state === JobState.RUNNING;
+      });
+      if (live.length) throw err; // real concurrent conflict — keep failing loud
+      for (const id of owners) {
+        const ownerJob = this.#jobs.get(id);
+        this.#registry.release(id);
+        if (ownerJob) this.#trace("owned_file_reclaimed", ownerJob, { reclaimed_by: agentId });
+      }
+      this.#registry.allocate(agentId, ownedFiles);
+    }
+  }
+
   #findInterruptedJob(descriptor) {
     const stepId = descriptor?.step_id ?? null;
     const catalogAgentId = descriptor?.agent_id ?? null;
@@ -486,6 +513,11 @@ export class SubagentCoordinator {
         finishedAt: j.finishedAt,
         descriptor: {
           agent_id: j.descriptor.agent_id,
+          // step_id is REQUIRED for #findInterruptedJob to match a restored interrupted worker on resume;
+          // without it a redispatch never fires and the stale owned-file allocation conflicts. write_scope
+          // is preserved so a redispatched code-writing worker keeps its project write scope.
+          step_id: j.descriptor.step_id ?? null,
+          write_scope: j.descriptor.write_scope ?? null,
           owned_files: j.descriptor.owned_files ?? [],
         },
         result: j.result,

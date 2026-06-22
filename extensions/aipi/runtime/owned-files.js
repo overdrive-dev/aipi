@@ -91,6 +91,16 @@ export class OwnedFileRegistry {
     this.#byAgent.delete(agentId);
   }
 
+  // Agent ids currently holding any of the given files (for reclaiming a dead worker's lingering scope).
+  ownersOf(files) {
+    const owners = new Set();
+    for (const f of files ?? []) {
+      const owner = this.#owner.get(this.#abs(f));
+      if (owner) owners.add(owner);
+    }
+    return [...owners];
+  }
+
   owns(agentId, file) {
     const abs = this.#abs(file);
     if (this.#byAgent.get(agentId)?.has(abs)) return true;
