@@ -201,7 +201,7 @@ export async function executeWorkflowRun({
 
     const result = await executeStepWithTransientRetries({
       adapter,
-      args: { root, state, workflow, step, context, contract },
+      args: { root, state, workflow, step, context, contract, notify },
       retry: transientProviderRetryConfig(contract),
     });
     const artifactContents = await readStepArtifactContents({ root, result });
@@ -449,6 +449,7 @@ async function executeFanoutSubagentStep({
   pollIntervalMs,
   collectTimeoutMs,
   modelResolver,
+  notify = null,
 }) {
   const artifacts = step.produces.map((template) => renderTemplate(template, state, step));
   const assignments = assignArtifactsToAgents(step.agents, artifacts);
@@ -500,6 +501,9 @@ async function executeFanoutSubagentStep({
     const collect = await collectSubagentResult(coordinator, worker.agent_id, {
       pollIntervalMs,
       collectTimeoutMs,
+      notify,
+      root,
+      stepId: step.id,
     });
     if (!collect.ready) {
       return workerOutcomeOrThrow({ step, agentId: worker.agent_id, collect });
@@ -548,6 +552,7 @@ async function executeSubagentStep({
   pollIntervalMs,
   collectTimeoutMs,
   modelResolver,
+  notify = null,
 }) {
   const artifacts = step.produces.map((template) => renderTemplate(template, state, step));
   const modelResolution = await modelResolver({ root, workflow, step, context, contract });
@@ -583,6 +588,9 @@ async function executeSubagentStep({
   const collect = await collectSubagentResult(coordinator, agentId, {
     pollIntervalMs,
     collectTimeoutMs,
+    notify,
+    root,
+    stepId: step.id,
   });
   if (!collect.ready) {
     return workerOutcomeOrThrow({ step, agentId, collect });
@@ -603,14 +611,85 @@ function dispatchSubagent(coordinator, descriptor) {
 async function collectSubagentResult(coordinator, agentId, {
   pollIntervalMs,
   collectTimeoutMs,
+  notify = null,
+  root = null,
+  stepId = null,
 }) {
   const startedAt = Date.now();
+  let lastActivityAt = 0;
   while (Date.now() - startedAt <= collectTimeoutMs) {
     const collect = coordinator.collect(agentId);
     if (collect.ready || ["failed", "cancelled", "interrupted"].includes(collect.state)) return collect;
+    // Live worker telemetry: while the worker runs (which is the minutes-long part of a step), surface
+    // what it's actually doing — tool-call count + the file it's reading + thinking — into the spinner's
+    // status line so the terminal isn't silent. Throttled, best-effort, never blocks the poll.
+    if (typeof notify?.updateActivity === "function" && Date.now() - lastActivityAt >= 1200) {
+      lastActivityAt = Date.now();
+      try {
+        const status = coordinator.status?.(agentId) ?? {};
+        const tools = status.tool_call_count ?? 0;
+        const action = root ? await readWorkerLiveAction(root, agentId) : null;
+        const parts = [`${tools} tool${tools === 1 ? "" : "s"}`];
+        if (action) parts.push(action);
+        notify.updateActivity(parts.join(" · "));
+      } catch {
+        /* telemetry is best-effort and must never break the run */
+      }
+    }
     await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
   }
   return { agent_id: agentId, ready: false, state: "timeout" };
+}
+
+// Best-effort live read of what the forked worker is currently doing, from the tail of its session
+// jsonl: the latest tool call (e.g. "read AdminSidebar.ts", "grep useUser") or "thinking…". Reads only
+// the last 32KB (the newest events) so it stays cheap on a growing multi-MB session. Never throws.
+async function readWorkerLiveAction(root, agentId) {
+  try {
+    const dir = path.join(root, ".aipi", "runtime", "subagents", "sessions", String(agentId).replaceAll(":", "-"));
+    const entries = await fs.readdir(dir).catch(() => []);
+    const jsonl = entries.filter((name) => name.endsWith(".jsonl")).sort().at(-1);
+    if (!jsonl) return null;
+    const filePath = path.join(dir, jsonl);
+    const stat = await fs.stat(filePath).catch(() => null);
+    if (!stat || !stat.size) return null;
+    const start = Math.max(0, stat.size - 32 * 1024);
+    const handle = await fs.open(filePath, "r");
+    let text;
+    try {
+      const buf = Buffer.alloc(stat.size - start);
+      await handle.read(buf, 0, buf.length, start);
+      text = buf.toString("utf8");
+    } finally {
+      await handle.close();
+    }
+    const lines = text.split(/\r?\n/);
+    if (start > 0 && lines.length) lines.shift(); // drop a possibly-partial first line
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const content = event?.message?.content;
+      if (!Array.isArray(content)) continue;
+      for (let j = content.length - 1; j >= 0; j -= 1) {
+        const part = content[j];
+        if (part?.type === "tool_use") {
+          const target = part.input?.path ?? part.input?.pattern ?? part.input?.file ?? part.input?.query ?? "";
+          const short = target ? String(target).replaceAll("\\", "/").split("/").pop() : "";
+          return `${part.name}${short ? ` ${short}` : ""}`.trim();
+        }
+        if (part?.type === "thinking") return "thinking…";
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function blockedStepResult({ step, agentId, reason }) {

@@ -717,6 +717,46 @@ try {
   assert.doesNotMatch(workerTask, /\{\{\s*bug\s*\}\}/, "rendered worker prompt must not contain the literal {{ bug }}");
   assert.ok(workerTask.includes(bugText), "rendered worker prompt must contain the user's task text");
 
+  // Live worker telemetry (ADV-63): while a worker runs (the minutes-long part of a step), the executor
+  // surfaces what it is DOING — tool-call count + the file it's reading — into the progress sink's
+  // updateActivity channel (which feeds the spinner status line), so the terminal isn't silent.
+  const teleAgentId = "orchestration-reasoner:tele01";
+  const teleSessionDir = path.join(tempRoot, ".aipi", "runtime", "subagents", "sessions", teleAgentId.replaceAll(":", "-"));
+  await fs.mkdir(teleSessionDir, { recursive: true });
+  await fs.writeFile(
+    path.join(teleSessionDir, "2026-06-22T19-00-00-000Z_sess.jsonl"),
+    `${JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "thinking", thinking: "…" }] } })}\n` +
+      `${JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "tool_use", name: "read", input: { path: "frontend/src/components/admin/AdminSidebar.tsx" } }] } })}\n`,
+  );
+  let telePolls = 0;
+  const teleCoordinator = {
+    spawn: () => ({ agent_id: teleAgentId }),
+    status: () => ({ tool_call_count: 7, elapsed_ms: 4000 }),
+    collect: () => {
+      telePolls += 1;
+      if (telePolls < 3) return { agent_id: teleAgentId, ready: false, state: "running" };
+      return {
+        agent_id: teleAgentId,
+        ready: true,
+        step_result: { schema: "aipi.step-result.v1", step_id: "triage", agent_ids: [teleAgentId], verdict: "PASS", evidence: [{ rung: "ran", source: "w", ref: teleAgentId, result: "ok" }], artifacts: [] },
+        artifacts: [],
+      };
+    },
+  };
+  const teleActivity = [];
+  const teleSink = () => {};
+  teleSink.updateActivity = (text) => teleActivity.push(text);
+  const teleAdapter = createSubagentWorkflowAdapter(teleCoordinator, {
+    pollIntervalMs: 1,
+    collectTimeoutMs: 2_000,
+    modelResolver: async () => ({ model_class: "code-strong", model: { provider: "anthropic", id: "x" }, thinking_level: "medium", source: "t" }),
+  });
+  await teleAdapter.executeStep({ root: tempRoot, state: bugParamRun.state, workflow: bugParamWorkflow, step: triageStep, context: {}, contract: {}, notify: teleSink });
+  assert.ok(
+    teleActivity.some((a) => /\b7 tools\b/.test(a) && /read AdminSidebar\.tsx/.test(a)),
+    `live worker telemetry must surface tool count + current file; got: ${JSON.stringify(teleActivity)}`,
+  );
+
   // collect-timeout (real-path mechanism): a real agentic worker takes minutes; the 120s spike default
   // timed it out mid-step (BLOCKED "did not finish: timeout") even though it would succeed. Prove the
   // collect timeout governs this: a worker that becomes ready AFTER a short timeout times out, but with

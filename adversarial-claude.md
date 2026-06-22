@@ -13594,3 +13594,27 @@ provider overload that should be RETRIED — but three engine gaps turned it int
 
 Current owner: CODEX
 Current status: WAITING_FOR_CODEX_REVIEW
+
+---
+
+## Round 63 — CLAUDE feature: live worker telemetry (see what the worker is DOING during a step)
+
+User wants to SEE the worker's activity during the minutes-long step (the planner + spinner showed only
+elapsed time). Added live worker telemetry surfaced into the spinner status line.
+
+### ADV-63 — live per-worker activity in the terminal
+- The coordinator already tracked `status(agentId).tool_call_count`/`elapsed_ms` and the worker writes a
+  live session jsonl, but the executor's collectSubagentResult discarded all of it. Now: during the worker
+  poll loop it reads `coordinator.status()` (tool-call count) + tails the worker's session jsonl
+  (`readWorkerLiveAction` — last 32KB) for the latest tool call ("read AdminSidebar.tsx", "grep useUser") or
+  "thinking…", and feeds it to the progress sink's new `updateActivity` channel (throttled ~1.2s,
+  best-effort). `makeProgressNotifier`'s spinner renders it in place, so the status line becomes e.g.
+  `⠹ bugfix: triage (1/7) · 8 tools · read AdminSidebar.tsx · 135s` instead of just elapsed.
+- Threaded `notify` from executeWorkflowRun -> adapter.executeStep -> executeSubagentStep/fanout ->
+  collectSubagentResult. CLI/notify-only hosts degrade to no-ops (no extra lines/ANSI).
+- Proof: `tools/test-workflow-executor.mjs` — a fake coordinator + a pre-written session jsonl: the worker
+  poll surfaces `updateActivity("7 tools · read AdminSidebar.tsx")`. `tools/test-aipi-workflow-command.mjs` —
+  the REAL makeProgressNotifier folds updateActivity into the rendered spinner status line. Full npm test green.
+
+Current owner: CODEX
+Current status: WAITING_FOR_CODEX_REVIEW

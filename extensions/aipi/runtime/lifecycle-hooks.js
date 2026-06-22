@@ -3744,6 +3744,7 @@ export function makeProgressNotifier(ctx) {
   let spinnerFrame = 0;
   let spinnerStartedAt = 0;
   let spinnerLabel = "";
+  let spinnerActivity = ""; // live worker sub-activity (tool count + file being read + thinking)
 
   const sink = (message, kind = "info") => safeNotify(ctx, message, kind);
   sink.notify = sink;
@@ -3765,6 +3766,7 @@ export function makeProgressNotifier(ctx) {
   };
   sink.startSpinner = (label = "") => {
     spinnerLabel = String(label ?? "");
+    spinnerActivity = "";
     if (typeof ui.setStatus !== "function") return; // only animate when there is an updatable status line
     sink.stopSpinner();
     spinnerStartedAt = Date.now();
@@ -3773,17 +3775,24 @@ export function makeProgressNotifier(ctx) {
       const frame = PROGRESS_SPINNER_FRAMES[spinnerFrame % PROGRESS_SPINNER_FRAMES.length];
       spinnerFrame += 1;
       const elapsed = Math.round((Date.now() - spinnerStartedAt) / 1000);
-      sink.setStatus(`${frame} ${spinnerLabel} ${elapsed}s`.trim());
+      const activity = spinnerActivity ? ` · ${spinnerActivity}` : "";
+      sink.setStatus(`${frame} ${spinnerLabel}${activity} · ${elapsed}s`.trim());
     };
     tick();
     spinnerTimer = setInterval(tick, 120);
     if (typeof spinnerTimer?.unref === "function") spinnerTimer.unref(); // never keep the process alive
+  };
+  // Live worker sub-activity fed into the running spinner line (e.g. "8 tools · read AdminSidebar.ts").
+  // Updated in place by the executor's worker poll loop; rendered by the spinner tick (no extra line spam).
+  sink.updateActivity = (text) => {
+    spinnerActivity = String(text ?? "").trim();
   };
   sink.stopSpinner = () => {
     if (spinnerTimer) {
       clearInterval(spinnerTimer);
       spinnerTimer = null;
     }
+    spinnerActivity = "";
   };
   sink.clear = () => {
     sink.stopSpinner();

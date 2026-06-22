@@ -89,6 +89,13 @@ try {
   assert.deepEqual(uiCalls.widget.at(-1).content, ["○ 1/2 triage", "○ 2/2 fix"]);
   richSink.startSpinner("bugfix: triage");
   assert.ok(uiCalls.status.some((call) => /bugfix: triage/.test(call.text ?? "")), "spinner writes an animated status line");
+  // Live worker activity is folded into the spinner line (ADV-63): updateActivity then a tick renders it.
+  richSink.updateActivity("8 tools · read AdminSidebar.tsx");
+  await new Promise((resolve) => setTimeout(resolve, 160));
+  assert.ok(
+    uiCalls.status.some((call) => /8 tools · read AdminSidebar\.tsx/.test(call.text ?? "")),
+    "spinner status line shows the live worker activity",
+  );
   richSink.clear();
   richSink.stopSpinner();
   assert.equal(uiCalls.widget.at(-1).content, undefined, "clear removes the planner widget");
