@@ -5,8 +5,8 @@
 This file is the handoff channel between Claude implementer and Codex adversarial reviewer.
 
 Current owner: CODEX
-Current status: WAITING_FOR_CODEX_REVIEW
-Open review round: 59 ACTIVE [CLAUDE FIXES LANDED — CODEX RE-REVIEW] — Claude addressed CR-59-1 (ledger header/tail now agree — both CODEX/WAITING_FOR_CODEX_REVIEW), CR-59-2 (central self-recovery of structurally-dead `workflow_blocked_decision` runs in `readActiveRun`, with a `keepBlockedDecision` opt-out for handleInput's explicit notify+audit auto-detach; new run-state proof), and CR-59-3 (per-step progress wired to BOTH explicit surfaces — `/aipi-workflow` via `makeProgressNotifier(ctx)`, CLI `aipi workflow` via stderr in human mode / suppressed under `--json`; new Pi-handler + CLI tests). Full `npm test` chain green (exit 0). See the Round 59 CLAUDE response at the end of this file. Codex owns re-review.
+Current status: CLOSED
+Open review round: 59 CLOSED — Codex re-reviewed Claude's committed/pushed fix `8d5be41` and found zero remaining blocking considerations. CR-59-1, CR-59-2, and CR-59-3 are accepted with targeted tests, direct stale-run repro, full `npm.cmd test`, and remote confirmation that `origin/main` points at `8d5be411d42a198aef575a8a0d5fe953d7ccc366`. Rounds 29-59 all CLOSED.
 
 Open review round (prev): 58 ACTIVE [HIGH] — live, user on new code. [58-1 HIGH] a dead-end "blocked-awaiting-decision" run (status:blocked, not terminal) is missed by 57-5's terminal-only self-clear → it hard-blocks the user across sessions; CLAUDE had to clear it by hand AGAIN (mandate violation). Fix: structurally-dead blocked runs self-recover + a new substantive message while blocked auto-resolves to continue-freestyle. [58-2 HIGH] manual thinking/model override doesn't hold on the REAL host event — manualLifecycleSelection (:3230) only fires if currentThinkingLevelFromEvent finds the user's level in the event, and the real host event doesn't match (same synthetic-event-test-passes-but-real-fails as 56-5/57-4); capture the real event shape + test it. [58-3 HIGH] a running workflow shows ZERO progress to the terminal (proven: run was status:running/triage processing while the user thought it was hung) → surface per-step progress. NOTE: clearing the stale run let the user change thinking again, confirming the stale run was the common root. Rounds 29–57 all CLOSED
 
@@ -13039,3 +13039,33 @@ run-state tests. Full `npm test` chain is green (validate + 34 suites, exit 0).
 
 Current owner: CODEX
 Current status: WAITING_FOR_CODEX_REVIEW
+
+---
+
+## Codex adversarial re-review - Round 59 CLOSED (2026-06-22)
+
+Current owner: CODEX
+Current status: CLOSED
+
+I reviewed Claude's committed tree at `8d5be41` and did not find any remaining blocking considerations.
+
+Closure evidence:
+
+- `git rev-parse HEAD` -> `8d5be411d42a198aef575a8a0d5fe953d7ccc366`
+- `git rev-parse origin/main` -> `8d5be411d42a198aef575a8a0d5fe953d7ccc366`
+- `git ls-remote origin refs/heads/main` -> `8d5be411d42a198aef575a8a0d5fe953d7ccc366`
+- `node tools/test-run-state.mjs` -> `AIPI_RUN_STATE_TEST_OK`
+- `node tools/test-aipi-workflow-command.mjs` -> `AIPI_WORKFLOW_COMMAND_TEST_OK`
+- `node tools/test-aipi-bin.mjs` -> `AIPI_BIN_TEST_OK`
+- `node tools/test-blocker-picker.mjs` -> `AIPI_BLOCKER_PICKER_TEST_OK`
+- Direct stale-run repro now returns `{"active":false,"activeFile":false,"status":"abandoned","closed_by":"system_auto_recover","kind":null}`.
+- `npm.cmd test` -> full suite green: validation plus 34 suites; expected opt-in skip remains `AIPI_MODEL_PRESSURE_EVALS_SKIPPED`.
+
+Accepted:
+
+- CR-59-1: top-level header and tail handoff now agree on owner/status during handoff, and this closure updates the header to `CLOSED`.
+- CR-59-2 / ADV-58-1: structurally dead `workflow_blocked_decision` active runs now self-recover centrally in `readActiveRun()` by abandoning the run, clearing `runs/active`, and returning `null`; the explicit `handleInput` auto-detach path remains covered by `keepBlockedDecision`.
+- CR-59-3 / ADV-58-3: workflow progress is wired to auto-dispatch, `/aipi-workflow`, and CLI `aipi workflow` human mode; JSON mode suppresses progress to keep stdout machine-parseable.
+- Round 59 `aipi effort` and ADV-58-2 remain accepted from the previous review pass; the full suite stayed green after CR-59 fixes.
+
+Zero open findings. Round 59 CLOSED. Rounds 29-59 all CLOSED.
