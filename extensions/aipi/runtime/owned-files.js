@@ -31,10 +31,25 @@ const RUNTIME_RUNS_PREFIX = ".aipi/runtime/runs/";
 export class OwnedFileRegistry {
   #byAgent = new Map(); // agent_id -> Set<absolutePath>
   #owner = new Map(); // absolutePath -> agent_id
+  #projectScoped = new Set(); // agent_ids granted project-wide source-write scope
   #root;
 
   constructor(root) {
     this.#root = path.resolve(root ?? process.cwd());
+  }
+
+  // Grant an implementation/fix/tdd worker the right to write ANY project source
+  // file (anything not controller-owned). Code-writing steps cannot pre-declare the
+  // exact files a fix will touch (a root-cause fix may create new files), so they get a
+  // path-scope instead of an exact owned-file set. Controller paths (.aipi/memory,
+  // .aipi/runtime/runs non-artifacts, .git) stay protected — see owns()/isProtectedWritePath.
+  grantProjectScope(agentId) {
+    this.#projectScoped.add(agentId);
+    return agentId;
+  }
+
+  hasProjectScope(agentId) {
+    return this.#projectScoped.has(agentId);
   }
 
   #abs(p) {
@@ -69,6 +84,7 @@ export class OwnedFileRegistry {
   }
 
   release(agentId) {
+    this.#projectScoped.delete(agentId);
     const set = this.#byAgent.get(agentId);
     if (!set) return;
     for (const f of set) this.#owner.delete(f);
@@ -76,7 +92,14 @@ export class OwnedFileRegistry {
   }
 
   owns(agentId, file) {
-    return this.#byAgent.get(agentId)?.has(this.#abs(file)) ?? false;
+    const abs = this.#abs(file);
+    if (this.#byAgent.get(agentId)?.has(abs)) return true;
+    if (this.#projectScoped.has(agentId)) {
+      const rel = this.#rel(abs);
+      // Stay inside the project root and off controller-owned paths; everything else is writable.
+      if (!rel.startsWith("..") && !path.isAbsolute(rel) && !isControllerOwnedPath(rel)) return true;
+    }
+    return false;
   }
 
   isProtectedWritePath(file) {
@@ -84,11 +107,19 @@ export class OwnedFileRegistry {
   }
 
   snapshot() {
-    return [...this.#byAgent].map(([agentId, set]) => ({ agentId, files: [...set] }));
+    const agentIds = new Set([...this.#byAgent.keys(), ...this.#projectScoped]);
+    return [...agentIds].map((agentId) => ({
+      agentId,
+      files: [...(this.#byAgent.get(agentId) ?? [])],
+      projectScope: this.#projectScoped.has(agentId),
+    }));
   }
 
   restore(entries) {
-    for (const { agentId, files } of entries ?? []) this.allocate(agentId, files);
+    for (const { agentId, files, projectScope } of entries ?? []) {
+      if (files?.length) this.allocate(agentId, files);
+      if (projectScope) this.grantProjectScope(agentId);
+    }
   }
 }
 
@@ -201,7 +232,7 @@ function blockedToolResult(reason) {
   return { content: [{ type: "text", text: reason }], isError: true };
 }
 
-function isControllerOwnedPath(relPath) {
+export function isControllerOwnedPath(relPath) {
   const normalized = String(relPath ?? "").replaceAll("\\", "/").replace(/^\.\/+/, "");
   if (normalized === MEMORY_PREFIX.slice(0, -1) || normalized.startsWith(MEMORY_PREFIX)) return true;
   if (normalized === RUNTIME_RUNS_PREFIX.slice(0, -1)) return true;

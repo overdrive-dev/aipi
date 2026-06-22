@@ -363,7 +363,8 @@
         "user_bash"
       ],
       "unknownToolDefault": "BLOCK",
-      "shellRule": "Forked pi_subagents workers do not receive opaque shell tools from AIPI. Shell, build, format, test, and codegen commands run in serialized controller/skill steps, not inside spawned AIPI workers."
+      "shellRule": "Forked pi_subagents workers do not receive opaque shell tools from AIPI. Shell, build, format, test, and codegen commands run in serialized controller/skill steps, not inside spawned AIPI workers.",
+      "writeScopeRule": "Each worker's write tool is scoped by step. Analysis/review/planning steps are artifacts-only: they may write only their declared owned files. Code-writing steps (stage implementation, fix, or tdd, or an explicit write_scope: project) get a project write scope so the worker can create or edit the actual source/test files its change requires, since a root-cause fix cannot pre-declare every file it touches. Controller-owned state (.aipi/memory, .aipi/runtime/runs non-artifact paths, .git) stays blocked under every scope. The scope is carried on the spawn descriptor write_scope, enforced host-side by OwnedFileRegistry.grantProjectScope/owns and worker-side by AIPI_SUBAGENTS_WRITE_SCOPE in aipi-guarded-write-child. Project write scope is granted only to single-lead code-writing steps that run sequentially; parallel review fanout stays artifact-disjoint."
     }
   },
   "providerAuth": {

@@ -9,6 +9,7 @@ import {
   createSubagentWorkflowAdapter,
   executeWorkflowRun,
   parseWorkflowDefinition,
+  resolveWriteScope,
   writeControllerArtifact,
 } from "../extensions/aipi/runtime/workflow-executor.js";
 import { SubagentCoordinator } from "../extensions/aipi/runtime/subagents.js";
@@ -814,6 +815,58 @@ try {
   // Generous timeout: the same slow worker's PASS result is collected and the step succeeds.
   const generous = await runTriageWith(makeSlowCoordinator(250), 10_000);
   assert.equal(generous.verdict, "PASS");
+
+  // Write scope (real-path): the bugfix `fix` step (stage: implementation) must dispatch a worker
+  // with a PROJECT write scope so the worker can apply its fix to actual source files, not just its
+  // run-dir artifacts. Analysis/requirements steps stay artifact-scoped.
+  assert.equal(resolveWriteScope({ stage: "implementation" }), "project");
+  assert.equal(resolveWriteScope({ stage: "fix" }), "project");
+  assert.equal(resolveWriteScope({ stage: "tdd" }), "project");
+  assert.equal(resolveWriteScope({ stage: "requirements" }), "artifacts");
+  assert.equal(resolveWriteScope({ stage: "review" }), "artifacts");
+  assert.equal(resolveWriteScope({ stage: "implementation", write_scope: "artifacts" }), "artifacts");
+  assert.equal(resolveWriteScope({ stage: "requirements", write_scope: "project" }), "project");
+
+  const capturedDescriptors = [];
+  const captureCoordinator = {
+    spawn(descriptor) {
+      capturedDescriptors.push(descriptor);
+      return { agent_id: descriptor.agent_id };
+    },
+    collect(agentId) {
+      return {
+        agent_id: agentId,
+        ready: true,
+        step_result: {
+          schema: "aipi.step-result.v1",
+          step_id: capturedDescriptors.at(-1)?.step_id ?? "step",
+          agent_ids: [agentId],
+          verdict: "PASS",
+          evidence: [{ rung: "ran", source: "capture", ref: agentId, result: "ok" }],
+          artifacts: [],
+        },
+        artifacts: [],
+      };
+    },
+  };
+  const captureAdapter = createSubagentWorkflowAdapter(captureCoordinator, {
+    pollIntervalMs: 1,
+    collectTimeoutMs: 2_000,
+    modelResolver: async () => ({ model_class: "code-strong", model: { provider: "anthropic", id: "x" }, thinking_level: "medium", source: "t" }),
+  });
+  const fixStep = timeoutWorkflow.steps.find((step) => step.id === "fix");
+  await captureAdapter.executeStep({ root: tempRoot, state: timeoutRun.state, workflow: timeoutWorkflow, step: fixStep, context: {}, contract: {} });
+  assert.equal(
+    capturedDescriptors.at(-1)?.write_scope,
+    "project",
+    "bugfix fix step (stage: implementation) must dispatch a worker with project write scope",
+  );
+  await captureAdapter.executeStep({ root: tempRoot, state: timeoutRun.state, workflow: timeoutWorkflow, step: timeoutTriageStep, context: {}, contract: {} });
+  assert.equal(
+    capturedDescriptors.at(-1)?.write_scope,
+    "artifacts",
+    "analysis/requirements steps stay artifact-scoped",
+  );
 
   const contradictoryReviewRun = await startWorkflowRun({
     projectRoot: tempRoot,

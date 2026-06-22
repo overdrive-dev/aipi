@@ -161,6 +161,11 @@ export class SubagentCoordinator {
     if (Array.isArray(descriptor.owned_files) && descriptor.owned_files.length) {
       this.#registry.allocate(agentId, descriptor.owned_files); // throws on overlap
     }
+    // Code-writing steps (implementation/fix/tdd) get a project-write scope so the worker can
+    // apply its fix to the real source files, not just document a patch in its run-dir artifacts.
+    if (descriptor.write_scope === "project") {
+      this.#registry.grantProjectScope(agentId);
+    }
     if (modelResolution.warning) this.#emitModelWarning(agentId, modelResolution.warning);
     const budget = normalizeBudget(descriptor.budget);
     this.#jobs.set(agentId, {
@@ -693,6 +698,7 @@ export function buildWorkerPrompt(job) {
     ? descriptor.expected_artifacts.map((file) => `- ${file}`).join("\n")
     : "(none)";
   const contextPacket = descriptor.context_packet?.trim() || "(no context packet provided)";
+  const projectScope = descriptor.write_scope === "project";
 
   return [
     "You are an AIPI spawned session worker.",
@@ -703,11 +709,18 @@ export function buildWorkerPrompt(job) {
     "",
     "Rules:",
     "- Use only the tools available in this worker session.",
-    "- You may write only files listed in Owned files.",
+    projectScope
+      ? "- Write scope is PROJECT: apply your change directly to the real source files it requires (you may create or edit any project file except .aipi/memory, .aipi/runtime, and .git). Do NOT merely describe a patch — implement it on the actual source, then document it in the expected artifacts."
+      : "- You may write only files listed in Owned files.",
     "- Do not write project memory under .aipi/memory.",
     "- If you cannot complete the assignment, return BLOCKED or FAIL as structured JSON.",
     "- A PASS result must include at least one evidence item with rung ran or verified.",
     "- Return only JSON. Do not wrap it in prose.",
+    "",
+    "Write scope:",
+    projectScope
+      ? "project — any project source file is writable except .aipi/memory, .aipi/runtime, and .git."
+      : "artifacts — only the owned files listed below are writable.",
     "",
     "Owned files:",
     ownedFiles,

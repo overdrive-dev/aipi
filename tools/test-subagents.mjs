@@ -291,6 +291,7 @@ const previousGuardEnv = {
   AIPI_SUBAGENTS_PROJECT_ROOT: process.env.AIPI_SUBAGENTS_PROJECT_ROOT,
   AIPI_SUBAGENTS_OWNED_FILES: process.env.AIPI_SUBAGENTS_OWNED_FILES,
   AIPI_SUBAGENTS_AGENT_ID: process.env.AIPI_SUBAGENTS_AGENT_ID,
+  AIPI_SUBAGENTS_WRITE_SCOPE: process.env.AIPI_SUBAGENTS_WRITE_SCOPE,
 };
 try {
   const registeredTools = [];
@@ -320,6 +321,48 @@ try {
   );
   await assert.rejects(
     () => childWrite.execute("escape", { path: "../outside.js", content: "x" }),
+    /escapes project root/,
+  );
+
+  // Project write scope (implementation/fix/tdd steps): the worker may apply its fix to ANY
+  // project source file it did not pre-declare, while controller-owned state stays blocked.
+  process.env.AIPI_SUBAGENTS_WRITE_SCOPE = "project";
+  process.env.AIPI_SUBAGENTS_OWNED_FILES = JSON.stringify([
+    ".aipi/runtime/runs/run-1/steps/fix/FIXES.md",
+  ]);
+  const projectScopedTools = [];
+  registerAipiGuardedWriteChild({
+    registerTool(tool) {
+      projectScopedTools.push(tool);
+    },
+  });
+  const projectWrite = projectScopedTools.find((tool) => tool.name === "write");
+  assert.ok(projectWrite, "expected guarded child write tool to register under project scope");
+  // A source file the worker never declared as owned is now writable.
+  await projectWrite.execute("source", {
+    path: "frontend/src/lib/gestores-tipo.ts",
+    content: "export const ok = true;\n",
+  });
+  assert.equal(
+    await fs.readFile(path.join(guardedChildWriteRoot, "frontend", "src", "lib", "gestores-tipo.ts"), "utf8"),
+    "export const ok = true;\n",
+  );
+  // Its own run-dir step artifact is still writable under project scope.
+  await projectWrite.execute("artifact", {
+    path: ".aipi/runtime/runs/run-1/steps/fix/FIXES.md",
+    content: "# fix\n",
+  });
+  // Controller-owned memory and non-artifact runtime state remain blocked even under project scope.
+  assert.equal(
+    (await projectWrite.execute("memory", { path: ".aipi/memory/project/project.md", content: "x" })).isError,
+    true,
+  );
+  assert.equal(
+    (await projectWrite.execute("runtime", { path: ".aipi/runtime/runs/run-1/state.json", content: "x" })).isError,
+    true,
+  );
+  await assert.rejects(
+    () => projectWrite.execute("escape", { path: "../outside.js", content: "x" }),
     /escapes project root/,
   );
 } finally {

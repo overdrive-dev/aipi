@@ -40,4 +40,42 @@ assert.equal(
   undefined,
 );
 
+// Project-write scope: a code-writing (implementation/fix/tdd) worker may write ANY project
+// source file it never pre-declared, while controller-owned state stays blocked.
+const scoped = new OwnedFileRegistry(process.cwd());
+scoped.allocate("fixer:1", [".aipi/runtime/runs/run-1/steps/fix/FIXES.md"]);
+scoped.grantProjectScope("fixer:1");
+assert.equal(scoped.hasProjectScope("fixer:1"), true);
+const fixerGuard = makeOwnedFileGuard(scoped, "fixer:1");
+// Undeclared source file is writable under project scope.
+assert.equal(fixerGuard({ name: "write", input: { path: "frontend/src/lib/gestores-tipo.ts" } }), undefined);
+assert.equal(fixerGuard({ name: "write", input: { path: "src/brand-new.js" } }), undefined);
+// Its own run-dir artifact is still writable.
+assert.equal(fixerGuard({ name: "write", input: { path: ".aipi/runtime/runs/run-1/steps/fix/FIXES.md" } }), undefined);
+// Controller-owned memory/runtime stays blocked even with project scope.
+assert.match(
+  fixerGuard({ name: "write", input: { path: ".aipi/memory/project/project.md" } })?.reason,
+  /controller-owned AIPI memory\/runtime/,
+);
+assert.match(
+  fixerGuard({ name: "write", input: { path: ".aipi/runtime/runs/run-1/state.json" } })?.reason,
+  /controller-owned AIPI memory\/runtime/,
+);
+// A worker WITHOUT project scope still can't write an undeclared source file.
+assert.equal(scoped.owns("fixer:1", "frontend/src/lib/gestores-tipo.ts"), true);
+assert.equal(registry.owns("implementer:step-artifact", "frontend/src/lib/gestores-tipo.ts"), false);
+// Releasing the worker drops its project scope.
+scoped.release("fixer:1");
+assert.equal(scoped.hasProjectScope("fixer:1"), false);
+assert.equal(scoped.owns("fixer:1", "frontend/src/lib/gestores-tipo.ts"), false);
+
+// snapshot/restore round-trips the project-scope grant.
+const snapSource = new OwnedFileRegistry(process.cwd());
+snapSource.allocate("fixer:2", [".aipi/runtime/runs/run-2/steps/fix/FIXES.md"]);
+snapSource.grantProjectScope("fixer:2");
+const restored = new OwnedFileRegistry(process.cwd());
+restored.restore(snapSource.snapshot());
+assert.equal(restored.hasProjectScope("fixer:2"), true);
+assert.equal(restored.owns("fixer:2", "src/anything.js"), true);
+
 console.log("AIPI_OWNED_FILES_TEST_OK");

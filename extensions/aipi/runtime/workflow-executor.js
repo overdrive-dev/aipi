@@ -475,6 +475,7 @@ async function executeFanoutSubagentStep({
       artifact_target: path.join(runRelDir(state), "steps", step.id).replaceAll("\\", "/"),
       expected_artifacts: assignedArtifacts,
       owned_files: assignedArtifacts,
+      write_scope: resolveWriteScope(step),
       context_packet: JSON.stringify(
         {
           schema: "aipi.worker-context.v1",
@@ -567,6 +568,7 @@ async function executeSubagentStep({
     artifact_target: path.join(runRelDir(state), "steps", step.id).replaceAll("\\", "/"),
     expected_artifacts: artifacts,
     owned_files: artifacts,
+    write_scope: resolveWriteScope(step),
     context_packet: JSON.stringify(
       {
         schema: "aipi.worker-context.v1",
@@ -1257,6 +1259,19 @@ function renderText(template, state, step = null) {
     const value = values[key];
     return value === undefined || value === null ? "" : String(value);
   });
+}
+
+// Stages whose job is to MODIFY the project (apply a fix, write a real failing/regression
+// test, implement code). Their workers get a project-write scope so they can edit/create the
+// actual source files the change requires, instead of being trapped writing only their own
+// run-dir artifacts. Analysis/review/planning stages stay artifact-scoped. A step may override
+// with an explicit `write_scope: project|artifacts`.
+const CODE_WRITING_STAGES = new Set(["implementation", "fix", "tdd"]);
+
+export function resolveWriteScope(step) {
+  const explicit = step?.write_scope;
+  if (explicit === "project" || explicit === "artifacts") return explicit;
+  return CODE_WRITING_STAGES.has(step?.stage) ? "project" : "artifacts";
 }
 
 function normalizeRelPath(relPath) {

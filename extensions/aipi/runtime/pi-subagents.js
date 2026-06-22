@@ -251,12 +251,14 @@ export async function runAipiForkedSubagent({
   );
 
   const ownedFiles = normalizeOwnedFiles(params.owned_files ?? job?.descriptor?.owned_files);
+  const writeScope = params.write_scope ?? job?.descriptor?.write_scope ?? "artifacts";
   const envRestore = applyScopedRuntimeEnv({
     AIPI_SUBAGENTS_AGENT_DIR: paths.agentDir,
     AIPI_SUBAGENTS_RUNTIME_DIR: paths.runtimeRoot,
     AIPI_SUBAGENTS_PROJECT_ROOT: root,
     AIPI_SUBAGENTS_AGENT_ID: job?.agentId ?? params.id ?? AIPI_SUBAGENTS_AGENT_NAME,
     AIPI_SUBAGENTS_OWNED_FILES: JSON.stringify(ownedFiles),
+    AIPI_SUBAGENTS_WRITE_SCOPE: writeScope === "project" ? "project" : "artifacts",
     AIPI_SUBAGENTS_MAX_TOOL_CALLS: maxToolCalls == null ? "" : String(maxToolCalls),
   });
   try {

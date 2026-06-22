@@ -405,6 +405,17 @@ if (!deniedSingleWorktreeTools.has("bash")) {
 if (contract.workerToolPolicy?.singleWorktreeSessionAgents?.unknownToolDefault !== "BLOCK") {
   errors.push("runtime-contract workerToolPolicy.singleWorktreeSessionAgents.unknownToolDefault must be BLOCK");
 }
+const writeScopeRule = contract.workerToolPolicy?.singleWorktreeSessionAgents?.writeScopeRule;
+if (
+  !writeScopeRule?.includes("write_scope") ||
+  !writeScopeRule?.includes("implementation") ||
+  !writeScopeRule?.includes("AIPI_SUBAGENTS_WRITE_SCOPE") ||
+  !writeScopeRule?.includes(".aipi/memory")
+) {
+  errors.push(
+    "runtime-contract workerToolPolicy.singleWorktreeSessionAgents.writeScopeRule must document the per-step write_scope, code-writing project scope, AIPI_SUBAGENTS_WRITE_SCOPE enforcement, and protected controller paths",
+  );
+}
 if (contract.profilePolicy) {
   errors.push("runtime-contract must not define the removed permission-profile block");
 }
