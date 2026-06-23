@@ -16,9 +16,12 @@ import {
   classifyAipiInputRoute,
   createAipiLifecycleHandlers,
   formatStallStatus,
+  getStallHeartbeat,
   handleBeforeAgentStart,
+  looksLikeAipiProject,
   renderRecentRunSummary,
   StallHeartbeat,
+  updateStallHeartbeat,
   estimateProviderUsageCost,
   normalizeProviderUsage,
   pruneAipiContextMessages,
@@ -1514,6 +1517,12 @@ try {
     assert.match(formatStallStatus({ idleMs: 60_000, pendingModelMs: 60_000, softMs: soft, hardMs: hard }), /esperando resposta do modelo.*há 60s/);
     assert.doesNotMatch(formatStallStatus({ idleMs: 60_000, softMs: soft, hardMs: hard }), /Esc para cancelar/);
     assert.match(formatStallStatus({ idleMs: 200_000, softMs: soft, hardMs: hard }), /Esc para cancelar e reenviar/);
+    // UI-1: a LONG but healthy model response (request in flight, past the hard threshold) must NOT tell the
+    // user to cancel — it's a normal slow generation, not a hang. Only a pre-send idle escalates to "Esc".
+    assert.doesNotMatch(formatStallStatus({ idleMs: 200_000, pendingModelMs: 200_000, softMs: soft, hardMs: hard }), /Esc para cancelar/, "UI-1: a long model response never says to cancel");
+    assert.match(formatStallStatus({ idleMs: 200_000, pendingModelMs: 200_000, softMs: soft, hardMs: hard }), /esperando resposta do modelo há 200s/);
+    // UI-3: a sub-floor threshold env value is ignored in favor of the default (won't spam every pause).
+    assert.equal(formatStallStatus({ idleMs: 3_000, softMs: 45_000, hardMs: 150_000 }), null);
 
     const statusCalls = [];
     const hbCtx = { ui: { setStatus: (key, text) => statusCalls.push({ key, text }) } };
@@ -1554,6 +1563,30 @@ try {
     headless.arm({ ui: {} }, clock);
     headless.tick(clock + 200_000);
     headless.disarm();
+
+    // FF-1: turn_end is fired per agent-loop turn (many per prompt), so updateStallHeartbeat must route it to
+    // TOUCH, not disarm — only agent_end ends the prompt. Drive the real hook routing and inspect armed state.
+    const ffCtx = { ui: { setStatus: () => {} } };
+    updateStallHeartbeat({ hook: "before_agent_start", ctx: ffCtx, projectRoot: tempRoot });
+    const hbRoot = getStallHeartbeat(tempRoot);
+    assert.equal(hbRoot.armed, true, "armed on before_agent_start");
+    updateStallHeartbeat({ hook: "turn_end", ctx: ffCtx, projectRoot: tempRoot });
+    assert.equal(hbRoot.armed, true, "FF-1: turn_end keeps the heartbeat armed (it is mid-loop, not end-of-prompt)");
+    updateStallHeartbeat({ hook: "message_end", ctx: ffCtx, projectRoot: tempRoot });
+    assert.equal(hbRoot.armed, true, "message_end keeps it armed too");
+    updateStallHeartbeat({ hook: "agent_end", ctx: ffCtx, projectRoot: tempRoot });
+    assert.equal(hbRoot.armed, false, "agent_end ends the prompt and disarms");
+
+    // RS-3: the heartbeat gate keys on an installed AIPI project (tempRoot was init'd); a bare dir is not one.
+    assert.equal(looksLikeAipiProject(tempRoot), true);
+    const bareDir = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-not-a-project-"));
+    try {
+      assert.equal(looksLikeAipiProject(bareDir), false, "RS-3: a non-AIPI project is not gated in");
+      // updateStallHeartbeat on a non-AIPI root is a no-op (never arms / never throws).
+      updateStallHeartbeat({ hook: "before_agent_start", ctx: ffCtx, projectRoot: bareDir });
+    } finally {
+      await fs.rm(bareDir, { recursive: true, force: true });
+    }
   }
 
   console.log("AIPI_LIFECYCLE_HOOKS_TEST_OK");

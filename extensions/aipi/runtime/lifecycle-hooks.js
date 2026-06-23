@@ -260,22 +260,29 @@ const STALL_CHECK_MS = 10_000;
 const DEFAULT_STALL_SOFT_MS = 45_000;
 const DEFAULT_STALL_HARD_MS = 150_000;
 
+const MIN_STALL_THRESHOLD_MS = 5_000; // a sub-5s threshold would surface on every normal pause — floor it
 function stallThresholds(env = process.env) {
   const soft = Number.parseInt(env?.AIPI_STALL_SOFT_MS ?? "", 10);
   const hard = Number.parseInt(env?.AIPI_STALL_HARD_MS ?? "", 10);
-  const softMs = Number.isFinite(soft) && soft > 0 ? soft : DEFAULT_STALL_SOFT_MS;
-  const hardMs = Number.isFinite(hard) && hard > 0 ? hard : DEFAULT_STALL_HARD_MS;
+  const softMs = Number.isFinite(soft) && soft >= MIN_STALL_THRESHOLD_MS ? soft : DEFAULT_STALL_SOFT_MS;
+  const hardMs = Number.isFinite(hard) && hard >= MIN_STALL_THRESHOLD_MS ? hard : DEFAULT_STALL_HARD_MS;
   return { softMs, hardMs: Math.max(hardMs, softMs) };
 }
 
 // Pure formatter (testable): the status line for an idle turn, or null when still within the soft window.
 export function formatStallStatus({ idleMs, pendingModelMs = null, softMs, hardMs }) {
   if (!Number.isFinite(idleMs) || idleMs < softMs) return null;
+  // A request IS in flight: a long model generation is perfectly normal — inform with how long it's been,
+  // but NEVER tell the user to cancel (a healthy multi-minute response would otherwise trip a false
+  // "travado; Esc"). Count from when the request was sent.
+  if (Number.isFinite(pendingModelMs)) {
+    return `⏳ AIPI: esperando resposta do modelo há ${Math.round(pendingModelMs / 1000)}s`;
+  }
+  // No request in flight — the turn has gone idle BEFORE sending to the model. THIS is the suspicious hang (a
+  // silent send-stall), so past the hard threshold suggest cancel+resend.
   const idleS = Math.round(idleMs / 1000);
-  const waitingModel = Number.isFinite(pendingModelMs);
-  const what = waitingModel ? "esperando resposta do modelo" : "sem atividade (antes de chamar o modelo)";
   const tail = idleMs >= hardMs ? " — pode estar travado; Esc para cancelar e reenviar" : "";
-  return `⏳ AIPI: ${what} há ${idleS}s${tail}`;
+  return `⏳ AIPI: sem atividade (antes de chamar o modelo) há ${idleS}s`.concat(tail);
 }
 
 export class StallHeartbeat {
@@ -374,7 +381,7 @@ export class StallHeartbeat {
 
 const stallHeartbeats = new Map(); // projectRoot -> StallHeartbeat
 
-function getStallHeartbeat(projectRoot) {
+export function getStallHeartbeat(projectRoot) {
   let hb = stallHeartbeats.get(projectRoot);
   if (!hb) {
     hb = new StallHeartbeat();
@@ -383,14 +390,35 @@ function getStallHeartbeat(projectRoot) {
   return hb;
 }
 
+// Cheap, cached "is this an AIPI project" check so the heartbeat never arms in a non-AIPI repo where the
+// extension merely happens to be loaded (RS-3). Positives are cached permanently; a negative is re-checked
+// (an existsSync stat is microseconds) so a freshly-onboarded project is picked up. fsSync mirrors the async
+// isAipiInstalled contract (.aipi/runtime-contract.json) without an await on every hook.
+const aipiProjectCache = new Map();
+export function looksLikeAipiProject(projectRoot) {
+  if (aipiProjectCache.get(projectRoot) === true) return true;
+  let installed = false;
+  try {
+    installed = fsSync.existsSync(path.join(projectRoot, ".aipi", "runtime-contract.json"));
+  } catch {
+    installed = false;
+  }
+  if (installed) aipiProjectCache.set(projectRoot, true);
+  return installed;
+}
+
 export function updateStallHeartbeat({ hook, ctx, projectRoot }) {
+  if (!looksLikeAipiProject(projectRoot)) return; // RS-3: don't run the heartbeat in non-AIPI projects
   const hb = getStallHeartbeat(projectRoot);
   switch (hook) {
     case "before_agent_start":
       hb.arm(ctx);
       break;
+    // Disarm only at the END OF THE WHOLE PROMPT (agent_end) — NOT turn_end. The host fires turn_end at the
+    // end of EACH agent-loop turn (model call + tool round), many times per prompt; disarming there killed the
+    // heartbeat after the first turn, so a stall on any later turn's model send went unwatched — defeating the
+    // whole feature (FF-1). turn_end falls through to touch: a completed turn is activity; keep watching.
     case "agent_end":
-    case "turn_end":
     case "session_shutdown":
       hb.disarm();
       break;
