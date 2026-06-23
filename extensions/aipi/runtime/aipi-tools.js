@@ -531,11 +531,16 @@ export function registerAipiRuntimeTools(pi, { projectRootResolver = () => proce
 function runtimeToolProgress(onUpdate) {
   if (typeof onUpdate !== "function") return null;
   return (event) => {
-    onUpdate({
-      type: "progress",
-      text: event?.message ? `${event.message}\n` : "",
-      event,
-    });
+    // Pi renders EVERY onUpdate value as a partial tool result — getTextOutput does result.content.filter(...)
+    // with no guard, so a partial WITHOUT a `content` array throws an uncaught TypeError that crashes the whole
+    // session (the same class as the aipi_guarded_bash bug). Emit a content-shaped partial (the
+    // tool-result contract) and swallow any render failure — streamed progress is advisory and must never
+    // break the tool run.
+    try {
+      onUpdate({ content: [{ type: "text", text: event?.message ? `${event.message}\n` : "" }] });
+    } catch {
+      /* progress is best-effort */
+    }
   };
 }
 
@@ -4903,4 +4908,5 @@ function jsonResult(value) {
 
 export const __aipiTestInternals = Object.freeze({
   readReusableEmbeddingCache,
+  runtimeToolProgress,
 });

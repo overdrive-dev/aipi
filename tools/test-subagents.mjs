@@ -106,17 +106,22 @@ assert.doesNotThrow(() => assertAipiHostScopedModel("bedrock/claude-opus-4-8"));
 assert.doesNotThrow(() => assertAipiHostScopedModel("deepseek/deepseek-r1"));
 assert.doesNotThrow(() => assertAipiHostScopedModel("zai/glm-4.5"));
 assert.throws(() => assertAipiHostScopedModel("openai/gpt-5.5", { allowedProvider: "anthropic" }), /only allow host provider anthropic/);
+// MODEL-AGNOSTIC by default: any provider (Anthropic, openai-codex, unqualified gpt) is an acceptable host.
 assert.doesNotThrow(() => assertAipiSupportedHostModel("anthropic/claude-opus-4-8", { requireProvider: true }));
-assert.throws(
-  () => assertAipiSupportedHostModel("openai-codex/gpt-5.5", { requireProvider: true }),
-  /not supported for the orchestrator turn/,
-);
-assert.throws(
-  () => assertAipiSupportedHostModel("gpt-5.5", { requireProvider: true }),
-  /Unqualified GPT\/Codex-style host models are not supported/,
-);
+assert.doesNotThrow(() => assertAipiSupportedHostModel("openai-codex/gpt-5.5", { requireProvider: true }));
+assert.doesNotThrow(() => assertAipiSupportedHostModel("gpt-5.5", { requireProvider: true }));
+assert.equal(aipiHostModelReadiness("openai-codex/gpt-5.5").ok, true);
+assert.equal(aipiHostModelReadiness("openai-codex/gpt-5.5").code, "AIPI_HOST_MODEL_SUPPORTED");
+assert.equal(aipiHostModelReadiness("gpt-5.5").code, "AIPI_HOST_MODEL_UNQUALIFIED_ALLOWED");
 assert.equal(aipiHostModelReadiness(null, { requireProvider: false }).ok, true);
-assert.equal(aipiHostModelReadiness("gpt-5.5", { requireProvider: false }).code, "AIPI_HOST_MODEL_UNSUPPORTED");
+// Opt-in restriction via AIPI_HOST_PROVIDERS — operator can pin the host to specific providers.
+const restrictEnv = { AIPI_HOST_PROVIDERS: "anthropic" };
+assert.equal(aipiHostModelReadiness("anthropic/claude-opus-4-8", { env: restrictEnv }).ok, true);
+assert.equal(aipiHostModelReadiness("openai-codex/gpt-5.5", { env: restrictEnv }).code, "AIPI_HOST_MODEL_UNSUPPORTED");
+assert.match(aipiHostModelReadiness("openai-codex/gpt-5.5", { env: restrictEnv }).message, /AIPI_HOST_PROVIDERS/);
+assert.equal(aipiHostModelReadiness("gpt-5.5", { env: restrictEnv }).code, "AIPI_HOST_MODEL_UNSUPPORTED");
+// A multi-provider allowlist admits the listed ones.
+assert.equal(aipiHostModelReadiness("openai-codex/gpt-5.5", { env: { AIPI_HOST_PROVIDERS: "anthropic, openai-codex" } }).ok, true);
 
 const { buildModelCandidates, resolveModelCandidate } = jiti(
   "../extensions/aipi/runtime/vendor/pi-subagents/src/runs/shared/model-fallback.ts",

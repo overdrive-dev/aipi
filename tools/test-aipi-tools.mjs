@@ -1798,6 +1798,26 @@ try {
     ]),
   );
 
+  // runtimeToolProgress must emit a CONTENT-shaped partial — Pi renders every onUpdate value as a tool result
+  // (getTextOutput -> result.content.filter), so a content-less partial crashes the whole session. (Same class
+  // as the aipi_guarded_bash bug; this emitter feeds the aipi graph tools' progress stream.)
+  {
+    const partials = [];
+    const progress = __aipiTestInternals.runtimeToolProgress((p) => partials.push(p));
+    progress({ message: "scanning files" });
+    progress({}); // no message -> still content-shaped, never undefined
+    assert.equal(partials.length, 2);
+    for (const p of partials) {
+      assert.ok(Array.isArray(p.content), "every progress partial carries a content array");
+      assert.equal(p.content[0].type, "text");
+    }
+    assert.match(partials[0].content[0].text, /scanning files/);
+    assert.equal(__aipiTestInternals.runtimeToolProgress(null), null);
+    // A throwing host onUpdate is swallowed (a render hiccup must not break the tool run).
+    const safe = __aipiTestInternals.runtimeToolProgress(() => { throw new Error("render boom"); });
+    safe({ message: "x" }); // must not throw
+  }
+
   console.log("AIPI_TOOLS_TEST_OK");
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });

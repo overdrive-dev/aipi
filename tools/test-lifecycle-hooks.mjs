@@ -31,6 +31,12 @@ import {
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-lifecycle-hooks-"));
 const sourceRoot = path.resolve("templates/.aipi");
 
+// The host is MODEL-AGNOSTIC by default now; pin the host to Anthropic for this suite so the unsupported-host
+// BLOCK path (which only fires under an AIPI_HOST_PROVIDERS restriction) is exercised. The agnostic default
+// is asserted separately below.
+const priorHostProviders = process.env.AIPI_HOST_PROVIDERS;
+process.env.AIPI_HOST_PROVIDERS = "anthropic";
+
 try {
   await initProject({ sourceRoot, targetRoot: tempRoot });
   await forceFastSemanticFallback(tempRoot);
@@ -471,12 +477,12 @@ try {
           code: "AIPI_HOST_MODEL_UNSUPPORTED",
           model_id: "openai-codex/gpt-5.5",
           provider: "openai-codex",
-          message: "AIPI host model is unavailable to the AIPI orchestrator turn. Current host model: openai-codex/gpt-5.5. Host provider openai-codex is not supported for the orchestrator turn; use it as the adversarial reviewer or set the host to a supported Anthropic model.",
+          message: "AIPI host model is unavailable to the AIPI orchestrator turn. Current host model: openai-codex/gpt-5.5. Host provider openai-codex is not in AIPI_HOST_PROVIDERS (anthropic). Remove the restriction or set the host to an allowed provider.",
         },
         message: {
           customType: "aipi.unsupported-host",
           display: true,
-          content: "AIPI host model is unavailable to the AIPI orchestrator turn. Current host model: openai-codex/gpt-5.5. Host provider openai-codex is not supported for the orchestrator turn; use it as the adversarial reviewer or set the host to a supported Anthropic model.",
+          content: "AIPI host model is unavailable to the AIPI orchestrator turn. Current host model: openai-codex/gpt-5.5. Host provider openai-codex is not in AIPI_HOST_PROVIDERS (anthropic). Remove the restriction or set the host to an allowed provider.",
           details: {
             schema: "aipi.unsupported-host-block.v1",
             recorded_at: unsupportedHostEntries.at(-1)?.data?.recorded_at,
@@ -487,7 +493,7 @@ try {
             host_model: "openai-codex/gpt-5.5",
             host_provider: "openai-codex",
             code: "AIPI_HOST_MODEL_UNSUPPORTED",
-            message: "AIPI host model is unavailable to the AIPI orchestrator turn. Current host model: openai-codex/gpt-5.5. Host provider openai-codex is not supported for the orchestrator turn; use it as the adversarial reviewer or set the host to a supported Anthropic model.",
+            message: "AIPI host model is unavailable to the AIPI orchestrator turn. Current host model: openai-codex/gpt-5.5. Host provider openai-codex is not in AIPI_HOST_PROVIDERS (anthropic). Remove the restriction or set the host to an allowed provider.",
             runtime_error_recorded: true,
             runtime_error_ref: unsupportedHostEntries.at(-1)?.data?.runtime_error_ref,
             pipeline_classification: "root_cause_bugfix",
@@ -497,7 +503,7 @@ try {
     );
     assert.equal(unsupportedHostRunnerCalls.length, 0);
     assert.equal(unsupportedHostNotifications.at(-1)?.kind, "error");
-    assert.match(unsupportedHostNotifications.at(-1)?.message ?? "", /not supported for the orchestrator turn/);
+    assert.match(unsupportedHostNotifications.at(-1)?.message ?? "", /not in AIPI_HOST_PROVIDERS/);
     assert.doesNotMatch(unsupportedHostNotifications.at(-1)?.message ?? "", /Cannot read properties of undefined/);
     const unsupportedHostEntry = unsupportedHostEntries.find((entry) => entry.type === "aipi.host.unsupported");
     assert.equal(unsupportedHostEntry.data.host_provider, "openai-codex");
@@ -1540,9 +1546,27 @@ try {
     }
   }
 
+  // Agnostic DEFAULT (no AIPI_HOST_PROVIDERS restriction): a non-Anthropic host is accepted — no block.
+  {
+    delete process.env.AIPI_HOST_PROVIDERS;
+    const agnosticEntries = [];
+    const agnosticHandlers = createAipiLifecycleHandlers({
+      pi: { appendEntry(type, data) { agnosticEntries.push({ type, data }); } },
+      projectRootResolver: () => tempRoot,
+      coordinator: { setHostModel() {}, getHostModel: () => null },
+    });
+    const agnosticCtx = { cwd: tempRoot, model: "openai-codex/gpt-5.5", ui: { notify() {} } };
+    const agnosticBefore = await agnosticHandlers.before_agent_start({ type: "before_agent_start", prompt: "do a task" }, agnosticCtx);
+    assert.notEqual(agnosticBefore?.block_reason, "AIPI_HOST_MODEL_UNSUPPORTED", "agnostic default: a non-Anthropic host is NOT blocked");
+    assert.equal(agnosticEntries.some((e) => e.type === "aipi.host.unsupported"), false, "agnostic default: no unsupported-host block recorded");
+    process.env.AIPI_HOST_PROVIDERS = "anthropic"; // restore for any trailing assertions
+  }
+
   console.log("AIPI_LIFECYCLE_HOOKS_TEST_OK");
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });
+  if (priorHostProviders === undefined) delete process.env.AIPI_HOST_PROVIDERS;
+  else process.env.AIPI_HOST_PROVIDERS = priorHostProviders;
 }
 
 function assertWorkflowSuggestion(route, workflow) {

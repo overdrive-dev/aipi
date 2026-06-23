@@ -60,7 +60,7 @@ export function modelProvider(modelId) {
   return separator > 0 ? text.slice(0, separator).toLowerCase() : null;
 }
 
-export function aipiHostModelReadiness(model, { requireProvider = false, requireModel = false } = {}) {
+export function aipiHostModelReadiness(model, { requireProvider = false, requireModel = false, env = process.env } = {}) {
   const modelId = modelToPiModelId(model);
   const normalizedModelId = String(modelId ?? "").trim();
   const provider = modelProvider(normalizedModelId);
@@ -80,14 +80,38 @@ export function aipiHostModelReadiness(model, { requireProvider = false, require
           message: null,
         };
   }
+  // Provider-AVAILABILITY gate (runtime capability, not policy): a provider the installed worker runtime
+  // literally cannot run is always rejected. Empty by default, so normally a no-op.
+  if (provider && AIPI_SUBAGENTS_DISALLOWED_PROVIDERS.includes(provider)) {
+    return unsupportedHostModelReadiness({
+      code: "AIPI_HOST_MODEL_UNSUPPORTED",
+      modelId: normalizedModelId,
+      provider,
+      detail: `Provider ${provider} is not available in this installed AIPI/Pi worker runtime.`,
+    });
+  }
+  const allowlist = aipiHostProviderAllowlist(env);
+  // MODEL-AGNOSTIC by default: any model/provider may be the AIPI host/orchestrator (and any other role).
+  // The orchestration is provider-neutral; whether a given model produces valid step structured-outputs is a
+  // model-capability question, not a policy one. Set AIPI_HOST_PROVIDERS (comma list, e.g. "anthropic") to
+  // restrict the host to specific providers; unset/empty = allow ALL.
+  if (!allowlist) {
+    return {
+      ok: true,
+      code: provider ? "AIPI_HOST_MODEL_SUPPORTED" : "AIPI_HOST_MODEL_UNQUALIFIED_ALLOWED",
+      model_id: normalizedModelId,
+      provider: provider ?? null,
+      message: null,
+    };
+  }
+  // Operator restricted the host providers — enforce membership.
   if (!provider) {
     if (looksUnsupportedUnqualifiedHostModel(normalizedModelId)) {
       return unsupportedHostModelReadiness({
         code: "AIPI_HOST_MODEL_UNSUPPORTED",
         modelId: normalizedModelId,
         provider: null,
-        detail:
-          "Unqualified GPT/Codex-style host models are not supported for the orchestrator turn; use them as adversarial reviewers or choose a supported Anthropic host model.",
+        detail: `Unqualified host model and AIPI_HOST_PROVIDERS restricts the host to: ${[...allowlist].join(", ")}. Remove the restriction or qualify the host model with a provider.`,
       });
     }
     return {
@@ -98,21 +122,12 @@ export function aipiHostModelReadiness(model, { requireProvider = false, require
       message: null,
     };
   }
-  if (!AIPI_HOST_SUPPORTED_PROVIDERS.includes(provider)) {
+  if (!allowlist.has(provider)) {
     return unsupportedHostModelReadiness({
       code: "AIPI_HOST_MODEL_UNSUPPORTED",
       modelId: normalizedModelId,
       provider,
-      detail:
-        `Host provider ${provider} is not supported for the orchestrator turn; use it as the adversarial reviewer or set the host to a supported Anthropic model.`,
-    });
-  }
-  if (AIPI_SUBAGENTS_DISALLOWED_PROVIDERS.includes(provider)) {
-    return unsupportedHostModelReadiness({
-      code: "AIPI_HOST_MODEL_UNSUPPORTED",
-      modelId: normalizedModelId,
-      provider,
-      detail: `Provider ${provider} is not available in this installed AIPI/Pi worker runtime.`,
+      detail: `Host provider ${provider} is not in AIPI_HOST_PROVIDERS (${[...allowlist].join(", ")}). Remove the restriction or set the host to an allowed provider.`,
     });
   }
   return {
@@ -122,6 +137,15 @@ export function aipiHostModelReadiness(model, { requireProvider = false, require
     provider,
     message: null,
   };
+}
+
+// Model-agnostic by default: no provider is privileged as the AIPI host/orchestrator. AIPI_HOST_PROVIDERS
+// (comma list) optionally restricts the host to specific providers; unset/empty = allow ALL providers.
+export function aipiHostProviderAllowlist(env = process.env) {
+  const raw = String(env?.AIPI_HOST_PROVIDERS ?? "").trim();
+  if (!raw) return null;
+  const set = new Set(raw.split(",").map((p) => p.trim().toLowerCase()).filter(Boolean));
+  return set.size ? set : null;
 }
 
 function looksUnsupportedUnqualifiedHostModel(modelId) {
