@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { executeWorkflowRun } from "./workflow-executor.js";
+import { formatAwaitingUserInputPrompt } from "./blocker-input.js";
 
 const TERMINAL_ACTIVE_STATUSES = new Set([
   "complete",
@@ -369,7 +370,7 @@ export function formatWorkflowCommandResult(result) {
       `run_dir=${result.run.runRelDir}`,
       `status=${result.execution.status}`,
       `current_step=${result.execution.state.current_step ?? "none"}`,
-    ].join("\n");
+    ].join("\n") + formatRunOutcomeDetail(result.execution.state);
   }
 
   const run = result.run;
@@ -388,7 +389,28 @@ function formatExecutionResult(mode, execution) {
     `run_id=${execution.runId}`,
     `status=${execution.status}`,
     `current_step=${execution.state.current_step ?? "none"}`,
-  ].join("\n");
+  ].join("\n") + formatRunOutcomeDetail(execution.state);
+}
+
+// #11 — a run that ends anything other than `completed` must NOT end silently. Append a step summary, the
+// reason it stopped, and the blocker question (with options) so the user always gets a summary + a concrete
+// way to proceed instead of a bare `status=escalated_to_human current_step=none`.
+function formatRunOutcomeDetail(state) {
+  if (!state || state.status === "completed") return "";
+  const glyph = (status) =>
+    status === "passed" ? "✓" : status === "failed" ? "✗" : status === "skipped" ? "⊘" : status === "running" ? "▶" : "○";
+  const lines = [];
+  const steps = (state.steps ?? []).map((step) => `${glyph(step.status)} ${step.id}`);
+  if (steps.length) lines.push(`steps: ${steps.join("  ")}`);
+  if (state.blocked_reason) {
+    lines.push(`reason: ${String(state.blocked_reason).replace(/\s+/g, " ").trim().slice(0, 400)}`);
+  }
+  if (state.awaiting_user_input) {
+    lines.push("", formatAwaitingUserInputPrompt(state.awaiting_user_input));
+  } else if (state.status === "blocked" || state.status === "escalated_to_human") {
+    lines.push("", "Needs your decision to proceed — tell me how to continue, or fix the cause and re-run.");
+  }
+  return lines.length ? `\n${lines.join("\n")}` : "";
 }
 
 function resolveWorkflowName(value) {

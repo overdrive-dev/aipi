@@ -84,6 +84,45 @@ try {
   assert.equal(active.state.workflow, "feature");
   assert.match(formatWorkflowCommandResult({ action: "status", active }), /current_step=load_contract/);
 
+  // #11: a non-completed run is NEVER silent — the formatted result carries a step summary, the reason it
+  // stopped, and the blocker question with options (so the user gets a summary + a way to proceed).
+  const blockedRun = formatWorkflowCommandResult({
+    action: "run",
+    run: { workflow: "bugfix", runId: "r-blk", runRelDir: ".aipi/runtime/runs/r-blk" },
+    execution: {
+      status: "escalated_to_human",
+      state: {
+        workflow: "bugfix",
+        status: "escalated_to_human",
+        current_step: null,
+        blocked_reason: "review failed after 3 attempts; fix hit its visit limit",
+        steps: [
+          { id: "triage", status: "passed" },
+          { id: "fix", status: "passed" },
+          { id: "review", status: "failed" },
+        ],
+        awaiting_user_input: {
+          step_id: "review",
+          question: "How should I proceed with the failing review?",
+          options: ["Retry the fix", "Adjust the approach", "Stop"],
+          allow_free_text: true,
+        },
+      },
+    },
+  });
+  assert.match(blockedRun, /✓ triage/);
+  assert.match(blockedRun, /✗ review/);
+  assert.match(blockedRun, /reason: review failed/);
+  assert.match(blockedRun, /How should I proceed/);
+  assert.match(blockedRun, /Retry the fix/);
+  // A completed run stays terse (no outcome detail appended).
+  const okRun = formatWorkflowCommandResult({
+    action: "run",
+    run: { workflow: "quick", runId: "r-ok", runRelDir: "d" },
+    execution: { status: "completed", state: { workflow: "quick", status: "completed", current_step: null, steps: [] } },
+  });
+  assert.doesNotMatch(okRun, /reason:|Needs your decision|aguardando decis/);
+
   const userInput = await recordWorkflowUserInput({
     projectRoot: tempRoot,
     text: "api_key=SECRETSECRET12345\nCliente enterprise exige aprovacao fiscal.",
