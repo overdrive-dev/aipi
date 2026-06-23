@@ -99,7 +99,27 @@ exist only to run restricted parallel workers — the exact thing that caused th
 
 **Add (optional)** — `/aipi-review` (independent adversarial verification, flexible agents).
 
-## 5. Refactor plan (sequenced; gated on preconditions, not a calendar)
+## 5b. Implementation status (2026-06-22)
+
+- **Phase A — DONE** (`ddd7900`): auto-dispatch off; flexible main agent default.
+- **Guidance + Definition of Done — DONE** (`ea315af`): project guidance + DoD injected every flexible turn.
+- **Phase B1 — DONE** (`4f6ae47`): flexible workers — `aipi_guarded_bash` (watchdog) wired into workers;
+  no-shell contract reversed to guarded-shell; raw bash/user_bash stay denied. Mechanism tested.
+- **Phase B2 — DONE** (`711692d`): the flexible-agent finish gate (claim-evidence audit now SURFACED).
+- **#11 — DONE** (`4dc160a`): blocked/escalated runs append a summary + reason + blocker question (never silent).
+- **Phase C — DONE** (`2c9a22a`): `adversarial-review` discipline (adversary model + skill + check guideline),
+  wired into the review phase; review agents can now run real verification via guarded bash.
+
+### Reconciling Phases D/E with decision #4 (keep flexible orchestration)
+Decision #4 ("multi-agent orchestration WORKING, flexible") means we are NOT removing the orchestration — so
+"remove the forked runtime" does not apply. What "remove the restricted model" (#3) actually meant is now
+done: the **no-shell worker policy is reversed** (B1) and the orchestration (coordinator, owned-files, fanout)
+is **kept and made flexible**. onboarding/lifecycle keep using it (now with flexible workers), so the Phase-D
+decoupling-for-removal is moot. The one OPTIONAL remaining polish is softening the explicit-workflow hard
+gates from blockers to advisory — low priority now that workflows are opt-in (auto-dispatch off) AND
+non-silent (#11), and the GOOD gate (evidence) is retained. Deferred unless a concrete need appears.
+
+## 5. Refactor plan (original sequencing; see 5b for status)
 
 - **Phase A — DONE.** Auto-dispatch off (tasks → flexible agent); project guidance + Definition of Done
   injected every turn.
