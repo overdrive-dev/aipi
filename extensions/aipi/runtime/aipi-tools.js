@@ -721,12 +721,13 @@ export async function aipiImpact({
   path: targetPath = "",
   limit = 16,
   rebuild = false,
+  buildIfMissing = true,
   env = process.env,
   embeddingFetch = globalThis.fetch,
   onProgress = null,
 } = {}) {
   const root = assertRoot(projectRoot);
-  const graph = await ensureGraph(root, { rebuild, env, embeddingFetch, onProgress });
+  const graph = await ensureGraph(root, { rebuild, buildIfMissing, env, embeddingFetch, onProgress });
   const needle = symbol || query || targetPath;
   const refs = needle ? await graphRefs({ root, graph, query: needle, limit, env, embeddingFetch }) : [];
   const relatedTests = graph.files
@@ -1093,19 +1094,34 @@ async function findRunContracts(root) {
 
 async function ensureGraph(root, {
   rebuild = false,
+  buildIfMissing = true,
   env = process.env,
   embeddingFetch = globalThis.fetch,
   onProgress = null,
 } = {}) {
   if (!rebuild) {
     const existing = await readJson(path.join(root, GRAPH_REL_PATH));
-    if (existing?.schema === "aipi.code-graph.v1" && !existing.stale && (await graphSidecarReady(root, existing))) {
+    const usable = existing?.schema === "aipi.code-graph.v1" && (await graphSidecarReady(root, existing));
+    if (usable && !existing.stale) {
       const freshness = await inspectGraphFreshness(root, existing, { env });
       if (!freshness.stale) {
         return { ...existing, stale: false, freshness };
       }
+      // Stale index: a full rebuild is an expensive WRITE that holds the sqlite handle open. When the caller
+      // can't afford to build synchronously (buildIfMissing:false — e.g. the before_agent_start blast-radius
+      // probe), query the stale index read-only instead of blocking on, and abandoning, a rebuild.
+      if (!buildIfMissing) {
+        return { ...existing, stale: true, freshness, skipped_rebuild: true };
+      }
       const rebuilt = await rebuildCodeGraph({ projectRoot: root, previousGraph: existing, env, embeddingFetch, onProgress });
       return { ...rebuilt, rebuilt_from_stale: freshness };
+    }
+    if (!buildIfMissing) {
+      // No fresh graph and the caller opted out of building here. Query a stale-but-present index if we have
+      // one; otherwise degrade to an empty, queryable shell (no refs this turn) rather than triggering — and
+      // potentially abandoning — a synchronous write that would leave the sqlite file locked.
+      if (usable) return { ...existing, stale: true, skipped_rebuild: true };
+      return { schema: "aipi.code-graph.v1", generated_at: null, files: [], stale: true, not_built: true };
     }
   }
   const previousGraph = await readJson(path.join(root, GRAPH_REL_PATH)).catch(() => null);

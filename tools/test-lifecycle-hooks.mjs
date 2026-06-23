@@ -8,6 +8,8 @@ import { rebuildCodeGraph } from "../extensions/aipi/runtime/aipi-tools.js";
 import { SUBAGENT_STATE_ENTRY } from "../extensions/aipi/runtime/subagents.js";
 import {
   applyProviderPayloadPolicy,
+  blastRadiusBudgetMs,
+  buildBlastRadiusPointer,
   buildProviderBudgetReport,
   buildRecentRunSummary,
   classifyAipiCodePipeline,
@@ -1382,6 +1384,92 @@ try {
     await fs.rm(emptyRoot, { recursive: true, force: true });
   } finally {
     await fs.rm(recentRoot, { recursive: true, force: true });
+  }
+
+  // P1 — the before_agent_start blast-radius probe is time-boxed and never blocks the agent on a slow graph
+  // op. A slow impactFn past the budget yields a "deferred" pointer (agent starts now); a fast one yields
+  // refs. The probe also opts out of building (buildIfMissing:false) so it can never abandon a write.
+  {
+    assert.equal(blastRadiusBudgetMs({ AIPI_BLAST_RADIUS_BUDGET_MS: "1500" }), 1500);
+    assert.equal(blastRadiusBudgetMs({}), 2500, "default budget");
+    assert.equal(blastRadiusBudgetMs({ AIPI_BLAST_RADIUS_BUDGET_MS: "garbage" }), 2500, "bad value -> default");
+
+    let sawBuildOptOut = null;
+    const slowImpact = ({ buildIfMissing }) => {
+      sawBuildOptOut = buildIfMissing;
+      return new Promise((resolve) => {
+        const t = setTimeout(() => resolve({ graph: {}, refs: [{ path: "x.js" }], relationships: [] }), 200);
+        if (typeof t?.unref === "function") t.unref();
+      });
+    };
+    const deferred = await buildBlastRadiusPointer({
+      projectRoot: tempRoot,
+      query: "some query string",
+      env: { AIPI_BLAST_RADIUS_BUDGET_MS: "20" },
+      impactFn: slowImpact,
+    });
+    assert.equal(deferred.status, "deferred", "slow graph op past budget -> deferred, agent starts now");
+    assert.equal(sawBuildOptOut, false, "probe must pass buildIfMissing:false so it never triggers a build");
+    assert.deepEqual(deferred.refs, []);
+
+    const fast = await buildBlastRadiusPointer({
+      projectRoot: tempRoot,
+      query: "some query string",
+      env: { AIPI_BLAST_RADIUS_BUDGET_MS: "5000" },
+      impactFn: () => Promise.resolve({ graph: { files: 1 }, refs: [{ path: "src/a.js", line: 3 }], relationships: [{ relation: "calls", source_ref: "a", target_ref: "b" }] }),
+    });
+    assert.equal(fast.status, "available");
+    assert.equal(fast.refs[0].path, "src/a.js");
+    assert.equal(fast.relationships[0].relation, "calls");
+
+    // An empty query is skipped without touching the graph at all.
+    const skipped = await buildBlastRadiusPointer({ projectRoot: tempRoot, query: "   " });
+    assert.equal(skipped.status, "skipped");
+  }
+
+  // P2 — the finish-audit warning is high-precision: it fires only on a genuine COMPLETION claim with no
+  // evidence, NOT on investigative narration that merely contains a claim-ish word, and at most once/turn.
+  {
+    const auditNotes = [];
+    const auditEntries = [];
+    const auditHandlers = createAipiLifecycleHandlers({
+      pi: { appendEntry(type, data) { auditEntries.push({ type, data }); } },
+      projectRootResolver: () => tempRoot,
+      coordinator: { setHostModel() {}, getHostModel: () => null },
+    });
+    const auditCtx = { ui: { notify: (message, kind) => auditNotes.push({ message, kind }) } };
+    const msgEnd = (content) => invokeMessageEndWithHostContract(
+      auditHandlers.message_end,
+      { type: "message_end", message: { role: "assistant", content } },
+      auditCtx,
+    );
+    const warnings = () => auditNotes.filter((n) => n.kind === "warning" && /evidence rung/i.test(n.message ?? ""));
+
+    // Start a fresh turn so the per-project finish-audit dedupe (module state, possibly set by an earlier
+    // block on the same root) is cleared.
+    await auditHandlers.before_agent_start({ type: "before_agent_start", prompt: "start the audit-block turn" }, auditCtx);
+
+    // Investigative narration that mentions how code behaves must NOT warn (the spam the user hit).
+    await msgEnd("I'm tracing the save flow; clicking Salvar fails to save. The modal handler funciona quando o user está ativo. Vou localizar o código.");
+    assert.equal(warnings().length, 0, "investigative message with a stray claim word does not warn");
+
+    // A genuine unsupported completion claim DOES warn — once.
+    await msgEnd("Corrigi o handler do save e está tudo resolvido.");
+    assert.equal(warnings().length, 1, "an unsupported completion claim surfaces exactly one warning");
+
+    // Dedupe: a second completion claim in the SAME turn does not double the warning.
+    await msgEnd("Pronto, implementei e agora funciona.");
+    assert.equal(warnings().length, 1, "the finish-audit warning is deduped to once per turn");
+
+    // A new turn (before_agent_start) resets the dedupe so the next unsupported claim can surface again.
+    await auditHandlers.before_agent_start({ type: "before_agent_start", prompt: "next task please" }, auditCtx);
+    await msgEnd("Corrigido e funcionando.");
+    assert.equal(warnings().length, 2, "a fresh turn re-arms the finish-audit warning");
+
+    // An evidence-backed completion claim never warns.
+    const before = warnings().length;
+    await msgEnd("Corrigi o bug. Evidence: ran `npm test` -> passed.");
+    assert.equal(warnings().length, before, "an evidence-backed completion claim does not warn");
   }
 
   console.log("AIPI_LIFECYCLE_HOOKS_TEST_OK");

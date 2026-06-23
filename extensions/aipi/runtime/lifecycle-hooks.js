@@ -1367,10 +1367,22 @@ function codePipelineWithDispatch({ pipeline = {}, route = {}, result = null, er
   };
 }
 
+// The finish-audit warning is a constant string, and message_end fires once per assistant message — so an
+// agent that legitimately wraps up across two messages could surface it twice. Dedupe to at most one per
+// turn: remember the last surfaced warning per project root and reset it at the start of each turn
+// (handleBeforeAgentStart). Keyed by projectRoot so concurrent projects don't suppress each other.
+const lastSurfacedClaimWarning = new Map();
+
 function auditEndDisciplineEvent({ event, hook, activeDisciplines = [] } = {}) {
   const text = extractUserFacingText(event);
   const claims = claimEvidenceFindings(text);
   const outcome = outcomeFirstFinding(text);
+  // Only a genuine COMPLETION/hand-back claim warrants the warning. A claim term alone is not enough — it
+  // fires on investigative narration that merely describes how code behaves ("o save funciona quando…",
+  // "the flow works like X") and spams a warning on every mid-task message. Require completion framing so
+  // only the agent actually asserting it finished ("corrigi", "fixed", "tudo passou", "safe to deploy")
+  // without an evidence rung surfaces.
+  const completionClaim = claims.length > 0 && isCompletionClaim(text);
   const checks = [
     {
       id: "finish-turn",
@@ -1386,13 +1398,13 @@ function auditEndDisciplineEvent({ event, hook, activeDisciplines = [] } = {}) {
     },
     {
       id: "claim-evidence",
-      state: claims.length ? "warn" : "pass",
-      evidence: claims.length
-        ? `unsupported claim(s): ${claims.map((claim) => claim.term).join(", ")}`
-        : "no unsupported fixed/passed/safe/done claim without an evidence rung",
+      state: completionClaim ? "warn" : "pass",
+      evidence: completionClaim
+        ? `unsupported completion claim(s): ${claims.map((claim) => claim.term).join(", ")}`
+        : "no unsupported completion claim (fixed/passed/done) without an evidence rung",
     },
   ];
-  const state = hook === "message_end" && claims.length ? "warn" : "pass";
+  const state = hook === "message_end" && completionClaim ? "warn" : "pass";
   return {
     state,
     reason: state === "warn" ? "AIPI_MESSAGE_END_CLAIM_EVIDENCE_REQUIRED" : null,
@@ -1451,6 +1463,36 @@ function claimEvidenceFindings(text) {
       term: claim.term,
       evidence_required: "written|ran|verified plus concrete command/test/artifact",
     }));
+}
+
+// True only when the text reads as the agent ASSERTING it finished the work (or handing it back as done),
+// not investigative narration that happens to contain a claim word. This is the gate that stops the
+// finish-audit warning from firing on every mid-task message — investigation describes the system
+// ("o save funciona quando X", "the flow works like Y"); a completion claim asserts a change the agent made.
+function isCompletionClaim(text) {
+  const normalized = normalizeInputText(text);
+  if (!normalized) return false;
+  // Investigative / intent / hypothesis / negative framing — never a completion claim, even when it carries
+  // a done-word. This is what separates "o save funciona quando…" / "vou corrigir" / "fails to save" (the
+  // mid-task narration that was spamming the warning) from an actual hand-back.
+  const investigative =
+    /\b(vou|irei|i'?ll|i will|let me|deixa eu|i'?m (going|tracing|looking|investigating|checking|examining|reading|trying|seeing)|investigando|analisando|examinando|verificando|rastreando|preciso|i need to|proximo passo|next step|likely|provavelmente|talvez|maybe|suspeito|parece que|it seems|fails? to|nao (funciona|salva|esta)|does ?n'?t (work|save))\b/.test(normalized) ||
+    /\?\s*$/.test(String(text ?? "").trim());
+  if (investigative) return false;
+  return (
+    // first-person past-tense completion (PT)
+    /\b(corrigi|consertei|implementei|ajustei|conclui|finalizei|terminei|resolvi|apliquei|adicionei|criei|removi)\b/.test(normalized) ||
+    // done-state participles/adjectives asserted as the result (PT)
+    /\b(corrigid[oa]s?|resolvid[oa]s?|consertad[oa]s?|implementad[oa]s?|ajustad[oa]s?|aplicad[oa]s?|adicionad[oa]s?|pronto|pronta|prontos|prontas|funcionando)\b/.test(normalized) ||
+    // completion verbs / done-state (EN)
+    /\b(fixed|implemented|resolved|completed|finished|shipped|applied|added|removed|working now|now works|passing|done)\b/.test(normalized) ||
+    // tests/all pass
+    /\b(all|todos|todas|tudo)\b[^.!?\n]{0,40}\b(pass|passed|passes|passing|passou|passaram|green|verde)\b/.test(normalized) ||
+    // explicit hand-back / deploy readiness
+    /\b(safe to (deploy|merge|ship)|pronto para (deploy|merge|review|produc|producao|homolog))\b/.test(normalized) ||
+    // close-out actions completed
+    /\b(deployed|mergeado|merged|pr (aberto|criado|mergeado))\b/.test(normalized)
+  );
 }
 
 function hasEvidenceRung(text) {
@@ -1702,6 +1744,8 @@ export async function handleBeforeAgentStart({ event, ctx, pi, projectRoot, coor
   // Gate on install like the sibling hooks — without this the guidance pointer was injected into EVERY
   // project, including non-AIPI repos (pointing at a .aipi/memory/project/procedures.md that doesn't exist).
   if (!(await isAipiInstalled(projectRoot))) return undefined;
+  // New turn — clear the finish-audit dedupe so a fresh "fixed without evidence" claim can surface once.
+  lastSurfacedClaimWarning.delete(projectRoot);
   const snapshot = await buildRunSnapshot(projectRoot);
   const hostBlock = await blockUnsupportedHostTurn({
     hook: "before_agent_start",
@@ -1737,7 +1781,7 @@ export async function handleBeforeAgentStart({ event, ctx, pi, projectRoot, coor
     // plus the most recent run so it can answer follow-ups instead of acting like nothing happened.
     const recent = await buildRecentRunSummary(projectRoot).catch(() => null);
     const blast = blastQuery.length >= 12
-      ? await buildBlastRadiusPointer({ projectRoot, query: blastQuery }).catch(() => null)
+      ? await runBlastRadiusWithProgress({ projectRoot, query: blastQuery, ctx }).catch(() => null)
       : null;
     const details = {
       schema: "aipi.context-pointer.v1",
@@ -1770,7 +1814,7 @@ export async function handleBeforeAgentStart({ event, ctx, pi, projectRoot, coor
     schema: "aipi.context-pointer.v1",
     run: snapshot,
     memory_refs: PROJECT_GUIDANCE_REFS,
-    blast_radius: await buildBlastRadiusPointer({ projectRoot, query: blastQuery }),
+    blast_radius: await runBlastRadiusWithProgress({ projectRoot, query: blastQuery, ctx }),
     active_disciplines: activeDisciplines,
   };
   safeAppendEntry(pi, "aipi.context.pointer", details);
@@ -1851,7 +1895,10 @@ export async function handleEndDisciplineAudit({ event, ctx, pi, projectRoot, ho
   // recording the claim-evidence audit silently we SURFACE it: a "fixed/passed/done" claim with no evidence
   // rung (a real command/test/artifact) now warns the user, so an unverified "it works" can't pass unseen.
   if (hook === "message_end" && audit.state === "warn" && audit.message) {
-    safeNotify(ctx, audit.message, "warning");
+    if (lastSurfacedClaimWarning.get(projectRoot) !== audit.message) {
+      lastSurfacedClaimWarning.set(projectRoot, audit.message);
+      safeNotify(ctx, audit.message, "warning");
+    }
   }
   return undefined;
 }
@@ -2876,10 +2923,32 @@ function buildContextPointerDetails({ snapshot, activeDisciplines = [] }) {
   };
 }
 
-async function buildBlastRadiusPointer({ projectRoot, query }) {
+// The blast-radius pointer builds/queries the code graph (parse + lexical/graph/semantic doors). On a
+// large repo the first build — or a semantic round-trip — can take seconds, and it runs inside
+// before_agent_start (BEFORE the agent gets control), so without a budget it reads as the agent
+// "hanging" before it even starts. Time-box the WAIT (not the work): if the budget elapses we return a
+// "deferred" pointer and let the agent start now, while the graph keeps building in the background so the
+// NEXT task gets it cheaply.
+const DEFAULT_BLAST_RADIUS_BUDGET_MS = 2500;
+const BLAST_RADIUS_TIMEOUT_MARKER = "aipi_blast_radius_timeout";
+
+export function blastRadiusBudgetMs(env = process.env) {
+  const raw = Number.parseInt(env?.AIPI_BLAST_RADIUS_BUDGET_MS ?? "", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_BLAST_RADIUS_BUDGET_MS;
+}
+
+export async function buildBlastRadiusPointer({ projectRoot, query, env = process.env, impactFn = aipiImpact, onProgress = null } = {}) {
   if (!query?.trim()) return { status: "skipped", refs: [], relationships: [] };
+  const budgetMs = blastRadiusBudgetMs(env);
+  // buildIfMissing:false — the probe only QUERIES an existing graph; it never triggers a synchronous build
+  // (the expensive write) before the agent starts. If the graph isn't built yet this turn gets no refs; it
+  // gets built lazily by the agent's own aipi_impact/aipi_retrieve tool calls or onboarding/rebuild.
+  const impactPromise = Promise.resolve(impactFn({ projectRoot, query, limit: 4, buildIfMissing: false, onProgress }));
+  // If we stop waiting on a slow build, the original promise still settles later; swallow it so an
+  // abandoned graph build can never surface as an unhandled rejection.
+  impactPromise.catch(() => {});
   try {
-    const impact = await aipiImpact({ projectRoot, query, limit: 4 });
+    const impact = await withTimeout(impactPromise, budgetMs, BLAST_RADIUS_TIMEOUT_MARKER);
     return {
       status: "available",
       graph: impact.graph,
@@ -2895,13 +2964,72 @@ async function buildBlastRadiusPointer({ projectRoot, query }) {
       })),
     };
   } catch (error) {
+    const message = String(error?.message ?? error);
+    if (message.includes(BLAST_RADIUS_TIMEOUT_MARKER)) {
+      return {
+        status: "deferred",
+        reason: `blast-radius exceeded ${budgetMs}ms budget; agent started without it (graph still building in background)`,
+        refs: [],
+        relationships: [],
+      };
+    }
     return {
       status: "unavailable",
-      reason: String(error?.message ?? error),
+      reason: message,
       refs: [],
       relationships: [],
     };
   }
+}
+
+// Format an aipiImpact/ensureGraph onProgress event into a short sub-activity label for the live spinner.
+function graphProgressLabel(event) {
+  if (!event) return "";
+  if (typeof event === "string") return event.replace(/\s+/g, " ").trim().slice(0, 60);
+  const stage = event.stage ?? event.phase ?? event.step ?? null;
+  const message = event.message ?? event.detail ?? null;
+  const count = Number.isFinite(event.count) ? event.count : Number.isFinite(event.files) ? event.files : null;
+  const parts = [stage, message, count != null ? `${count} arquivos` : null].filter(Boolean);
+  return parts.join(" · ").replace(/\s+/g, " ").trim().slice(0, 60);
+}
+
+// Run the blast-radius graph op as a VISIBLE process: an animated "AIPI graph · <query> · working · Ns"
+// spinner while it runs (fed live with the graph build sub-activity), then a single result line with the
+// elapsed time and what came back — so the graph query/write reads like the other tool/process lines in
+// the terminal instead of an invisible pause. Falls back cleanly to the plain pointer when the host has
+// no updatable UI (CLI/tests): the spinner/notify simply no-op and the same blast object is returned.
+async function runBlastRadiusWithProgress({ projectRoot, query, ctx, env = process.env }) {
+  if (!query?.trim()) return { status: "skipped", refs: [], relationships: [] };
+  const progress = makeProgressNotifier(ctx);
+  const label = `AIPI graph · ${String(query).replace(/\s+/g, " ").trim().slice(0, 48)}`;
+  const startedAt = Date.now();
+  progress?.startSpinner?.(label);
+  try {
+    const blast = await buildBlastRadiusPointer({
+      projectRoot,
+      query,
+      env,
+      onProgress: (event) => progress?.updateActivity?.(graphProgressLabel(event)),
+    });
+    const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+    progress?.stopSpinner?.();
+    progress?.setStatus?.(undefined);
+    progress?.notify?.(renderBlastRadiusProcessLine({ label, blast, elapsed }), blast.status === "unavailable" ? "warning" : "info");
+    return blast;
+  } catch (error) {
+    progress?.stopSpinner?.();
+    progress?.setStatus?.(undefined);
+    return { status: "unavailable", reason: String(error?.message ?? error), refs: [], relationships: [] };
+  }
+}
+
+function renderBlastRadiusProcessLine({ label, blast, elapsed }) {
+  if (blast.status === "deferred") return `${label} · adiado (${elapsed}s, budget) · seguindo sem grafo`;
+  if (blast.status === "unavailable") return `${label} · indisponível (${elapsed}s): ${blast.reason ?? "erro"}`;
+  if (blast.status === "skipped") return `${label} · sem consulta`;
+  const refs = blast.refs?.length ?? 0;
+  const rels = blast.relationships?.length ?? 0;
+  return `${label} → ${refs} ref${refs === 1 ? "" : "s"}, ${rels} relaç${rels === 1 ? "ão" : "ões"} · ${elapsed}s`;
 }
 
 function renderBlastRadiusSummary(blastRadius = {}) {
