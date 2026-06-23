@@ -650,10 +650,16 @@ function controllerUpdateStagingPlan(state, step) {
 // if the worker didn't stage a file the evidence gate already blocked the PASS, so we never reach here with a
 // missing stage on a real PASS; the try/catch only guards an unexpected fs race.
 async function promoteControllerUpdates({ root, plan }) {
+  const resolvedRoot = path.resolve(root);
+  const rootWithSep = resolvedRoot.endsWith(path.sep) ? resolvedRoot : `${resolvedRoot}${path.sep}`;
+  const insideRoot = (p) => p === resolvedRoot || p.startsWith(rootWithSep);
   for (const { staging, target } of plan) {
     try {
-      const src = path.resolve(root, staging);
-      const dest = path.resolve(root, target);
+      const src = path.resolve(resolvedRoot, staging);
+      const dest = path.resolve(resolvedRoot, target);
+      // Defense-in-depth: the promote copies straight to disk (it does not go through the controller write
+      // allowlist), so refuse any staged source or target that escapes the project root.
+      if (!insideRoot(src) || !insideRoot(dest)) continue;
       await fs.mkdir(path.dirname(dest), { recursive: true });
       await fs.copyFile(src, dest);
     } catch {
