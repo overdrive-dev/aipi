@@ -219,7 +219,9 @@ export async function executeWorkflowRun({
     // count). This drives the planner's `(n)` label so an interrupted/resumed attempt doesn't inflate it.
     state.step_runs[step.id] = (state.step_runs[step.id] ?? 0) + 1;
     const artifactContents = await readStepArtifactContents({ root, result });
-    const validation = validateStepResult(result, { step, contract, artifactContents });
+    // shellLess is the TRUSTED descriptor-derived signal (set by the coordinator/fanout aggregator, never by
+    // the worker) that relaxes the evidence bar to `written` for a parallel review fanout — see step-result.js.
+    const validation = validateStepResult(result, { step, contract, artifactContents, shellLess: result?.aipi_shell_less === true });
     recordPolicyDecision({ state, step, result, validation, now });
     const missingArtifacts = validation.gatePassed
       ? await missingRequiredArtifacts({ root, state, step, result })
@@ -231,6 +233,12 @@ export async function executeWorkflowRun({
 
     if (validation.gatePassed && missingArtifacts.length === 0 && !memoryPromotionGate?.error) {
       const status = result.verdict === "SKIPPED" ? "skipped" : "passed";
+      // Materialize controller-owned shared artifacts ONLY now that the AUTHORITATIVE gate has passed (and no
+      // required artifact is missing) — not on the worker's self-PASS — so a step the executor BLOCKS never
+      // updates a run-root surface. PASS only (a SKIPPED step produced no controller_updates content).
+      if (result.verdict === "PASS") {
+        await promoteControllerUpdates({ root, plan: controllerUpdateStagingPlan(state, step) });
+      }
       markStep(state, step.id, {
         status,
         verdict: result.verdict,
@@ -532,6 +540,12 @@ async function executeFanoutSubagentStep({
     collected.push(collect);
   }
 
+  // TRUSTED shell-less marker for the aggregate, derived from each worker's coordinator-stamped flag (set
+  // from the descriptor's allow_shell, never from worker-reported evidence). A fanout of shell-less reviewers
+  // can only reach `written`; the executor's gate relaxes to that bar via this flag — not via any evidence
+  // source string the workers control.
+  const aggregateShellLess = collected.length > 0 && collected.every((item) => item.step_result?.aipi_shell_less === true);
+
   const nonPass = collected.find((item) => item.step_result?.verdict !== "PASS");
   if (nonPass) {
     return {
@@ -541,6 +555,7 @@ async function executeFanoutSubagentStep({
       verdict: nonPass.step_result?.verdict ?? "FAIL",
       evidence: collected.flatMap((item) => item.step_result?.evidence ?? []),
       artifacts: collected.flatMap((item) => item.step_result?.artifacts ?? item.artifacts ?? []),
+      aipi_shell_less: aggregateShellLess,
     };
   }
 
@@ -549,6 +564,7 @@ async function executeFanoutSubagentStep({
     step_id: step.id,
     agent_ids: collected.map((item) => item.agent_id),
     verdict: "PASS",
+    aipi_shell_less: aggregateShellLess,
     evidence: [
       {
         rung: "written",
@@ -614,6 +630,10 @@ async function executeSubagentStep({
     ),
   };
 
+  // Clear any stale staged controller_updates from a prior attempt BEFORE dispatch, so a no-op redispatch
+  // can't pass (and re-promote) old content on the strength of a pre-existing file — the worker must freshly
+  // write its stage to earn evidence (SE-3).
+  await clearStagingArtifacts({ root, plan: controllerStaging });
   const { agent_id: agentId } = dispatchSubagent(coordinator, descriptor);
   const collect = await collectSubagentResult(coordinator, agentId, {
     pollIntervalMs,
@@ -625,20 +645,17 @@ async function executeSubagentStep({
   if (!collect.ready) {
     return workerOutcomeOrThrow({ step, agentId, collect });
   }
-  const stepResult = {
+  return {
     ...collect.step_result,
     artifacts: collect.step_result?.artifacts?.length ? collect.step_result.artifacts : collect.artifacts ?? [],
   };
-  // On a PASS, materialize the controller-owned shared artifacts from their staged copies.
-  if (controllerStaging.length && String(stepResult.verdict) === "PASS") {
-    await promoteControllerUpdates({ root, plan: controllerStaging });
-  }
-  return stepResult;
+  // NOTE: controller_updates are promoted by the main loop AFTER the authoritative gate passes (not here on
+  // the worker's self-PASS), so a step the executor ultimately BLOCKS never materializes the run-root surface.
 }
 
 // Map each of a step's controller_updates targets to a step-scoped staging path (same basename) the worker
 // can own and write. steps/<id>/<file> passes isControllerOwnedPath; the run-root target does not.
-function controllerUpdateStagingPlan(state, step) {
+export function controllerUpdateStagingPlan(state, step) {
   return (step.controller_updates ?? []).map((template) => {
     const target = renderTemplate(template, state, step);
     const staging = path.join(runRelDir(state), "steps", step.id, path.basename(target)).replaceAll("\\", "/");
@@ -646,22 +663,54 @@ function controllerUpdateStagingPlan(state, step) {
   });
 }
 
-// Controller-side promotion: copy each staged file to its run-root controller_updates target. Best-effort —
-// if the worker didn't stage a file the evidence gate already blocked the PASS, so we never reach here with a
-// missing stage on a real PASS; the try/catch only guards an unexpected fs race.
-async function promoteControllerUpdates({ root, plan }) {
-  const resolvedRoot = path.resolve(root);
+export async function clearStagingArtifacts({ root, plan }) {
+  for (const { staging } of plan) {
+    try {
+      await fs.rm(path.resolve(root, staging), { force: true });
+    } catch {
+      /* best-effort: a missing stale stage is the desired state */
+    }
+  }
+}
+
+// realpath the nearest existing ancestor of a (possibly not-yet-created) path, so symlink/junction
+// components are resolved before a containment check. Returns the resolved ancestor, or the literal path.
+async function realpathExistingAncestor(target) {
+  let current = path.resolve(target);
+  for (let i = 0; i < 64; i += 1) {
+    try {
+      return await fs.realpath(current);
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return current;
+      current = parent;
+    }
+  }
+  return current;
+}
+
+// Controller-side promotion: copy each staged file to its run-root controller_updates target, AFTER the
+// authoritative gate has passed. Hardened: (1) symlink-resolved containment on both source and the
+// destination's existing ancestor — a junction/symlink planted in the run dir can't redirect the copy outside
+// the project root; (2) refuse a symlink destination (write a real file, never through a link); (3) never
+// promote an empty/non-file stage onto the load-bearing surface.
+export async function promoteControllerUpdates({ root, plan }) {
+  const resolvedRoot = await fs.realpath(root).catch(() => path.resolve(root));
   const rootWithSep = resolvedRoot.endsWith(path.sep) ? resolvedRoot : `${resolvedRoot}${path.sep}`;
   const insideRoot = (p) => p === resolvedRoot || p.startsWith(rootWithSep);
   for (const { staging, target } of plan) {
     try {
-      const src = path.resolve(resolvedRoot, staging);
-      const dest = path.resolve(resolvedRoot, target);
-      // Defense-in-depth: the promote copies straight to disk (it does not go through the controller write
-      // allowlist), so refuse any staged source or target that escapes the project root.
-      if (!insideRoot(src) || !insideRoot(dest)) continue;
+      const src = path.resolve(root, staging);
+      const dest = path.resolve(root, target);
+      const realSrc = await fs.realpath(src).catch(() => null);
+      if (!realSrc || !insideRoot(realSrc)) continue;
+      if (!insideRoot(await realpathExistingAncestor(path.dirname(dest)))) continue;
+      const srcStat = await fs.stat(realSrc);
+      if (!srcStat.isFile() || srcStat.size === 0) continue; // never materialize an empty/non-file surface (SE-2)
+      const destLink = await fs.lstat(dest).catch(() => null);
+      if (destLink?.isSymbolicLink()) continue; // refuse to write through a symlinked target
       await fs.mkdir(path.dirname(dest), { recursive: true });
-      await fs.copyFile(src, dest);
+      await fs.copyFile(realSrc, dest);
     } catch {
       /* a missing stage means the PASS lacked real evidence and was already downgraded upstream */
     }

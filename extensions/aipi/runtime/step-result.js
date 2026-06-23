@@ -40,10 +40,10 @@ const nonExecutingEvidenceSources = new Set([
   "aipi-subagent-fanout",
 ]);
 
-// Stages whose deliverable IS running code — a PASS legitimately requires ran/verified evidence. Every other
-// stage (review, planning, requirements, research, memory…) delivers a WRITTEN artifact, so `written` is its
-// honest ceiling. These are also the stages that never fan out (only review-stage multi-agent steps do), so
-// keeping the ran/verified bar here can't collide with the shell-less-fanout relaxation below.
+// Stages whose deliverable IS running code — a PASS legitimately requires ran/verified evidence even when a
+// worker is shell-less. Defense-in-depth: a worker is only ever marked shell-less for a parallel REVIEW
+// fanout (never a code/verify step), so these should never be shell-less in practice — but if one ever is
+// (misconfiguration), keep it on the strict bar rather than accepting `written`.
 const executionEvidenceStages = new Set([
   "implementation",
   "fix",
@@ -51,17 +51,13 @@ const executionEvidenceStages = new Set([
   "local-verification",
   "final-verification",
   "regression",
+  "homolog",
+  "ops",
+  "deployment-plan",
 ]);
 
 function requiresExecutionEvidence(step) {
   return executionEvidenceStages.has(String(step?.stage ?? "").toLowerCase());
-}
-
-// A fanout result always carries the aggregator's synthetic written-rung entry (workflow-executor.js stamps
-// it), so its presence reliably marks "this step fanned out to parallel review workers". Those workers run
-// shell-less (allow_shell:false), so the strongest rung they can honestly reach is `written`.
-function resultIsFanout(result) {
-  return (result?.evidence ?? []).some((item) => item?.source === "aipi-subagent-fanout");
 }
 
 const reviewArtifactNamePattern = /(^|[/\\])(?:CODE-REVIEW|SECURITY|DEV-REVIEW|HUMAN-REVIEW|COMPLEXITY-REVIEW|INTEGRATION|BLAST-RADIUS|PLAN-REVIEW)(?:\.[A-Za-z0-9_-]+)?$/i;
@@ -70,7 +66,7 @@ const actionableFindingPattern = /\b(?:CRITICAL|HIGH|BLOCKER|P0|P1)\b\s*(?:[:\]-
 const findingLabelPattern = /\b(?:severity|impact|priority)\s*[:=]\s*(?:CRITICAL|HIGH|BLOCKER|P0|P1)\b/i;
 const resolvedFindingPattern = /\b(?:resolved|fixed|mitigated|closed|not\s+applicable|none|no)\b.*\b(?:CRITICAL|HIGH|BLOCKER|P0|P1)\b|\b(?:CRITICAL|HIGH|BLOCKER|P0|P1)\b.*\b(?:resolved|fixed|mitigated|closed|none|0)\b/i;
 
-export function validateStepResult(result, { step = null, contract = defaultContract, artifactContents = null } = {}) {
+export function validateStepResult(result, { step = null, contract = defaultContract, artifactContents = null, shellLess = false } = {}) {
   const errors = [];
   const warnings = [];
   const schema = contract.stepResultSchema ?? defaultContract.stepResultSchema;
@@ -130,7 +126,7 @@ export function validateStepResult(result, { step = null, contract = defaultCont
 
   const gatePassed =
     errors.length === 0 &&
-    verdictPasses(result, step, contract, errors, warnings) &&
+    verdictPasses(result, step, contract, errors, warnings, shellLess) &&
     policyDecisionPasses(policyDecision, step);
 
   return {
@@ -233,7 +229,7 @@ function findingSeverity(line) {
   return match ? match[1].toUpperCase() : null;
 }
 
-function verdictPasses(result, step, contract, errors, warnings) {
+function verdictPasses(result, step, contract, errors, warnings, shellLess = false) {
   const declaredPassVerdicts = passVerdictsForStep(step);
   // Verdict-ALLOWANCE (is this verdict accepted by THIS step's pass_verdicts / allow_skip) is a
   // STEP-GATE decision. The subagent coordinator validates a worker result for well-formedness
@@ -248,7 +244,7 @@ function verdictPasses(result, step, contract, errors, warnings) {
   }
 
   if (result.verdict === "PASS") {
-    return passEvidenceRule(result, step, errors);
+    return passEvidenceRule(result, step, errors, shellLess);
   }
 
   if (result.verdict === "SKIPPED") {
@@ -328,7 +324,7 @@ function tokenMentioned(text, token) {
   return new RegExp(`(^|[^A-Za-z0-9_-])${escaped}([^A-Za-z0-9_-]|$)`, "i").test(String(text ?? ""));
 }
 
-function passEvidenceRule(result, step, errors) {
+function passEvidenceRule(result, step, errors, shellLess = false) {
   const strongest = strongestGateEvidenceRung(result.evidence);
   const required = step?.gate?.require_evidence_rung ?? null;
 
@@ -342,12 +338,13 @@ function passEvidenceRule(result, step, errors) {
     return true;
   }
 
-  // A shell-less fanout review step (its workers read sources and WRITE findings — they have no shell, so
-  // they can never reach ran/verified) would be forced to BLOCKED by the ran/verified default below even on
-  // an honest PASS. Accept `written` for a fanout result on a non-execution stage; the worker still had to
-  // produce a findings artifact, so the anti-self-deception intent holds. Execution stages
-  // (implementation/fix/tdd/verification) never fan out and keep the ran/verified bar — they must prove a run.
-  if (resultIsFanout(result) && !requiresExecutionEvidence(step)) {
+  // A shell-LESS worker (a parallel review fanout — it reads sources and WRITES findings, it has no shell)
+  // can never reach ran/verified, so the ran/verified default below would force every honest PASS to BLOCKED.
+  // Accept `written` for it. `shellLess` is a TRUSTED signal threaded from the descriptor's allow_shell flag
+  // by the coordinator/executor — NEVER derived from the worker's own evidence (which the worker controls and
+  // could forge: source/rung are not authoritative). Execution stages keep the strict bar even if somehow
+  // shell-less, so a misconfigured code/verify step can't pass on `written`.
+  if (shellLess && !requiresExecutionEvidence(step)) {
     if (strongest === null) {
       errors.push("PASS requires at least written evidence (a review artifact)");
       return false;

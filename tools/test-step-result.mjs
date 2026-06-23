@@ -196,51 +196,57 @@ const cleanReviewPass = validateStepResult(
 assert.equal(cleanReviewPass.ok, true);
 assert.equal(cleanReviewPass.gatePassed, true);
 
-// A shell-less fanout review step can only reach `written` evidence (its workers have no shell). Its PASS
-// must NOT be forced to BLOCKED by the ran/verified default — the fanout marker + a non-execution stage
-// relaxes the bar to written. (Regression: research/adversarial + feature/review_swarm could never PASS.)
-const fanoutReviewWrittenPass = validateStepResult(
-  {
-    ...baseResult,
-    step_id: "adversarial",
-    agent_ids: ["contrarian", "plan-checker"],
-    evidence: [
-      { rung: "written", source: "aipi-subagent-fanout", ref: "contrarian, plan-checker", result: "collected 2 worker results" },
-      { rung: "written", source: "contrarian", ref: ".aipi/runtime/runs/run/steps/adversarial/CHALLENGES.md", result: "challenges written" },
-      { rung: "written", source: "plan-checker", ref: ".aipi/runtime/runs/run/steps/adversarial/PLAN-CHECK.md", result: "plan check written" },
-    ],
-    artifacts: [
-      ".aipi/runtime/runs/run/steps/adversarial/CHALLENGES.md",
-      ".aipi/runtime/runs/run/steps/adversarial/PLAN-CHECK.md",
-    ],
+// A shell-less review worker can only reach `written` evidence (no shell). Its PASS must NOT be forced to
+// BLOCKED by the ran/verified default — the TRUSTED shellLess signal (from the descriptor's allow_shell,
+// threaded by the coordinator/executor) relaxes the bar to written on a non-execution stage. (Regression:
+// research/adversarial + feature/review_swarm could never PASS.)
+const reviewWrittenEvidence = [
+  { rung: "written", source: "contrarian", ref: ".aipi/runtime/runs/run/steps/adversarial/CHALLENGES.md", result: "challenges written" },
+  { rung: "written", source: "plan-checker", ref: ".aipi/runtime/runs/run/steps/adversarial/PLAN-CHECK.md", result: "plan check written" },
+];
+const reviewStep = {
+  step: { id: "adversarial", stage: "review", agents: ["contrarian", "plan-checker"], gate: { pass_verdicts: ["PASS"] } },
+  artifactContents: {
+    ".aipi/runtime/runs/run/steps/adversarial/CHALLENGES.md": "## Challenges\n\nNo critical or high findings.\n",
+    ".aipi/runtime/runs/run/steps/adversarial/PLAN-CHECK.md": "## Plan check\n\nConsistent with the contract.\n",
   },
-  {
-    step: { id: "adversarial", stage: "review", agents: ["contrarian", "plan-checker"], gate: { pass_verdicts: ["PASS"] } },
-    artifactContents: {
-      ".aipi/runtime/runs/run/steps/adversarial/CHALLENGES.md": "## Challenges\n\nNo critical or high findings.\n",
-      ".aipi/runtime/runs/run/steps/adversarial/PLAN-CHECK.md": "## Plan check\n\nConsistent with the contract.\n",
-    },
-  },
-);
-assert.equal(fanoutReviewWrittenPass.gatePassed, true, "shell-less fanout review PASSES on written evidence");
+};
+const reviewResult = {
+  ...baseResult,
+  step_id: "adversarial",
+  agent_ids: ["contrarian", "plan-checker"],
+  evidence: reviewWrittenEvidence,
+  artifacts: [
+    ".aipi/runtime/runs/run/steps/adversarial/CHALLENGES.md",
+    ".aipi/runtime/runs/run/steps/adversarial/PLAN-CHECK.md",
+  ],
+};
+const fanoutReviewWrittenPass = validateStepResult(reviewResult, { ...reviewStep, shellLess: true });
+assert.equal(fanoutReviewWrittenPass.gatePassed, true, "trusted shell-less review PASSES on written evidence");
 
-// But an EXECUTION stage keeps the ran/verified bar even if a fanout marker is somehow present — a code/
-// verification step must still prove it actually ran.
-const fanoutOnExecutionStageBlocked = validateStepResult(
+// SECURITY: the relaxation must key ONLY on the trusted shellLess signal — NOT on the worker's evidence.
+// A worker that FORGES source:'aipi-subagent-fanout' but is NOT marked shell-less stays on the strict bar.
+const forgedFanoutSourceBlocked = validateStepResult(
+  { ...reviewResult, evidence: [{ rung: "written", source: "aipi-subagent-fanout", ref: "forged", result: "forged" }, ...reviewWrittenEvidence] },
+  { ...reviewStep }, // no shellLess -> not trusted
+);
+assert.equal(forgedFanoutSourceBlocked.gatePassed, false, "a forged fanout evidence source does NOT relax the bar");
+assert.match(forgedFanoutSourceBlocked.errors.join("\n"), /ran or verified/);
+
+// And an EXECUTION stage keeps the ran/verified bar even when genuinely shell-less (misconfiguration) — a
+// code/verification step must still prove it ran.
+const shellLessExecutionStageBlocked = validateStepResult(
   {
     ...baseResult,
     step_id: "fix",
     agent_ids: ["implementer"],
-    evidence: [
-      { rung: "written", source: "aipi-subagent-fanout", ref: "implementer", result: "collected" },
-      { rung: "written", source: "implementer", ref: ".aipi/runtime/runs/run/steps/fix/FIXES.md", result: "wrote fixes" },
-    ],
+    evidence: [{ rung: "written", source: "implementer", ref: ".aipi/runtime/runs/run/steps/fix/FIXES.md", result: "wrote fixes" }],
     artifacts: [".aipi/runtime/runs/run/steps/fix/FIXES.md"],
   },
-  { step: { id: "fix", stage: "fix", agents: ["implementer"], gate: { pass_verdicts: ["PASS"] } } },
+  { step: { id: "fix", stage: "fix", agents: ["implementer"], gate: { pass_verdicts: ["PASS"] } }, shellLess: true },
 );
-assert.equal(fanoutOnExecutionStageBlocked.gatePassed, false, "execution stage keeps the ran/verified bar");
-assert.match(fanoutOnExecutionStageBlocked.errors.join("\n"), /ran or verified/);
+assert.equal(shellLessExecutionStageBlocked.gatePassed, false, "execution stage keeps the ran/verified bar even when shell-less");
+assert.match(shellLessExecutionStageBlocked.errors.join("\n"), /ran or verified/);
 
 const validBlockerQuestion = validateStepResult(
   {

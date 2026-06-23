@@ -957,6 +957,13 @@ for (const workflowPath of list("templates/.aipi/workflows", ".yaml")) {
         errors.push(`${workflowPath} step ${step.id} lists shared artifact ${basename} under produces; use controller_updates`);
       }
     }
+
+    // A review-stage multi-agent step fans out to disjoint shell-less workers, so no single worker can own
+    // and stage a controller-owned shared artifact — controller_updates would be silently dropped (no
+    // staging/promote on the fanout path). Forbid the incoherent combination at validation time (INT-2).
+    if ((step.controller_updates?.length ?? 0) > 0 && step.stage === "review" && (step.agents?.length ?? 0) > 1) {
+      errors.push(`${workflowPath} step ${step.id} is a review fanout but declares controller_updates; a disjoint fanout has no single writer for a controller-owned artifact`);
+    }
   }
 
   const duplicates = produced.filter((item, index) => produced.indexOf(item) !== index);

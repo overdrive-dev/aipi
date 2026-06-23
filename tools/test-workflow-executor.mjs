@@ -5,10 +5,13 @@ import path from "node:path";
 import { initProject } from "../extensions/aipi/runtime/project-init.js";
 import {
   assertControllerWriteAllowed,
+  clearStagingArtifacts,
+  controllerUpdateStagingPlan,
   createLocalWorkflowAdapter,
   createSubagentWorkflowAdapter,
   executeWorkflowRun,
   parseWorkflowDefinition,
+  promoteControllerUpdates,
   resolveWriteScope,
   writeControllerArtifact,
 } from "../extensions/aipi/runtime/workflow-executor.js";
@@ -1592,37 +1595,53 @@ try {
       true,
       "worker wrote the step-scoped staging artifact (its evidence)",
     );
+    // SE-1/INT-1: executeSubagentStep (the worker's self-PASS) must NOT promote — promotion is deferred to the
+    // main loop AFTER the authoritative gate, so the run-root surface is materialized only by a gate-passed run.
     assert.equal(
       await pathExists(path.join(tempRoot, ".aipi", "runtime", "runs", stagingRunId, "BDD-CONTRACT.md")),
-      true,
-      "controller promoted the staged contract to the run-root controller_updates target",
+      false,
+      "the worker step does NOT promote on its own self-PASS (promote is gated by the main loop)",
     );
+  }
 
-    // intake-like step: a produced artifact AND a controller_update — both land, RUN-MANIFEST.md no longer dropped.
-    const intakeStep = {
-      id: "intake",
-      stage: "intake",
-      agents: ["orchestration-reasoner"],
-      name: "Intake",
-      prompt: "Intake the request.",
-      produces: [`.aipi/runtime/runs/${stagingRunId}/steps/intake/INTAKE.md`],
-      controller_updates: [`.aipi/runtime/runs/${stagingRunId}/RUN-MANIFEST.md`],
-      gate: { schema: "aipi.step-result.v1", pass_verdicts: ["PASS"], allow_skip: false },
-    };
-    const intakeResult = await stagingAdapter.executeStep({
-      root: tempRoot,
-      state: stagingState,
-      workflow: { name: "planning" },
-      step: intakeStep,
-      context: { contract_path: stagingState.contract_path },
-      contract: {},
-    });
-    assert.equal(intakeResult.verdict, "PASS");
-    assert.equal(
-      await pathExists(path.join(tempRoot, ".aipi", "runtime", "runs", stagingRunId, "RUN-MANIFEST.md")),
-      true,
-      "intake's controller_update (RUN-MANIFEST.md) is materialized, not silently dropped",
-    );
+  // promoteControllerUpdates unit coverage (it runs only after the authoritative gate): happy path materializes
+  // the run-root surface; empty/missing/symlink/traversal sources are refused (SE-2 + promote-traversal-1).
+  {
+    const pRun = "promote-unit-run";
+    const stepDir = path.join(tempRoot, ".aipi", "runtime", "runs", pRun, "steps", "contract");
+    await fs.mkdir(stepDir, { recursive: true });
+    const stagingRel = `.aipi/runtime/runs/${pRun}/steps/contract/BDD-CONTRACT.md`;
+    const targetRel = `.aipi/runtime/runs/${pRun}/BDD-CONTRACT.md`;
+    await fs.writeFile(path.join(tempRoot, stagingRel), "# contract body\n");
+    await promoteControllerUpdates({ root: tempRoot, plan: [{ staging: stagingRel, target: targetRel }] });
+    assert.equal(await pathExists(path.join(tempRoot, targetRel)), true, "promote materializes the run-root surface from a non-empty stage");
+    assert.match(await fs.readFile(path.join(tempRoot, targetRel), "utf8"), /contract body/);
+
+    // SE-2: an empty stage is never promoted onto the load-bearing surface.
+    const emptyRel = `.aipi/runtime/runs/${pRun}/steps/contract/EMPTY.md`;
+    const emptyTarget = `.aipi/runtime/runs/${pRun}/EMPTY.md`;
+    await fs.writeFile(path.join(tempRoot, emptyRel), "");
+    await promoteControllerUpdates({ root: tempRoot, plan: [{ staging: emptyRel, target: emptyTarget }] });
+    assert.equal(await pathExists(path.join(tempRoot, emptyTarget)), false, "SE-2: an empty stage is not promoted");
+
+    // A missing stage is a no-op (no throw, nothing created).
+    await promoteControllerUpdates({ root: tempRoot, plan: [{ staging: `.aipi/runtime/runs/${pRun}/steps/contract/MISSING.md`, target: `.aipi/runtime/runs/${pRun}/MISSING.md` }] });
+    assert.equal(await pathExists(path.join(tempRoot, `.aipi/runtime/runs/${pRun}/MISSING.md`)), false, "a missing stage is a no-op");
+
+    // promote-traversal-1: a target that escapes the project root is refused even though the stage is valid.
+    const escapeTargetAbs = path.join(tempRoot, "..", `aipi-promote-escape-${pRun}.md`);
+    await fs.rm(escapeTargetAbs, { force: true });
+    await promoteControllerUpdates({ root: tempRoot, plan: [{ staging: stagingRel, target: `../aipi-promote-escape-${pRun}.md` }] });
+    assert.equal(await pathExists(escapeTargetAbs), false, "promote refuses a target escaping the project root");
+
+    // SE-3: clearStagingArtifacts removes a stale stage so a no-op redispatch can't pass on it.
+    assert.equal(await pathExists(path.join(tempRoot, stagingRel)), true);
+    await clearStagingArtifacts({ root: tempRoot, plan: [{ staging: stagingRel, target: targetRel }] });
+    assert.equal(await pathExists(path.join(tempRoot, stagingRel)), false, "SE-3: clearStagingArtifacts removes the stale stage");
+
+    // controllerUpdateStagingPlan maps a run-root target to a step-scoped staging path with the same basename.
+    const plan = controllerUpdateStagingPlan({ run_id: pRun }, { id: "contract", controller_updates: [`.aipi/runtime/runs/${pRun}/BDD-CONTRACT.md`] });
+    assert.deepEqual(plan, [{ staging: `.aipi/runtime/runs/${pRun}/steps/contract/BDD-CONTRACT.md`, target: `.aipi/runtime/runs/${pRun}/BDD-CONTRACT.md` }]);
   }
 
   console.log("AIPI_WORKFLOW_EXECUTOR_TEST_OK");

@@ -403,7 +403,14 @@ export class SubagentCoordinator {
 
   #parseResult(job, raw) {
     const stepResult = raw?.stepResult ?? raw;
-    const validation = validateStepResult(stepResult);
+    // TRUSTED provenance: whether this worker ran shell-less is set by the executor on the descriptor
+    // (allow_shell:false for a parallel review fanout), never self-reported by the worker. The evidence gate
+    // relaxes to `written` ONLY for a shell-less worker — so deriving this from worker-controlled fields
+    // (evidence source/rung) would let a worker forge it. Stamp it on the result so the executor's
+    // authoritative re-validation inherits the same trusted signal.
+    const shellLess = job?.descriptor?.allow_shell === false;
+    stepResult.aipi_shell_less = shellLess;
+    const validation = validateStepResult(stepResult, { shellLess });
     if (!validation.ok) {
       throw new Error(
         `${job.agentId} returned invalid ${STEP_RESULT_SCHEMA}: ${validation.errors.join("; ")}`,
