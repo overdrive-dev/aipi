@@ -833,6 +833,12 @@ try {
     }, ctx),
     undefined,
   );
+  // B2: an unsupported "fixed/safe" claim SURFACES a visible warning at message_end (anti-self-deception
+  // finish gate); the evidence-backed claim above does not add one.
+  assert.ok(
+    notifications.some((note) => note.kind === "warning" && /evidence rung/i.test(note.message ?? "")),
+    "B2: unsupported claim at message_end surfaces a visible warning",
+  );
   assert.equal(
     entries.some(
       (entry) =>

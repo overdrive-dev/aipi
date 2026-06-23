@@ -1843,6 +1843,13 @@ export async function handleEndDisciplineAudit({ event, ctx, pi, projectRoot, ho
   safeAppendEntry(pi, "aipi.discipline.end_audit", entry);
   await appendRuntimeEvent(projectRoot, DISCIPLINE_AUDIT_LOG, entry);
   if (snapshot.active) await appendRuntimeEvent(projectRoot, runScopedLog(snapshot.run_id, "discipline-audit.jsonl"), entry);
+  // B2 — the flexible-agent finish gate (anti-self-deception). Pi's message_end hook cannot hard-block the
+  // main agent (only the forked-worker step-result gate can, via verifyWorkerPassEvidence), so instead of
+  // recording the claim-evidence audit silently we SURFACE it: a "fixed/passed/done" claim with no evidence
+  // rung (a real command/test/artifact) now warns the user, so an unverified "it works" can't pass unseen.
+  if (hook === "message_end" && audit.state === "warn" && audit.message) {
+    safeNotify(ctx, audit.message, "warning");
+  }
   return undefined;
 }
 
