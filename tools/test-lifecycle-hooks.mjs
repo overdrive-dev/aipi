@@ -1310,7 +1310,9 @@ try {
     assert.match(rendered, /✗ review/);
     assert.match(rendered, /fix \(4\)/, "loop count is shown in the recent-run summary");
     assert.match(rendered, /Do NOT claim this is the first message/);
-    // Integration (#7): handleBeforeAgentStart injects the recent-run pointer when NO run is active.
+    // Integration (#7/#10): in the flexible flow (no active run) handleBeforeAgentStart injects a project
+    // guidance context-pointer — project instructions + the project's Definition of Done — AND folds in the
+    // recent-run summary so the agent can answer follow-ups.
     const hbas = await handleBeforeAgentStart({
       event: { type: "before_agent_start", prompt: "did you run tests?" },
       ctx: { model: { provider: "anthropic", id: "claude-opus-4-8" }, ui: { notify() {} } },
@@ -1318,14 +1320,32 @@ try {
       projectRoot: recentRoot,
       coordinator: { setHostModel() {}, getHostModel: () => null },
     });
-    assert.ok(hbas?.message, "handleBeforeAgentStart returns a message when a recent run exists with no active run");
-    assert.equal(hbas.message.customType, "aipi.recent-run-pointer");
+    assert.ok(hbas?.message, "handleBeforeAgentStart returns a guidance pointer in the flexible flow");
+    assert.equal(hbas.message.customType, "aipi.context-pointer");
     assert.equal(hbas.message.display, false);
+    // #10: the agent is pointed to the project's procedures / Definition of Done (generic, not hardcoded).
+    assert.match(hbas.message.content, /procedures\.md/);
+    assert.match(hbas.message.content, /DEFINITION OF DONE/);
+    // The recent run is folded in so the agent can answer follow-ups.
     assert.match(hbas.message.content, /regression_test/);
     assert.match(hbas.message.content, /Do NOT claim this is the first message/);
-    // The header is status-aware (#4): an escalated run is NOT mislabeled "completed".
+    // Status-aware: an escalated run is NOT mislabeled "completed".
     assert.doesNotMatch(hbas.message.content, /a COMPLETED run/);
     assert.match(hbas.message.content, /STOPPED for human review/);
+    // Even with NO recent run, the flexible flow still injects the project guidance (so the agent always
+    // knows the project's conventions + Definition of Done).
+    const noRunRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-flex-guidance-"));
+    const hbas2 = await handleBeforeAgentStart({
+      event: { type: "before_agent_start", prompt: "fix the gestores navigation bug please" },
+      ctx: { model: { provider: "anthropic", id: "claude-opus-4-8" }, ui: { notify() {} } },
+      pi: { appendEntry() {} },
+      projectRoot: noRunRoot,
+      coordinator: { setHostModel() {}, getHostModel: () => null },
+    });
+    assert.equal(hbas2?.message?.customType, "aipi.context-pointer", "guidance is injected even with no recent run");
+    assert.match(hbas2.message.content, /DEFINITION OF DONE/);
+    assert.match(hbas2.message.content, /procedures\.md/);
+    await fs.rm(noRunRoot, { recursive: true, force: true });
     // A run older than the recency window is not surfaced.
     const aged = await buildRecentRunSummary(recentRoot, { maxAgeMs: 1, now: () => Date.now() + 10_000 });
     assert.equal(aged, null, "a stale run beyond the recency window is not surfaced");

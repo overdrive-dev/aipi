@@ -1687,6 +1687,17 @@ function workflowForInput(normalized) {
   return null;
 }
 
+// Project instruction files the agent is pointed to every turn. These are PROJECT-authored (the engine
+// ships templates but never hardcodes content) — including procedures.md, the home of the project's own
+// "Definition of Done" / close-out (how THIS project finishes a task: tests, PR, CI, merge…). The engine
+// only delivers whatever the project wrote; it prescribes nothing project-specific.
+const PROJECT_GUIDANCE_REFS = Object.freeze([
+  ".aipi/memory/project/project.md",
+  ".aipi/memory/project/procedures.md",
+  ".aipi/memory/project/business-rules.md",
+  ".aipi/memory/project/decisions.md",
+]);
+
 export async function handleBeforeAgentStart({ event, ctx, pi, projectRoot, coordinator = null }) {
   const snapshot = await buildRunSnapshot(projectRoot);
   const hostBlock = await blockUnsupportedHostTurn({
@@ -1714,19 +1725,32 @@ export async function handleBeforeAgentStart({ event, ctx, pi, projectRoot, coor
     },
     snapshot,
   });
+  const blastQuery = [event?.prompt, snapshot.current_step, snapshot.stage].filter(Boolean).join(" ").trim();
+
   if (!snapshot.active) {
-    // No active run, but a workflow may have JUST finished — surface it so the assistant can answer
-    // follow-ups ("did you run tests?", "check the kanban") instead of acting like nothing happened.
+    // Flexible flow (no forced workflow): still give the agent the project's guidance — conventions,
+    // procedures, and the project's own DEFINITION OF DONE — so it carries the task through to the
+    // project's close-out (tests / PR / CI / merge exactly as the PROJECT defines, nothing hardcoded) —
+    // plus the most recent run so it can answer follow-ups instead of acting like nothing happened.
     const recent = await buildRecentRunSummary(projectRoot).catch(() => null);
-    if (!recent) return undefined;
-    const recentDetails = { schema: "aipi.recent-run-pointer.v1", recent };
-    safeAppendEntry(pi, "aipi.context.recent-run", recentDetails);
+    const blast = blastQuery.length >= 12
+      ? await buildBlastRadiusPointer({ projectRoot, query: blastQuery }).catch(() => null)
+      : null;
+    const details = {
+      schema: "aipi.context-pointer.v1",
+      run: snapshot,
+      memory_refs: PROJECT_GUIDANCE_REFS,
+      blast_radius: blast,
+      active_disciplines: [],
+      recent_run: recent,
+    };
+    safeAppendEntry(pi, "aipi.context.pointer", details);
     return {
       message: {
-        customType: "aipi.recent-run-pointer",
+        customType: "aipi.context-pointer",
         display: false,
-        content: renderRecentRunSummary(recent),
-        details: recentDetails,
+        content: renderContextPointer(details),
+        details,
       },
     };
   }
@@ -1742,15 +1766,8 @@ export async function handleBeforeAgentStart({ event, ctx, pi, projectRoot, coor
   const details = {
     schema: "aipi.context-pointer.v1",
     run: snapshot,
-    memory_refs: [
-      ".aipi/memory/project/business-rules.md",
-      ".aipi/memory/project/decisions.md",
-      ".aipi/memory/project/project.md",
-    ],
-    blast_radius: await buildBlastRadiusPointer({
-      projectRoot,
-      query: [event?.prompt, snapshot.current_step, snapshot.stage].filter(Boolean).join(" "),
-    }),
+    memory_refs: PROJECT_GUIDANCE_REFS,
+    blast_radius: await buildBlastRadiusPointer({ projectRoot, query: blastQuery }),
     active_disciplines: activeDisciplines,
   };
   safeAppendEntry(pi, "aipi.context.pointer", details);
@@ -2781,22 +2798,34 @@ export function safeProviderHeaders(headers = {}) {
 }
 
 function renderContextPointer(details) {
-  const run = details.run;
+  const run = details.run ?? {};
   const activeDisciplines = details.active_disciplines ?? [];
-  return [
-    "AIPI active run context:",
-    `- run_id: ${run.run_id}`,
-    `- workflow: ${run.workflow}`,
-    `- status: ${run.status}`,
-    `- current_step: ${run.current_step ?? "none"}`,
-    `- stage: ${run.stage ?? "none"}`,
-    `- contract_path: ${run.contract_path ?? "none"}`,
+  const lines = [];
+  if (run.active) {
+    lines.push(
+      "AIPI active run context:",
+      `- run_id: ${run.run_id}`,
+      `- workflow: ${run.workflow}`,
+      `- status: ${run.status}`,
+      `- current_step: ${run.current_step ?? "none"}`,
+      `- stage: ${run.stage ?? "none"}`,
+      `- contract_path: ${run.contract_path ?? "none"}`,
+    );
+  } else {
+    lines.push("AIPI project context (no active workflow run — handle this task as the flexible main agent):");
+  }
+  lines.push(
     `- memory_refs: ${details.memory_refs.join(", ")}`,
+    "- Follow the project's conventions and its DEFINITION OF DONE in .aipi/memory/project/procedures.md and project.md — they define what FINISHED means for THIS project (e.g. how to test, open a PR, watch CI, merge). Do not stop early if the project's procedure requires more.",
     `- blast_radius: ${renderBlastRadiusSummary(details.blast_radius)}`,
     `- active_disciplines: ${activeDisciplines.map((discipline) => discipline.id).join(", ") || "none"}`,
-    "Use these as pointers only; materialize detailed context through AIPI workflow/context tools.",
-    ...renderActiveDisciplineText(activeDisciplines),
-  ].join("\n");
+  );
+  if (details.recent_run) {
+    lines.push("", renderRecentRunSummary(details.recent_run));
+  }
+  lines.push("Use these as pointers only; materialize detailed context through AIPI workflow/context tools.");
+  lines.push(...renderActiveDisciplineText(activeDisciplines));
+  return lines.join("\n");
 }
 
 async function readSessionEntries(ctx = {}) {
