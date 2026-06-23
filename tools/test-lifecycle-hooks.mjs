@@ -161,6 +161,13 @@ try {
   // Explicit continue/review of an ACTIVE run is NOT auto-dispatch — still works without the flag.
   assert.equal(classifyAipiInputRoute("review adversarial", { activeRun: started }).workflowArgs, "execute");
   assertWorkflowSuggestion(classifyAipiInputRoute("review adversarial", { activeRun: null, autoDispatchEnabled: true }), "planning");
+  // #6: substantive input into an ACTIVE run does NOT auto-continue the workflow with auto-dispatch off
+  // (stays the user's turn / flexible agent); with the flag on, it continues the active run.
+  assert.equal(classifyAipiInputRoute("corrigir bug no login", { activeRun: started }), null);
+  assert.equal(
+    classifyAipiInputRoute("corrigir bug no login", { activeRun: started, autoDispatchEnabled: true }).intent,
+    "continue_active_workflow",
+  );
   assert.equal(
     classifyAipiInputRoute("Sim, essa regra vale para enterprise", {
       activeRun: {
@@ -1290,6 +1297,7 @@ try {
     const runId = "20260622T200133Z-260314";
     const runDir = path.join(recentRoot, ".aipi", "runtime", "runs", runId);
     await fs.mkdir(runDir, { recursive: true });
+    await fs.writeFile(path.join(recentRoot, ".aipi", "runtime-contract.json"), "{}"); // mark AIPI-installed
     await fs.writeFile(
       path.join(runDir, "state.json"),
       JSON.stringify({
@@ -1341,6 +1349,8 @@ try {
     // Even with NO recent run, the flexible flow still injects the project guidance (so the agent always
     // knows the project's conventions + Definition of Done).
     const noRunRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-flex-guidance-"));
+    await fs.mkdir(path.join(noRunRoot, ".aipi"), { recursive: true });
+    await fs.writeFile(path.join(noRunRoot, ".aipi", "runtime-contract.json"), "{}"); // AIPI-installed
     const hbas2 = await handleBeforeAgentStart({
       event: { type: "before_agent_start", prompt: "fix the gestores navigation bug please" },
       ctx: { model: { provider: "anthropic", id: "claude-opus-4-8" }, ui: { notify() {} } },
@@ -1352,6 +1362,17 @@ try {
     assert.match(hbas2.message.content, /DEFINITION OF DONE/);
     assert.match(hbas2.message.content, /procedures\.md/);
     await fs.rm(noRunRoot, { recursive: true, force: true });
+    // #4: a NON-AIPI project (no .aipi/runtime-contract.json) gets NOTHING — no pointer to nonexistent files.
+    const nonAipiRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-non-installed-"));
+    const hbasNon = await handleBeforeAgentStart({
+      event: { type: "before_agent_start", prompt: "fix something" },
+      ctx: { model: { provider: "anthropic", id: "claude-opus-4-8" }, ui: { notify() {} } },
+      pi: { appendEntry() {} },
+      projectRoot: nonAipiRoot,
+      coordinator: { setHostModel() {}, getHostModel: () => null },
+    });
+    assert.equal(hbasNon, undefined, "#4: a non-AIPI project gets no guidance pointer");
+    await fs.rm(nonAipiRoot, { recursive: true, force: true });
     // A run older than the recency window is not surfaced.
     const aged = await buildRecentRunSummary(recentRoot, { maxAgeMs: 1, now: () => Date.now() + 10_000 });
     assert.equal(aged, null, "a stale run beyond the recency window is not surfaced");

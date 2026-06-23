@@ -397,6 +397,14 @@ try {
   assert.match(JSON.stringify(ran), /GUARDED_BASH_OK/);
   // Empty command is refused.
   assert.equal((await bash.execute("empty", { command: "   " })).isError, true);
+  // Security: cwd is CONFINED to the project root — `..`, deep traversal, and absolute escapes fail closed.
+  assert.equal((await bash.execute("up", { command: "node --version", cwd: ".." })).isError, true);
+  assert.equal((await bash.execute("deep", { command: "node --version", cwd: "../../../etc" })).isError, true);
+  assert.equal((await bash.execute("abs", { command: "node --version", cwd: "/etc" })).isError, true);
+  assert.equal((await bash.execute("sneaky", { command: "node --version", cwd: "sub/../../../outside" })).isError, true);
+  // An in-root relative cwd is allowed.
+  await fs.mkdir(path.join(guardedBashRoot, "sub"), { recursive: true });
+  assert.notEqual((await bash.execute("sub", { command: "node --version", cwd: "sub" })).isError, true);
 } finally {
   for (const [key, value] of Object.entries(priorBashEnv)) {
     if (value === undefined) delete process.env[key];

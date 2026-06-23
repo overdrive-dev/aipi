@@ -1997,6 +1997,7 @@ for (const requiredText of [
   "name: \"aipi_guarded_bash\"",
   "runGuardedCommand",
   "AIPI_SUBAGENTS_PROJECT_ROOT",
+  "cwd escapes the project root", // fail-closed cwd confinement guard must not regress
 ]) {
   if (!guardedBashChild.includes(requiredText)) {
     errors.push(`runtime/aipi-guarded-bash-child.js must include ${requiredText}`);

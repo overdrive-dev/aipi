@@ -1699,6 +1699,9 @@ const PROJECT_GUIDANCE_REFS = Object.freeze([
 ]);
 
 export async function handleBeforeAgentStart({ event, ctx, pi, projectRoot, coordinator = null }) {
+  // Gate on install like the sibling hooks — without this the guidance pointer was injected into EVERY
+  // project, including non-AIPI repos (pointing at a .aipi/memory/project/procedures.md that doesn't exist).
+  if (!(await isAipiInstalled(projectRoot))) return undefined;
   const snapshot = await buildRunSnapshot(projectRoot);
   const hostBlock = await blockUnsupportedHostTurn({
     hook: "before_agent_start",

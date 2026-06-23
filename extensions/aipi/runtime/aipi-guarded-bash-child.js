@@ -36,10 +36,17 @@ export default function registerAipiGuardedBashChild(pi) {
       if (!command) {
         return { content: [{ type: "text", text: `aipi: ${agentId} guarded_bash requires a command` }], isError: true };
       }
-      // cwd is confined to the project root (a relative escape stays inside, like the write child's scope).
-      const cwd = params.cwd
-        ? path.resolve(projectRoot, String(params.cwd).replace(/^([A-Za-z]:)?[\\/]+/, ""))
-        : projectRoot;
+      // Confine cwd to the project root, FAIL-CLOSED on any escape (`..`, absolute) — mirroring the write
+      // child's assertInside. (A strip-only regex does NOT neutralize `..`, which would let cwd escape root.)
+      let cwd = projectRoot;
+      if (params.cwd) {
+        const resolved = path.resolve(projectRoot, String(params.cwd));
+        const rootWithSep = projectRoot.endsWith(path.sep) ? projectRoot : `${projectRoot}${path.sep}`;
+        if (resolved !== projectRoot && !resolved.startsWith(rootWithSep)) {
+          return { content: [{ type: "text", text: `aipi: ${agentId} guarded_bash cwd escapes the project root: ${params.cwd}` }], isError: true };
+        }
+        cwd = resolved;
+      }
       try {
         const result = await runGuardedCommand({
           projectRoot,

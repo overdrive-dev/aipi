@@ -267,7 +267,11 @@ export async function runAipiForkedSubagent({
     const { runSync } = loadForkedRunSync();
     const result = await runSync(
       root,
-      [createAipiWorkerAgentConfig({ thinking: params.thinking_level ?? undefined })],
+      [createAipiWorkerAgentConfig({
+        thinking: params.thinking_level ?? undefined,
+        // Single-lead workers get the guarded shell; parallel fanout (review) workers do not (allow_shell:false).
+        allowShell: (params.allow_shell ?? job?.descriptor?.allow_shell) !== false,
+      })],
       AIPI_SUBAGENTS_AGENT_NAME,
       params.task ?? "",
       {
@@ -335,7 +339,14 @@ function loadForkedRunSync() {
   return cachedJiti(runSyncEntrypoint);
 }
 
-function createAipiWorkerAgentConfig({ thinking = undefined } = {}) {
+function createAipiWorkerAgentConfig({ thinking = undefined, allowShell = true } = {}) {
+  // Shell (aipi_guarded_bash) is granted ONLY to single-lead, sequential workers — NOT to parallel fanout
+  // (review_swarm) workers. A shell bypasses the owned-file/controller-path write guards (it can write
+  // outside its owned files, touch .git or .aipi/memory), so giving it to PARALLEL workers would void
+  // write-disjointness and controller-path protection. A single-lead worker runs alone (same trust as the
+  // main agent), so its shell is acceptable; parallel reviewers stay shell-less and read the verify step's
+  // evidence instead. (Validator/tests still see both names in source — they are conditionally included.)
+  const shellTools = allowShell ? ["aipi_guarded_bash", guardedBashExtensionPath] : [];
   return {
     name: AIPI_SUBAGENTS_AGENT_NAME,
     package: "aipi",
@@ -346,16 +357,11 @@ function createAipiWorkerAgentConfig({ thinking = undefined } = {}) {
     // stripped, leaving workers unable to author their owned artifacts (every step BLOCKED). Listing
     // "write" activates it; the extension's guarded write overrides the unguarded builtin write by
     // name (custom tools win in the child registry), so owned-file scoping is still enforced.
-    // Both child extensions register tools (write / aipi_guarded_bash); the child filters tools through the
-    // `--tools` ALLOWLIST by NAME, so each tool NAME must also be listed or the registered tool is stripped.
-    // aipi_guarded_bash is the worker's ONLY shell (watchdog-wrapped, project-root-scoped) — raw bash/exec
-    // stay absent — so the worker can actually run tests/typecheck/build to VERIFY, not just document.
     tools: [
       ...AIPI_SUBAGENTS_READ_ONLY_TOOLS,
       "write",
       guardedWriteExtensionPath,
-      "aipi_guarded_bash",
-      guardedBashExtensionPath,
+      ...shellTools,
     ],
     extensions: [],
     fallbackModels: [],
@@ -368,9 +374,10 @@ function createAipiWorkerAgentConfig({ thinking = undefined } = {}) {
     systemPrompt: [
       "You are an AIPI worker running inside the project-scoped AIPI subagent runtime.",
       "Use only the allowed project tools. The write tool is guarded by AIPI owned-file scope.",
-      "For shell (tests, typecheck, build, git, lint) use aipi_guarded_bash — it is your only shell; do not",
-      "use raw bash/exec or a provider/model other than the selected worker model. Prefer running the real",
-      "verification (e.g. the project's test command) over claiming a result.",
+      allowShell
+        ? "For shell (tests, typecheck, build, git, lint) use aipi_guarded_bash — your only shell; do not use raw bash/exec. Prefer running the real verification (e.g. the project's test command) over claiming a result."
+        : "You have NO shell in this parallel review step; review by reading the code and the verify step's test evidence, and do not claim a result you did not see verified.",
+      "Do not use a provider/model other than the selected worker model.",
       "Follow the task exactly and return the requested output format.",
     ].join("\n"),
   };

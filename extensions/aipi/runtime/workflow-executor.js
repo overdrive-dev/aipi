@@ -493,6 +493,9 @@ async function executeFanoutSubagentStep({
       expected_artifacts: assignedArtifacts,
       owned_files: assignedArtifacts,
       write_scope: resolveWriteScope(step),
+      // Parallel fanout (review) workers get NO shell — a shell bypasses owned-file/controller-path write
+      // guards, so giving it to concurrent workers would void write-disjointness. They review by reading.
+      allow_shell: false,
       context_packet: JSON.stringify(
         {
           schema: "aipi.worker-context.v1",
