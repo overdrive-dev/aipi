@@ -21,7 +21,6 @@ import {
   WORKFLOW_BLOCKED_DECISION_KIND,
 } from "./workflow-executor.js";
 import { describeModel, resolveModelClass, resolveStepModel } from "./model-router.js";
-import { aipiImpact } from "./aipi-tools.js";
 import { aipiHostModelReadiness } from "./pi-subagents.js";
 
 const LIFECYCLE_LOG = ".aipi/runtime/lifecycle.jsonl";
@@ -1979,22 +1978,18 @@ export async function handleBeforeAgentStart({ event, ctx, pi, projectRoot, coor
     },
     snapshot,
   });
-  const blastQuery = [event?.prompt, snapshot.current_step, snapshot.stage].filter(Boolean).join(" ").trim();
-
   if (!snapshot.active) {
-    // Flexible flow (no forced workflow): still give the agent the project's guidance — conventions,
-    // procedures, and the project's own DEFINITION OF DONE — so it carries the task through to the
-    // project's close-out (tests / PR / CI / merge exactly as the PROJECT defines, nothing hardcoded) —
-    // plus the most recent run so it can answer follow-ups instead of acting like nothing happened.
+    // Flexible flow (no forced workflow): give the agent the project's guidance — conventions, procedures,
+    // and the project's own DEFINITION OF DONE — so it carries the task through to the project's close-out
+    // (tests / PR / CI / merge exactly as the PROJECT defines, nothing hardcoded) — plus the most recent run
+    // so it can answer follow-ups. The code graph is NOT auto-queried here: it is a PULL tool the agent calls
+    // when it actually needs impact analysis (aipi_impact/aipi_retrieve — see the guidance), not a per-turn
+    // push that runs even on a "yes/no" reply.
     const recent = await buildRecentRunSummary(projectRoot).catch(() => null);
-    const blast = blastQuery.length >= 12
-      ? await runBlastRadiusWithProgress({ projectRoot, query: blastQuery, ctx }).catch(() => null)
-      : null;
     const details = {
       schema: "aipi.context-pointer.v1",
       run: snapshot,
       memory_refs: PROJECT_GUIDANCE_REFS,
-      blast_radius: blast,
       active_disciplines: [],
       recent_run: recent,
     };
@@ -2021,7 +2016,6 @@ export async function handleBeforeAgentStart({ event, ctx, pi, projectRoot, coor
     schema: "aipi.context-pointer.v1",
     run: snapshot,
     memory_refs: PROJECT_GUIDANCE_REFS,
-    blast_radius: await runBlastRadiusWithProgress({ projectRoot, query: blastQuery, ctx }),
     active_disciplines: activeDisciplines,
   };
   safeAppendEntry(pi, "aipi.context.pointer", details);
@@ -3081,7 +3075,7 @@ function renderContextPointer(details) {
   lines.push(
     `- memory_refs: ${details.memory_refs.join(", ")}`,
     "- Follow the project's conventions and its DEFINITION OF DONE in .aipi/memory/project/procedures.md and project.md — they define what FINISHED means for THIS project (e.g. how to test, open a PR, watch CI, merge). Do not stop early if the project's procedure requires more.",
-    `- blast_radius: ${renderBlastRadiusSummary(details.blast_radius)}`,
+    "- Code graph (PULL, not auto): use aipi_impact (what a change affects) / aipi_callers / aipi_retrieve when you actually need impact analysis — before a substantive change to find affected files, at review to check the blast radius, before closing to catch regressions in related files. Skip it for trivial replies.",
     `- active_disciplines: ${activeDisciplines.map((discipline) => discipline.id).join(", ") || "none"}`,
   );
   if (details.recent_run) {
@@ -3125,130 +3119,8 @@ function buildContextPointerDetails({ snapshot, activeDisciplines = [] }) {
       ".aipi/memory/project/decisions.md",
       ".aipi/memory/project/project.md",
     ],
-    blast_radius: { status: "not_materialized", refs: [], relationships: [] },
     active_disciplines: activeDisciplines,
   };
-}
-
-// The blast-radius pointer builds/queries the code graph (parse + lexical/graph/semantic doors). On a
-// large repo the first build — or a semantic round-trip — can take seconds, and it runs inside
-// before_agent_start (BEFORE the agent gets control), so without a budget it reads as the agent
-// "hanging" before it even starts. Time-box the WAIT (not the work): if the budget elapses we return a
-// "deferred" pointer and let the agent start now, while the graph keeps building in the background so the
-// NEXT task gets it cheaply.
-const DEFAULT_BLAST_RADIUS_BUDGET_MS = 2500;
-const BLAST_RADIUS_TIMEOUT_MARKER = "aipi_blast_radius_timeout";
-
-// node's setTimeout clamps any delay above 2^31-1 ms to 1ms (with a TimeoutOverflowWarning), which would
-// invert the budget — a huge value would make the probe time out near-instantly and always "defer". Clamp
-// to the 32-bit ceiling so an over-large env value can't sabotage the timeout.
-const MAX_BLAST_RADIUS_BUDGET_MS = 2 ** 31 - 1;
-export function blastRadiusBudgetMs(env = process.env) {
-  const raw = Number.parseInt(env?.AIPI_BLAST_RADIUS_BUDGET_MS ?? "", 10);
-  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_BLAST_RADIUS_BUDGET_MS;
-  return Math.min(raw, MAX_BLAST_RADIUS_BUDGET_MS);
-}
-
-export async function buildBlastRadiusPointer({ projectRoot, query, env = process.env, impactFn = aipiImpact, onProgress = null } = {}) {
-  if (!query?.trim()) return { status: "skipped", refs: [], relationships: [] };
-  const budgetMs = blastRadiusBudgetMs(env);
-  // buildIfMissing:false — the probe only QUERIES an existing graph; it never triggers a synchronous build
-  // (the expensive write) before the agent starts. If the graph isn't built yet this turn gets no refs; it
-  // gets built lazily by the agent's own aipi_impact/aipi_retrieve tool calls or onboarding/rebuild.
-  const impactPromise = Promise.resolve(impactFn({ projectRoot, query, limit: 4, buildIfMissing: false, onProgress }));
-  // If we stop waiting on a slow build, the original promise still settles later; swallow it so an
-  // abandoned graph build can never surface as an unhandled rejection.
-  impactPromise.catch(() => {});
-  try {
-    const impact = await withTimeout(impactPromise, budgetMs, BLAST_RADIUS_TIMEOUT_MARKER);
-    return {
-      status: "available",
-      graph: impact.graph,
-      refs: (impact.refs ?? []).map((ref) => ({
-        path: ref.path,
-        line: ref.line ?? null,
-        source: ref.source ?? null,
-      })),
-      relationships: (impact.relationships ?? []).map((edge) => ({
-        relation: edge.relation,
-        source_ref: edge.source_ref,
-        target_ref: edge.target_ref,
-      })),
-    };
-  } catch (error) {
-    const message = String(error?.message ?? error);
-    if (message.includes(BLAST_RADIUS_TIMEOUT_MARKER)) {
-      return {
-        status: "deferred",
-        reason: `blast-radius exceeded ${budgetMs}ms budget; agent started without it (graph still building in background)`,
-        refs: [],
-        relationships: [],
-      };
-    }
-    return {
-      status: "unavailable",
-      reason: message,
-      refs: [],
-      relationships: [],
-    };
-  }
-}
-
-// Format an aipiImpact/ensureGraph onProgress event into a short sub-activity label for the live spinner.
-function graphProgressLabel(event) {
-  if (!event) return "";
-  if (typeof event === "string") return event.replace(/\s+/g, " ").trim().slice(0, 60);
-  const stage = event.stage ?? event.phase ?? event.step ?? null;
-  const message = event.message ?? event.detail ?? null;
-  const count = Number.isFinite(event.count) ? event.count : Number.isFinite(event.files) ? event.files : null;
-  const parts = [stage, message, count != null ? `${count} arquivos` : null].filter(Boolean);
-  return parts.join(" · ").replace(/\s+/g, " ").trim().slice(0, 60);
-}
-
-// Run the blast-radius graph op as a VISIBLE process: an animated "AIPI graph · <query> · working · Ns"
-// spinner while it runs (fed live with the graph build sub-activity), then a single result line with the
-// elapsed time and what came back — so the graph query/write reads like the other tool/process lines in
-// the terminal instead of an invisible pause. Falls back cleanly to the plain pointer when the host has
-// no updatable UI (CLI/tests): the spinner/notify simply no-op and the same blast object is returned.
-async function runBlastRadiusWithProgress({ projectRoot, query, ctx, env = process.env }) {
-  if (!query?.trim()) return { status: "skipped", refs: [], relationships: [] };
-  const progress = makeProgressNotifier(ctx);
-  const label = `AIPI graph · ${String(query).replace(/\s+/g, " ").trim().slice(0, 48)}`;
-  const startedAt = Date.now();
-  progress?.startSpinner?.(label);
-  try {
-    const blast = await buildBlastRadiusPointer({
-      projectRoot,
-      query,
-      env,
-      onProgress: (event) => progress?.updateActivity?.(graphProgressLabel(event)),
-    });
-    const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
-    progress?.stopSpinner?.();
-    progress?.setStatus?.(undefined);
-    progress?.notify?.(renderBlastRadiusProcessLine({ label, blast, elapsed }), blast.status === "unavailable" ? "warning" : "info");
-    return blast;
-  } catch (error) {
-    progress?.stopSpinner?.();
-    progress?.setStatus?.(undefined);
-    return { status: "unavailable", reason: String(error?.message ?? error), refs: [], relationships: [] };
-  }
-}
-
-function renderBlastRadiusProcessLine({ label, blast, elapsed }) {
-  if (blast.status === "deferred") return `${label} · adiado (${elapsed}s, budget) · seguindo sem grafo`;
-  if (blast.status === "unavailable") return `${label} · indisponível (${elapsed}s): ${blast.reason ?? "erro"}`;
-  if (blast.status === "skipped") return `${label} · sem consulta`;
-  const refs = blast.refs?.length ?? 0;
-  const rels = blast.relationships?.length ?? 0;
-  return `${label} → ${refs} ref${refs === 1 ? "" : "s"}, ${rels} relaç${rels === 1 ? "ão" : "ões"} · ${elapsed}s`;
-}
-
-function renderBlastRadiusSummary(blastRadius = {}) {
-  if (!blastRadius || blastRadius.status === "not_materialized") return "not_materialized";
-  const refs = (blastRadius.refs ?? []).map((ref) => `${ref.path}${ref.line ? `:${ref.line}` : ""}`);
-  const relationships = (blastRadius.relationships ?? []).map((edge) => `${edge.relation}:${edge.source_ref}->${edge.target_ref}`);
-  return [blastRadius.status, ...refs, ...relationships].filter(Boolean).slice(0, 6).join(", ") || blastRadius.status || "unknown";
 }
 
 function renderActiveDisciplineText(activeDisciplines) {

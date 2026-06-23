@@ -8,8 +8,6 @@ import { rebuildCodeGraph } from "../extensions/aipi/runtime/aipi-tools.js";
 import { SUBAGENT_STATE_ENTRY } from "../extensions/aipi/runtime/subagents.js";
 import {
   applyProviderPayloadPolicy,
-  blastRadiusBudgetMs,
-  buildBlastRadiusPointer,
   buildProviderBudgetReport,
   buildRecentRunSummary,
   classifyAipiCodePipeline,
@@ -287,13 +285,10 @@ try {
   assert.equal(beforeAgent.message.display, false);
   assert.match(beforeAgent.message.content, new RegExp(started.runId));
   assert.match(beforeAgent.message.content, /active_disciplines: context-thrift, contract-first/);
-  assert.match(beforeAgent.message.content, /blast_radius:/);
-  assert.match(beforeAgent.message.content, /src\/billing\.js/);
-  assert.equal(beforeAgent.message.details.blast_radius.refs.length > 0, true);
-  assert.equal(
-    beforeAgent.message.details.blast_radius.refs.some((ref) => ref.path === "src/billing.js"),
-    true,
-  );
+  // The code graph is a PULL tool now (no per-turn auto-probe): the pointer points the agent at aipi_impact
+  // and carries NO blast_radius field.
+  assert.match(beforeAgent.message.content, /Code graph \(PULL, not auto\).*aipi_impact/s);
+  assert.equal("blast_radius" in beforeAgent.message.details, false, "no auto blast_radius is injected per turn");
   assert.match(beforeAgent.message.content, /# context-thrift/);
   assert.match(beforeAgent.message.content, /# contract-first/);
   assert.deepEqual(
@@ -1389,50 +1384,6 @@ try {
     await fs.rm(emptyRoot, { recursive: true, force: true });
   } finally {
     await fs.rm(recentRoot, { recursive: true, force: true });
-  }
-
-  // P1 — the before_agent_start blast-radius probe is time-boxed and never blocks the agent on a slow graph
-  // op. A slow impactFn past the budget yields a "deferred" pointer (agent starts now); a fast one yields
-  // refs. The probe also opts out of building (buildIfMissing:false) so it can never abandon a write.
-  {
-    assert.equal(blastRadiusBudgetMs({ AIPI_BLAST_RADIUS_BUDGET_MS: "1500" }), 1500);
-    assert.equal(blastRadiusBudgetMs({}), 2500, "default budget");
-    assert.equal(blastRadiusBudgetMs({ AIPI_BLAST_RADIUS_BUDGET_MS: "garbage" }), 2500, "bad value -> default");
-    // A huge value is clamped to the 32-bit setTimeout ceiling, not passed through (which would clamp to 1ms
-    // and invert the budget — always "deferred").
-    assert.equal(blastRadiusBudgetMs({ AIPI_BLAST_RADIUS_BUDGET_MS: "99999999999" }), 2 ** 31 - 1, "huge value clamped to 2^31-1");
-
-    let sawBuildOptOut = null;
-    const slowImpact = ({ buildIfMissing }) => {
-      sawBuildOptOut = buildIfMissing;
-      return new Promise((resolve) => {
-        const t = setTimeout(() => resolve({ graph: {}, refs: [{ path: "x.js" }], relationships: [] }), 200);
-        if (typeof t?.unref === "function") t.unref();
-      });
-    };
-    const deferred = await buildBlastRadiusPointer({
-      projectRoot: tempRoot,
-      query: "some query string",
-      env: { AIPI_BLAST_RADIUS_BUDGET_MS: "20" },
-      impactFn: slowImpact,
-    });
-    assert.equal(deferred.status, "deferred", "slow graph op past budget -> deferred, agent starts now");
-    assert.equal(sawBuildOptOut, false, "probe must pass buildIfMissing:false so it never triggers a build");
-    assert.deepEqual(deferred.refs, []);
-
-    const fast = await buildBlastRadiusPointer({
-      projectRoot: tempRoot,
-      query: "some query string",
-      env: { AIPI_BLAST_RADIUS_BUDGET_MS: "5000" },
-      impactFn: () => Promise.resolve({ graph: { files: 1 }, refs: [{ path: "src/a.js", line: 3 }], relationships: [{ relation: "calls", source_ref: "a", target_ref: "b" }] }),
-    });
-    assert.equal(fast.status, "available");
-    assert.equal(fast.refs[0].path, "src/a.js");
-    assert.equal(fast.relationships[0].relation, "calls");
-
-    // An empty query is skipped without touching the graph at all.
-    const skipped = await buildBlastRadiusPointer({ projectRoot: tempRoot, query: "   " });
-    assert.equal(skipped.status, "skipped");
   }
 
   // P2 — the finish-audit warning is high-precision: it fires only on a genuine COMPLETION claim with no
