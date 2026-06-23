@@ -29,6 +29,9 @@ activation:
   before_root_cause_fix:
     disciplines: [root-cause]
     pi_hooks: [before_agent_start, context, tool_call]
+  adversarial_review:
+    disciplines: [adversarial-review]
+    pi_hooks: [before_agent_start, context]
 
 disciplines:
   - id: context-thrift
@@ -84,3 +87,9 @@ disciplines:
     file: .aipi/disciplines/root-cause.md
     applies_to: [fixer]
     purpose: Confirm the actual bug cause from evidence before implementing a fix.
+
+  - id: adversarial-review
+    status: predicted
+    file: .aipi/disciplines/adversarial-review.md
+    applies_to: [reviewer, verifier]
+    purpose: Independently verify a change against its acceptance criteria — refute it, run the real tests, separate regressions from pre-existing debt.
