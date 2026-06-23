@@ -11,6 +11,7 @@ const defaultContract = {
       "model_warning",
       "blocker_question",
       "awaiting_user_input",
+      "aipi_shell_less",
     ],
   },
   stepVerdicts: ["PASS", "FAIL", "SKIPPED", "BLOCKED", "BLOCKED_TO_PLANNING"],

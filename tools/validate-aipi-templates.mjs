@@ -958,11 +958,15 @@ for (const workflowPath of list("templates/.aipi/workflows", ".yaml")) {
       }
     }
 
-    // A review-stage multi-agent step fans out to disjoint shell-less workers, so no single worker can own
-    // and stage a controller-owned shared artifact — controller_updates would be silently dropped (no
-    // staging/promote on the fanout path). Forbid the incoherent combination at validation time (INT-2).
-    if ((step.controller_updates?.length ?? 0) > 0 && step.stage === "review" && (step.agents?.length ?? 0) > 1) {
-      errors.push(`${workflowPath} step ${step.id} is a review fanout but declares controller_updates; a disjoint fanout has no single writer for a controller-owned artifact`);
+    // A multi-agent step that fans out to disjoint shell-less workers has no single writer that can own and
+    // stage a controller-owned shared artifact — controller_updates would be silently dropped (no
+    // staging/promote on the fanout path). The executor fans out a multi-agent step when its stage is
+    // `review` OR its id is a known fanout id (default fanoutStepIds=["review_swarm"]); mirror BOTH triggers
+    // so the validation stays in lockstep with shouldFanout. Forbid the incoherent combination (INT-2).
+    const fanoutById = new Set(["review_swarm"]);
+    const wouldFanout = (step.agents?.length ?? 0) > 1 && (step.stage === "review" || fanoutById.has(step.id));
+    if ((step.controller_updates?.length ?? 0) > 0 && wouldFanout) {
+      errors.push(`${workflowPath} step ${step.id} fans out to disjoint workers but declares controller_updates; a fanout has no single writer for a controller-owned artifact`);
     }
   }
 

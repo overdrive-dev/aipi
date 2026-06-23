@@ -417,8 +417,10 @@ export class SubagentCoordinator {
       );
     }
     if (stepResult?.verdict === "PASS" && !validation.gatePassed) {
+      // validateStepResult exposes the failures as `errors` (not `gateErrors`) — referencing the wrong field
+      // threw a TypeError that masked the real "PASS without evidence" message on this path.
       throw new Error(
-        `${job.agentId} returned PASS without required evidence gate: ${validation.gateErrors.join("; ")}`,
+        `${job.agentId} returned PASS without required evidence gate: ${(validation.errors ?? []).join("; ")}`,
       );
     }
     // Stamp authoritative model provenance — a worker can't reliably self-report which

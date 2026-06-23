@@ -630,10 +630,10 @@ async function executeSubagentStep({
     ),
   };
 
-  // Clear any stale staged controller_updates from a prior attempt BEFORE dispatch, so a no-op redispatch
-  // can't pass (and re-promote) old content on the strength of a pre-existing file — the worker must freshly
-  // write its stage to earn evidence (SE-3).
-  await clearStagingArtifacts({ root, plan: controllerStaging });
+  // Clear any stale expected outputs (produces + staged controller_updates) from a prior attempt BEFORE
+  // dispatch, so a no-op redispatch can't pass (and re-promote) old content on the strength of a pre-existing
+  // file — the worker must freshly write its artifacts this run to earn evidence (SE-3).
+  await clearExpectedArtifacts({ root, paths: expectedArtifacts });
   const { agent_id: agentId } = dispatchSubagent(coordinator, descriptor);
   const collect = await collectSubagentResult(coordinator, agentId, {
     pollIntervalMs,
@@ -663,30 +663,43 @@ export function controllerUpdateStagingPlan(state, step) {
   });
 }
 
-export async function clearStagingArtifacts({ root, plan }) {
-  for (const { staging } of plan) {
+// Remove a worker step's expected output files (produces + controller_updates staging) BEFORE dispatch, so a
+// no-op/lazy redispatch can't pass on the strength of a stale artifact left by a prior attempt. The worker
+// re-writes what it actually produces this run; verifyWorkerPassEvidence keys PASS on the artifact existing,
+// so clearing makes "exists" mean "freshly written" (SE-3). Confined to paths inside the run dir.
+export async function clearExpectedArtifacts({ root, paths }) {
+  const runScopedPrefix = ".aipi/runtime/runs/";
+  for (const rel of paths ?? []) {
+    const normalized = String(rel ?? "").replaceAll("\\", "/");
+    if (!normalized.startsWith(runScopedPrefix)) continue; // never delete outside a run's own artifact tree
     try {
-      await fs.rm(path.resolve(root, staging), { force: true });
+      await fs.rm(path.resolve(root, normalized), { force: true });
     } catch {
-      /* best-effort: a missing stale stage is the desired state */
+      /* best-effort: a missing stale artifact is the desired state */
     }
   }
 }
 
 // realpath the nearest existing ancestor of a (possibly not-yet-created) path, so symlink/junction
-// components are resolved before a containment check. Returns the resolved ancestor, or the literal path.
+// components are resolved before a containment check. FAILS CLOSED: returns null if no existing ancestor can
+// be resolved (the filesystem root always exists, so this only happens on an unreadable/pathological path) —
+// the caller treats null as "outside the root" rather than trusting an unresolved lexical path. The walk is
+// bounded by the target's own component depth (a path has no more ancestors than components), so a target
+// with very many non-existent trailing components can't cause us to stop ABOVE a junction we'd otherwise
+// resolve (the earlier fixed 64-cap could return a junction-unresolved lexical path and fail open).
 async function realpathExistingAncestor(target) {
   let current = path.resolve(target);
-  for (let i = 0; i < 64; i += 1) {
+  const maxHops = current.split(/[\\/]/).filter(Boolean).length + 4;
+  for (let i = 0; i < maxHops; i += 1) {
     try {
       return await fs.realpath(current);
     } catch {
       const parent = path.dirname(current);
-      if (parent === current) return current;
+      if (parent === current) return null; // reached the fs root without resolving -> fail closed
       current = parent;
     }
   }
-  return current;
+  return null; // exhausted the bounded walk without resolving -> fail closed
 }
 
 // Controller-side promotion: copy each staged file to its run-root controller_updates target, AFTER the
@@ -704,7 +717,8 @@ export async function promoteControllerUpdates({ root, plan }) {
       const dest = path.resolve(root, target);
       const realSrc = await fs.realpath(src).catch(() => null);
       if (!realSrc || !insideRoot(realSrc)) continue;
-      if (!insideRoot(await realpathExistingAncestor(path.dirname(dest)))) continue;
+      const realDestAncestor = await realpathExistingAncestor(path.dirname(dest));
+      if (!realDestAncestor || !insideRoot(realDestAncestor)) continue; // fail closed when unresolved
       const srcStat = await fs.stat(realSrc);
       if (!srcStat.isFile() || srcStat.size === 0) continue; // never materialize an empty/non-file surface (SE-2)
       const destLink = await fs.lstat(dest).catch(() => null);

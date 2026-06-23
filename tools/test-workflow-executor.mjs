@@ -5,7 +5,7 @@ import path from "node:path";
 import { initProject } from "../extensions/aipi/runtime/project-init.js";
 import {
   assertControllerWriteAllowed,
-  clearStagingArtifacts,
+  clearExpectedArtifacts,
   controllerUpdateStagingPlan,
   createLocalWorkflowAdapter,
   createSubagentWorkflowAdapter,
@@ -1634,14 +1634,57 @@ try {
     await promoteControllerUpdates({ root: tempRoot, plan: [{ staging: stagingRel, target: `../aipi-promote-escape-${pRun}.md` }] });
     assert.equal(await pathExists(escapeTargetAbs), false, "promote refuses a target escaping the project root");
 
-    // SE-3: clearStagingArtifacts removes a stale stage so a no-op redispatch can't pass on it.
+    // SE-3: clearExpectedArtifacts removes stale expected outputs (produces + staging) so a no-op redispatch
+    // can't pass on them; it refuses to touch anything outside a run's own artifact tree.
     assert.equal(await pathExists(path.join(tempRoot, stagingRel)), true);
-    await clearStagingArtifacts({ root: tempRoot, plan: [{ staging: stagingRel, target: targetRel }] });
-    assert.equal(await pathExists(path.join(tempRoot, stagingRel)), false, "SE-3: clearStagingArtifacts removes the stale stage");
+    const outsideRunRel = ".aipi/keep-me.md";
+    await fs.writeFile(path.join(tempRoot, outsideRunRel), "keep");
+    await clearExpectedArtifacts({ root: tempRoot, paths: [stagingRel, outsideRunRel] });
+    assert.equal(await pathExists(path.join(tempRoot, stagingRel)), false, "SE-3: clearExpectedArtifacts removes the stale run artifact");
+    assert.equal(await pathExists(path.join(tempRoot, outsideRunRel)), true, "clearExpectedArtifacts never deletes outside a run's artifact tree");
 
     // controllerUpdateStagingPlan maps a run-root target to a step-scoped staging path with the same basename.
     const plan = controllerUpdateStagingPlan({ run_id: pRun }, { id: "contract", controller_updates: [`.aipi/runtime/runs/${pRun}/BDD-CONTRACT.md`] });
     assert.deepEqual(plan, [{ staging: `.aipi/runtime/runs/${pRun}/steps/contract/BDD-CONTRACT.md`, target: `.aipi/runtime/runs/${pRun}/BDD-CONTRACT.md` }]);
+  }
+
+  // End-to-end through the REAL executeWorkflowRun main loop: a worker step with controller_updates stages
+  // its deliverable, passes the AUTHORITATIVE gate, and the main loop promotes it to the run-root surface.
+  // Closes the wiring-coverage gap (the unit tests above stop at executeSubagentStep / call promote directly).
+  {
+    const e2eRun = await startWorkflowRun({ projectRoot: tempRoot, workflow: "planning", now: () => fixedDate, randomBytes: fixedRandom });
+    const e2eCoordinator = new SubagentCoordinator(
+      { appendEntry() {} },
+      { root: tempRoot, maxConcurrent: 1, piSubagentsRunner: fakeWorkflowRunner({ root: tempRoot }) },
+    );
+    const e2eExecution = await executeWorkflowRun({
+      projectRoot: tempRoot,
+      runId: e2eRun.runId,
+      now: () => fixedDate,
+      adapter: createSubagentWorkflowAdapter(e2eCoordinator, {
+        workerStepIds: ["contract"], // only the controller_updates terminal step runs as a real worker
+        fallback: createTestPassWorkflowAdapter(),
+        pollIntervalMs: 1,
+        collectTimeoutMs: 1_000,
+        modelResolver: async () => ({
+          model_class: "code-strong",
+          model: { provider: "anthropic", id: "claude-test" },
+          thinking_level: "medium",
+          source: "test",
+        }),
+      }),
+    });
+    assert.equal(e2eExecution.status, "completed");
+    assert.equal(
+      await pathExists(path.join(tempRoot, ".aipi", "runtime", "runs", e2eRun.runId, "steps", "contract", "BDD-CONTRACT.md")),
+      true,
+      "the contract worker staged its deliverable",
+    );
+    assert.equal(
+      await pathExists(path.join(tempRoot, ".aipi", "runtime", "runs", e2eRun.runId, "BDD-CONTRACT.md")),
+      true,
+      "the main loop promoted the staged contract to the run-root surface after the authoritative gate",
+    );
   }
 
   console.log("AIPI_WORKFLOW_EXECUTOR_TEST_OK");
