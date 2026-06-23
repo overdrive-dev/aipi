@@ -1470,26 +1470,39 @@ function claimEvidenceFindings(text) {
 // finish-audit warning from firing on every mid-task message — investigation describes the system
 // ("o save funciona quando X", "the flow works like Y"); a completion claim asserts a change the agent made.
 function isCompletionClaim(text) {
+  const raw = String(text ?? "").trim();
   const normalized = normalizeInputText(text);
   if (!normalized) return false;
-  // Investigative / intent / hypothesis / negative framing — never a completion claim, even when it carries
-  // a done-word. This is what separates "o save funciona quando…" / "vou corrigir" / "fails to save" (the
-  // mid-task narration that was spamming the warning) from an actual hand-back.
-  const investigative =
-    /\b(vou|irei|i'?ll|i will|let me|deixa eu|i'?m (going|tracing|looking|investigating|checking|examining|reading|trying|seeing)|investigando|analisando|examinando|verificando|rastreando|preciso|i need to|proximo passo|next step|likely|provavelmente|talvez|maybe|suspeito|parece que|it seems|fails? to|nao (funciona|salva|esta)|does ?n'?t (work|save))\b/.test(normalized) ||
-    /\?\s*$/.test(String(text ?? "").trim());
-  if (investigative) return false;
+  // Investigative/intent framing in the LEAD (first sentence) means the message is about work the agent is
+  // ABOUT to do, not a hand-back — suppress. Scoped to the lead so a trailing "next I'll…" clause or a
+  // courtesy question AFTER a real completion claim doesn't silence the warning (CG-1).
+  const lead = normalizeInputText(raw.split(/(?<=[.!?])\s+/)[0] ?? raw);
+  const leadInvestigative =
+    /\b(vou|irei|i'?ll|i will|let me|deixa eu|i'?m (going|tracing|looking|investigating|checking|examining|reading|trying|seeing)|investigando|analisando|examinando|verificando|rastreando|preciso|i need to|proximo passo|next step|likely|provavelmente|talvez|maybe|suspeito|parece que|it seems|fails? to|nao (funciona|salva|esta)|does ?n'?t (work|save))\b/.test(lead);
+  if (leadInvestigative) return false;
+  // A message that is a single bare question (no claim sentence before the trailing "?") is investigative.
+  if (/\?\s*$/.test(raw) && !/[.!]/.test(raw.slice(0, -1))) return false;
+  // Descriptive / historical / negated framing — describes existing or prior-state behavior, not a fresh
+  // completion the agent just produced ("the flow works like this… already implemented", "foi corrigido na
+  // PR anterior, mas o bug voltou") (CG-2).
+  const descriptive =
+    /\b(works? like|funciona (assim|como)|already (implemented|fixed|done|working)|ja (implementad|corrigid|resolvid|funciona)|na pr anterior|previously (fixed|implemented)|anteriormente)\b/.test(normalized) ||
+    /\b(mas|but|porem|however|todavia)\b[^.!?\n]{0,60}\b(voltou|quebrou|broke|fails?|nao funciona|regrediu|back)\b/.test(normalized);
+  if (descriptive) return false;
   return (
     // first-person past-tense completion (PT)
     /\b(corrigi|consertei|implementei|ajustei|conclui|finalizei|terminei|resolvi|apliquei|adicionei|criei|removi)\b/.test(normalized) ||
-    // done-state participles/adjectives asserted as the result (PT)
-    /\b(corrigid[oa]s?|resolvid[oa]s?|consertad[oa]s?|implementad[oa]s?|ajustad[oa]s?|aplicad[oa]s?|adicionad[oa]s?|pronto|pronta|prontos|prontas|funcionando)\b/.test(normalized) ||
+    // done-state participles/adjectives asserted as the result (PT) — incl. concluído (CG-3)
+    /\b(corrigid[oa]s?|resolvid[oa]s?|consertad[oa]s?|implementad[oa]s?|ajustad[oa]s?|aplicad[oa]s?|adicionad[oa]s?|conclu[ií]d[oa]s?|restaurad[oa]s?|pront[oa]s?|funcionando)\b/.test(normalized) ||
+    // PT "(agora) funciona / funciona agora" now-works (CG-3)
+    /\b(funciona agora|agora funciona)\b/.test(normalized) ||
     // completion verbs / done-state (EN)
-    /\b(fixed|implemented|resolved|completed|finished|shipped|applied|added|removed|working now|now works|passing|done)\b/.test(normalized) ||
+    /\b(fixed|implemented|resolved|completed|finished|shipped|applied|added|removed|restored|working now|now works|passing|done)\b/.test(normalized) ||
     // tests/all pass
     /\b(all|todos|todas|tudo)\b[^.!?\n]{0,40}\b(pass|passed|passes|passing|passou|passaram|green|verde)\b/.test(normalized) ||
-    // explicit hand-back / deploy readiness
-    /\b(safe to (deploy|merge|ship)|pronto para (deploy|merge|review|produc|producao|homolog))\b/.test(normalized) ||
+    // explicit hand-back / deploy readiness — incl. PT "seguro/pronto para …" and "deploy está seguro" (CG-3)
+    /\b(safe to (deploy|merge|ship)|seguro para (deploy|merge|produc|producao)|pronto para (deploy|merge|review|produc|producao|homolog))\b/.test(normalized) ||
+    /\b(deploy|release|merge)\b[^.!?\n]{0,20}\b(seguro|safe)\b/.test(normalized) ||
     // close-out actions completed
     /\b(deployed|mergeado|merged|pr (aberto|criado|mergeado))\b/.test(normalized)
   );
@@ -2932,9 +2945,14 @@ function buildContextPointerDetails({ snapshot, activeDisciplines = [] }) {
 const DEFAULT_BLAST_RADIUS_BUDGET_MS = 2500;
 const BLAST_RADIUS_TIMEOUT_MARKER = "aipi_blast_radius_timeout";
 
+// node's setTimeout clamps any delay above 2^31-1 ms to 1ms (with a TimeoutOverflowWarning), which would
+// invert the budget — a huge value would make the probe time out near-instantly and always "defer". Clamp
+// to the 32-bit ceiling so an over-large env value can't sabotage the timeout.
+const MAX_BLAST_RADIUS_BUDGET_MS = 2 ** 31 - 1;
 export function blastRadiusBudgetMs(env = process.env) {
   const raw = Number.parseInt(env?.AIPI_BLAST_RADIUS_BUDGET_MS ?? "", 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_BLAST_RADIUS_BUDGET_MS;
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_BLAST_RADIUS_BUDGET_MS;
+  return Math.min(raw, MAX_BLAST_RADIUS_BUDGET_MS);
 }
 
 export async function buildBlastRadiusPointer({ projectRoot, query, env = process.env, impactFn = aipiImpact, onProgress = null } = {}) {

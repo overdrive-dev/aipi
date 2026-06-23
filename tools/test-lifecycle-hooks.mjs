@@ -1393,6 +1393,9 @@ try {
     assert.equal(blastRadiusBudgetMs({ AIPI_BLAST_RADIUS_BUDGET_MS: "1500" }), 1500);
     assert.equal(blastRadiusBudgetMs({}), 2500, "default budget");
     assert.equal(blastRadiusBudgetMs({ AIPI_BLAST_RADIUS_BUDGET_MS: "garbage" }), 2500, "bad value -> default");
+    // A huge value is clamped to the 32-bit setTimeout ceiling, not passed through (which would clamp to 1ms
+    // and invert the budget — always "deferred").
+    assert.equal(blastRadiusBudgetMs({ AIPI_BLAST_RADIUS_BUDGET_MS: "99999999999" }), 2 ** 31 - 1, "huge value clamped to 2^31-1");
 
     let sawBuildOptOut = null;
     const slowImpact = ({ buildIfMissing }) => {
@@ -1470,6 +1473,31 @@ try {
     const before = warnings().length;
     await msgEnd("Corrigi o bug. Evidence: ran `npm test` -> passed.");
     assert.equal(warnings().length, before, "an evidence-backed completion claim does not warn");
+
+    // CG-1: a real completion claim that ends with a courtesy question / "next" clause still warns (the
+    // investigative exclusion is scoped to the LEAD sentence, not the whole message).
+    await auditHandlers.before_agent_start({ type: "before_agent_start", prompt: "cg1 turn" }, auditCtx);
+    let n = warnings().length;
+    await msgEnd("Corrigi o save e tudo passou. Quer que eu rode o lint também?");
+    assert.equal(warnings().length, n + 1, "CG-1: completion claim + trailing courtesy question still warns");
+
+    await auditHandlers.before_agent_start({ type: "before_agent_start", prompt: "cg1b turn" }, auditCtx);
+    n = warnings().length;
+    await msgEnd("Fixed the parser and all tests pass now. Maybe I should also update docs.");
+    assert.equal(warnings().length, n + 1, "CG-1: leading claim is not silenced by a later 'maybe'");
+
+    // CG-3: PT done-participles/phrasings that are claim terms now also trip the completion gate.
+    await auditHandlers.before_agent_start({ type: "before_agent_start", prompt: "cg3 turn" }, auditCtx);
+    n = warnings().length;
+    await msgEnd("Concluído. O comportamento esperado foi restaurado.");
+    assert.equal(warnings().length, n + 1, "CG-3: 'concluído/restaurado' completion claim warns");
+
+    // CG-2: descriptive / historical narration does NOT warn (no fresh completion).
+    await auditHandlers.before_agent_start({ type: "before_agent_start", prompt: "cg2 turn" }, auditCtx);
+    n = warnings().length;
+    await msgEnd("The flow works like this: the controller calls save, which is already implemented.");
+    await msgEnd("Esse código foi corrigido na PR anterior, mas o bug voltou.");
+    assert.equal(warnings().length, n, "CG-2: descriptive/historical narration does not warn");
   }
 
   console.log("AIPI_LIFECYCLE_HOOKS_TEST_OK");
