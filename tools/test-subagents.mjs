@@ -28,6 +28,7 @@ import {
   runPiSubagentsLiveSpike,
 } from "../extensions/aipi/runtime/pi-subagents.js";
 import registerAipiGuardedWriteChild from "../extensions/aipi/runtime/aipi-guarded-write-child.js";
+import registerAipiGuardedBashChild from "../extensions/aipi/runtime/aipi-guarded-bash-child.js";
 import { OwnedFileRegistry } from "../extensions/aipi/runtime/owned-files.js";
 
 const require = createRequire(import.meta.url);
@@ -187,10 +188,11 @@ try {
   const spawnedArgs = realRuntimeCalls[0].args;
   assert.equal(spawnedArgs.includes("--model"), true);
   assert.equal(spawnedArgs[spawnedArgs.indexOf("--model") + 1], "anthropic/claude-opus-4-8");
-  // The production --tools allowlist MUST include "write" so the guarded-write extension's registered
-  // write tool survives the child's tool allowlist filter (without it, every artifact step BLOCKs).
-  assert.deepEqual(spawnedTools(spawnedArgs), ["read", "grep", "find", "ls", "write"]);
-  assert.equal(spawnedTools(spawnedArgs).some((tool) => /^(bash|shell|exec)$/i.test(tool)), false);
+  // The production --tools allowlist MUST include "write" (guarded-write extension) AND "aipi_guarded_bash"
+  // (guarded-bash extension) so both registered tools survive the child's allowlist filter. Raw bash/shell/
+  // exec stay ABSENT — the worker's only shell is the watchdog-wrapped aipi_guarded_bash.
+  assert.deepEqual(spawnedTools(spawnedArgs), ["read", "grep", "find", "ls", "write", "aipi_guarded_bash"]);
+  assert.equal(spawnedTools(spawnedArgs).some((tool) => /^(bash|shell|exec|user_bash)$/i.test(tool)), false);
   assert.equal(spawnedArgs.includes("--no-extensions"), true);
   assert.equal(
     spawnedArgs.some((arg) => String(arg).replaceAll("\\", "/").endsWith("extensions/aipi/runtime/aipi-guarded-write-child.js")),
@@ -376,6 +378,31 @@ try {
     else process.env[key] = value;
   }
   await fs.rm(guardedChildWriteRoot, { recursive: true, force: true });
+}
+
+// Guarded-bash child (B1): a forked worker's shell. Prove it RUNS a real command through the watchdog and
+// returns the output (this is the capability that lets a worker actually verify — run tests/build).
+const guardedBashRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-guarded-bash-child-"));
+const priorBashEnv = { AIPI_SUBAGENTS_PROJECT_ROOT: process.env.AIPI_SUBAGENTS_PROJECT_ROOT, AIPI_SUBAGENTS_AGENT_ID: process.env.AIPI_SUBAGENTS_AGENT_ID };
+try {
+  process.env.AIPI_SUBAGENTS_PROJECT_ROOT = guardedBashRoot;
+  process.env.AIPI_SUBAGENTS_AGENT_ID = "guarded:bash";
+  const bashTools = [];
+  registerAipiGuardedBashChild({ registerTool(tool) { bashTools.push(tool); } });
+  const bash = bashTools.find((tool) => tool.name === "aipi_guarded_bash");
+  assert.ok(bash, "guarded-bash child registers an aipi_guarded_bash tool");
+  // Runs a real command and captures its output.
+  const ran = await bash.execute("ok", { command: `node -e "process.stdout.write('GUARDED_BASH_OK')"` });
+  assert.notEqual(ran.isError, true);
+  assert.match(JSON.stringify(ran), /GUARDED_BASH_OK/);
+  // Empty command is refused.
+  assert.equal((await bash.execute("empty", { command: "   " })).isError, true);
+} finally {
+  for (const [key, value] of Object.entries(priorBashEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  await fs.rm(guardedBashRoot, { recursive: true, force: true });
 }
 
 const piEntries = [];

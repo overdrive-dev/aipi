@@ -312,8 +312,9 @@ if (!backendOptions) {
   }
   if (!backendOptions.criterionZero?.includes("forked pi-subagents runtime") ||
     !backendOptions.criterionZero?.includes("Anthropic OAuth") ||
-    !backendOptions.criterionZero?.includes("no-shell worker policy")) {
-    errors.push("runtime-contract subagentBackendOptions.criterionZero must document forked pi-subagents, Anthropic OAuth, and no-shell policy");
+    !backendOptions.criterionZero?.includes("guarded-shell worker policy") ||
+    !backendOptions.criterionZero?.includes("aipi_guarded_bash")) {
+    errors.push("runtime-contract subagentBackendOptions.criterionZero must document forked pi-subagents, Anthropic OAuth, and the guarded-shell worker policy (aipi_guarded_bash)");
   }
   if (backendOptions.eventEntry !== "aipi.subagents.event") {
     errors.push("runtime-contract subagentBackendOptions.eventEntry must be aipi.subagents.event");
@@ -1963,8 +1964,16 @@ for (const requiredText of [
 if (piSubagentsRuntime.includes("tools: [...AIPI_SUBAGENTS_ALLOWED_TOOLS]")) {
   errors.push("runtime/pi-subagents.js must not pass the unguarded builtin write to forked workers");
 }
-if (!piSubagentsRuntime.includes("tools: [...AIPI_SUBAGENTS_READ_ONLY_TOOLS, \"write\", guardedWriteExtensionPath]")) {
-  errors.push("runtime/pi-subagents.js must expose read-only builtins plus the \"write\" allow-name and the guarded write extension to forked workers");
+for (const requiredToolToken of [
+  "...AIPI_SUBAGENTS_READ_ONLY_TOOLS",
+  "\"write\"",
+  "guardedWriteExtensionPath",
+  "\"aipi_guarded_bash\"",
+  "guardedBashExtensionPath",
+]) {
+  if (!piSubagentsRuntime.includes(requiredToolToken)) {
+    errors.push(`runtime/pi-subagents.js worker tools must include ${requiredToolToken} (read-only builtins + the guarded write AND guarded bash extensions)`);
+  }
 }
 if (!piSubagentsRuntime.includes("extensions: []")) {
   errors.push("runtime/pi-subagents.js must disable ambient child extensions and explicitly load only runtime/tool extensions");
@@ -1981,6 +1990,16 @@ for (const requiredText of [
 ]) {
   if (!guardedWriteChild.includes(requiredText)) {
     errors.push(`runtime/aipi-guarded-write-child.js must include ${requiredText}`);
+  }
+}
+const guardedBashChild = read("extensions/aipi/runtime/aipi-guarded-bash-child.js");
+for (const requiredText of [
+  "name: \"aipi_guarded_bash\"",
+  "runGuardedCommand",
+  "AIPI_SUBAGENTS_PROJECT_ROOT",
+]) {
+  if (!guardedBashChild.includes(requiredText)) {
+    errors.push(`runtime/aipi-guarded-bash-child.js must include ${requiredText}`);
   }
 }
 for (const forbiddenText of [

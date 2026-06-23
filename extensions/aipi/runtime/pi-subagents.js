@@ -9,9 +9,10 @@ export const PI_SUBAGENTS_ISOLATION = "pi_subagents";
 export const PI_SUBAGENTS_LIVE_SPIKE_SCHEMA = "aipi.pi-subagents-spike.v1";
 export const AIPI_SUBAGENTS_RUNTIME_ROOT = ".aipi/runtime/subagents";
 export const AIPI_SUBAGENTS_AGENT_NAME = "aipi-worker";
-export const AIPI_SUBAGENTS_ALLOWED_TOOLS = ["read", "grep", "find", "ls", "write"];
+export const AIPI_SUBAGENTS_ALLOWED_TOOLS = ["read", "grep", "find", "ls", "write", "aipi_guarded_bash"];
 export const AIPI_SUBAGENTS_READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
 export const AIPI_SUBAGENTS_GUARDED_WRITE_EXTENSION = "extensions/aipi/runtime/aipi-guarded-write-child.js";
+export const AIPI_SUBAGENTS_GUARDED_BASH_EXTENSION = "extensions/aipi/runtime/aipi-guarded-bash-child.js";
 export const AIPI_SUBAGENTS_DISALLOWED_PROVIDERS = [];
 export const AIPI_HOST_SUPPORTED_PROVIDERS = ["anthropic"];
 export const AIPI_HOST_MODEL_READINESS_MESSAGE =
@@ -22,6 +23,7 @@ const currentDir = path.dirname(fileURLToPath(import.meta.url));
 const vendorRoot = path.join(currentDir, "vendor", "pi-subagents");
 const runSyncEntrypoint = path.join(vendorRoot, "src", "runs", "foreground", "execution.ts");
 const guardedWriteExtensionPath = path.join(currentDir, "aipi-guarded-write-child.js");
+const guardedBashExtensionPath = path.join(currentDir, "aipi-guarded-bash-child.js");
 let cachedJiti = null;
 
 export function normalizePiSubagentsBackend(value) {
@@ -344,7 +346,17 @@ function createAipiWorkerAgentConfig({ thinking = undefined } = {}) {
     // stripped, leaving workers unable to author their owned artifacts (every step BLOCKED). Listing
     // "write" activates it; the extension's guarded write overrides the unguarded builtin write by
     // name (custom tools win in the child registry), so owned-file scoping is still enforced.
-    tools: [...AIPI_SUBAGENTS_READ_ONLY_TOOLS, "write", guardedWriteExtensionPath],
+    // Both child extensions register tools (write / aipi_guarded_bash); the child filters tools through the
+    // `--tools` ALLOWLIST by NAME, so each tool NAME must also be listed or the registered tool is stripped.
+    // aipi_guarded_bash is the worker's ONLY shell (watchdog-wrapped, project-root-scoped) — raw bash/exec
+    // stay absent — so the worker can actually run tests/typecheck/build to VERIFY, not just document.
+    tools: [
+      ...AIPI_SUBAGENTS_READ_ONLY_TOOLS,
+      "write",
+      guardedWriteExtensionPath,
+      "aipi_guarded_bash",
+      guardedBashExtensionPath,
+    ],
     extensions: [],
     fallbackModels: [],
     thinking,
@@ -356,7 +368,9 @@ function createAipiWorkerAgentConfig({ thinking = undefined } = {}) {
     systemPrompt: [
       "You are an AIPI worker running inside the project-scoped AIPI subagent runtime.",
       "Use only the allowed project tools. The write tool is guarded by AIPI owned-file scope.",
-      "Do not use shell, bash, exec, or a provider/model other than the selected worker model.",
+      "For shell (tests, typecheck, build, git, lint) use aipi_guarded_bash — it is your only shell; do not",
+      "use raw bash/exec or a provider/model other than the selected worker model. Prefer running the real",
+      "verification (e.g. the project's test command) over claiming a result.",
       "Follow the task exactly and return the requested output format.",
     ].join("\n"),
   };

@@ -20,6 +20,11 @@ const READ_ONLY_TOOLS = new Set([
   "aipi_callers",
   "aipi_impact",
   "aipi_retrieve",
+  // Watchdog-wrapped, project-root-scoped worker shell (aipi-guarded-bash-child). The owned-file guard
+  // cannot police writes a shell makes, so worker write-disjointness is BEST-EFFORT once a worker has it —
+  // a deliberate trade for letting workers actually run tests/build to verify. Raw bash/user_bash stay
+  // OPAQUE-denied below.
+  "aipi_guarded_bash",
 ]);
 
 const PATH_MUTATING_TOOLS = new Set(["write", "edit", "multi_edit", "apply_patch"]);
