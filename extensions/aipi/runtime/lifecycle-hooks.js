@@ -211,6 +211,14 @@ function wrapLifecycleHandlers(handlers, { rootFor, pi } = {}) {
   return Object.fromEntries(Object.entries(handlers).map(([hook, handler]) => [
     hook,
     async (event, ctx) => {
+      const heartbeatRoot = isTruthyFlag(process.env.AIPI_STALL_DISABLE) ? null : safeProjectRoot(rootFor, ctx, event);
+      // Stall heartbeat: ANY hook firing means the host turn is making progress, so touch the per-project
+      // heartbeat. When NO hook fires for a while (a silent/hung model send shows up as a mute "working…"),
+      // the heartbeat's own timer surfaces how long it has been idle — and whether it's waiting on a model
+      // response vs stalled before even sending — so a hang stops being invisible. Best-effort, never throws.
+      if (heartbeatRoot) {
+        try { updateStallHeartbeat({ hook, ctx, projectRoot: heartbeatRoot }); } catch { /* heartbeat is advisory */ }
+      }
       try {
         return await handler(event, ctx);
       } catch (error) {
@@ -236,6 +244,164 @@ function safeProjectRoot(rootFor, ctx, event) {
     return path.resolve(rootFor(ctx, event) ?? process.cwd());
   } catch {
     return null;
+  }
+}
+
+// ── Stall heartbeat ───────────────────────────────────────────────────────────────────────────────────
+// A turn can go silent for minutes — most painfully when a model request hangs at the network/SDK level
+// BEFORE it is even dispatched (no before_provider_request fires, so nothing logs and the host shows a mute
+// "working…"). aipi can't abort the host's own model call, but it CAN make the silence VISIBLE: a per-project
+// heartbeat is touched by every lifecycle hook, and its own unref'd timer (which keeps firing on the event
+// loop during a hung await) surfaces how long the turn has been idle once that crosses a threshold — and
+// whether it is waiting on a model RESPONSE (request sent) or stalled BEFORE sending. The user then knows to
+// wait or to cancel+resend instead of staring at an opaque spinner.
+const STALL_STATUS_KEY = "aipi.stall.heartbeat";
+const STALL_CHECK_MS = 10_000;
+const DEFAULT_STALL_SOFT_MS = 45_000;
+const DEFAULT_STALL_HARD_MS = 150_000;
+
+function stallThresholds(env = process.env) {
+  const soft = Number.parseInt(env?.AIPI_STALL_SOFT_MS ?? "", 10);
+  const hard = Number.parseInt(env?.AIPI_STALL_HARD_MS ?? "", 10);
+  const softMs = Number.isFinite(soft) && soft > 0 ? soft : DEFAULT_STALL_SOFT_MS;
+  const hardMs = Number.isFinite(hard) && hard > 0 ? hard : DEFAULT_STALL_HARD_MS;
+  return { softMs, hardMs: Math.max(hardMs, softMs) };
+}
+
+// Pure formatter (testable): the status line for an idle turn, or null when still within the soft window.
+export function formatStallStatus({ idleMs, pendingModelMs = null, softMs, hardMs }) {
+  if (!Number.isFinite(idleMs) || idleMs < softMs) return null;
+  const idleS = Math.round(idleMs / 1000);
+  const waitingModel = Number.isFinite(pendingModelMs);
+  const what = waitingModel ? "esperando resposta do modelo" : "sem atividade (antes de chamar o modelo)";
+  const tail = idleMs >= hardMs ? " — pode estar travado; Esc para cancelar e reenviar" : "";
+  return `⏳ AIPI: ${what} há ${idleS}s${tail}`;
+}
+
+export class StallHeartbeat {
+  constructor({ env = process.env } = {}) {
+    const { softMs, hardMs } = stallThresholds(env);
+    this.softMs = softMs;
+    this.hardMs = hardMs;
+    this.ui = null;
+    this.timer = null;
+    this.armed = false;
+    this.surfaced = false;
+    this.lastActivityAt = 0;
+    this.pendingModelSince = null;
+  }
+
+  arm(ctx, now = Date.now()) {
+    if (typeof ctx?.ui?.setStatus !== "function") return; // only animate where there is an updatable status line
+    this.ui = ctx.ui;
+    this.lastActivityAt = now;
+    this.pendingModelSince = null;
+    this.armed = true;
+    this.#startTimer();
+  }
+
+  touch(now = Date.now()) {
+    this.lastActivityAt = now;
+    this.#clearIfSurfaced();
+  }
+
+  modelRequestStarted(now = Date.now()) {
+    this.pendingModelSince = now;
+    this.touch(now);
+  }
+
+  modelResponded(now = Date.now()) {
+    this.pendingModelSince = null;
+    this.touch(now);
+  }
+
+  disarm() {
+    this.armed = false;
+    this.#stopTimer();
+    this.#clearStatus();
+    this.surfaced = false;
+    this.pendingModelSince = null;
+  }
+
+  // Exposed for the timer and for tests (drive it with a controlled clock instead of real time).
+  tick(now = Date.now()) {
+    if (!this.armed) return;
+    const pendingModelMs = this.pendingModelSince != null ? now - this.pendingModelSince : null;
+    const status = formatStallStatus({
+      idleMs: now - this.lastActivityAt,
+      pendingModelMs,
+      softMs: this.softMs,
+      hardMs: this.hardMs,
+    });
+    if (status) {
+      this.#setStatus(status);
+      this.surfaced = true;
+    } else {
+      this.#clearIfSurfaced();
+    }
+  }
+
+  #startTimer() {
+    this.#stopTimer();
+    this.timer = setInterval(() => {
+      try { this.tick(); } catch { /* advisory */ }
+    }, STALL_CHECK_MS);
+    if (typeof this.timer?.unref === "function") this.timer.unref(); // never keep the process alive
+  }
+
+  #stopTimer() {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  }
+
+  #clearIfSurfaced() {
+    if (this.surfaced) {
+      this.#clearStatus();
+      this.surfaced = false;
+    }
+  }
+
+  #setStatus(text) {
+    try { this.ui?.setStatus?.(STALL_STATUS_KEY, text); } catch { /* best-effort UI */ }
+  }
+
+  #clearStatus() {
+    try { this.ui?.setStatus?.(STALL_STATUS_KEY, undefined); } catch { /* best-effort UI */ }
+  }
+}
+
+const stallHeartbeats = new Map(); // projectRoot -> StallHeartbeat
+
+function getStallHeartbeat(projectRoot) {
+  let hb = stallHeartbeats.get(projectRoot);
+  if (!hb) {
+    hb = new StallHeartbeat();
+    stallHeartbeats.set(projectRoot, hb);
+  }
+  return hb;
+}
+
+export function updateStallHeartbeat({ hook, ctx, projectRoot }) {
+  const hb = getStallHeartbeat(projectRoot);
+  switch (hook) {
+    case "before_agent_start":
+      hb.arm(ctx);
+      break;
+    case "agent_end":
+    case "turn_end":
+    case "session_shutdown":
+      hb.disarm();
+      break;
+    case "before_provider_request":
+      hb.modelRequestStarted();
+      break;
+    case "after_provider_response":
+      hb.modelResponded();
+      break;
+    default:
+      hb.touch();
   }
 }
 

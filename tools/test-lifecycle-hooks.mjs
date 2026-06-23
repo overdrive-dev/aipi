@@ -15,8 +15,10 @@ import {
   classifyAipiCodePipeline,
   classifyAipiInputRoute,
   createAipiLifecycleHandlers,
+  formatStallStatus,
   handleBeforeAgentStart,
   renderRecentRunSummary,
+  StallHeartbeat,
   estimateProviderUsageCost,
   normalizeProviderUsage,
   pruneAipiContextMessages,
@@ -1498,6 +1500,60 @@ try {
     await msgEnd("The flow works like this: the controller calls save, which is already implemented.");
     await msgEnd("Esse código foi corrigido na PR anterior, mas o bug voltou.");
     assert.equal(warnings().length, n, "CG-2: descriptive/historical narration does not warn");
+  }
+
+  // Stall heartbeat — make a silent/hung turn VISIBLE (a model send can hang before it's even dispatched, so
+  // nothing logs and the host shows a mute "working…"). The formatter is pure; the state machine is driven
+  // with a controlled clock + a fake setStatus sink.
+  {
+    const soft = 45_000;
+    const hard = 150_000;
+    // formatter: below soft -> null; above soft -> idle line; pending model -> waiting-on-model wording; above hard -> escalated.
+    assert.equal(formatStallStatus({ idleMs: 10_000, softMs: soft, hardMs: hard }), null, "within the soft window: no status");
+    assert.match(formatStallStatus({ idleMs: 60_000, softMs: soft, hardMs: hard }), /sem atividade.*há 60s/);
+    assert.match(formatStallStatus({ idleMs: 60_000, pendingModelMs: 60_000, softMs: soft, hardMs: hard }), /esperando resposta do modelo.*há 60s/);
+    assert.doesNotMatch(formatStallStatus({ idleMs: 60_000, softMs: soft, hardMs: hard }), /Esc para cancelar/);
+    assert.match(formatStallStatus({ idleMs: 200_000, softMs: soft, hardMs: hard }), /Esc para cancelar e reenviar/);
+
+    const statusCalls = [];
+    const hbCtx = { ui: { setStatus: (key, text) => statusCalls.push({ key, text }) } };
+    const hb = new StallHeartbeat({ env: { AIPI_STALL_SOFT_MS: "45000", AIPI_STALL_HARD_MS: "150000" } });
+    let clock = 1_000_000;
+    hb.arm(hbCtx, clock);
+
+    hb.tick(clock + 10_000); // idle 10s -> within soft, nothing surfaced
+    assert.equal(statusCalls.length, 0, "no status within the soft window");
+
+    hb.tick(clock + 60_000); // idle 60s -> surfaces "sem atividade"
+    assert.equal(statusCalls.length, 1);
+    assert.match(statusCalls[0].text, /sem atividade.*há 60s/);
+    assert.equal(statusCalls[0].key, "aipi.stall.heartbeat");
+
+    hb.tick(clock + 200_000); // idle 200s -> escalated wording
+    assert.match(statusCalls.at(-1).text, /Esc para cancelar e reenviar/);
+
+    // A model request is sent (touch + pending), then the response hangs -> waiting-on-model wording.
+    hb.modelRequestStarted(clock + 210_000);
+    hb.tick(clock + 270_000); // 60s since the request, no response
+    assert.match(statusCalls.at(-1).text, /esperando resposta do modelo/);
+
+    // Activity resumes -> the stall status is cleared (text undefined).
+    const beforeTouch = statusCalls.length;
+    hb.touch(clock + 271_000);
+    assert.ok(statusCalls.length > beforeTouch && statusCalls.at(-1).text === undefined, "touch clears a surfaced stall status");
+
+    // Disarm clears and stops; a tick after disarm does nothing.
+    hb.modelResponded(clock + 272_000);
+    hb.disarm();
+    const afterDisarm = statusCalls.length;
+    hb.tick(clock + 999_000);
+    assert.equal(statusCalls.length, afterDisarm, "no status updates after disarm");
+
+    // Headless ctx (no setStatus) -> arm is a no-op, never throws.
+    const headless = new StallHeartbeat();
+    headless.arm({ ui: {} }, clock);
+    headless.tick(clock + 200_000);
+    headless.disarm();
   }
 
   console.log("AIPI_LIFECYCLE_HOOKS_TEST_OK");
