@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { runGuardedCommand } from "./command-watchdog.js";
+import { piStreamingUpdate, runGuardedCommand } from "./command-watchdog.js";
 
 export const AIPI_RUNTIME_TOOL_NAMES = [
   "aipi_memory_query",
@@ -481,7 +481,7 @@ export function registerAipiRuntimeTools(pi, { projectRootResolver = () => proce
         silenceTimeoutMs: params.silence_timeout_ms,
         hardCapMs: params.hard_cap_ms,
         allowInteractive: params.allow_interactive === true,
-        onUpdate,
+        onUpdate: piStreamingUpdate(onUpdate),
       }));
     },
   });

@@ -6,6 +6,7 @@ import { registerAipiRuntimeTools, AIPI_RUNTIME_TOOL_NAMES } from "../extensions
 import {
   detectInteractiveTrap,
   isAmbiguousLongRunningCommand,
+  piStreamingUpdate,
   runGuardedCommand,
 } from "../extensions/aipi/runtime/command-watchdog.js";
 
@@ -187,6 +188,47 @@ try {
   const parsedToolResult = JSON.parse(toolResult.content[0].text);
   assert.equal(parsedToolResult.status, "completed");
   assert.match(parsedToolResult.stdout, /guarded tool ok/);
+
+  // piStreamingUpdate adapts raw {type,text} chunks into Pi's partial-result {content:[...]} shape. A chunk
+  // without `content` crashes the host renderer (getTextOutput -> result.content.filter) — an uncaught
+  // TypeError that took the whole session down on a verbose run. Every streamed update MUST carry content.
+  {
+    const partials = [];
+    const adapted = piStreamingUpdate((partial) => partials.push(partial));
+    adapted({ type: "stdout", text: "line 1\n" });
+    adapted({ type: "stderr", text: "warn\n" });
+    assert.equal(partials.length, 2);
+    for (const p of partials) {
+      assert.ok(Array.isArray(p.content), "every streamed partial carries a content array");
+      assert.equal(p.content[0].type, "text");
+    }
+    // Accumulates (so the live display grows) — the 2nd partial includes the 1st.
+    assert.match(partials[1].content[0].text, /line 1[\s\S]*warn/);
+    // Tail-capped so a flood of output can't grow unbounded in the closure.
+    const flood = piStreamingUpdate((p) => partials.push(p));
+    flood({ type: "stdout", text: "x".repeat(40_000) });
+    assert.ok(partials.at(-1).content[0].text.length <= 32_768, "streamed display is tail-capped");
+    // No host onUpdate -> null (forked/headless: runGuardedCommand simply won't stream).
+    assert.equal(piStreamingUpdate(null), null);
+    assert.equal(piStreamingUpdate(undefined), null);
+    // A throwing host onUpdate is swallowed (a render failure must not break the command).
+    const safe = piStreamingUpdate(() => { throw new Error("render boom"); });
+    safe({ type: "stdout", text: "hi" }); // must not throw
+  }
+
+  // Regression: a real guarded command streams content-shaped partials, never a bare {type,text}.
+  {
+    const streamed = [];
+    await runGuardedCommand({
+      projectRoot: tempRoot,
+      command: process.platform === "win32" ? "echo streamed-line" : "echo streamed-line",
+      minRuntimeMs: 0,
+      onUpdate: piStreamingUpdate((p) => streamed.push(p)),
+    });
+    for (const p of streamed) {
+      assert.ok(Array.isArray(p?.content), "guarded command streams only content-shaped partials");
+    }
+  }
 
   console.log("AIPI_COMMAND_WATCHDOG_TEST_OK");
 } finally {

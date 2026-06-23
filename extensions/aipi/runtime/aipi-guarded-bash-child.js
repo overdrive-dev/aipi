@@ -1,5 +1,5 @@
 import path from "node:path";
-import { runGuardedCommand } from "./command-watchdog.js";
+import { piStreamingUpdate, runGuardedCommand } from "./command-watchdog.js";
 
 // Guarded-shell tool for a forked AIPI worker, the bash analogue of aipi-guarded-write-child.js. A worker
 // gets THIS (watchdog-wrapped, project-root-scoped) shell — never a raw `bash`/`user_bash` — so it can run
@@ -55,7 +55,7 @@ export default function registerAipiGuardedBashChild(pi) {
           silenceTimeoutMs: params.silence_timeout_ms,
           hardCapMs: params.hard_cap_ms,
           allowInteractive: false,
-          onUpdate,
+          onUpdate: piStreamingUpdate(onUpdate),
         });
         return { content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result) }] };
       } catch (error) {

@@ -16,6 +16,27 @@ const DEFAULT_KILL_GRACE_MS = 500;
 const LONG_RUNNING_COMMAND_RE =
   /\b(npm\s+(test|run|install|ci|build)|pnpm\s+(test|run|install|build)|yarn\s+(test|run|install|build)|pytest|cargo\s+(test|build)|go\s+test|dotnet\s+test|mvn\s+test|gradle|docker\s+build|make(\s|$))\b/i;
 
+// Adapt runGuardedCommand's raw streaming chunks ({type:"stdout"|"stderr", text}) into the partial-result
+// shape a Pi host renders. Pi feeds every onUpdate value straight into its tool-result renderer, which does
+// `result.content.filter(...)` — a chunk WITHOUT a `content` array throws an UNCAUGHT TypeError that crashes
+// the whole interactive session (observed: a verbose aipi_guarded_bash run — pytest — took the session down).
+// Accumulate the streamed output (tail-capped) and hand the host a valid {content:[...]} each time. Returns
+// null when there is no host onUpdate (forked/headless), so runGuardedCommand simply doesn't stream.
+const GUARDED_BASH_STREAM_TAIL = 32_768;
+export function piStreamingUpdate(onUpdate) {
+  if (typeof onUpdate !== "function") return null;
+  let streamed = "";
+  return (chunk) => {
+    streamed = `${streamed}${chunk?.text ?? ""}`;
+    if (streamed.length > GUARDED_BASH_STREAM_TAIL) streamed = streamed.slice(-GUARDED_BASH_STREAM_TAIL);
+    try {
+      onUpdate({ content: [{ type: "text", text: streamed }] });
+    } catch {
+      /* a host that can't take a streamed partial must never break the command itself */
+    }
+  };
+}
+
 export async function runGuardedCommand({
   command,
   cwd = null,
