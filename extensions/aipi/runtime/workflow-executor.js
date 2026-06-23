@@ -576,6 +576,13 @@ async function executeSubagentStep({
   notify = null,
 }) {
   const artifacts = step.produces.map((template) => renderTemplate(template, state, step));
+  // controller_updates are run-root single-writer surfaces owned by the controller — a worker cannot write
+  // them (isControllerOwnedPath blocks the guard). Stage each under steps/<id>/<basename>, a path the worker
+  // CAN own and write (and which counts as PASS evidence); the controller promotes the staged content to the
+  // run-root path after a PASS. Without this a controller_updates-only step (planning/contract) had no
+  // worker-writable evidence -> forced BLOCKED, and intake's RUN-MANIFEST.md was silently never materialized.
+  const controllerStaging = controllerUpdateStagingPlan(state, step);
+  const expectedArtifacts = [...artifacts, ...controllerStaging.map((entry) => entry.staging)];
   const modelResolution = await modelResolver({ root, workflow, step, context, contract });
   const descriptor = {
     agent_id: step.agents[0] ?? "aipi-worker",
@@ -586,8 +593,8 @@ async function executeSubagentStep({
     thinking_level: modelResolution.thinking_level,
     result_schema: "aipi.step-result.v1",
     artifact_target: path.join(runRelDir(state), "steps", step.id).replaceAll("\\", "/"),
-    expected_artifacts: artifacts,
-    owned_files: artifacts,
+    expected_artifacts: expectedArtifacts,
+    owned_files: expectedArtifacts,
     write_scope: resolveWriteScope(step),
     context_packet: JSON.stringify(
       {
@@ -598,7 +605,8 @@ async function executeSubagentStep({
         step_prompt: step.prompt ? renderText(step.prompt, state, step) : null,
         run_id: state.run_id,
         contract_path: state.contract_path,
-        expected_artifacts: artifacts,
+        expected_artifacts: expectedArtifacts,
+        controller_updates: controllerStaging.map((entry) => ({ write: entry.staging, promoted_to: entry.target })),
         context,
       },
       null,
@@ -617,10 +625,41 @@ async function executeSubagentStep({
   if (!collect.ready) {
     return workerOutcomeOrThrow({ step, agentId, collect });
   }
-  return {
+  const stepResult = {
     ...collect.step_result,
     artifacts: collect.step_result?.artifacts?.length ? collect.step_result.artifacts : collect.artifacts ?? [],
   };
+  // On a PASS, materialize the controller-owned shared artifacts from their staged copies.
+  if (controllerStaging.length && String(stepResult.verdict) === "PASS") {
+    await promoteControllerUpdates({ root, plan: controllerStaging });
+  }
+  return stepResult;
+}
+
+// Map each of a step's controller_updates targets to a step-scoped staging path (same basename) the worker
+// can own and write. steps/<id>/<file> passes isControllerOwnedPath; the run-root target does not.
+function controllerUpdateStagingPlan(state, step) {
+  return (step.controller_updates ?? []).map((template) => {
+    const target = renderTemplate(template, state, step);
+    const staging = path.join(runRelDir(state), "steps", step.id, path.basename(target)).replaceAll("\\", "/");
+    return { staging, target };
+  });
+}
+
+// Controller-side promotion: copy each staged file to its run-root controller_updates target. Best-effort —
+// if the worker didn't stage a file the evidence gate already blocked the PASS, so we never reach here with a
+// missing stage on a real PASS; the try/catch only guards an unexpected fs race.
+async function promoteControllerUpdates({ root, plan }) {
+  for (const { staging, target } of plan) {
+    try {
+      const src = path.resolve(root, staging);
+      const dest = path.resolve(root, target);
+      await fs.mkdir(path.dirname(dest), { recursive: true });
+      await fs.copyFile(src, dest);
+    } catch {
+      /* a missing stage means the PASS lacked real evidence and was already downgraded upstream */
+    }
+  }
 }
 
 function dispatchSubagent(coordinator, descriptor) {

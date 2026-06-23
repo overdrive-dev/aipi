@@ -1540,6 +1540,91 @@ try {
     /not declared by workflow step/,
   );
 
+  // controller_updates materialization (staging + promote). A real worker can't write a run-root
+  // single-writer shared artifact (isControllerOwnedPath blocks it), so a controller_updates-only step had
+  // no worker-writable evidence and was forced BLOCKED, and intake's RUN-MANIFEST.md was silently dropped.
+  // The worker now stages each under steps/<id>/<basename> (writable + counts as evidence) and the controller
+  // promotes it to the run-root path on PASS. Driven through the REAL executeSubagentStep + REAL coordinator
+  // evidence gate (a fake adapter would bypass exactly the path that was broken).
+  {
+    const stagingRunId = "staging-materialize-run";
+    const stagingCoordinator = new SubagentCoordinator(
+      { appendEntry() {} },
+      { root: tempRoot, maxConcurrent: 1, piSubagentsRunner: fakeWorkflowRunner({ root: tempRoot }) },
+    );
+    const stagingAdapter = createSubagentWorkflowAdapter(stagingCoordinator, {
+      pollIntervalMs: 1,
+      collectTimeoutMs: 1_000,
+      modelResolver: async () => ({
+        model_class: "code-strong",
+        model: { provider: "anthropic", id: "claude-test" },
+        thinking_level: "medium",
+        source: "test",
+      }),
+    });
+    const stagingState = {
+      run_id: stagingRunId,
+      workflow: "planning",
+      contract_path: `.aipi/runtime/runs/${stagingRunId}/BDD-CONTRACT.md`,
+    };
+    // contract-like step: produces:[] + a run-root controller_updates target. Pre-fix this could never PASS.
+    const contractStep = {
+      id: "contract",
+      stage: "planning",
+      agents: ["orchestration-reasoner"],
+      name: "Produce BDD contract package",
+      prompt: "Produce the BDD contract.",
+      produces: [],
+      controller_updates: [`.aipi/runtime/runs/${stagingRunId}/BDD-CONTRACT.md`],
+      gate: { schema: "aipi.step-result.v1", pass_verdicts: ["PASS"], allow_skip: false },
+    };
+    const contractResult = await stagingAdapter.executeStep({
+      root: tempRoot,
+      state: stagingState,
+      workflow: { name: "planning" },
+      step: contractStep,
+      context: { contract_path: stagingState.contract_path },
+      contract: {},
+    });
+    assert.equal(contractResult.verdict, "PASS", "shell-less worker PASSES a controller_updates-only step via the staged artifact");
+    assert.equal(
+      await pathExists(path.join(tempRoot, ".aipi", "runtime", "runs", stagingRunId, "steps", "contract", "BDD-CONTRACT.md")),
+      true,
+      "worker wrote the step-scoped staging artifact (its evidence)",
+    );
+    assert.equal(
+      await pathExists(path.join(tempRoot, ".aipi", "runtime", "runs", stagingRunId, "BDD-CONTRACT.md")),
+      true,
+      "controller promoted the staged contract to the run-root controller_updates target",
+    );
+
+    // intake-like step: a produced artifact AND a controller_update — both land, RUN-MANIFEST.md no longer dropped.
+    const intakeStep = {
+      id: "intake",
+      stage: "intake",
+      agents: ["orchestration-reasoner"],
+      name: "Intake",
+      prompt: "Intake the request.",
+      produces: [`.aipi/runtime/runs/${stagingRunId}/steps/intake/INTAKE.md`],
+      controller_updates: [`.aipi/runtime/runs/${stagingRunId}/RUN-MANIFEST.md`],
+      gate: { schema: "aipi.step-result.v1", pass_verdicts: ["PASS"], allow_skip: false },
+    };
+    const intakeResult = await stagingAdapter.executeStep({
+      root: tempRoot,
+      state: stagingState,
+      workflow: { name: "planning" },
+      step: intakeStep,
+      context: { contract_path: stagingState.contract_path },
+      contract: {},
+    });
+    assert.equal(intakeResult.verdict, "PASS");
+    assert.equal(
+      await pathExists(path.join(tempRoot, ".aipi", "runtime", "runs", stagingRunId, "RUN-MANIFEST.md")),
+      true,
+      "intake's controller_update (RUN-MANIFEST.md) is materialized, not silently dropped",
+    );
+  }
+
   console.log("AIPI_WORKFLOW_EXECUTOR_TEST_OK");
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });
