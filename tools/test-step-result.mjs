@@ -196,6 +196,52 @@ const cleanReviewPass = validateStepResult(
 assert.equal(cleanReviewPass.ok, true);
 assert.equal(cleanReviewPass.gatePassed, true);
 
+// A shell-less fanout review step can only reach `written` evidence (its workers have no shell). Its PASS
+// must NOT be forced to BLOCKED by the ran/verified default — the fanout marker + a non-execution stage
+// relaxes the bar to written. (Regression: research/adversarial + feature/review_swarm could never PASS.)
+const fanoutReviewWrittenPass = validateStepResult(
+  {
+    ...baseResult,
+    step_id: "adversarial",
+    agent_ids: ["contrarian", "plan-checker"],
+    evidence: [
+      { rung: "written", source: "aipi-subagent-fanout", ref: "contrarian, plan-checker", result: "collected 2 worker results" },
+      { rung: "written", source: "contrarian", ref: ".aipi/runtime/runs/run/steps/adversarial/CHALLENGES.md", result: "challenges written" },
+      { rung: "written", source: "plan-checker", ref: ".aipi/runtime/runs/run/steps/adversarial/PLAN-CHECK.md", result: "plan check written" },
+    ],
+    artifacts: [
+      ".aipi/runtime/runs/run/steps/adversarial/CHALLENGES.md",
+      ".aipi/runtime/runs/run/steps/adversarial/PLAN-CHECK.md",
+    ],
+  },
+  {
+    step: { id: "adversarial", stage: "review", agents: ["contrarian", "plan-checker"], gate: { pass_verdicts: ["PASS"] } },
+    artifactContents: {
+      ".aipi/runtime/runs/run/steps/adversarial/CHALLENGES.md": "## Challenges\n\nNo critical or high findings.\n",
+      ".aipi/runtime/runs/run/steps/adversarial/PLAN-CHECK.md": "## Plan check\n\nConsistent with the contract.\n",
+    },
+  },
+);
+assert.equal(fanoutReviewWrittenPass.gatePassed, true, "shell-less fanout review PASSES on written evidence");
+
+// But an EXECUTION stage keeps the ran/verified bar even if a fanout marker is somehow present — a code/
+// verification step must still prove it actually ran.
+const fanoutOnExecutionStageBlocked = validateStepResult(
+  {
+    ...baseResult,
+    step_id: "fix",
+    agent_ids: ["implementer"],
+    evidence: [
+      { rung: "written", source: "aipi-subagent-fanout", ref: "implementer", result: "collected" },
+      { rung: "written", source: "implementer", ref: ".aipi/runtime/runs/run/steps/fix/FIXES.md", result: "wrote fixes" },
+    ],
+    artifacts: [".aipi/runtime/runs/run/steps/fix/FIXES.md"],
+  },
+  { step: { id: "fix", stage: "fix", agents: ["implementer"], gate: { pass_verdicts: ["PASS"] } } },
+);
+assert.equal(fanoutOnExecutionStageBlocked.gatePassed, false, "execution stage keeps the ran/verified bar");
+assert.match(fanoutOnExecutionStageBlocked.errors.join("\n"), /ran or verified/);
+
 const validBlockerQuestion = validateStepResult(
   {
     ...baseResult,

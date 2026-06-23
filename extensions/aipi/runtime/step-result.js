@@ -40,6 +40,30 @@ const nonExecutingEvidenceSources = new Set([
   "aipi-subagent-fanout",
 ]);
 
+// Stages whose deliverable IS running code — a PASS legitimately requires ran/verified evidence. Every other
+// stage (review, planning, requirements, research, memory…) delivers a WRITTEN artifact, so `written` is its
+// honest ceiling. These are also the stages that never fan out (only review-stage multi-agent steps do), so
+// keeping the ran/verified bar here can't collide with the shell-less-fanout relaxation below.
+const executionEvidenceStages = new Set([
+  "implementation",
+  "fix",
+  "tdd",
+  "local-verification",
+  "final-verification",
+  "regression",
+]);
+
+function requiresExecutionEvidence(step) {
+  return executionEvidenceStages.has(String(step?.stage ?? "").toLowerCase());
+}
+
+// A fanout result always carries the aggregator's synthetic written-rung entry (workflow-executor.js stamps
+// it), so its presence reliably marks "this step fanned out to parallel review workers". Those workers run
+// shell-less (allow_shell:false), so the strongest rung they can honestly reach is `written`.
+function resultIsFanout(result) {
+  return (result?.evidence ?? []).some((item) => item?.source === "aipi-subagent-fanout");
+}
+
 const reviewArtifactNamePattern = /(^|[/\\])(?:CODE-REVIEW|SECURITY|DEV-REVIEW|HUMAN-REVIEW|COMPLEXITY-REVIEW|INTEGRATION|BLAST-RADIUS|PLAN-REVIEW)(?:\.[A-Za-z0-9_-]+)?$/i;
 const reviewAgentPattern = /\b(review|reviewer|auditor|adversarial|contrarian|security|blast-radius|integration-checker|complexity-reviewer)\b/i;
 const actionableFindingPattern = /\b(?:CRITICAL|HIGH|BLOCKER|P0|P1)\b\s*(?:[:\]-]|finding|issue|risk|vulnerability|bug)/i;
@@ -313,6 +337,19 @@ function passEvidenceRule(result, step, errors) {
     const strongestRank = evidenceRank.get(strongest) ?? -1;
     if (strongestRank < requiredRank) {
       errors.push(`PASS requires evidence rung ${required} or stronger`);
+      return false;
+    }
+    return true;
+  }
+
+  // A shell-less fanout review step (its workers read sources and WRITE findings — they have no shell, so
+  // they can never reach ran/verified) would be forced to BLOCKED by the ran/verified default below even on
+  // an honest PASS. Accept `written` for a fanout result on a non-execution stage; the worker still had to
+  // produce a findings artifact, so the anti-self-deception intent holds. Execution stages
+  // (implementation/fix/tdd/verification) never fan out and keep the ran/verified bar — they must prove a run.
+  if (resultIsFanout(result) && !requiresExecutionEvidence(step)) {
+    if (strongest === null) {
+      errors.push("PASS requires at least written evidence (a review artifact)");
       return false;
     }
     return true;
