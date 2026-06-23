@@ -23,6 +23,7 @@ import {
   assertAipiHostScopedModel,
   assertAipiSupportedHostModel,
   createAipiSubagentsRunner,
+  createAipiWorkerAgentConfig,
   projectSubagentsRuntimePaths,
   runAipiForkedSubagent,
   runPiSubagentsLiveSpike,
@@ -402,6 +403,12 @@ try {
   assert.equal((await bash.execute("deep", { command: "node --version", cwd: "../../../etc" })).isError, true);
   assert.equal((await bash.execute("abs", { command: "node --version", cwd: "/etc" })).isError, true);
   assert.equal((await bash.execute("sneaky", { command: "node --version", cwd: "sub/../../../outside" })).isError, true);
+  // Sibling prefix-collision (root .../X, cwd '../X-evil' -> .../X-evil shares X's string prefix) is rejected
+  // by the separator-appended containment check — this is the exact case the guard hardened.
+  assert.equal(
+    (await bash.execute("sibling", { command: "node --version", cwd: `../${path.basename(guardedBashRoot)}-evil` })).isError,
+    true,
+  );
   // An in-root relative cwd is allowed.
   await fs.mkdir(path.join(guardedBashRoot, "sub"), { recursive: true });
   assert.notEqual((await bash.execute("sub", { command: "node --version", cwd: "sub" })).isError, true);
@@ -412,6 +419,20 @@ try {
   }
   await fs.rm(guardedBashRoot, { recursive: true, force: true });
 }
+
+// Shell gating (security, fix #2): single-lead workers get aipi_guarded_bash; parallel fanout workers
+// (allowShell:false, set by executeFanoutSubagentStep) get NO shell — preserving write-disjointness +
+// .git/.aipi/memory protection across concurrent workers.
+const leadCfg = createAipiWorkerAgentConfig({ allowShell: true });
+assert.ok(leadCfg.tools.includes("aipi_guarded_bash"), "single-lead worker has the guarded shell");
+assert.ok(leadCfg.tools.some((tool) => String(tool).includes("aipi-guarded-bash-child")), "single-lead worker loads the bash extension");
+const defaultCfg = createAipiWorkerAgentConfig({});
+assert.ok(defaultCfg.tools.includes("aipi_guarded_bash"), "shell defaults ON for an unspecified (single-lead) worker");
+const fanoutCfg = createAipiWorkerAgentConfig({ allowShell: false });
+assert.ok(!fanoutCfg.tools.includes("aipi_guarded_bash"), "parallel fanout worker has NO guarded shell");
+assert.ok(!fanoutCfg.tools.some((tool) => String(tool).includes("aipi-guarded-bash-child")), "fanout worker does NOT load the bash extension");
+assert.ok(fanoutCfg.tools.includes("write"), "fanout worker still has the guarded write");
+assert.match(fanoutCfg.systemPrompt, /NO shell/);
 
 const piEntries = [];
 const piSubagentsCalls = [];

@@ -339,7 +339,7 @@ function loadForkedRunSync() {
   return cachedJiti(runSyncEntrypoint);
 }
 
-function createAipiWorkerAgentConfig({ thinking = undefined, allowShell = true } = {}) {
+export function createAipiWorkerAgentConfig({ thinking = undefined, allowShell = true } = {}) {
   // Shell (aipi_guarded_bash) is granted ONLY to single-lead, sequential workers — NOT to parallel fanout
   // (review_swarm) workers. A shell bypasses the owned-file/controller-path write guards (it can write
   // outside its owned files, touch .git or .aipi/memory), so giving it to PARALLEL workers would void

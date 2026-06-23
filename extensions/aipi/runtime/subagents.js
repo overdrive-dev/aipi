@@ -518,6 +518,10 @@ export class SubagentCoordinator {
           // is preserved so a redispatched code-writing worker keeps its project write scope.
           step_id: j.descriptor.step_id ?? null,
           write_scope: j.descriptor.write_scope ?? null,
+          // allow_shell is as security-relevant as write_scope: it gates whether a worker gets a shell. Persist
+          // it so a restore/resume path can't silently re-grant the shell to a parallel fanout worker via the
+          // default-true fallback (createAipiWorkerAgentConfig defaults allowShell:true on a missing field).
+          allow_shell: j.descriptor.allow_shell ?? null,
           owned_files: j.descriptor.owned_files ?? [],
         },
         result: j.result,
