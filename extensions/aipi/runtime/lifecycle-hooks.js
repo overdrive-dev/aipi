@@ -1567,7 +1567,7 @@ function codePipelineWithDispatch({ pipeline = {}, route = {}, result = null, er
 const lastSurfacedClaimWarning = new Map();
 
 function auditEndDisciplineEvent({ event, hook, activeDisciplines = [] } = {}) {
-  const text = extractUserFacingText(event);
+  const text = extractUserFacingText(event, { hook });
   const claims = claimEvidenceFindings(text);
   const outcome = outcomeFirstFinding(text);
   // Only a genuine COMPLETION/hand-back claim warrants the warning. A claim term alone is not enough — it
@@ -1611,7 +1611,27 @@ function auditEndDisciplineEvent({ event, hook, activeDisciplines = [] } = {}) {
   };
 }
 
-function extractUserFacingText(event = {}) {
+// message_end fires for EVERY message role, not just the assistant's reply — Pi's own consumers gate on
+// `event.message.role === "assistant"` (see vendored subagent-runner.ts:351). The finish-audit did NOT,
+// so it read two kinds of non-claim text and flagged "done"/"fixed" words inside them:
+//   1. AIPI's OWN injected context pointer (role "custom", display:false) — it carries the "DEFINITION OF
+//      DONE" line, so the audit warned on AIPI's own context every turn.
+//   2. Tool-result messages (role "user"/"tool") — git logs ("fix(...)"), file reads, code blobs.
+// Neither is a user-facing completion claim. Gate strictly on the assistant role (and on block type) so
+// only the agent's own prose is scanned; non-assistant messages carry no claim.
+function extractUserFacingText(event = {}, { hook } = {}) {
+  const role = event?.message?.role ?? event?.role ?? null;
+  // message_end is the ONLY hook that surfaces the finish-audit warning, and Pi fires it for EVERY message
+  // role (its own consumers gate on event.message.role === "assistant" — vendored subagent-runner.ts:351).
+  // Fail CLOSED here: require an explicit assistant role. Pi always stamps it on a real reply, so this never
+  // drops one — but it rejects role:"custom"/"user"/"tool" AND role-LESS messages (AIPI's injected
+  // context-pointer can be returned without a role from handleBeforeAgentStart). agent_end/turn_end pass a
+  // plain { text } with no role and never warn, so leave their recording behavior unchanged (fail open).
+  if (hook === "message_end") {
+    if (role !== "assistant") return "";
+  } else if (role && role !== "assistant") {
+    return "";
+  }
   const candidates = [
     event.text,
     event.output,
@@ -1622,16 +1642,40 @@ function extractUserFacingText(event = {}) {
   ];
   for (const candidate of candidates) {
     const text = flattenText(candidate).trim();
-    if (text) return text;
+    if (text && !isAipiInjectedContext(text)) return text;
   }
   return "";
 }
+
+// AIPI's injected context-pointer (renderContextPointer) is never a user-facing claim. The fail-closed
+// role gate already rejects it (it is a role:"custom"/role-less message and message_end requires the
+// assistant role), so this is pure defense-in-depth for the unlikely case it is ever merged INTO an
+// assistant message. Match ONLY the unambiguous AIPI HEADER at the START — never body lines like
+// "DEFINITION OF DONE" or "memory_refs:", which an assistant could legitimately echo while making a real,
+// warnable completion claim (else the warning would be wrongly suppressed).
+function isAipiInjectedContext(text) {
+  const head = normalizeInputText(String(text ?? "").slice(0, 120));
+  return head.startsWith("aipi project context") || head.startsWith("aipi active run context");
+}
+
+// Content blocks that are NOT the assistant's prose: tool calls/results, thinking, attachments. A
+// tool_result block carries `.content` (e.g. a git log) that flattenText would otherwise read as the
+// agent's own words — skip them so only genuine text blocks feed the claim scan.
+const NON_USER_FACING_BLOCK_TYPES = new Set([
+  "tool_use",
+  "tool_result",
+  "thinking",
+  "redacted_thinking",
+  "image",
+  "document",
+]);
 
 function flattenText(value) {
   if (value == null) return "";
   if (typeof value === "string") return value;
   if (Array.isArray(value)) return value.map(flattenText).filter(Boolean).join("\n");
   if (typeof value === "object") {
+    if (typeof value.type === "string" && NON_USER_FACING_BLOCK_TYPES.has(value.type)) return "";
     if (typeof value.text === "string") return value.text;
     if (typeof value.content === "string") return value.content;
     if (Array.isArray(value.content)) return flattenText(value.content);

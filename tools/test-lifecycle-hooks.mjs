@@ -1460,6 +1460,93 @@ try {
     await msgEnd("The flow works like this: the controller calls save, which is already implemented.");
     await msgEnd("Esse código foi corrigido na PR anterior, mas o bug voltou.");
     assert.equal(warnings().length, n, "CG-2: descriptive/historical narration does not warn");
+
+    // P2b — THE REAL false-positive the user kept hitting ("message_end audit still appearing"). message_end
+    // fires for EVERY message role; Pi's own consumers gate on role==="assistant" (vendored
+    // subagent-runner.ts:351) but the audit did not. Ground truth from nora-app's discipline-audit.jsonl: the
+    // warn entries' text was AIPI's OWN injected context-pointer (role "custom", carries "DEFINITION OF DONE")
+    // and raw tool results (git logs with "fix(...)", code blobs) — NOT the agent's reply. None may warn,
+    // regardless of "done"/"fixed" words; only a genuine assistant message is a claim.
+    await auditHandlers.before_agent_start({ type: "before_agent_start", prompt: "p2b role-gate turn" }, auditCtx);
+    const base = warnings().length;
+    const msgEndRaw = (message) => invokeMessageEndWithHostContract(
+      auditHandlers.message_end,
+      { type: "message_end", message },
+      auditCtx,
+    );
+
+    // (1) AIPI's own injected context-pointer (role "custom", display:false) — its "DEFINITION OF DONE" line.
+    await msgEndRaw({
+      role: "custom",
+      content:
+        "AIPI project context (no active workflow run — handle this task as the flexible main agent):\n" +
+        "- memory_refs: .aipi/memory/project/project.md, .aipi/memory/project/procedures.md\n" +
+        "- Follow the project's conventions and its DEFINITION OF DONE in .aipi/memory/project/procedures.md and project.md. Do not stop early.",
+    });
+    assert.equal(warnings().length, base, "P2b: AIPI's injected context-pointer (role custom) must not warn");
+
+    // (2) a tool-result message (role "user"): a git log whose commit subjects contain fix/done.
+    await msgEndRaw({
+      role: "user",
+      content:
+        "=== recent commits touching edit pages / sections / api / schemas (last 40) ===\n" +
+        "269e02a8 fix(invite): NOR-761 — the bug was fixed and the migration is done\n" +
+        "559c2ca4 refactor(nav): T5/Fase B",
+    });
+    assert.equal(warnings().length, base, "P2b: a tool-result git log (role user) must not warn despite 'fixed'/'done'");
+
+    // (3) a tool-result message (role "user"): a code blob the agent Read — not its own claim.
+    await msgEndRaw({
+      role: "user",
+      content:
+        "# M048/S07 — pop functions from the setattr payload BEFORE the generic loop. " +
+        "Function assignments are now persisted (fixed) via sync_user_functions.",
+    });
+    assert.equal(warnings().length, base, "P2b: a tool-result code blob (role user) must not warn");
+
+    // (4) a tool_result CONTENT BLOCK nested in an array is dropped by block-type filtering.
+    await msgEndRaw({
+      role: "user",
+      content: [{ type: "tool_result", content: "all checks fixed and done; everything passed" }],
+    });
+    assert.equal(warnings().length, base, "P2b: a tool_result content block must not warn");
+
+    // (5) defensive: even if the context-pointer were ever merged into an assistant message, the header
+    //     sentinel keeps it from reading as a completion claim (matches the AIPI header at the START only).
+    await msgEndRaw({
+      role: "assistant",
+      content: "AIPI active run context:\n- Follow the DEFINITION OF DONE in .aipi/memory/project/procedures.md.",
+    });
+    assert.equal(warnings().length, base, "P2b: an injected-context header inside an assistant message is suppressed by the sentinel");
+
+    // (6) role-LESS message (e.g. AIPI's context-pointer returned without a role from handleBeforeAgentStart):
+    //     message_end is fail-closed, so a null role is NOT audited.
+    await msgEndRaw({ content: "Tudo corrigido e o deploy está pronto." });
+    assert.equal(warnings().length, base, "P2b: a role-less message_end is not audited (fail-closed)");
+
+    // Control A (review finding 1/2): an assistant that legitimately ECHOES the procedures doc ("DEFINITION
+    // OF DONE") while making an UNSUPPORTED completion claim must STILL warn — the sentinel matches only the
+    // AIPI header at the start, never body phrases. Fresh turn: the warning dedupes once per turn.
+    await auditHandlers.before_agent_start({ type: "before_agent_start", prompt: "p2b control-A turn" }, auditCtx);
+    let cb = warnings().length;
+    await msgEndRaw({
+      role: "assistant",
+      content: "Seguindo a DEFINITION OF DONE em .aipi/memory/project/procedures.md, corrigi o save e está resolvido.",
+    });
+    assert.equal(warnings().length, cb + 1, "P2b: a real claim that echoes the procedures doc still warns (header-only sentinel)");
+
+    // Control B: a genuine assistant completion claim in ARRAY content (with a tool_use block) STILL warns —
+    // the role/block gating must not break the anti-self-deception warning. Fresh turn for the dedupe.
+    await auditHandlers.before_agent_start({ type: "before_agent_start", prompt: "p2b control-B turn" }, auditCtx);
+    cb = warnings().length;
+    await msgEndRaw({
+      role: "assistant",
+      content: [
+        { type: "text", text: "Corrigi o save e está resolvido." },
+        { type: "tool_use", name: "noop", input: {} },
+      ],
+    });
+    assert.equal(warnings().length, cb + 1, "P2b: a genuine assistant text claim still warns (tool_use block ignored)");
   }
 
   // Stall heartbeat — make a silent/hung turn VISIBLE (a model send can hang before it's even dispatched, so
