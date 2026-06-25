@@ -546,6 +546,19 @@ async function executeFanoutSubagentStep({
   // source string the workers control.
   const aggregateShellLess = collected.length > 0 && collected.every((item) => item.step_result?.aipi_shell_less === true);
 
+  // Per-worker model provenance, folded up from each worker's coordinator-stamped step_result. A review
+  // fanout discards the per-worker step_result (it cherry-picks fields), so without this the cross-family
+  // signal — e.g. reviewers on openai-codex/gpt-5.5 while the implementer ran on anthropic/... — never
+  // reaches the review RESULT.json. `models` is self-describing (carries its own agent_id), so it stays
+  // correct regardless of ordering; `model_cross_family` is the at-a-glance "a reviewer ran off-family" flag.
+  const aggregateModels = collected.map((item) => ({
+    agent_id: item.agent_id,
+    model_resolved: item.step_result?.model_resolved ?? null,
+    model_family: item.step_result?.model_family ?? null,
+    model_cross_family: item.step_result?.model_cross_family === true,
+  }));
+  const aggregateModelCrossFamily = aggregateModels.some((entry) => entry.model_cross_family);
+
   const nonPass = collected.find((item) => item.step_result?.verdict !== "PASS");
   if (nonPass) {
     return {
@@ -556,6 +569,8 @@ async function executeFanoutSubagentStep({
       evidence: collected.flatMap((item) => item.step_result?.evidence ?? []),
       artifacts: collected.flatMap((item) => item.step_result?.artifacts ?? item.artifacts ?? []),
       aipi_shell_less: aggregateShellLess,
+      models: aggregateModels,
+      model_cross_family: aggregateModelCrossFamily,
     };
   }
 
@@ -565,6 +580,8 @@ async function executeFanoutSubagentStep({
     agent_ids: collected.map((item) => item.agent_id),
     verdict: "PASS",
     aipi_shell_less: aggregateShellLess,
+    models: aggregateModels,
+    model_cross_family: aggregateModelCrossFamily,
     evidence: [
       {
         rung: "written",

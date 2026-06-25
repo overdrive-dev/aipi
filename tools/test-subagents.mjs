@@ -1024,6 +1024,112 @@ try {
   await fs.rm(piSubagentsSpikeRoot, { recursive: true, force: true });
 }
 
+// ── Cross-family model visibility ───────────────────────────────────────────
+// A worker that resolves to a DIFFERENT model family than the host (e.g. an
+// adversarial reviewer on openai-codex/gpt-5.5 while the host implements on
+// anthropic/claude-opus-4-8) must surface that — live (pi.log), durably
+// (worker_model_divergent trace), on status(), and stamped on the step result.
+// A same-family worker must surface NOTHING (no false positives).
+const xfRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-subagents-xfamily-"));
+const xfEntries = [];
+const xfLogs = [];
+const xfCoordinator = new SubagentCoordinator(
+  {
+    appendEntry(name, value) {
+      xfEntries.push({ name, value });
+    },
+    log(line) {
+      xfLogs.push(line);
+    },
+  },
+  {
+    root: xfRoot,
+    maxConcurrent: 2,
+    env: {},
+    hostModel: { provider: "anthropic", id: "claude-opus-4-8" },
+    knownModelClasses: ["adversarial-heavy", "code-strong"],
+    piSubagentsRunner: {
+      async spawn(params) {
+        const agentId = params.task.match(/AIPI worker id: ([^\n]+)/)?.[1] ?? "unknown";
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ ...stepResult, verdict: "FAIL", step_id: "review", agent_ids: [agentId] }),
+            },
+          ],
+          tool_call_count: 1,
+        };
+      },
+    },
+  },
+);
+
+const { agent_id: xfAgent } = xfCoordinator.spawn({
+  agent_id: "code-reviewer",
+  model_class: "adversarial-heavy",
+  model: { provider: "openai-codex", id: "gpt-5.5" },
+  step_id: "review",
+  context_packet: "BDD: cross-family adversarial review.",
+  owned_files: ["src/xf-review.js"],
+});
+// Live signal fires synchronously at spawn time (before the worker runs).
+assert.equal(
+  xfLogs.some((line) => /cross-family model: running on openai-codex\/gpt-5\.5 \(openai-codex\)/.test(line)),
+  true,
+  "cross-family spawn must emit a live pi.log line",
+);
+// Durable lifecycle trace.
+const xfDivergence = xfEntries.find(
+  (entry) => entry.name === SUBAGENT_EVENT_ENTRY && entry.value.event === "worker_model_divergent",
+);
+assert.ok(xfDivergence, "cross-family spawn must emit a worker_model_divergent trace");
+assert.equal(xfDivergence.value.worker_family, "openai-codex");
+assert.equal(xfDivergence.value.host_family, "anthropic");
+assert.equal(xfDivergence.value.model_resolved, "openai-codex/gpt-5.5");
+assert.equal(xfDivergence.value.host_model, "anthropic/claude-opus-4-8");
+// status() exposes the cross-family flag while the worker is still in flight.
+const xfStatus = xfCoordinator.status(xfAgent);
+assert.equal(xfStatus.model_cross_family, true);
+assert.equal(xfStatus.model_family, "openai-codex");
+assert.equal(xfStatus.model_host, "anthropic/claude-opus-4-8");
+// The provenance is stamped on the collected step result.
+await waitFor(() => xfCoordinator.status(xfAgent).state === "done");
+const xfCollect = xfCoordinator.collect(xfAgent);
+assert.equal(xfCollect.ready, true);
+assert.equal(xfCollect.step_result.model_resolved, "openai-codex/gpt-5.5");
+assert.equal(xfCollect.step_result.model_host, "anthropic/claude-opus-4-8");
+assert.equal(xfCollect.step_result.model_family, "openai-codex");
+assert.equal(xfCollect.step_result.model_cross_family, true);
+
+// Same-family worker: no divergence signal, no false positive.
+const { agent_id: sfAgent } = xfCoordinator.spawn({
+  agent_id: "implementer",
+  model_class: "code-strong",
+  model: { provider: "anthropic", id: "claude-opus-4-8" },
+  step_id: "review",
+  context_packet: "BDD: same-family implementation.",
+  owned_files: ["src/sf-impl.js"],
+});
+assert.equal(
+  xfEntries.some(
+    (entry) =>
+      entry.name === SUBAGENT_EVENT_ENTRY &&
+      entry.value.event === "worker_model_divergent" &&
+      String(entry.value.agent_id).startsWith("implementer"),
+  ),
+  false,
+  "same-family spawn must NOT emit a divergence trace",
+);
+const sfStatus = xfCoordinator.status(sfAgent);
+assert.equal(sfStatus.model_cross_family, false);
+assert.equal(sfStatus.model_family, "anthropic");
+await waitFor(() => xfCoordinator.status(sfAgent).state === "done");
+const sfCollect = xfCoordinator.collect(sfAgent);
+assert.equal(sfCollect.step_result.model_cross_family, false);
+assert.equal(sfCollect.step_result.model_family, "anthropic");
+await fs.rm(xfRoot, { recursive: true, force: true });
+
 console.log("AIPI_SUBAGENTS_TEST_OK");
 
 function latestPiState(entries) {

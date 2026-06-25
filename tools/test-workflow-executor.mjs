@@ -672,6 +672,67 @@ try {
     );
   }
 
+  // Cross-model visibility (aggregate fold): a review fanout DISCARDS each worker's step_result, so the
+  // aggregate must fold the per-worker model provenance up into `models[]` + a top-level `model_cross_family`
+  // flag — otherwise a reviewer running off-family (e.g. openai-codex/gpt-5.5 while the host implements on
+  // anthropic) is invisible in the review RESULT.json. Drive the REAL executeStep with a host model and a
+  // mixed-family resolver to prove the fold flips the flag and labels each agent.
+  const xfReviewRun = await startWorkflowRun({
+    projectRoot: tempRoot,
+    workflow: "bugfix",
+    now: () => fixedDate,
+    randomBytes: fixedRandom,
+  });
+  const xfReviewCoordinator = new SubagentCoordinator(
+    { appendEntry() {} },
+    {
+      root: tempRoot,
+      maxConcurrent: 4,
+      hostModel: { provider: "anthropic", id: "claude-opus-4-8" },
+      knownModelClasses: ["adversarial-heavy", "context-fast"],
+      piSubagentsRunner: fakeWorkflowRunner({ calls: [], rawWrites: [], root: tempRoot }),
+    },
+  );
+  const xfReviewAdapter = createSubagentWorkflowAdapter(xfReviewCoordinator, {
+    pollIntervalMs: 1,
+    collectTimeoutMs: 1_000,
+    // code-reviewer + security-auditor review OFF-family (openai-codex); the rest stay on the host family.
+    modelResolver: async ({ step }) => {
+      const offFamily = step.agents[0] === "code-reviewer" || step.agents[0] === "security-auditor";
+      return {
+        model_class: offFamily ? "adversarial-heavy" : "context-fast",
+        model: offFamily
+          ? { provider: "openai-codex", id: "gpt-5.5" }
+          : { provider: "anthropic", id: "claude-opus-4-8" },
+        thinking_level: "medium",
+        source: "test",
+      };
+    },
+  });
+  const xfReviewResult = await xfReviewAdapter.executeStep({
+    root: tempRoot,
+    state: xfReviewRun.state,
+    workflow: bugfixWorkflow,
+    step: bugfixReviewStep,
+    context: {},
+    contract: {},
+  });
+  assert.ok(Array.isArray(xfReviewResult.models), "review aggregate must carry a per-agent models[] array");
+  assert.equal(xfReviewResult.models.length, bugfixReviewStep.agents.length);
+  assert.equal(xfReviewResult.model_cross_family, true, "an off-family reviewer must flip the aggregate flag");
+  const offFamilyModels = xfReviewResult.models.filter((entry) => entry.model_cross_family);
+  assert.equal(offFamilyModels.length >= 1, true, "at least one reviewer ran off-family");
+  assert.equal(
+    offFamilyModels.every((entry) => entry.model_family === "openai-codex" && entry.model_resolved === "openai-codex/gpt-5.5"),
+    true,
+    "off-family entries must be labeled with the worker's resolved provider/model",
+  );
+  assert.equal(
+    xfReviewResult.models.some((entry) => !entry.model_cross_family && entry.model_family === "anthropic"),
+    true,
+    "same-family reviewers must NOT be flagged cross-family",
+  );
+
   // bug-param (real-path): a task passed via params.bug must be RENDERED into the worker's prompt so
   // triage has a real defect to triage — the literal "{{ bug }}" placeholder must be gone. Previously
   // params were never plumbed/rendered, so triage blocked on the unrendered "{{ bug }}".

@@ -26,6 +26,7 @@ import {
   PI_SUBAGENTS_ISOLATION,
   assertAipiHostScopedModel,
   extractToolText,
+  modelProvider,
   normalizePiSubagentsBackend,
   normalizePiSubagentsRunner,
 } from "./pi-subagents.js";
@@ -167,6 +168,7 @@ export class SubagentCoordinator {
       this.#registry.grantProjectScope(agentId);
     }
     if (modelResolution.warning) this.#emitModelWarning(agentId, modelResolution.warning);
+    this.#emitModelDivergence(agentId, modelResolution);
     const budget = normalizeBudget(descriptor.budget);
     this.#jobs.set(agentId, {
       agentId,
@@ -211,6 +213,9 @@ export class SubagentCoordinator {
       model_resolved: model?.resolved ?? null,
       model_fallback: model?.fallback ?? false,
       model_source: model?.source ?? null,
+      model_host: model ? this.#modelFamilies(model).host : null,
+      model_family: model ? this.#modelFamilies(model).workerFamily : null,
+      model_cross_family: model ? this.#modelFamilies(model).crossFamily : false,
       model_warning: model?.warning ?? null,
       budget_timeout_ms: job.budgetTimeoutMs,
       budget_max_tool_calls: job.budget?.maxToolCalls ?? null,
@@ -447,9 +452,13 @@ export class SubagentCoordinator {
     }
     const model = job.modelResolution;
     if (model) {
+      const families = this.#modelFamilies(model);
       stepResult.model_requested = model.requested ?? null;
       stepResult.model_resolved = model.resolved ?? null;
       stepResult.model_fallback = model.fallback ?? false;
+      if (families.host) stepResult.model_host = families.host;
+      if (families.workerFamily) stepResult.model_family = families.workerFamily;
+      stepResult.model_cross_family = families.crossFamily;
       if (model.warning) stepResult.model_warning = model.warning.message;
     }
     job.lastSummary = stepResult?.verdict ?? null;
@@ -464,6 +473,43 @@ export class SubagentCoordinator {
     } catch {
       /* logging is best-effort */
     }
+  }
+
+  // Derive the worker vs host model families from the spawn decision. "Cross-family" is true
+  // ONLY when both providers are known and differ — a null/unknown provider, or a host-fallback
+  // where the worker runs ON the host model (resolved == host_model), is NOT a divergence.
+  #modelFamilies(modelResolution) {
+    const worker = modelResolution?.resolved ?? null;
+    const host = modelResolution?.host_model ?? null;
+    const workerFamily = modelProvider(worker);
+    const hostFamily = modelProvider(host);
+    const crossFamily = Boolean(workerFamily && hostFamily && workerFamily !== hostFamily);
+    return { worker, host, workerFamily, hostFamily, crossFamily };
+  }
+
+  // Surface — live AND durably — when a worker resolves to a DIFFERENT model family than the host
+  // (e.g. an adversarial reviewer on openai-codex/gpt-5.5 while the host implements on anthropic/...).
+  // This is independent of #emitModelWarning: a cleanly-resolved cross-family worker carries NO
+  // warning, so without this the cross-provider run is invisible in the host-level logs.
+  #emitModelDivergence(agentId, modelResolution) {
+    const families = this.#modelFamilies(modelResolution);
+    if (!families.crossFamily) return;
+    const line =
+      `[aipi:${agentId}] cross-family model: running on ${families.worker} (${families.workerFamily}) ` +
+      `— host is ${families.host} (${families.hostFamily})`;
+    try {
+      this.#pi?.log?.(line);
+    } catch {
+      /* logging is best-effort */
+    }
+    this.#trace("worker_model_divergent", null, {
+      agent_id: agentId,
+      model_class: modelResolution?.requested ?? null,
+      model_resolved: families.worker,
+      host_model: families.host,
+      worker_family: families.workerFamily,
+      host_family: families.hostFamily,
+    });
   }
 
   #requireJob(agentId) {
@@ -549,6 +595,7 @@ export class SubagentCoordinator {
               resolved: j.modelResolution.resolved ?? null,
               fallback: j.modelResolution.fallback ?? false,
               source: j.modelResolution.source ?? null,
+              host_model: j.modelResolution.host_model ?? null,
             }
           : null,
       })),

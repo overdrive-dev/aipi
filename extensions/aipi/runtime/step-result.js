@@ -9,6 +9,10 @@ const defaultContract = {
       "model_resolved",
       "model_fallback",
       "model_warning",
+      "model_host",
+      "model_family",
+      "model_cross_family",
+      "models",
       "blocker_question",
       "awaiting_user_input",
       "aipi_shell_less",
@@ -411,6 +415,23 @@ function validateModelProvenance(result, errors) {
   }
   if ("model_fallback" in result && typeof result.model_fallback !== "boolean") {
     errors.push("model_fallback must be a boolean when present");
+  }
+  if ("model_host" in result && result.model_host != null && typeof result.model_host !== "string") {
+    errors.push("model_host must be a string or null when present");
+  }
+  if ("model_family" in result && result.model_family != null && typeof result.model_family !== "string") {
+    errors.push("model_family must be a string or null when present");
+  }
+  if ("model_cross_family" in result && typeof result.model_cross_family !== "boolean") {
+    errors.push("model_cross_family must be a boolean when present");
+  }
+  // Aggregate (review-fanout) provenance: one entry per worker, each self-describing.
+  if ("models" in result && result.models != null) {
+    if (!Array.isArray(result.models)) {
+      errors.push("models must be an array when present");
+    } else if (!result.models.every((entry) => entry && typeof entry === "object" && !Array.isArray(entry))) {
+      errors.push("models entries must be objects when present");
+    }
   }
 }
 
