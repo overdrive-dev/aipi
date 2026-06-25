@@ -1,7 +1,7 @@
 import { executeWorkflowRun } from "./workflow-executor.js";
 import { recordWorkflowUserInput, startWorkflowRun } from "./run-state.js";
-import { planPolicyGate } from "./plan-policy.js";
-import { readActivePlan, readPlan, setTaskStatus, unsettledReasons } from "./plan-state.js";
+import { assertPlanExecutable, planPolicyGate } from "./plan-policy.js";
+import { readActivePlan, readPlan, setTaskStatus } from "./plan-state.js";
 
 // The multi-run executor. It drives ONE workflow run per plan task, in plan order, AFTER the plan is
 // settled (all questions answered in pre-flight). Per task it: checks the plan policy gate (rules +
@@ -27,10 +27,9 @@ export async function executePlanRun({
   const loaded = planId ? await readPlan(projectRoot, planId) : await readActivePlan(projectRoot, { includeTerminal: true });
   const plan = loaded?.plan;
   if (!plan) throw new Error("No AIPI plan to execute; create and settle one first");
-  if (plan.status !== "settled" && plan.status !== "executing") {
-    const reasons = unsettledReasons(plan);
-    throw new Error(`plan ${plan.plan_id} is not settled (status=${plan.status})${reasons.length ? `: ${reasons.join("; ")}` : ""}`);
-  }
+  // before_plan_execution gate: the plan must be settled, every question answered, and a runnable task
+  // present. This is where answers stop being context and become a hard precondition (throws PlanPolicyError).
+  assertPlanExecutable(plan);
 
   const results = [];
   let halted = false;

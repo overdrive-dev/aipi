@@ -88,6 +88,8 @@ export async function createPlan({
       params: task.params,
       kanban_task: task.kanban_task,
       depends_on: task.depends_on,
+      requires_rules: task.requires_rules,
+      requires_answers: task.requires_answers,
       status: "pending",
       run_id: null,
       notes: null,
@@ -322,12 +324,16 @@ function normalizeTaskInputs(tasks, classify) {
         ...(param ? { [param]: text } : {}),
       };
       const dependsOn = typeof raw === "object" && Array.isArray(raw?.depends_on) ? raw.depends_on : [];
+      const requiresRules = typeof raw === "object" && Array.isArray(raw?.requires_rules) ? raw.requires_rules : [];
+      const requiresAnswers = typeof raw === "object" && Array.isArray(raw?.requires_answers) ? raw.requires_answers : [];
       return {
         text,
         workflow: classified.workflow,
         params,
         kanban_task: kanbanTaskLabel(text),
         depends_on: dependsOn,
+        requires_rules: requiresRules,
+        requires_answers: requiresAnswers,
       };
     })
     .filter(Boolean);

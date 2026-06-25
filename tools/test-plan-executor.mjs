@@ -120,7 +120,7 @@ try {
   const { planId: p3 } = await createPlan({ projectRoot: tempRoot, tasks: ["algo qualquer"], now, randomBytes: fixedRandom });
   await assert.rejects(
     () => executePlanRun({ projectRoot: tempRoot, planId: p3, now, startRun: fakeStart, executeRun: fakeExec, recordUserInput: fakeRecord }),
-    /not settled/,
+    /not executable|must be settled/,
   );
 
   // --- Resume: a task already passed is not re-run. ---
