@@ -3,7 +3,8 @@ import path from "node:path";
 import { awaitingUserInputFromStepResult } from "./blocker-input.js";
 import { buildStepContext, ContextMaterializationError } from "./context-builder.js";
 import { aipiPromoteMemory } from "./aipi-tools.js";
-import { resolveStepModel } from "./model-router.js";
+import { describeModel, resolveStepModel } from "./model-router.js";
+import { recordWorkerModelRoute } from "./lifecycle-hooks.js";
 import { validateStepResult } from "./step-result.js";
 
 const terminalActions = new Set([
@@ -522,7 +523,11 @@ async function executeFanoutSubagentStep({
         2,
       ),
     };
-    spawned.push({ catalogAgentId: agent, ...dispatchSubagent(coordinator, descriptor) });
+    const dispatched = dispatchSubagent(coordinator, descriptor);
+    spawned.push({ catalogAgentId: agent, ...dispatched });
+    // Log the unique dispatched id (base:uuid), not the catalog base name, so a routing record can be
+    // correlated back to its worker session jsonl.
+    await recordWorkerRoute({ root, state, step, agentId: dispatched.agent_id ?? agent, descriptor, modelResolution, coordinator });
   }
 
   const collected = [];
@@ -652,6 +657,7 @@ async function executeSubagentStep({
   // file — the worker must freshly write its artifacts this run to earn evidence (SE-3).
   await clearExpectedArtifacts({ root, paths: expectedArtifacts });
   const { agent_id: agentId } = dispatchSubagent(coordinator, descriptor);
+  await recordWorkerRoute({ root, state, step, agentId: agentId ?? descriptor.agent_id, descriptor, modelResolution, coordinator });
   const collect = await collectSubagentResult(coordinator, agentId, {
     pollIntervalMs,
     collectTimeoutMs,
@@ -745,6 +751,26 @@ export async function promoteControllerUpdates({ root, plan }) {
     } catch {
       /* a missing stage means the PASS lacked real evidence and was already downgraded upstream */
     }
+  }
+}
+
+// Surface the per-worker model resolution in model-routing.jsonl (host + run-scoped). The host model_select
+// hook only logs the orchestrator turn, so without this a worker that resolved off-family is invisible in the
+// log operators scan. Best-effort: a telemetry failure must never block or fail a spawn.
+async function recordWorkerRoute({ root, state, step, agentId, descriptor, modelResolution, coordinator }) {
+  try {
+    await recordWorkerModelRoute({
+      projectRoot: root,
+      runId: state?.run_id ?? null,
+      stepId: step?.id ?? descriptor?.step_id ?? null,
+      agentId,
+      modelClass: descriptor?.model_class ?? modelResolution?.model_class ?? null,
+      workerModel: describeModel(modelResolution?.model ?? descriptor?.model ?? null),
+      hostModel: describeModel(coordinator?.getHostModel?.() ?? null),
+      source: descriptor?.model_resolution_source ?? modelResolution?.source ?? null,
+    });
+  } catch {
+    /* routing telemetry is best-effort */
   }
 }
 

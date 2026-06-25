@@ -21,7 +21,7 @@ import {
   WORKFLOW_BLOCKED_DECISION_KIND,
 } from "./workflow-executor.js";
 import { describeModel, resolveModelClass, resolveStepModel } from "./model-router.js";
-import { aipiHostModelReadiness } from "./pi-subagents.js";
+import { aipiHostModelReadiness, modelProvider } from "./pi-subagents.js";
 
 const LIFECYCLE_LOG = ".aipi/runtime/lifecycle.jsonl";
 const TOOL_RESULT_LOG = ".aipi/runtime/tool-results.jsonl";
@@ -3746,6 +3746,57 @@ async function recordModelRoutingDecision({ projectRoot, routing }) {
   await appendRuntimeEvent(projectRoot, MODEL_ROUTING_LOG, entry);
   if (snapshot.active) {
     await appendRuntimeEvent(projectRoot, runScopedLog(snapshot.run_id, "model-routing.jsonl"), entry);
+  }
+  return entry;
+}
+
+// Per-WORKER routing record. The host `model_select` hook (recordModelRoutingDecision) only captures the
+// orchestrator turn; spawned workers resolve their model in a forked child, so without this the worker's
+// model never reaches model-routing.jsonl and a host-only scan reads "Anthropic-only" even when a reviewer
+// ran on a different provider. Mirrors the aipi.model-routing.v1 shape (existing readers stay compatible)
+// with hook "worker_spawn" and selector "worker" so it is filterable. cross_family is null when the host
+// model is unknown — distinct from false (confirmed same-family), so an off-family run is never silently
+// hidden when the host model was never captured.
+export async function recordWorkerModelRoute({
+  projectRoot,
+  runId = null,
+  stepId = null,
+  agentId = null,
+  modelClass = null,
+  workerModel = null,
+  hostModel = null,
+  source = null,
+}) {
+  const workerFamily = modelProvider(workerModel);
+  const hostFamily = modelProvider(hostModel);
+  const crossFamily = workerFamily && hostFamily ? workerFamily !== hostFamily : null;
+  const entry = {
+    schema: "aipi.model-routing.v1",
+    recorded_at: new Date().toISOString(),
+    hook: "worker_spawn",
+    status: crossFamily === true ? "worker_cross_family" : "worker_resolved",
+    run_id: runId,
+    workflow: null,
+    step_id: stepId,
+    agent_id: agentId,
+    selector: "worker",
+    model_class: modelClass,
+    model: workerModel,
+    thinking_level: null,
+    source,
+    current_model: hostModel,
+    cross_family: crossFamily,
+    worker_family: workerFamily,
+    host_family: hostFamily,
+    preferred_families: [],
+    family_warning: null,
+    capability_report: null,
+    warning: null,
+    manual_selection: null,
+  };
+  await appendRuntimeEvent(projectRoot, MODEL_ROUTING_LOG, entry);
+  if (runId) {
+    await appendRuntimeEvent(projectRoot, runScopedLog(runId, "model-routing.jsonl"), entry);
   }
   return entry;
 }

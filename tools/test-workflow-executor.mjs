@@ -732,6 +732,34 @@ try {
     true,
     "same-family reviewers must NOT be flagged cross-family",
   );
+  // The per-worker route must also land in the run-scoped model-routing.jsonl — the host-only log that
+  // previously read "Anthropic-only" and produced the false-negative. Every fanout worker logs one record;
+  // off-family workers are flagged cross_family with their real provider/model.
+  const xfRouteLogPath = path.join(tempRoot, ".aipi", "runtime", "runs", xfReviewRun.runId, "model-routing.jsonl");
+  const xfWorkerRoutes = (await fs.readFile(xfRouteLogPath, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line))
+    .filter((record) => record.hook === "worker_spawn");
+  assert.equal(
+    xfWorkerRoutes.length,
+    bugfixReviewStep.agents.length,
+    "every fanout worker must write a worker_spawn model-routing record",
+  );
+  const offFamilyRoutes = xfWorkerRoutes.filter((record) => record.cross_family === true);
+  assert.equal(offFamilyRoutes.length >= 1, true, "off-family workers must be logged with cross_family: true");
+  assert.equal(
+    offFamilyRoutes.every(
+      (record) => record.model === "openai-codex/gpt-5.5" && record.current_model === "anthropic/claude-opus-4-8",
+    ),
+    true,
+    "a cross-family route must record the worker model and the host model it diverged from",
+  );
+  assert.equal(
+    xfWorkerRoutes.some((record) => record.cross_family === false && record.model === "anthropic/claude-opus-4-8"),
+    true,
+    "same-family workers must be logged with cross_family: false",
+  );
 
   // bug-param (real-path): a task passed via params.bug must be RENDERED into the worker's prompt so
   // triage has a real defect to triage — the literal "{{ bug }}" placeholder must be gone. Previously
