@@ -31,62 +31,77 @@ export async function executePlanRun({
   // present. This is where answers stop being context and become a hard precondition (throws PlanPolicyError).
   assertPlanExecutable(plan);
 
+  const planId_ = plan.plan_id;
+  const taskOrder = plan.tasks.map((task) => task.task_id);
   const results = [];
   let halted = false;
-  for (const task of plan.tasks) {
+  for (const taskId of taskOrder) {
+    // RE-READ the plan fresh before gating/acting on each task. setTaskStatus persists to disk, so the
+    // initial snapshot goes stale within this loop — without the re-read a depends_on chain would see the
+    // prior task as still "pending", and a concurrent external edit to PLAN.json would slip past the gate.
+    const fresh = (await readPlan(projectRoot, planId_)).plan;
+    const task = fresh.tasks.find((entry) => entry.task_id === taskId);
+    if (!task) continue;
+
     // Resume support: a task already finished in a prior execution is not re-run.
     if (["passed", "skipped"].includes(task.status)) {
-      results.push({ task_id: task.task_id, status: task.status, resumed: true });
+      results.push({ task_id: taskId, status: task.status, resumed: true });
       continue;
     }
 
-    // Policy gate (rules + answers + dependencies) BEFORE acting. A violation blocks the task and halts the
-    // plan — answers/rules are a hard precondition, not advisory context.
-    const verdict = gate({ plan, task });
+    // Policy gate (rules + answers + dependencies) BEFORE acting, on FRESH state. A violation blocks the
+    // task and halts the plan — answers/rules are a hard precondition, not advisory context.
+    const verdict = gate({ plan: fresh, task });
     if (!verdict.ok) {
-      await setStatus({ projectRoot, planId: plan.plan_id, taskId: task.task_id, status: "blocked", notes: verdict.reason, now });
-      results.push({ task_id: task.task_id, status: "blocked", reason: verdict.reason });
+      await setStatus({ projectRoot, planId: planId_, taskId, status: "blocked", notes: verdict.reason, now });
+      results.push({ task_id: taskId, status: "blocked", reason: verdict.reason });
       halted = true;
       break;
     }
 
-    await setStatus({ projectRoot, planId: plan.plan_id, taskId: task.task_id, status: "running", now });
-
-    const started = await startRun({
-      projectRoot,
-      workflow: task.workflow,
-      params: task.params,
-      planId: plan.plan_id,
-      taskId: task.task_id,
-      now,
-    });
-
-    // Seed the run with the answers collected in pre-flight, so the run's steps consume them through the
-    // existing user-input context path (no mid-run re-asking of what the plan already settled).
-    for (const question of plan.questions) {
-      if (!isAnswered(question)) continue;
-      if (question.task_id && question.task_id !== task.task_id) continue;
-      await recordUserInput({
+    // Crash recovery: a task left "running" with a run_id (the executor died mid-task) RESUMES that run
+    // rather than orphaning it and starting a fresh one. A fresh task starts a new run + seeds answers.
+    let runId;
+    if (task.status === "running" && task.run_id) {
+      runId = task.run_id;
+    } else {
+      await setStatus({ projectRoot, planId: planId_, taskId, status: "running", now });
+      const started = await startRun({
         projectRoot,
-        runId: started.runId,
-        text: `Q: ${question.question}\nA: ${question.answer}`,
-        source: "plan_preflight",
+        workflow: task.workflow,
+        params: task.params,
+        planId: planId_,
+        taskId,
         now,
       });
+      runId = started.runId;
+      // Seed the run with the answers collected in pre-flight, so the run's steps consume them through the
+      // existing user-input context path (no mid-run re-asking of what the plan already settled).
+      for (const question of fresh.questions) {
+        if (!isAnswered(question)) continue;
+        if (question.task_id && question.task_id !== taskId) continue;
+        await recordUserInput({
+          projectRoot,
+          runId,
+          text: `Q: ${question.question}\nA: ${question.answer}`,
+          source: "plan_preflight",
+          now,
+        });
+      }
     }
 
-    const execution = await executeRun({ projectRoot, runId: started.runId, adapter, notify });
+    const execution = await executeRun({ projectRoot, runId, adapter, notify });
     const taskStatus = mapRunStatusToTask(execution?.status);
     await setStatus({
       projectRoot,
-      planId: plan.plan_id,
-      taskId: task.task_id,
+      planId: planId_,
+      taskId,
       status: taskStatus,
-      runId: started.runId,
+      runId,
       notes: `run ${execution?.status ?? "unknown"}`,
       now,
     });
-    results.push({ task_id: task.task_id, run_id: started.runId, run_status: execution?.status ?? null, status: taskStatus });
+    results.push({ task_id: taskId, run_id: runId, run_status: execution?.status ?? null, status: taskStatus });
 
     if (taskStatus !== "passed" && taskStatus !== "skipped") {
       halted = true;
@@ -94,8 +109,8 @@ export async function executePlanRun({
     }
   }
 
-  const finalPlan = (await readPlan(projectRoot, plan.plan_id)).plan;
-  return { planId: plan.plan_id, status: finalPlan.status, halted, tasks: results, plan: finalPlan };
+  const finalPlan = (await readPlan(projectRoot, planId_)).plan;
+  return { planId: planId_, status: finalPlan.status, halted, tasks: results, plan: finalPlan };
 }
 
 // Map a run's terminal status onto a plan task status.

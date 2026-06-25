@@ -139,6 +139,21 @@ try {
   const cleared = await clearActivePlan(tempRoot);
   assert.equal(cleared.cleared, true);
 
+  // Review MEDIUM: a blocked task that later passes clears the stale "blocked" (status is state-derived).
+  const { plan: planR } = await createPlan({ projectRoot: tempRoot, tasks: ["corrigir P", "deploy Q"], now, randomBytes: fixedRandom });
+  await setTaskStatus({ projectRoot: tempRoot, planId: planR.plan_id, taskId: "t1", status: "blocked", now });
+  assert.equal((await readPlan(tempRoot, planR.plan_id)).plan.status, "blocked");
+  await setTaskStatus({ projectRoot: tempRoot, planId: planR.plan_id, taskId: "t1", status: "passed", now });
+  assert.equal((await readPlan(tempRoot, planR.plan_id)).plan.status, "executing", "a recovered task clears the stale blocked status");
+
+  // Review MEDIUM: questions/answers are discovery-phase only — a settled plan rejects mutation.
+  const { plan: planG } = await createPlan({ projectRoot: tempRoot, tasks: ["corrigir Z"], now, randomBytes: fixedRandom });
+  await addPlanQuestions({ projectRoot: tempRoot, planId: planG.plan_id, questions: [{ question: "q?" }], now });
+  await recordPlanAnswer({ projectRoot: tempRoot, planId: planG.plan_id, questionId: "q1", answer: "a", now });
+  await settlePlan({ projectRoot: tempRoot, planId: planG.plan_id, now });
+  await assert.rejects(() => addPlanQuestions({ projectRoot: tempRoot, planId: planG.plan_id, questions: [{ question: "q2?" }], now }), /discovery-phase only/);
+  await assert.rejects(() => recordPlanAnswer({ projectRoot: tempRoot, planId: planG.plan_id, questionId: "q1", answer: "b", now }), /discovery-phase only/);
+
   console.log("AIPI_PLAN_STATE_TEST_OK");
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });

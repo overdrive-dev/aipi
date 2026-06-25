@@ -152,6 +152,11 @@ export async function readPlan(projectRoot, planId) {
 
 export async function addPlanQuestions({ projectRoot, planId = null, questions = [], now = () => new Date() } = {}) {
   const { root, plan } = await loadPlanForMutation(projectRoot, planId);
+  // Questions are a DISCOVERY-phase artifact. Adding one after settle would silently un-settle the plan
+  // (settle requires every question answered), so the phase boundary is enforced here.
+  if (plan.status !== "discovery") {
+    throw new Error(`addPlanQuestions is discovery-phase only; plan ${plan.plan_id} status is ${plan.status}`);
+  }
   const createdAt = now().toISOString();
   const existing = plan.questions.length;
   const added = [];
@@ -183,6 +188,11 @@ export async function addPlanQuestions({ projectRoot, planId = null, questions =
 export async function recordPlanAnswer({ projectRoot, planId = null, questionId, answer, now = () => new Date() } = {}) {
   if (!questionId) throw new Error("recordPlanAnswer requires questionId");
   const { root, plan } = await loadPlanForMutation(projectRoot, planId);
+  // Answers are collected in DISCOVERY; once settled the definition is closed (changing an answer would
+  // mutate a settled spec the executor already trusts). Re-opening requires an explicit new discovery.
+  if (plan.status !== "discovery") {
+    throw new Error(`recordPlanAnswer is discovery-phase only; plan ${plan.plan_id} status is ${plan.status}`);
+  }
   const question = plan.questions.find((entry) => entry.question_id === questionId);
   if (!question) throw new Error(`recordPlanAnswer: unknown question_id ${questionId}`);
   question.answer = String(answer ?? "");
@@ -344,13 +354,18 @@ function kanbanTaskLabel(text) {
   return oneLine.length <= 80 ? oneLine : `${oneLine.slice(0, 77)}...`;
 }
 
+// Derive plan status PURELY from task states so a recovered task clears a stale "blocked" (a task that
+// went blocked -> running -> passed must not leave the plan stuck at "blocked").
 function rollupPlanStatus(plan) {
   if (isTerminalPlanStatus(plan.status)) return plan.status;
   const tasks = plan.tasks ?? [];
+  if (!tasks.length) return plan.status;
   if (tasks.some((task) => task.status === "blocked" || task.status === "failed")) return "blocked";
-  if (tasks.length && tasks.every((task) => task.status === "passed" || task.status === "skipped")) return "completed";
-  if (tasks.some((task) => task.status === "running")) return "executing";
-  return plan.status === "settled" ? "settled" : plan.status;
+  if (tasks.every((task) => task.status === "passed" || task.status === "skipped")) return "completed";
+  // Some task has started (running, or already passed/skipped with others pending) -> in flight.
+  if (tasks.some((task) => ["running", "passed", "skipped"].includes(task.status))) return "executing";
+  // All tasks still pending: ready to run (covers recovery from a prior "blocked").
+  return plan.status === "discovery" ? "discovery" : "settled";
 }
 
 async function loadPlanForMutation(projectRoot, planId) {

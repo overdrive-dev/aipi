@@ -141,6 +141,46 @@ try {
   assert.equal(startCalls4.length, 1, "only the unfinished task is started on resume");
   assert.equal(startCalls4[0].taskId, "t2");
 
+  // --- Review HIGH: intra-run dependency chain. t2 depends_on t1; both must pass in ONE execute (the
+  //     gate for t2 must see t1 as passed via the per-iteration re-read, not the stale initial snapshot). ---
+  const { planId: pdep } = await createPlan({
+    projectRoot: tempRoot,
+    tasks: ["preparar a base", { text: "fazer o deploy", depends_on: ["t1"] }],
+    now,
+    randomBytes: fixedRandom,
+  });
+  await settlePlan({ projectRoot: tempRoot, planId: pdep, now });
+  const depCalls = [];
+  const resDep = await executePlanRun({
+    projectRoot: tempRoot,
+    planId: pdep,
+    now,
+    startRun: async (opts) => { depCalls.push(opts.taskId); return { runId: `rd-${opts.taskId}` }; },
+    executeRun: async () => ({ status: "completed" }),
+    recordUserInput: async () => {},
+  });
+  assert.deepEqual(resDep.tasks.map((t) => t.status), ["passed", "passed"], "dependent task is NOT blocked by a stale snapshot");
+  assert.deepEqual(depCalls, ["t1", "t2"]);
+
+  // --- Review MEDIUM: crash recovery. A task left "running" with a run_id resumes that run instead of
+  //     orphaning it and starting a new one. ---
+  const { planId: pcrash } = await createPlan({ projectRoot: tempRoot, tasks: ["tarefa que crashou"], now, randomBytes: fixedRandom });
+  await settlePlan({ projectRoot: tempRoot, planId: pcrash, now });
+  await setTaskStatus({ projectRoot: tempRoot, planId: pcrash, taskId: "t1", status: "running", runId: "crashed-run-1", now });
+  let startedCrash = 0;
+  let resumedRunId = null;
+  const resCrash = await executePlanRun({
+    projectRoot: tempRoot,
+    planId: pcrash,
+    now,
+    startRun: async () => { startedCrash += 1; return { runId: "new-run" }; },
+    executeRun: async (opts) => { resumedRunId = opts.runId; return { status: "completed" }; },
+    recordUserInput: async () => {},
+  });
+  assert.equal(startedCrash, 0, "a stuck running task resumes its run; no new run is started");
+  assert.equal(resumedRunId, "crashed-run-1");
+  assert.equal(resCrash.tasks[0].status, "passed");
+
   console.log("AIPI_PLAN_EXECUTOR_TEST_OK");
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });
