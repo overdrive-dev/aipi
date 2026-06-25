@@ -90,8 +90,20 @@ try {
   assert.equal(settled.settled, true);
   assert.equal(settled.plan.status, "settled");
 
-  // execute without a wired executor (slice 3 provides it) fails clearly, not silently.
-  await assert.rejects(() => runPlanCommand({ projectRoot: tempRoot, args: "execute", now }), /not available/);
+  // execute dispatches to the injected plan executor with the active plan.
+  let executorCalledWith = null;
+  const exec = await runPlanCommand({
+    projectRoot: tempRoot,
+    args: "execute",
+    now,
+    planExecutor: async (opts) => {
+      executorCalledWith = opts;
+      return { status: "completed" };
+    },
+  });
+  assert.equal(exec.action, "execute");
+  assert.equal(exec.execution.status, "completed");
+  assert.ok(executorCalledWith.planId, "executor receives the active plan id");
 
   // status reflects the active settled plan; cancel clears it.
   const status = await runPlanCommand({ projectRoot: tempRoot, args: "status", now });

@@ -139,6 +139,8 @@ export async function startWorkflowRun({
   contractPath = null,
   dryRun = false,
   params = {},
+  planId = null,
+  taskId = null,
   now = () => new Date(),
   randomBytes = (size) => crypto.randomBytes(size),
 } = {}) {
@@ -177,6 +179,10 @@ export async function startWorkflowRun({
     source_workflow: workflowRelPath.replaceAll("\\", "/"),
     run_rel_dir: runRelDir.replaceAll("\\", "/"),
     contract_path: resolvedContractPath,
+    // When a run is dispatched as part of a multi-task plan, bind it back to its plan + task so the plan
+    // executor can map the run's outcome onto the plan task (and the kanban card). Absent for lone runs.
+    ...(planId ? { plan_id: planId } : {}),
+    ...(taskId ? { task_id: taskId } : {}),
     params: resolvedParams,
     current_step: workflowDefinition.steps[0]?.id ?? null,
     steps: workflowDefinition.steps.map((step) => ({

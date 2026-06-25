@@ -1,5 +1,6 @@
 import path from "node:path";
 import { materializeProjectMemory } from "./context-builder.js";
+import { executePlanRun } from "./plan-executor.js";
 import {
   addBusinessRules,
   closePlan,
@@ -103,7 +104,7 @@ export async function runPlanCommand({
   randomBytes = undefined,
   recordKanban = undefined,
   investigate = materializeProjectMemory,
-  planExecutor = null,
+  planExecutor = executePlanRun,
 } = {}) {
   if (!projectRoot) throw new Error("projectRoot is required");
   const command = parsePlanArgs(args);
