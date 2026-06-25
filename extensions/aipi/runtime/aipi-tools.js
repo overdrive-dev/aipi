@@ -3761,11 +3761,13 @@ async function readReusableEmbeddingCacheWithOpenMode({
   let db;
   const location = openMode === "immutable" ? sqliteImmutableUri(sqlitePath) : sqlitePath;
   try {
-    db = new sqlite.DatabaseSync(location, { readOnly: true, allowExtension: true, timeout: 1 });
-    const vecStatus = await prepareSqliteVec(db, embeddingConfig);
-    if (vecStatus.status !== "available") {
-      throw new Error(`sqlite-vec unavailable while reading embedding cache: ${vecStatus.reason ?? "unknown"}`);
-    }
+    // embedding_cache is a PLAIN BLOB table — reading it touches no vec0 virtual table, so it must NOT
+    // depend on sqlite-vec. Gating this read on prepareSqliteVec (which can throw when the extension is
+    // momentarily unavailable) made BOTH open modes fail -> readReusableEmbeddingCache returned an empty
+    // Map -> and because every rebuild drops+recreates the DB, the whole codebase was re-embedded from
+    // scratch. The decode (embeddingCacheEntryFromStored) is pure JS (Float32 BLOB -> array), no extension
+    // needed. Open read-only WITHOUT loading any extension.
+    db = new sqlite.DatabaseSync(location, { readOnly: true, timeout: 1 });
     const rows = db.prepare(`
       SELECT item_key, path, file_hash, dimensions, model, host, embedding
       FROM embedding_cache

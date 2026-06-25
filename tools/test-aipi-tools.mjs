@@ -1042,6 +1042,42 @@ try {
     }
   }
 
+  // Regression: the embedding_cache reuse read must NOT depend on sqlite-vec. embedding_cache is a plain
+  // BLOB table — gating its read on prepareSqliteVec (now removed) meant a momentary sqlite-vec outage threw
+  // in BOTH open modes -> empty reuse cache -> and because every rebuild drops+recreates the DB, the whole
+  // codebase was re-embedded FROM SCRATCH. Build a DB with ONLY embedding_cache + one sha256 row and read it
+  // with NO sqlite-vec loaded; the cached embedding must be reused.
+  const sqliteForVecFreeCache = await import("node:sqlite").catch(() => null);
+  if (sqliteForVecFreeCache) {
+    const vecFreeDir = path.join(tempRoot, "vec-free-cache");
+    await fs.mkdir(vecFreeDir, { recursive: true });
+    const vecFreePath = path.join(vecFreeDir, "aipi-graph.sqlite");
+    const vecFreeBlob = Buffer.from(new Float32Array([0.11, 0.22, 0.33, 0.44]).buffer);
+    const setupDb = new sqliteForVecFreeCache.DatabaseSync(vecFreePath);
+    try {
+      setupDb.exec(
+        "CREATE TABLE embedding_cache (item_key TEXT, path TEXT, file_hash TEXT, dimensions INTEGER, model TEXT, host TEXT, embedding BLOB)",
+      );
+      setupDb
+        .prepare(
+          "INSERT INTO embedding_cache(item_key, path, file_hash, dimensions, model, host, embedding) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run("sha256:deadbeef", "src/x.js", "h1", 4, "bge-m3", "http://127.0.0.1:11434", vecFreeBlob);
+    } finally {
+      setupDb.close();
+    }
+    const vecFreeResult = await __aipiTestInternals.readReusableEmbeddingCache({
+      sqlite: sqliteForVecFreeCache,
+      sqlitePath: vecFreePath,
+      previousGraph: null,
+      graph: { files: [] },
+      embeddingConfig: { dimensions: 4, model: "bge-m3", host: "http://127.0.0.1:11434" },
+    });
+    assert.equal(vecFreeResult.status.status, "available", "embedding_cache read succeeds without sqlite-vec loaded");
+    assert.equal(vecFreeResult.status.reused_item_count, 1, "the sha256 cache row is reused without the vec extension");
+    assert.equal(vecFreeResult.cache.has("sha256:deadbeef"), true);
+  }
+
   const oldDimGraph = JSON.parse(await fs.readFile(graphPath, "utf8"));
   const legacyVectorDimensions = 1024 - 256;
   oldDimGraph.vector = { ...(oldDimGraph.vector ?? {}), dimensions: legacyVectorDimensions, embedding_model: "legacy-embed-text" };
