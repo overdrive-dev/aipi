@@ -105,6 +105,8 @@ export async function runPlanCommand({
   recordKanban = undefined,
   investigate = materializeProjectMemory,
   planExecutor = executePlanRun,
+  adapter = undefined,
+  notify = null,
 } = {}) {
   if (!projectRoot) throw new Error("projectRoot is required");
   const command = parsePlanArgs(args);
@@ -144,7 +146,7 @@ export async function runPlanCommand({
     if (typeof planExecutor !== "function") {
       throw new Error("Plan execution is not available in this build");
     }
-    return { action: "execute", execution: await planExecutor({ projectRoot, planId: active.planId, now }) };
+    return { action: "execute", execution: await planExecutor({ projectRoot, planId: active.planId, now, adapter, notify }) };
   }
 
   throw new Error(`Unknown /aipi-plan action: ${command.action}`);

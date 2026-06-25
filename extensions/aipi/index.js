@@ -15,6 +15,10 @@ import {
   runWorkflowCommand,
 } from "./runtime/run-state.js";
 import { createSubagentWorkflowAdapter } from "./runtime/workflow-executor.js";
+import {
+  formatPlanCommandResult,
+  runPlanCommand,
+} from "./runtime/plan-command.js";
 import { resolveStepModel } from "./runtime/model-router.js";
 import { registerAipiRuntimeTools } from "./runtime/aipi-tools.js";
 import {
@@ -49,7 +53,7 @@ import {
   runProbeAPrime,
 } from "./runtime/probe-a-prime.js";
 
-export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowCommand } = {}) {
+export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowCommand, planCommandRunner = runPlanCommand } = {}) {
   const coordinator = new SubagentCoordinator(pi);
   const probeA = new ProbeAController(pi);
 
@@ -131,6 +135,30 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
         ctx.ui.notify(formatWorkflowCommandResult(result), "info");
       } catch (error) {
         ctx.ui.notify(`AIPI workflow failed: ${error.message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("aipi-plan", {
+    description: "Plan and autonomously execute a BATCH of tasks (multi-task pipeline): create | status | answer <q> <text> | settle | execute | cancel.",
+    handler: async (args, ctx) => {
+      try {
+        const projectRoot = resolveProjectRoot(ctx);
+        const adapter = createSubagentWorkflowAdapter(coordinator, {
+          modelResolver: (modelArgs) => resolveStepModel({ ...modelArgs, ctx }),
+          // Real agentic workers take minutes; match the /aipi-workflow ceiling so plan tasks are not
+          // timed out mid-step.
+          collectTimeoutMs: 20 * 60_000,
+        });
+        const result = await planCommandRunner({
+          args: args ?? "",
+          projectRoot,
+          adapter,
+          notify: makeProgressNotifier(ctx),
+        });
+        ctx.ui.notify(formatPlanCommandResult(result), "info");
+      } catch (error) {
+        ctx.ui.notify(`AIPI plan failed: ${error.message}`, "error");
       }
     },
   });

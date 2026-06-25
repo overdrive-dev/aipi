@@ -526,6 +526,30 @@ export async function handleInput({
     codePipeline,
   });
   if (hostBlock) return hostBlock;
+  // Multi-task mode (opt-in via AIPI_MULTI_TASK; default off). A CLEAR batch of tasks with no run/plan in
+  // flight is offered to the plan pre-flight surface (/aipi-plan) instead of being treated as one task.
+  // Non-destructive: it suggests, it does not hijack the turn, so single-task behavior is unchanged.
+  if (
+    aipiMultiTaskEnabled() &&
+    !isContinuableActiveRun(active) &&
+    !isAwaitingUserInput(active) &&
+    !(await hasActivePlan(projectRoot))
+  ) {
+    const batch = detectTaskBatch(event?.text ?? "");
+    if (batch.length >= 2) {
+      safeAppendEntry(pi, "aipi.input.route", {
+        schema: "aipi.input-route.v1",
+        routed_at: new Date().toISOString(),
+        input: "suggest_plan",
+        task_count: batch.length,
+        active_run_id: active?.runId ?? null,
+        result_action: "continue",
+        reason: "multi_task_batch",
+      });
+      safeNotify(ctx, formatPlanSuggestion(batch), "info");
+      return { action: "continue" };
+    }
+  }
   let route = classifyAipiInputRoute(event?.text ?? "", { activeRun: active, codePipeline, autoDispatchEnabled: aipiAutoDispatchEnabled() });
   const classifier = await applyAutoDispatchVeto({
     text: event?.text ?? "",
@@ -1803,6 +1827,44 @@ function isPoliteMutationRequest(normalized) {
 
 function routingDisabled(event, ctx) {
   return Boolean(event?.aipiDisableRouting || ctx?.aipiDisableRouting || isTruthyFlag(process.env.AIPI_DISABLE_ROUTING));
+}
+
+// Multi-task mode is opt-in (default off) so single-task flex-agent behavior is the unchanged default.
+export function aipiMultiTaskEnabled(env = process.env) {
+  return isTruthyFlag(env?.AIPI_MULTI_TASK);
+}
+
+// Detect a CLEAR multi-task batch: a list of >=2 lines that are MOSTLY explicit list items (bullets,
+// "1.", "1)"). Deliberately conservative — a single paragraph, a question, a continuation token, or a
+// 2-line prose message is NOT a batch (those keep their normal single-task handling). The explicit
+// /aipi-plan command is liberal (parsePlanTasks) for when the user wants any format.
+export function detectTaskBatch(text) {
+  const raw = String(text ?? "");
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.startsWith("/") || trimmed.startsWith("@")) return [];
+  const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (lines.length < 2) return [];
+  const markered = lines.filter((line) => /^(?:[-*•]|\d+[.)])\s+/.test(line));
+  if (markered.length >= 2 && markered.length >= Math.ceil(lines.length / 2)) {
+    return lines.map((line) => line.replace(/^(?:[-*•]|\d+[.)])\s+/, "").trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function formatPlanSuggestion(batch) {
+  const preview = batch.slice(0, 5).map((task, index) => `${index + 1}. ${task}`).join("\n");
+  return [
+    `AIPI multi-task: detected ${batch.length} tasks. Run them as ONE governed plan:`,
+    preview,
+    batch.length > 5 ? `…and ${batch.length - 5} more` : "",
+    "Use /aipi-plan (paste the list) to investigate rules once, answer the clarifying questions, then /aipi-plan settle && /aipi-plan execute.",
+  ].filter(Boolean).join("\n");
+}
+
+async function hasActivePlan(projectRoot) {
+  const activePath = path.join(path.resolve(projectRoot), ".aipi", "runtime", "plans", "active");
+  const id = await fs.readFile(activePath, "utf8").catch(() => "");
+  return Boolean(id.trim());
 }
 
 // A real agentic worker (reads the codebase, reasons, writes several artifacts) routinely takes
