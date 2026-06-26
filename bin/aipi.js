@@ -522,7 +522,11 @@ export function buildAipiUpdatePlan({
     // git is `git.exe`, a real executable, so it stays as-is.
     const npmCommand = platform === "win32" ? "npm.cmd" : "npm";
     steps.push({ label: "aipi", kind: "exec", command: "git", args: ["-C", packageRoot, "pull", "--ff-only"], note: "pull the latest AIPI" });
-    steps.push({ label: "aipi-deps", kind: "exec", command: npmCommand, args: ["install", "--prefix", packageRoot], note: "refresh AIPI dependencies without pruning dev SDKs" });
+    // `npm ci` (not `install`): a reproducible install straight from package-lock that NEVER mutates
+    // the lockfile. `npm install` can normalize lock fields (e.g. a transitive bin path), which would
+    // leave the runtime checkout dirty and make the NEXT `git pull --ff-only` get skipped — silently
+    // freezing the engine. ci keeps the checkout clean so consecutive updates keep working.
+    steps.push({ label: "aipi-deps", kind: "exec", command: npmCommand, args: ["ci", "--prefix", packageRoot], note: "reproducible install from package-lock; never mutates the lockfile" });
   }
 
   return steps;
