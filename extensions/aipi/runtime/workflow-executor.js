@@ -5,7 +5,7 @@ import { buildStepContext, ContextMaterializationError } from "./context-builder
 import { aipiPromoteMemory } from "./aipi-tools.js";
 import { describeModel, resolveStepModel } from "./model-router.js";
 import { recordWorkerModelRoute } from "./lifecycle-hooks.js";
-import { validateStepResult } from "./step-result.js";
+import { classifyGateKind, validateStepResult } from "./step-result.js";
 
 const terminalActions = new Set([
   "stop",
@@ -293,8 +293,9 @@ export async function executeWorkflowRun({
         step,
         result,
         reason: error,
-          createdAt: finishedAt,
-        });
+        createdAt: finishedAt,
+        infra: true,
+      });
       events.push({
         type: transientProviderBlock ? "transient_provider_failure" : "structural_no_executable_adapter",
         step_id: step.id,
@@ -1709,7 +1710,7 @@ function shouldAskUserOnGateStop({ target, failedStatus } = {}) {
   return false;
 }
 
-function awaitingUserDecisionForBlockedGate({ step, result = null, reason = "", createdAt } = {}) {
+function awaitingUserDecisionForBlockedGate({ step, result = null, reason = "", createdAt, infra = false } = {}) {
   const hasQuestion = Boolean(
     result?.blocker_question ||
       result?.awaiting_user_input ||
@@ -1736,6 +1737,15 @@ function awaitingUserDecisionForBlockedGate({ step, result = null, reason = "", 
   if (isWorkflowBlockedDecisionOptions(awaiting.options)) {
     awaiting.kind = WORKFLOW_BLOCKED_DECISION_KIND;
   }
+  // gate_kind FLOOR: deterministic authority for this stop. `infra` is asserted by the no-adapter/transient
+  // sink (work did NOT run -> never auto-continue); courtesy is reserved for a fabricated low-risk Sink-B
+  // stop the worker never raised. The optional stop-classifier may only downgrade courtesy -> continue.
+  const questionText =
+    resolvedResult?.blocker_question?.question ??
+    result?.awaiting_user_input?.question ??
+    result?.question ??
+    "";
+  awaiting.gate_kind = classifyGateKind({ reason, question: questionText, step, hasRealWorkerQuestion: hasQuestion, infra });
   return awaiting;
 }
 
