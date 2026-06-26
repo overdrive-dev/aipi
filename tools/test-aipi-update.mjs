@@ -68,7 +68,9 @@ const cleanPlan = buildAipiUpdatePlan({
   platform: "linux",
 });
 assert.deepEqual(cleanPlan.map((step) => step.label), ["pi", "aipi", "aipi-deps"]);
-assert.deepEqual(cleanPlan[2].args, ["install", "--prefix", packageRoot]);
+// `npm ci` keeps the runtime checkout clean (it never rewrites package-lock), so a lock-field
+// normalization can't dirty the tree and skip the next `git pull --ff-only`.
+assert.deepEqual(cleanPlan[2].args, ["ci", "--prefix", packageRoot]);
 assert.ok(!cleanPlan[2].args.includes("--omit=dev"));
 // POSIX uses bare `npm`; Windows must use `npm.cmd` (a bare `npm` spawn is ENOENT).
 assert.equal(cleanPlan[2].command, "npm");
@@ -136,7 +138,7 @@ await runAipiUpdate({
 assert.equal(spawnCalls.length, 3);
 assert.ok(logs.some((message) => message.includes("aipi update [pi] would run: pi update --self")));
 assert.ok(logs.some((message) => message.includes("aipi update [aipi] would run: git -C")));
-assert.ok(logs.some((message) => message.includes("aipi update [aipi-deps] would run: npm install --prefix")));
+assert.ok(logs.some((message) => message.includes("aipi update [aipi-deps] would run: npm ci --prefix")));
 assert.ok(logs.includes("aipi update dry-run complete."));
 
 // Regression: a real (non-dry-run) Windows update must run npm.cmd via a shell as a
