@@ -3191,6 +3191,7 @@ function renderContextPointer(details) {
     `- memory_refs: ${details.memory_refs.join(", ")}`,
     "- Follow the project's conventions and its DEFINITION OF DONE in .aipi/memory/project/procedures.md and project.md — they define what FINISHED means for THIS project (e.g. how to test, open a PR, watch CI, merge). Do not stop early if the project's procedure requires more.",
     "- Code graph (PULL, not auto): use aipi_impact (what a change affects) / aipi_callers / aipi_retrieve when you actually need impact analysis — before a substantive change to find affected files, at review to check the blast radius, before closing to catch regressions in related files. Skip it for trivial replies.",
+    "- Autonomous execution: do NOT end a turn with a cadence/checkpoint/permission question ('want me to continue?', 'keep this rhythm?'). Continue to the next step. Stop ONLY for a REAL gate (destructive / secrets / prod / scope / business-rule) — and STRUCTURE it as a blocker, never end as a prose question.",
     `- active_disciplines: ${activeDisciplines.map((discipline) => discipline.id).join(", ") || "none"}`,
   );
   if (details.recent_run) {

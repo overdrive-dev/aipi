@@ -807,6 +807,7 @@ export function buildWorkerPrompt(job) {
     "- Do not write project memory under .aipi/memory.",
     "- If you cannot complete the assignment, return BLOCKED or FAIL as structured JSON.",
     "- A PASS result must include at least one evidence item with rung ran or verified.",
+    "- Do NOT end with a cadence/checkpoint/permission question ('should I continue?', 'keep going?') — cadence is decided; continue. A REAL gate (destructive / secrets / prod / scope / business-rule) must be a STRUCTURED BLOCKED or FAIL, never a prose question.",
     "- Return only JSON. Do not wrap it in prose.",
     "",
     "Write scope:",

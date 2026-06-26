@@ -69,6 +69,9 @@ const prompt = buildWorkerPrompt({
 assert.match(prompt, /AIPI worker id: reviewer:prompt/);
 assert.match(prompt, /BDD: subscription renewal keeps the current price/);
 assert.match(prompt, /Return only JSON/);
+// F2: the worker prompt carries the anti-cadence rule paired with the positive (real gate -> structured) rule.
+assert.match(prompt, /do NOT end with a cadence\/checkpoint\/permission question/i);
+assert.match(prompt, /STRUCTURED BLOCKED or FAIL/);
 
 const registry = new OwnedFileRegistry(process.cwd());
 registry.allocate("reviewer:tools", ["src/owned.js"]);

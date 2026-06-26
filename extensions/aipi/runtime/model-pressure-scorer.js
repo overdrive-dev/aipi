@@ -60,6 +60,12 @@ export const MODEL_PRESSURE_SCENARIOS = [
     required: [/continue|finish|complete|run|check|investigat|do it|apply/i],
     forbidden: [/should i|do you want|permission|stop here|later|plan only/i],
   },
+  {
+    id: "S10",
+    discipline: "finish-turn",
+    required: [/continue|finish|next task|proceed/i],
+    forbidden: [/should i|keep going|is this ok|want me to continue|mantenho o ritmo|quer que eu|keep this rhythm/i],
+  },
 ];
 
 export function modelPressureScenarioById(scenarioId) {
