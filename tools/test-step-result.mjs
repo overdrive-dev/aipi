@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  classifyGateKind,
   formatStepResultValidation,
   strongestEvidenceRung,
   validateStepResult,
@@ -27,6 +28,22 @@ const pass = validateStepResult(baseResult);
 assert.equal(pass.ok, true);
 assert.equal(pass.gatePassed, true);
 assert.equal(formatStepResultValidation(pass), "step result gate: PASS");
+
+// gate_kind floor taxonomy: infra (no-adapter/transient) and high-risk tokens are real STOPs; a real
+// worker-raised question is never courtesy; only a fabricated low-risk stop is courtesy (auto-continue candidate).
+assert.equal(classifyGateKind({ infra: true }), "infra");
+assert.equal(classifyGateKind({ reason: "no executable adapter is configured for quick_scope" }), "infra");
+assert.equal(classifyGateKind({ reason: "this will rm -rf the prod database" }), "destructive");
+assert.equal(classifyGateKind({ reason: "needs the API key / secret to proceed" }), "secrets");
+assert.equal(classifyGateKind({ reason: "confirm the production deploy" }), "prod");
+assert.equal(classifyGateKind({ step: { id: "business_rule_check" }, hasRealWorkerQuestion: true }), "business_rule");
+assert.equal(classifyGateKind({ reason: "o gate nao passou", hasRealWorkerQuestion: true }), "business_rule");
+assert.equal(classifyGateKind({ reason: "AIPI parou: como voce quer seguir?", hasRealWorkerQuestion: false }), "courtesy");
+// validateGateKind: valid passes, invalid is flagged, absence is valid.
+assert.equal(validateStepResult({ ...baseResult, gate_kind: "courtesy" }).ok, true);
+const badKind = validateStepResult({ ...baseResult, gate_kind: "warp_speed" });
+assert.equal(badKind.ok, false);
+assert.match(badKind.errors.join(" "), /invalid gate_kind/);
 
 const weakPass = validateStepResult({
   ...baseResult,

@@ -16,6 +16,7 @@ const defaultContract = {
       "blocker_question",
       "awaiting_user_input",
       "aipi_shell_less",
+      "gate_kind",
     ],
   },
   stepVerdicts: ["PASS", "FAIL", "SKIPPED", "BLOCKED", "BLOCKED_TO_PLANNING"],
@@ -71,6 +72,36 @@ const actionableFindingPattern = /\b(?:CRITICAL|HIGH|BLOCKER|P0|P1)\b\s*(?:[:\]-
 const findingLabelPattern = /\b(?:severity|impact|priority)\s*[:=]\s*(?:CRITICAL|HIGH|BLOCKER|P0|P1)\b/i;
 const resolvedFindingPattern = /\b(?:resolved|fixed|mitigated|closed|not\s+applicable|none|no)\b.*\b(?:CRITICAL|HIGH|BLOCKER|P0|P1)\b|\b(?:CRITICAL|HIGH|BLOCKER|P0|P1)\b.*\b(?:resolved|fixed|mitigated|closed|none|0)\b/i;
 
+// Gate-kind taxonomy: the deterministic FLOOR for a blocked-gate stop. It is the authority that says STOP;
+// the optional stop-classifier (AIPI_STOP_CLASSIFIER) may only DOWNGRADE a `courtesy` floor to continue,
+// never the reverse, and never when any non-courtesy kind is present.
+// - infra        = no-executable-adapter / transient provider failure. The step's work did NOT run; it must
+//                  retry/fail-loud and NEVER auto-continue (would skip an unexecuted task — adversarial claim D).
+// - destructive/secrets/prod/business_rule = a REAL gate; only a human resolves it.
+// - courtesy     = a FABRICATED low-risk Sink-B stop the worker never raised, with zero high-risk tokens.
+//                  The ONLY auto-continue candidate.
+export const GATE_KINDS = Object.freeze(["destructive", "secrets", "prod", "business_rule", "courtesy", "infra"]);
+
+const GATE_KIND_INFRA = /no executable adapter|refusing to self-stamp|transient|provider (?:error|failure|unavailable)|rate.?limit|timed?\s*out|timeout/i;
+const GATE_KIND_DESTRUCTIVE = /\b(?:destructive|destrut\w*|delete|deletar|drop|truncate|overwrit\w*|irreversible|irrevers\w*|apagar|excluir|wipe|purge)\b|rm\s+-rf/i;
+const GATE_KIND_SECRETS = /\b(?:secret|secrets|segredo|credential|credenc\w*|password|senha|api[_-]?key|private\s+key)\b|\.env\b/i;
+const GATE_KIND_PROD = /\b(?:prod|production|produc\w*|deploy\w*|release|migration|migrac\w*|rollback|homolog\w*)\b/i;
+const GATE_KIND_BUSINESS = /\b(?:business[_-]?rule|policy|pol[ií]tica|compliance|scope|escopo|pricing|billing|faturament\w*|cobran\w*)\b|regra de neg\w*/i;
+
+// Classify a blocked-gate stop into the floor taxonomy. Conservative by construction: any high-risk token,
+// or a real worker-raised question, is a non-courtesy (real) gate; only a fabricated low-risk stop with no
+// worker question is `courtesy`. `infra` is asserted by the caller for the no-adapter/transient sink.
+export function classifyGateKind({ reason = "", question = "", step = null, hasRealWorkerQuestion = false, infra = false } = {}) {
+  if (infra) return "infra";
+  const text = `${reason}\n${question}\n${step?.id ?? ""}\n${step?.stage ?? ""}`;
+  if (GATE_KIND_INFRA.test(text)) return "infra";
+  if (GATE_KIND_DESTRUCTIVE.test(text)) return "destructive";
+  if (GATE_KIND_SECRETS.test(text)) return "secrets";
+  if (GATE_KIND_PROD.test(text)) return "prod";
+  if (GATE_KIND_BUSINESS.test(text)) return "business_rule";
+  return hasRealWorkerQuestion ? "business_rule" : "courtesy";
+}
+
 export function validateStepResult(result, { step = null, contract = defaultContract, artifactContents = null, shellLess = false } = {}) {
   const errors = [];
   const warnings = [];
@@ -116,6 +147,7 @@ export function validateStepResult(result, { step = null, contract = defaultCont
 
   validateModelProvenance(result, errors);
   validateBlockerQuestion(result, errors);
+  validateGateKind(result, errors);
   validateReviewArtifacts(result, step, artifactContents, errors);
 
   const policyDecision = result.policy_decision ?? null;
@@ -465,6 +497,21 @@ function validateBlockerQuestion(result, errors) {
     }
     if ("allow_free_text" in value && value.allow_free_text !== true) {
       errors.push(`${field}.allow_free_text must be true when present`);
+    }
+  }
+}
+
+// Optional, additive gate-kind taxonomy. Absence is valid; when present (top-level or on a blocker/awaiting
+// object) it must be a registered kind.
+function validateGateKind(result, errors) {
+  const kinds = new Set(GATE_KINDS);
+  if ("gate_kind" in result && result.gate_kind != null && !kinds.has(result.gate_kind)) {
+    errors.push(`invalid gate_kind: ${result.gate_kind}`);
+  }
+  for (const field of ["blocker_question", "awaiting_user_input"]) {
+    const value = result[field];
+    if (isPlainObject(value) && "gate_kind" in value && value.gate_kind != null && !kinds.has(value.gate_kind)) {
+      errors.push(`${field}.gate_kind is invalid: ${value.gate_kind}`);
     }
   }
 }

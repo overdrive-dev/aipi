@@ -84,6 +84,8 @@ try {
   assert.notEqual(state.status, "escalated_to_human");
   assert.equal(state.awaiting_user_input.step_id, "quick_scope");
   assert.match(state.awaiting_user_input.question, /nenhum executor esta configurado|Como voce quer seguir/);
+  // gate_kind FLOOR: the no-adapter Sink A is `infra` (work did NOT run) — never `courtesy`, so it can never be auto-continued.
+  assert.equal(state.awaiting_user_input.gate_kind, "infra");
   assert.deepEqual(state.awaiting_user_input.options, [
     "Continuar fora do workflow automatico nesta conversa",
     "Tentar executar este workflow novamente",
@@ -356,6 +358,8 @@ try {
   assert.equal(blocked.state.current_step, "business_rule_check");
   assert.equal(blocked.state.awaiting_user_input.step_id, "business_rule_check");
   assert.equal(blocked.state.awaiting_user_input.question, "Qual regra fiscal devemos aplicar?");
+  // gate_kind FLOOR: a real worker-raised gate (business_rule_check) is never `courtesy`.
+  assert.equal(blocked.state.awaiting_user_input.gate_kind, "business_rule");
   assert.deepEqual(blocked.state.awaiting_user_input.options, [
     "Aprovar fiscal antes da emissao",
     "Emitir sem aprovacao",
