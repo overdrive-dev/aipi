@@ -993,7 +993,16 @@ export function classifyAipiInputRoute(text, { activeRun = null, codePipeline = 
   if (!original || original.startsWith("/") || original.startsWith("@")) return null;
   const normalized = normalizeInputText(original);
 
-  if (/\b(aipi|workflow|run)\b.*\b(status|estado)\b|\b(status|estado)\b.*\b(aipi|workflow|run)\b/.test(normalized)) {
+  // Status detection must stay a SHORT, intent-bearing query ("aipi status", "qual o status do run").
+  // normalizeInputText flattens newlines, so an unbounded `.*` made any long paste that merely mentioned
+  // ".aipi/..." and the word "status" hijack the turn into the status command. Bound it: a small input,
+  // with the trigger word and "status" adjacent (no sentence boundary between them).
+  if (
+    normalized.length <= 80 &&
+    /\b(aipi|workflow|run)\b[^.!?]{0,16}\b(status|estado)\b|\b(status|estado)\b[^.!?]{0,16}\b(aipi|workflow|run)\b/.test(
+      normalized,
+    )
+  ) {
     return { intent: "status", workflowArgs: "status" };
   }
 

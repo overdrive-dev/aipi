@@ -149,6 +149,26 @@ try {
   const handlers = createAipiLifecycleHandlers({ pi, projectRootResolver: () => tempRoot, coordinator });
 
   assert.equal(classifyAipiInputRoute("/aipi-workflow status", { activeRun: started }), null);
+  // A real, SHORT status query still routes to the status command.
+  assert.equal(classifyAipiInputRoute("aipi status").intent, "status");
+  assert.equal(classifyAipiInputRoute("qual o status do workflow").intent, "status");
+  // Regression (greedy status-match bug): a long task paste that merely MENTIONS ".aipi/..." paths and
+  // the word "Status" must NOT be hijacked into the status command — normalizeInputText flattens newlines,
+  // so the old `.*` spanned the whole blob. It must fall through to the flexible agent (null), not status.
+  const longMissionPaste = [
+    "# Missao: fechar o backlog Lote 2",
+    "Definition of Done - ver .aipi/memory/project/procedures.md",
+    "CI/CD: AWS CodePipeline. Status: aws codepipeline get-pipeline-state --name noracare-dev",
+    "Backlog: esconder 'Funcao e Status' para MASTER.",
+    "Backlog completo em .aipi/runtime/kanban.jsonl",
+  ].join("\n");
+  assert.equal(classifyAipiInputRoute(longMissionPaste, { activeRun: null }), null);
+  assert.notEqual(
+    classifyAipiInputRoute(longMissionPaste, { activeRun: null, autoDispatchEnabled: true })?.intent,
+    "status",
+  );
+  // Incidental co-occurrence of "run" and "status" far apart is not a status query either.
+  assert.notEqual(classifyAipiInputRoute("o run de testes quebrou e o status do deploy travou")?.intent, "status");
   assert.equal(classifyAipiInputRoute("pode seguir", { activeRun: started }).workflowArgs, "execute");
   assert.equal(classifyAipiInputRoute("ok continua", { activeRun: started }).workflowArgs, "execute");
   assert.equal(classifyAipiInputRoute("pode seguir", { activeRun: null }), null);
