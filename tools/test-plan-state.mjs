@@ -65,6 +65,9 @@ try {
   assert.deepEqual(plan.tasks[2].params, {}, "feature is contract-driven: no free-text param");
   assert.equal(plan.tasks[3].params.topic, "investigar lentidão na listagem");
 
+  // F1: execution_cadence defaults to the conservative value at creation.
+  assert.equal(plan.execution_cadence, "checkpoint_per_task", "cadence defaults to checkpoint_per_task");
+
   // Each task is on the kanban as its own "planned" card.
   let kanban = await readKanban(tempRoot);
   assert.equal(kanban.length, 4, "one kanban card per task at creation");
@@ -107,6 +110,7 @@ try {
   const settled = await settlePlan({ projectRoot: tempRoot, now });
   assert.equal(settled.plan.status, "settled");
   assert.ok(settled.plan.settled_at);
+  assert.equal(settled.plan.execution_cadence, "checkpoint_per_task", "settle freezes the cadence");
 
   // Task transitions update status AND append an individual kanban event each time.
   await setTaskStatus({ projectRoot: tempRoot, taskId: "t1", status: "running", runId: "20260624T0001Z-run1", now });
@@ -153,6 +157,20 @@ try {
   await settlePlan({ projectRoot: tempRoot, planId: planG.plan_id, now });
   await assert.rejects(() => addPlanQuestions({ projectRoot: tempRoot, planId: planG.plan_id, questions: [{ question: "q2?" }], now }), /discovery-phase only/);
   await assert.rejects(() => recordPlanAnswer({ projectRoot: tempRoot, planId: planG.plan_id, questionId: "q1", answer: "b", now }), /discovery-phase only/);
+
+  // F1: cadence round-trip + legacy default + manifest emission. No migration runner exists, so the read
+  // chokepoint must back-fill a legacy PLAN.json (missing field) and coerce an invalid value to the default.
+  const { plan: planC } = await createPlan({ projectRoot: tempRoot, tasks: ["tarefa de cadencia"], now, randomBytes: fixedRandom });
+  const manifestC = await fs.readFile(path.join(tempRoot, planC.plan_rel_dir, "PLAN.md"), "utf8");
+  assert.match(manifestC, /execution_cadence: checkpoint_per_task/, "manifest emits the cadence");
+  const planCPath = path.join(tempRoot, planC.plan_rel_dir, "PLAN.json");
+  const rawC = JSON.parse(await fs.readFile(planCPath, "utf8"));
+  delete rawC.execution_cadence;
+  await fs.writeFile(planCPath, JSON.stringify(rawC));
+  assert.equal((await readPlan(tempRoot, planC.plan_id)).plan.execution_cadence, "checkpoint_per_task", "legacy plan (no field) reads the default cadence");
+  rawC.execution_cadence = "warp_speed";
+  await fs.writeFile(planCPath, JSON.stringify(rawC));
+  assert.equal((await readPlan(tempRoot, planC.plan_id)).plan.execution_cadence, "checkpoint_per_task", "invalid cadence coerced to the default");
 
   console.log("AIPI_PLAN_STATE_TEST_OK");
 } finally {
