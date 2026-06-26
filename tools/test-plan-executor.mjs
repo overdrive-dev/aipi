@@ -89,10 +89,22 @@ try {
   assert.equal(startCalls[0].planId, planId);
   assert.equal(startCalls[0].taskId, "t1");
   assert.equal(startCalls[1].workflow, "ops");
-  // task-scoped answer seeded ONLY into t1's run.
-  assert.equal(seeds.filter((s) => s.runId === "run-t1").length, 1);
-  assert.equal(seeds.filter((s) => s.runId === "run-t2").length, 0);
-  assert.match(seeds[0].text, /persistir inativos\?/);
+  // task-scoped answer seeded ONLY into t1's run (filter to plan_preflight; cadence is seeded into both).
+  assert.equal(seeds.filter((s) => s.runId === "run-t1" && s.source === "plan_preflight").length, 1);
+  assert.equal(seeds.filter((s) => s.runId === "run-t2" && s.source === "plan_preflight").length, 0);
+  assert.match(seeds.find((s) => s.source === "plan_preflight").text, /persistir inativos\?/);
+  // F1: the cadence directive is seeded once per FRESH run, LAST (after pre-flight answers), so it survives
+  // the last-N user-input window and removes the reason to improvise a cadence/checkpoint question.
+  const cadenceSeeds = seeds.filter((s) => s.source === "plan_cadence");
+  assert.equal(cadenceSeeds.length, 2, "cadence directive seeded once per fresh run");
+  assert.match(cadenceSeeds[0].text, /EXECUTION CADENCE \(plan-level, do not re-ask\)/);
+  assert.match(cadenceSeeds[0].text, /checkpoint_per_task/);
+  assert.match(cadenceSeeds[0].text, /do NOT ask about pace\/cadence\/checkpoints/);
+  assert.deepEqual(
+    seeds.filter((s) => s.runId === "run-t1").map((s) => s.source),
+    ["plan_preflight", "plan_cadence"],
+    "cadence is seeded LAST (after the pre-flight answers)",
+  );
   // each task got running + done kanban cards.
   assert.equal((await readKanban(tempRoot)).length, kanbanBefore + 4);
   const finished = (await readPlan(tempRoot, planId)).plan;

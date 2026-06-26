@@ -11,6 +11,20 @@ import { aipiKanbanUpdate } from "./aipi-tools.js";
 
 const TERMINAL_PLAN_STATUSES = new Set(["completed", "cancelled", "abandoned"]);
 
+// Execution cadence: a STANDING plan-level preference, set once and frozen at settle. Its job is to give the
+// "how often do I check in" decision a HOME so the agent never has to improvise a cadence/checkpoint question
+// mid-run. The default is the CONSERVATIVE value (checkpoint_per_task): a plan the user never explicitly opted
+// into autonomy for keeps a human checkpoint, and the host auto-continue net (if enabled) stays off for it.
+// `autonomous_to_pr` is an explicit opt-in. NOTE: this field does NOT change the forked executor's own
+// run-to-completion behavior (that would alter the executor status quo); its guaranteed effect is the seeded
+// "do not re-ask cadence" directive (see executePlanRun) plus gating the host auto-continue net.
+export const EXECUTION_CADENCES = Object.freeze(["checkpoint_per_task", "autonomous_to_pr"]);
+export const DEFAULT_EXECUTION_CADENCE = "checkpoint_per_task";
+
+export function normalizeExecutionCadence(value) {
+  return EXECUTION_CADENCES.includes(value) ? value : DEFAULT_EXECUTION_CADENCE;
+}
+
 // Per-workflow free-text param that carries a task's text (mirrors lifecycle-hooks.WORKFLOW_PRIMARY_PARAM).
 // Kept local so the plan layer does not import the lifecycle hooks (which would later be a require cycle
 // once the input router imports the plan layer). feature is contract-driven and takes no free-text param.
@@ -98,6 +112,7 @@ export async function createPlan({
     business_rules: [],
     current_task: null,
     settled_at: null,
+    execution_cadence: DEFAULT_EXECUTION_CADENCE,
   };
 
   await fs.mkdir(planDir, { recursive: true });
@@ -239,6 +254,9 @@ export async function settlePlan({ projectRoot, planId = null, now = () => new D
     error.reasons = reasons;
     throw error;
   }
+  // Freeze the cadence at settle: this is the "definition is closed" boundary (mirrors the discovery-phase
+  // guards on questions/answers). After settle the executor trusts it like an answer.
+  plan.execution_cadence = normalizeExecutionCadence(plan.execution_cadence);
   plan.status = "settled";
   plan.settled_at = now().toISOString();
   await persistPlan(root, plan);
@@ -379,7 +397,13 @@ async function loadPlanForMutation(projectRoot, planId) {
 
 async function readPlanState(root, planId) {
   const planPath = path.join(root, ".aipi", "runtime", "plans", planId, "PLAN.json");
-  return JSON.parse(await fs.readFile(planPath, "utf8"));
+  const plan = JSON.parse(await fs.readFile(planPath, "utf8"));
+  // Read-time default: there is no schema validator or migration runner, so a plan persisted before
+  // execution_cadence existed reads the field back as undefined. Normalizing here — the single chokepoint every
+  // reader funnels through (readPlan / readActivePlan / loadPlanForMutation) — back-fills legacy plans (the value
+  // is materialized on the next persist) and coerces any invalid value to the conservative default.
+  plan.execution_cadence = normalizeExecutionCadence(plan.execution_cadence);
+  return plan;
 }
 
 function isAnswered(question) {
@@ -440,6 +464,7 @@ plan_id: ${plan.plan_id}
 status: ${plan.status}
 created_at: ${plan.created_at}
 settled_at: ${plan.settled_at ?? ""}
+execution_cadence: ${normalizeExecutionCadence(plan.execution_cadence)}
 ---
 
 # AIPI Plan ${plan.plan_id}

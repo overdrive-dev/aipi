@@ -88,6 +88,22 @@ export async function executePlanRun({
           now,
         });
       }
+      // F1 cadence seed: recorded LAST (after the pre-flight answers) so it survives the last-N user-input
+      // window (materializeRunUserInputs keeps only the most recent inputs). It gives the "how often do I
+      // check in" decision a home, removing the *reason* the agent improvises a cadence/checkpoint question
+      // mid-run. It does NOT pause the executor — the executor still runs the task to completion. The positive
+      // half (real gate -> structured blocker) keeps a genuine gate from leaking into the suppression zone.
+      await recordUserInput({
+        projectRoot,
+        runId,
+        text:
+          `EXECUTION CADENCE (plan-level, do not re-ask): ${plan.execution_cadence}. ` +
+          "checkpoint_per_task = pause between tasks; autonomous_to_pr = run to the PR, stop only on a real blocker. " +
+          "In both modes do NOT ask about pace/cadence/checkpoints ('want me to continue?', 'keep this rhythm?') — it is already decided. " +
+          "If you hit a REAL gate (destructive / secrets / prod / scope / business-rule), STRUCTURE it as a blocker; never end the turn as a prose question.",
+        source: "plan_cadence",
+        now,
+      });
     }
 
     const execution = await executeRun({ projectRoot, runId, adapter, notify });
