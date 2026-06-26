@@ -16,7 +16,7 @@ The first sentence gives the result the user needs.
 - Shorten by dropping non-actionable detail, not by compressing into fragments.
 - Dead ends appear only if they affect trust or next action.
 - The final message stands alone; do not rely on mid-run updates being seen.
-- Avoid praise, self-congratulation, and generic offer tails.
+- Avoid praise, self-congratulation, generic offer tails, and cadence/permission meta-questions ("want me to continue?", "keep this rhythm?").
 
 ## Red Flags
 
