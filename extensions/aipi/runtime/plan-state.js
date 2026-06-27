@@ -216,6 +216,22 @@ export async function recordPlanAnswer({ projectRoot, planId = null, questionId,
   return { plan, question };
 }
 
+export async function setPlanCadence({ projectRoot, planId = null, cadence, now = () => new Date() } = {}) {
+  const { root, plan } = await loadPlanForMutation(projectRoot, planId);
+  // Cadence is a discovery-phase preference frozen at settle (mirrors questions/answers): changing it after
+  // settle would mutate a spec the executor already trusts. Opt into autonomous_to_pr here, before settle.
+  if (plan.status !== "discovery") {
+    throw new Error(`setPlanCadence is discovery-phase only; plan ${plan.plan_id} status is ${plan.status}`);
+  }
+  if (!EXECUTION_CADENCES.includes(cadence)) {
+    throw new Error(`setPlanCadence: cadence must be one of ${EXECUTION_CADENCES.join(", ")}`);
+  }
+  plan.execution_cadence = cadence;
+  plan.cadence_set_at = now().toISOString();
+  await persistPlan(root, plan);
+  return { plan };
+}
+
 export async function addBusinessRules({ projectRoot, planId = null, rules = [], now = () => new Date() } = {}) {
   const { root, plan } = await loadPlanForMutation(projectRoot, planId);
   const createdAt = now().toISOString();
