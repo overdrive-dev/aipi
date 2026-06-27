@@ -17,7 +17,10 @@ import { executePlanRun, mapRunStatusToTask } from "../extensions/aipi/runtime/p
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-plan-exec-"));
 const sourceRoot = path.resolve("templates/.aipi");
 let tick = 0;
-const now = () => new Date(`2026-06-24T02:00:${String(tick++).padStart(2, "0")}.000Z`);
+// Epoch-based so a large number of now() calls rolls over minutes cleanly (2-digit seconds would overflow
+// past :59 once enough steps run).
+const nowBase = Date.parse("2026-06-24T02:00:00.000Z");
+const now = () => new Date(nowBase + (tick++) * 1000);
 const fixedRandom = () => Buffer.from("abcdef", "hex");
 
 async function readKanban(root) {
@@ -192,6 +195,84 @@ try {
   assert.equal(startedCrash, 0, "a stuck running task resumes its run; no new run is started");
   assert.equal(resumedRunId, "crashed-run-1");
   assert.equal(resCrash.tasks[0].status, "passed");
+
+  // --- F4b consumer: stop-classifier gating of the halt decision. ---
+  async function makeSettledPlan(tasks, cadence) {
+    const { planId: pid } = await createPlan({ projectRoot: tempRoot, tasks, now, randomBytes: fixedRandom });
+    if (cadence) {
+      const pPath = path.join(tempRoot, ".aipi", "runtime", "plans", pid, "PLAN.json");
+      const raw = JSON.parse(await fs.readFile(pPath, "utf8"));
+      raw.execution_cadence = cadence;
+      await fs.writeFile(pPath, JSON.stringify(raw));
+    }
+    await settlePlan({ projectRoot: tempRoot, planId: pid, now });
+    return pid;
+  }
+  const blockedCourtesy = (firstRunId) => async (opts) => ({
+    status: opts.runId === firstRunId ? "blocked" : "completed",
+    state: opts.runId === firstRunId
+      ? { blocked_reason: "AIPI parou: como voce quer seguir?", awaiting_user_input: { gate_kind: "courtesy", question: "Mantenho o ritmo?" } }
+      : {},
+  });
+
+  // (a) autonomous + courtesy + classifier=continue => plan does NOT halt; both tasks start; the task stays blocked.
+  const pA = await makeSettledPlan(["corrigir bug A2", "corrigir bug B2"], "autonomous_to_pr");
+  const aCalls = [];
+  const resA = await executePlanRun({
+    projectRoot: tempRoot, planId: pA, now,
+    startRun: async (opts) => { aCalls.push(opts.taskId); return { runId: `ra-${opts.taskId}` }; },
+    executeRun: blockedCourtesy("ra-t1"),
+    recordUserInput: async () => {},
+    classifyStopFn: async () => ({ decision: "continue", reason: "courtesy_downgrade" }),
+  });
+  assert.equal(resA.halted, false, "courtesy stop under autonomous does not halt the plan");
+  assert.deepEqual(aCalls, ["t1", "t2"]);
+  assert.equal(resA.tasks[0].status, "blocked");
+  assert.equal(resA.tasks[0].stop_classifier.decision, "continue");
+
+  // (b) checkpoint_per_task (default) keeps the human checkpoint: classifier is NEVER consulted; plan halts.
+  const pB = await makeSettledPlan(["corrigir bug C2", "corrigir bug D2"]);
+  let bConsulted = false;
+  const bCalls = [];
+  const resB = await executePlanRun({
+    projectRoot: tempRoot, planId: pB, now,
+    startRun: async (opts) => { bCalls.push(opts.taskId); return { runId: `rb-${opts.taskId}` }; },
+    executeRun: blockedCourtesy("rb-t1"),
+    recordUserInput: async () => {},
+    classifyStopFn: async () => { bConsulted = true; return { decision: "continue" }; },
+  });
+  assert.equal(resB.halted, true, "checkpoint cadence halts on a courtesy stop");
+  assert.equal(bConsulted, false, "classifier is not consulted under checkpoint_per_task");
+  assert.equal(bCalls.length, 1);
+
+  // (c) infra (Sink A) is never courtesy: classifier is NEVER consulted; plan halts even autonomous + continue.
+  const pC = await makeSettledPlan(["corrigir bug E2", "corrigir bug F2"], "autonomous_to_pr");
+  let cConsulted = false;
+  const resC = await executePlanRun({
+    projectRoot: tempRoot, planId: pC, now,
+    startRun: async (opts) => ({ runId: `rc-${opts.taskId}` }),
+    executeRun: async (opts) => ({
+      status: opts.runId === "rc-t1" ? "blocked" : "completed",
+      state: opts.runId === "rc-t1"
+        ? { blocked_reason: "no executable adapter is configured", awaiting_user_input: { gate_kind: "infra", question: "Como voce quer seguir?" } }
+        : {},
+    }),
+    recordUserInput: async () => {},
+    classifyStopFn: async () => { cConsulted = true; return { decision: "continue" }; },
+  });
+  assert.equal(resC.halted, true, "infra (Sink A) halts — never auto-continued");
+  assert.equal(cConsulted, false, "classifier is not consulted for an infra stop");
+
+  // (d) default classifyStopFn (real classifyStop, flag off) => fail-STOP => halts even autonomous + courtesy.
+  const pD = await makeSettledPlan(["corrigir bug G2", "corrigir bug H2"], "autonomous_to_pr");
+  const resD = await executePlanRun({
+    projectRoot: tempRoot, planId: pD, now,
+    startRun: async (opts) => ({ runId: `rd-${opts.taskId}` }),
+    executeRun: blockedCourtesy("rd-t1"),
+    recordUserInput: async () => {},
+  });
+  assert.equal(resD.halted, true, "default (flag off) fail-STOPs => halts");
+  assert.equal(resD.tasks[0].stop_classifier.decision, "stop");
 
   console.log("AIPI_PLAN_EXECUTOR_TEST_OK");
 } finally {
