@@ -2,6 +2,7 @@ import { executeWorkflowRun } from "./workflow-executor.js";
 import { recordWorkflowUserInput, startWorkflowRun } from "./run-state.js";
 import { assertPlanExecutable, planPolicyGate } from "./plan-policy.js";
 import { readActivePlan, readPlan, setTaskStatus } from "./plan-state.js";
+import { classifyStop } from "./stop-classifier.js";
 
 // The multi-run executor. It drives ONE workflow run per plan task, in plan order, AFTER the plan is
 // settled (all questions answered in pre-flight). Per task it: checks the plan policy gate (rules +
@@ -22,6 +23,8 @@ export async function executePlanRun({
   gate = planPolicyGate,
   adapter = undefined,
   notify = null,
+  classifyStopFn = classifyStop,
+  stopClassifier = null,
 } = {}) {
   if (!projectRoot) throw new Error("projectRoot is required");
   const loaded = planId ? await readPlan(projectRoot, planId) : await readActivePlan(projectRoot, { includeTerminal: true });
@@ -120,6 +123,25 @@ export async function executePlanRun({
     results.push({ task_id: taskId, run_id: runId, run_status: execution?.status ?? null, status: taskStatus });
 
     if (taskStatus !== "passed" && taskStatus !== "skipped") {
+      // F4b net (opt-in): an OPTIONAL stop-classifier may auto-continue past a SPURIOUS courtesy stop so a
+      // fabricated cadence question does not halt the WHOLE plan. Gated hard: only under autonomous_to_pr
+      // cadence (checkpoint_per_task always keeps the human checkpoint), only a `courtesy` floor (Sink A/infra
+      // and every real gate are excluded), and only when the flag-gated, fail-STOP classifier affirms continue.
+      // The task stays blocked (surfaced for review); dependents are still protected — the next task's policy
+      // gate re-reads fresh state and blocks on depends_on.
+      const awaiting = execution?.state?.awaiting_user_input ?? null;
+      if (taskStatus === "blocked" && plan.execution_cadence === "autonomous_to_pr" && awaiting?.gate_kind === "courtesy") {
+        const verdict = await classifyStopFn({
+          gateKind: awaiting.gate_kind,
+          reason: execution?.state?.blocked_reason ?? "",
+          question: awaiting.question ?? "",
+          classifier: stopClassifier,
+        });
+        results[results.length - 1].stop_classifier = { decision: verdict.decision, reason: verdict.reason };
+        if (verdict.decision === "continue") {
+          continue;
+        }
+      }
       halted = true;
       break;
     }
