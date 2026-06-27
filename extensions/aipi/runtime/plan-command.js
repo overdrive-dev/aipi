@@ -7,6 +7,7 @@ import {
   createPlan,
   readActivePlan,
   recordPlanAnswer,
+  setPlanCadence,
   settlePlan,
   unsettledReasons,
 } from "./plan-state.js";
@@ -56,8 +57,9 @@ export function buildDiscoveryReport(plan) {
     tasks: plan.tasks.map((task) => ({ task_id: task.task_id, text: task.text, workflow: task.workflow })),
     business_rules: plan.business_rules.map((rule) => ({ rule_id: rule.rule_id, text: rule.text, source: rule.source })),
     open_questions: plan.questions.filter((q) => !isAnswered(q)).map((q) => ({ question_id: q.question_id, task_id: q.task_id, question: q.question })),
+    execution_cadence: plan.execution_cadence,
     instruction:
-      "Per the Autonomy Law (covered/gap/conflict/mechanics): for each business-visible decision either cite a rule above (covered) or draft ONE focused question (gap/conflict) and add it with addPlanQuestions. Surface questions to the user, record answers, then settle the plan. Pure mechanics need no question.",
+      "Per the Autonomy Law (covered/gap/conflict/mechanics): for each business-visible decision either cite a rule above (covered) or draft ONE focused question (gap/conflict) and add it with addPlanQuestions. Surface questions to the user, record answers, then settle the plan. Pure mechanics need no question. Cadence defaults to checkpoint_per_task (a human checkpoint between tasks); use /aipi-plan cadence autonomous to run to the PR (the stop-classifier then auto-continues spurious courtesy stops).",
   };
 }
 
@@ -90,6 +92,20 @@ export function parsePlanArgs(args = "") {
     const questionId = tokens[1] ?? null;
     if (!questionId) throw new Error("/aipi-plan answer requires a question id");
     return { action: "answer", questionId, answer: tokens.slice(2).join(" ") };
+  }
+  if (first === "cadence") {
+    // bare `cadence` = read-only query (NOT in the singleWord action allow-list, so it doesn't collide).
+    const value = (tokens[1] ?? "").toLowerCase();
+    if (!value) return { action: "cadence", set: false };
+    const map = {
+      checkpoint: "checkpoint_per_task",
+      checkpoint_per_task: "checkpoint_per_task",
+      autonomous: "autonomous_to_pr",
+      autonomous_to_pr: "autonomous_to_pr",
+    };
+    const cadence = map[value];
+    if (!cadence) throw new Error("/aipi-plan cadence expects: checkpoint | autonomous");
+    return { action: "cadence", set: true, cadence };
   }
   if (first === "create") {
     return { action: "create", tasks: parsePlanTasks(trimmed.slice(tokens[0].length)) };
@@ -124,6 +140,16 @@ export async function runPlanCommand({
   if (command.action === "answer") {
     const { plan, question } = await recordPlanAnswer({ projectRoot, questionId: command.questionId, answer: command.answer, now });
     return { action: "answer", question, remaining: unsettledReasons(plan).length };
+  }
+
+  if (command.action === "cadence") {
+    if (!command.set) {
+      const active = await readActivePlan(projectRoot, { includeTerminal: true });
+      if (!active) throw new Error("No active AIPI plan; create one first");
+      return { action: "cadence", set: false, cadence: active.plan.execution_cadence, planId: active.planId };
+    }
+    const { plan } = await setPlanCadence({ projectRoot, cadence: command.cadence, now });
+    return { action: "cadence", set: true, cadence: plan.execution_cadence, planId: plan.plan_id };
   }
 
   if (command.action === "settle") {
@@ -176,6 +202,15 @@ export function formatPlanCommandResult(result) {
   }
   if (result.action === "answer") {
     return `Answer recorded for ${result.question.question_id}. ${result.remaining} question(s) still open.`;
+  }
+  if (result.action === "cadence") {
+    if (!result.set) {
+      return `AIPI plan cadence: ${result.cadence} (${result.planId}). Change with /aipi-plan cadence checkpoint|autonomous.`;
+    }
+    const note = result.cadence === "autonomous_to_pr"
+      ? "runs to the PR, stops only on a real blocker; the stop-classifier auto-continues spurious courtesy stops"
+      : "pauses between tasks for a human checkpoint";
+    return `AIPI plan cadence set to ${result.cadence} (${result.planId}) — ${note}.`;
   }
   if (result.action === "settle") {
     if (result.settled) return `AIPI plan settled: ${result.plan.plan_id}. Ready to execute.`;

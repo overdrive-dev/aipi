@@ -140,7 +140,7 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
   });
 
   pi.registerCommand("aipi-plan", {
-    description: "Plan and autonomously execute a BATCH of tasks (multi-task pipeline): create | status | answer <q> <text> | settle | execute | cancel.",
+    description: "Plan and autonomously execute a BATCH of tasks (multi-task pipeline): create | status | answer <q> <text> | cadence [checkpoint|autonomous] | settle | execute | cancel.",
     handler: async (args, ctx) => {
       try {
         const projectRoot = resolveProjectRoot(ctx);

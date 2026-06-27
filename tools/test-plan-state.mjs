@@ -13,6 +13,7 @@ import {
   readActivePlan,
   readPlan,
   recordPlanAnswer,
+  setPlanCadence,
   setTaskStatus,
   settlePlan,
   unsettledReasons,
@@ -21,7 +22,8 @@ import {
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-plan-state-"));
 const sourceRoot = path.resolve("templates/.aipi");
 let tick = 0;
-const now = () => new Date(`2026-06-24T00:00:${String(tick++).padStart(2, "0")}.000Z`);
+const nowBase = Date.parse("2026-06-24T00:00:00.000Z");
+const now = () => new Date(nowBase + (tick++) * 1000);
 const fixedRandom = () => Buffer.from("abcdef", "hex");
 
 async function readKanban(root) {
@@ -171,6 +173,14 @@ try {
   rawC.execution_cadence = "warp_speed";
   await fs.writeFile(planCPath, JSON.stringify(rawC));
   assert.equal((await readPlan(tempRoot, planC.plan_id)).plan.execution_cadence, "checkpoint_per_task", "invalid cadence coerced to the default");
+
+  // setPlanCadence (the /aipi-plan cadence enabler): sets in discovery, validates the enum, frozen after settle.
+  const { plan: planCad } = await createPlan({ projectRoot: tempRoot, tasks: ["tarefa de cadencia setter"], now, randomBytes: fixedRandom });
+  await setPlanCadence({ projectRoot: tempRoot, planId: planCad.plan_id, cadence: "autonomous_to_pr", now });
+  assert.equal((await readPlan(tempRoot, planCad.plan_id)).plan.execution_cadence, "autonomous_to_pr", "setPlanCadence sets in discovery");
+  await assert.rejects(() => setPlanCadence({ projectRoot: tempRoot, planId: planCad.plan_id, cadence: "warp_speed", now }), /must be one of/);
+  await settlePlan({ projectRoot: tempRoot, planId: planCad.plan_id, now });
+  await assert.rejects(() => setPlanCadence({ projectRoot: tempRoot, planId: planCad.plan_id, cadence: "checkpoint_per_task", now }), /discovery-phase only/);
 
   console.log("AIPI_PLAN_STATE_TEST_OK");
 } finally {

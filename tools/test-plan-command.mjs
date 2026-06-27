@@ -16,7 +16,8 @@ import {
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-plan-cmd-"));
 const sourceRoot = path.resolve("templates/.aipi");
 let tick = 0;
-const now = () => new Date(`2026-06-24T01:00:${String(tick++).padStart(2, "0")}.000Z`);
+const nowBase = Date.parse("2026-06-24T01:00:00.000Z");
+const now = () => new Date(nowBase + (tick++) * 1000);
 
 async function readKanban(root) {
   const text = await fs.readFile(path.join(root, ".aipi", "runtime", "kanban.jsonl"), "utf8").catch((e) => {
@@ -52,6 +53,12 @@ try {
   assert.deepEqual(parsePlanArgs("- a\n- b"), { action: "create", tasks: ["a", "b"] });
   assert.deepEqual(parsePlanArgs("corrigir bug do save"), { action: "create", tasks: ["corrigir bug do save"] });
   assert.throws(() => parsePlanArgs("answer"), /requires a question id/);
+  // cadence verb: bare = read-only query; checkpoint|autonomous (incl. full names) set; bad value throws.
+  assert.deepEqual(parsePlanArgs("cadence"), { action: "cadence", set: false });
+  assert.deepEqual(parsePlanArgs("cadence autonomous"), { action: "cadence", set: true, cadence: "autonomous_to_pr" });
+  assert.deepEqual(parsePlanArgs("cadence checkpoint"), { action: "cadence", set: true, cadence: "checkpoint_per_task" });
+  assert.deepEqual(parsePlanArgs("cadence autonomous_to_pr"), { action: "cadence", set: true, cadence: "autonomous_to_pr" });
+  assert.throws(() => parsePlanArgs("cadence warp"), /checkpoint \| autonomous/);
 
   // create -> pre-flight: classifies tasks, investigates rules once, one kanban card per task.
   const created = await runPlanCommand({
@@ -67,6 +74,16 @@ try {
   assert.equal(created.discovery.business_rules[0].source, ".aipi/memory/project/business-rules.md:12");
   assert.equal((await readKanban(tempRoot)).length, 2, "one kanban card per task");
   assert.match(formatPlanCommandResult(created), /AIPI plan created/);
+
+  // cadence: query default, then set to autonomous in discovery (the enabler for the stop-classifier).
+  const cadQuery = await runPlanCommand({ projectRoot: tempRoot, args: "cadence", now });
+  assert.equal(cadQuery.set, false);
+  assert.equal(cadQuery.cadence, "checkpoint_per_task");
+  const cadSet = await runPlanCommand({ projectRoot: tempRoot, args: "cadence autonomous", now });
+  assert.equal(cadSet.set, true);
+  assert.equal(cadSet.cadence, "autonomous_to_pr");
+  assert.match(formatPlanCommandResult(cadSet), /autonomous_to_pr/);
+  assert.equal((await readActivePlan(tempRoot)).plan.execution_cadence, "autonomous_to_pr");
 
   // Orchestrator drafts a clarifying question (engine enforces it must be answered to settle).
   await addPlanQuestions({
@@ -89,6 +106,9 @@ try {
   const settled = await runPlanCommand({ projectRoot: tempRoot, args: "settle", now });
   assert.equal(settled.settled, true);
   assert.equal(settled.plan.status, "settled");
+  assert.equal(settled.plan.execution_cadence, "autonomous_to_pr", "settle freezes the chosen cadence");
+  // After settle the cadence is frozen: changing it is rejected.
+  await assert.rejects(() => runPlanCommand({ projectRoot: tempRoot, args: "cadence checkpoint", now }), /discovery-phase only/);
 
   // execute dispatches to the injected plan executor with the active plan.
   let executorCalledWith = null;
