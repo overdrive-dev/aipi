@@ -263,16 +263,37 @@ try {
   assert.equal(resC.halted, true, "infra (Sink A) halts — never auto-continued");
   assert.equal(cConsulted, false, "classifier is not consulted for an infra stop");
 
-  // (d) default classifyStopFn (real classifyStop, flag off) => fail-STOP => halts even autonomous + courtesy.
+  // (d) DEFAULT is automatic: the real classifyStop is ON by default with the deterministic discriminator,
+  // so a generic courtesy stop under autonomous cadence auto-continues (no flag, no model wiring).
   const pD = await makeSettledPlan(["corrigir bug G2", "corrigir bug H2"], "autonomous_to_pr");
+  const dCalls = [];
   const resD = await executePlanRun({
     projectRoot: tempRoot, planId: pD, now,
-    startRun: async (opts) => ({ runId: `rd-${opts.taskId}` }),
+    startRun: async (opts) => { dCalls.push(opts.taskId); return { runId: `rd-${opts.taskId}` }; },
     executeRun: blockedCourtesy("rd-t1"),
     recordUserInput: async () => {},
   });
-  assert.equal(resD.halted, true, "default (flag off) fail-STOPs => halts");
-  assert.equal(resD.tasks[0].stop_classifier.decision, "stop");
+  assert.equal(resD.halted, false, "default-on deterministic classifier auto-continues a generic courtesy stop");
+  assert.deepEqual(dCalls, ["t1", "t2"]);
+  assert.equal(resD.tasks[0].stop_classifier.decision, "continue");
+
+  // (e) DEFAULT keeps blocked when the courtesy stop's reason reads like a real gate FAILURE.
+  const pE = await makeSettledPlan(["corrigir bug I2", "corrigir bug J2"], "autonomous_to_pr");
+  const eCalls = [];
+  const resE = await executePlanRun({
+    projectRoot: tempRoot, planId: pE, now,
+    startRun: async (opts) => { eCalls.push(opts.taskId); return { runId: `re-${opts.taskId}` }; },
+    executeRun: async (opts) => ({
+      status: opts.runId === "re-t1" ? "blocked" : "completed",
+      state: opts.runId === "re-t1"
+        ? { blocked_reason: "AIPI parou em quick_memory: PASS requires memory_promotions. Como voce quer seguir?", awaiting_user_input: { gate_kind: "courtesy", question: "Como voce quer seguir?" } }
+        : {},
+    }),
+    recordUserInput: async () => {},
+  });
+  assert.equal(resE.halted, true, "default-on keeps blocked on a gate-failure-flavored courtesy stop");
+  assert.equal(eCalls.length, 1);
+  assert.equal(resE.tasks[0].stop_classifier.decision, "stop");
 
   console.log("AIPI_PLAN_EXECUTOR_TEST_OK");
 } finally {

@@ -2,19 +2,21 @@
 // courtesy/cadence stop (safe to continue) or a real one (keep blocked). It complements F1/F2 (which drop
 // the rate at the source); it is the net for the residue, never a substitute.
 //
-// SAFETY POSTURE (every branch defaults to STOP — fail-open-to-continue would be an irreversible blow-past
+// SAFETY POSTURE (every branch errs toward STOP — fail-open-to-continue would be an irreversible blow-past
 // of a real gate, an asymmetric cost):
-// - Flag-gated (AIPI_STOP_CLASSIFIER). Disabled OR un-wired (no model callback) => keep-blocked.
+// - ON by default (set AIPI_STOP_CLASSIFIER=0 to disable). It is consulted ONLY by the forked plan executor
+//   under autonomous_to_pr cadence — the default cadence (checkpoint_per_task) never consults it — so the
+//   blast radius of "on by default" is bounded to runs that explicitly opted into autonomous execution.
 // - The deterministic floor (gate_kind) is the AUTHORITY. This may ONLY downgrade a `courtesy` floor to
 //   continue. It can never turn a non-courtesy gate into continue, and never the reverse.
 // - Defense in depth: a high-risk token present, or the absence of a structured courtesy signal => keep-blocked
 //   (the floor `courtesy` is coarse — it also covers some fabricated gate failures).
-// - Any model error / timeout / ambiguous verdict => keep-blocked.
-//
-// The model itself is an INJECTED callback (mirrors lifecycle-hooks.applyAutoDispatchVeto's intentClassifier):
-// the module is pure, deterministic, and fully testable with a fake; the real call (a low-effort model of the
-// HOST family) is wired by the caller. Replay note: the result always carries floor_gate_kind alongside the
-// model verdict, so an audit can prove the FLOOR — not the model — decided every STOP.
+// - The discriminator defaults to a DETERMINISTIC one (the plan-sanctioned regex floor): it continues a generic
+//   fabricated proceed-question but keeps blocked on any gate-FAILURE language. A low-effort HOST-family model
+//   callback can be INJECTED to refine the residue (mirrors applyAutoDispatchVeto's intentClassifier). An
+//   explicit null callback, a model error/timeout, or an ambiguous verdict => keep-blocked.
+// Replay note: the result always carries floor_gate_kind alongside the verdict, so an audit can prove the
+// FLOOR — not the discriminator — decided every STOP.
 
 export const STOP_CLASSIFIER_FLAG = "AIPI_STOP_CLASSIFIER";
 
@@ -44,16 +46,29 @@ function stop(reason, gateKind, extra = {}) {
   return { decision: "stop", reason, floor_gate_kind: gateKind ?? null, llm_verdict: null, ...extra };
 }
 
+// Gate-FAILURE language: a fabricated stop whose reason reads like a real gate that did not pass (missing
+// evidence, required artifacts, policy/contract/acceptance, etc.) is NOT a courtesy stop — keep blocked.
+const GATE_FAILURE_SIGNAL =
+  /\b(?:requires?|must (?:include|have|cite|be)|evidence|no executable|memory_promotions|policy_decision|human[_ ]?review|contract|acceptance|missing|invalid|forbidden|verdict|not allowed|exhausted)\b/i;
+
+// Default discriminator (the plan-sanctioned regex floor). The hard gates (flag, floor==courtesy, no high-risk
+// token, courtesy signal present) already passed before this runs; here we only separate a generic proceed
+// question (continue) from a real gate FAILURE that happened to be fabricated with a courtesy phrasing (stop).
+export function defaultStopClassifier({ reason = "", question = "" } = {}) {
+  return { decision: GATE_FAILURE_SIGNAL.test(`${reason}\n${question}`) ? "stop" : "continue" };
+}
+
 // Returns { decision: "stop" | "continue", reason, floor_gate_kind, llm_verdict, ... }.
 export async function classifyStop({
   gateKind = null,
   reason = "",
   question = "",
   env = process.env,
-  classifier = null,
+  classifier = defaultStopClassifier,
   timeoutMs = 1500,
 } = {}) {
-  if (!isTruthyFlag(env?.[STOP_CLASSIFIER_FLAG])) return stop("classifier_disabled", gateKind);
+  // ON by default; AIPI_STOP_CLASSIFIER=0 (or false/off) disables and keeps everything blocked.
+  if (!isTruthyFlag(env?.[STOP_CLASSIFIER_FLAG] ?? "1")) return stop("classifier_disabled", gateKind);
   // Floor is authority: only a `courtesy` floor is even a downgrade candidate.
   if (gateKind !== "courtesy") return stop("floor_not_courtesy", gateKind);
   const text = `${reason}\n${question}`;

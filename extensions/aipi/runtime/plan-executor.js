@@ -135,7 +135,9 @@ export async function executePlanRun({
           gateKind: awaiting.gate_kind,
           reason: execution?.state?.blocked_reason ?? "",
           question: awaiting.question ?? "",
-          classifier: stopClassifier,
+          // undefined => classifyStop uses its default deterministic discriminator; a real model callback
+          // (stopClassifier) overrides it when wired.
+          classifier: stopClassifier ?? undefined,
         });
         results[results.length - 1].stop_classifier = { decision: verdict.decision, reason: verdict.reason };
         if (verdict.decision === "continue") {

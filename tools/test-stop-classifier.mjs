@@ -2,14 +2,23 @@ import assert from "node:assert/strict";
 import { classifyStop, STOP_CLASSIFIER_FLAG } from "../extensions/aipi/runtime/stop-classifier.js";
 
 const ON = { [STOP_CLASSIFIER_FLAG]: "1" };
-const OFF = {};
+const OFF = { [STOP_CLASSIFIER_FLAG]: "0" };
 const courtesy = { gateKind: "courtesy", reason: "AIPI parou: como voce quer seguir?", question: "Mantenho o ritmo de checkpoints ou sigo?" };
 const yes = async () => ({ decision: "continue" });
 const no = async () => ({ decision: "stop" });
 
-// Flag OFF => fail-STOP, even with a classifier that would continue.
+// Explicit AIPI_STOP_CLASSIFIER=0 => fail-STOP, even with a classifier that would continue.
 assert.equal((await classifyStop({ ...courtesy, env: OFF, classifier: yes })).decision, "stop");
 assert.equal((await classifyStop({ ...courtesy, env: OFF, classifier: yes })).reason, "classifier_disabled");
+
+// ON by default (env unset): the deterministic discriminator continues a generic courtesy stop out of the box.
+assert.equal((await classifyStop({ ...courtesy, env: {} })).decision, "continue");
+assert.equal((await classifyStop({ ...courtesy, env: {} })).reason, "courtesy_downgrade");
+// ...but keeps blocked when the reason reads like a real gate FAILURE (no flag, no model, deterministic default).
+assert.equal(
+  (await classifyStop({ gateKind: "courtesy", reason: "PASS requires memory_promotions", question: "Como voce quer seguir?", env: {} })).decision,
+  "stop",
+);
 
 // Floor is authority: a non-courtesy gate is never a downgrade candidate, even flag-on + continue.
 for (const gateKind of ["infra", "destructive", "secrets", "prod", "business_rule"]) {
