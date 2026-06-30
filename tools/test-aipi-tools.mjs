@@ -1639,6 +1639,14 @@ try {
   assert.equal(typeof candidateJson.content, "string");
   assert.equal(typeof candidateJson.source_ref, "string");
   assert.equal(typeof candidateJson.promotion_hash, "string");
+  // The candidate filename must be filesystem-safe: the hash segment must NOT carry the "sha256:" colon, which
+  // on Windows/NTFS opens an Alternate Data Stream and makes the candidate vanish from readdir (drain broken).
+  assert.equal(path.basename(deferred.candidate_json_path).includes(":"), false, "candidate filename carries no colon (Windows-safe)");
+  const candDirEntries = await fs.readdir(path.join(tempRoot, ".aipi", "runtime", "memory-candidates"));
+  assert.ok(
+    candDirEntries.includes(path.basename(deferred.candidate_json_path)),
+    "the deferred candidate .json is discoverable via readdir (the drain depends on this)",
+  );
 
   const selfApproved = await aipiPromoteMemory({
     projectRoot: tempRoot,
