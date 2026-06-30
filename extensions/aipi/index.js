@@ -164,7 +164,7 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
   });
 
   pi.registerCommand("aipi-memory", {
-    description: "Inspect AIPI memory + drain candidates: status | refs | query <terms> | candidates | promote <id> | discard <id>.",
+    description: "Inspect AIPI memory: status | refs | query <terms> | candidates | promote <id> | discard <id> | reconcile [scan|dismiss <id>|resolve <id>] | doctor | verify [--strict].",
     handler: async (args, ctx) => {
       try {
         const projectRoot = resolveProjectRoot(ctx);

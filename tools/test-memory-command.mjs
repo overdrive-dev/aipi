@@ -123,6 +123,23 @@ try {
   assert.equal((await runMemoryCommand({ projectRoot: tempRoot, args: "reconcile" })).drifts.length, 0);
   await assert.rejects(() => runMemoryCommand({ projectRoot: tempRoot, args: "reconcile dismiss does-not-exist" }), /no drift/);
 
+  // --- doctor + verify (P3-audit). ---
+  assert.deepEqual(parseMemoryArgs("doctor"), { action: "doctor" });
+  assert.deepEqual(parseMemoryArgs("verify"), { action: "verify", strict: false });
+  assert.deepEqual(parseMemoryArgs("verify --strict"), { action: "verify", strict: true });
+  assert.throws(() => parseMemoryArgs("verify bogus"), /Unexpected .* verify argument/);
+
+  const doctor = await runMemoryCommand({ projectRoot: tempRoot, args: "doctor" });
+  assert.equal(doctor.action, "doctor");
+  assert.equal(doctor.doctor.schema, "aipi.memory-doctor.v1");
+  assert.match(formatMemoryCommandResult(doctor), /AIPI memory doctor/);
+
+  const verify = await runMemoryCommand({ projectRoot: tempRoot, args: "verify --strict" });
+  assert.equal(verify.action, "verify");
+  assert.equal(verify.verify.schema, "aipi.memory-verify.v1");
+  assert.equal(typeof verify.verify.ok, "boolean");
+  assert.match(formatMemoryCommandResult(verify), /AIPI memory verify --strict/);
+
   console.log("AIPI_MEMORY_COMMAND_TEST_OK");
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });

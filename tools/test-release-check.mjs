@@ -27,6 +27,16 @@ const aggregate = buildReleaseReport({
 assert.equal(aggregate.schema, "aipi.release-check.v1");
 assert.equal(aggregate.status, "external_unavailable");
 
+const healthyVerifier = async ({ strict }) => ({
+  schema: "aipi.memory-verify.v1",
+  ok: true,
+  strict: Boolean(strict),
+  errors: 0,
+  warnings: 0,
+  problems: [],
+  counts: { rules: 0, open_drifts: 0 },
+});
+
 const seen = [];
 const stdout = [];
 const result = await runReleaseCheck({
@@ -34,6 +44,7 @@ const result = await runReleaseCheck({
   env: { TEMP: "C:/tmp" },
   stdout: { write: (chunk) => stdout.push(chunk) },
   stderr: { write: () => {} },
+  memoryVerifier: healthyVerifier,
   runner: async ({ args }) => {
     seen.push(args.join(" "));
     if (args.includes("test")) return { code: 0, signal: null, stdout: "tests ok", stderr: "" };
@@ -69,12 +80,42 @@ assert.equal(JSON.parse(stdout.join("")).schema, "aipi.release-check.v1");
 assert.equal(seen.some((entry) => entry.includes("npm-cli.js test")), true);
 assert.equal(seen.some((entry) => entry.includes("pack --dry-run --json")), true);
 assert.equal(seen.some((entry) => entry.includes("run release:audit")), true);
+// P3-audit: the in-process memory verify runs as a release check and passed.
+const memoryCheck = result.report.checks.find((check) => check.id === "memory_verify");
+assert.ok(memoryCheck, "memory_verify check is present in the release report");
+assert.equal(memoryCheck.status, "pass");
+
+// A failing memory verify FAILS the release (status fail, exit 1).
+const failOut = [];
+const failResult = await runReleaseCheck({
+  argv: ["--json", "--skip-test", "--skip-audit"],
+  stdout: { write: (chunk) => failOut.push(chunk) },
+  stderr: { write: () => {} },
+  memoryVerifier: async () => ({ schema: "aipi.memory-verify.v1", ok: false, strict: true, errors: 2, warnings: 1, problems: [], counts: { rules: 3, open_drifts: 1 } }),
+  runner: async () => ({ code: 0, signal: null, stdout: JSON.stringify([{ name: "aipi-templates", entryCount: 84 }]), stderr: "" }),
+});
+assert.equal(failResult.report.checks.find((c) => c.id === "memory_verify").status, "fail");
+assert.equal(failResult.report.status, "fail");
+assert.equal(failResult.exitCode, 1);
+
+// Fail-safe: a verifier that THROWS is reported as fail (never a silent pass).
+const throwResult = await runReleaseCheck({
+  argv: ["--json", "--skip-test", "--skip-audit"],
+  stdout: { write: () => {} },
+  stderr: { write: () => {} },
+  memoryVerifier: async () => { throw new Error("boom reading memory"); },
+  runner: async () => ({ code: 0, signal: null, stdout: JSON.stringify([{ name: "aipi-templates", entryCount: 84 }]), stderr: "" }),
+});
+const throwCheck = throwResult.report.checks.find((c) => c.id === "memory_verify");
+assert.equal(throwCheck.status, "fail");
+assert.match(throwCheck.reason, /could not complete/);
 
 const skippedOutput = [];
 const skipped = await runReleaseCheck({
   argv: ["--json", "--skip-test", "--skip-audit"],
   stdout: { write: (chunk) => skippedOutput.push(chunk) },
   stderr: { write: () => {} },
+  memoryVerifier: healthyVerifier,
   runner: async ({ args }) => {
     assert.equal(args.includes("pack"), true);
     return {
