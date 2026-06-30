@@ -4665,7 +4665,7 @@ function projectMemoryFileForKind(kind) {
   return PROJECT_MEMORY_KIND_TO_FILE.get(normalized) ?? "knowledge.md";
 }
 
-function memoryPromotionHash({ kind, title, content, source_ref } = {}) {
+export function memoryPromotionHash({ kind, title, content, source_ref } = {}) {
   return `sha256:${contentHash([
     slug(kind),
     String(title ?? "").trim(),

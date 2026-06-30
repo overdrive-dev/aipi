@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { aipiKanbanUpdate } from "./aipi-tools.js";
+import { captureSettledPlanRules } from "./memory-capture.js";
 
 // The plan layer sits ABOVE the single-run workflow engine. A plan holds SEVERAL tasks, the clarifying
 // questions gathered for them in one pre-flight phase, and the business rules investigated once. The
@@ -264,7 +265,7 @@ export function unsettledReasons(plan) {
   return reasons;
 }
 
-export async function settlePlan({ projectRoot, planId = null, now = () => new Date() } = {}) {
+export async function settlePlan({ projectRoot, planId = null, now = () => new Date(), captureRules = captureSettledPlanRules } = {}) {
   const { root, plan } = await loadPlanForMutation(projectRoot, planId);
   const reasons = unsettledReasons(plan);
   if (reasons.length) {
@@ -278,6 +279,13 @@ export async function settlePlan({ projectRoot, planId = null, now = () => new D
   plan.status = "settled";
   plan.settled_at = now().toISOString();
   await persistPlan(root, plan);
+  // RC1: a settled plan's accepted business rules become structured memory candidates (best-effort;
+  // capture never fails the settle, and it only stages candidates — the human drains them).
+  try {
+    await captureRules({ projectRoot: root, plan, now });
+  } catch {
+    // capture is advisory
+  }
   return { plan };
 }
 
