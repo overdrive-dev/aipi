@@ -1,10 +1,20 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { aipiMemoryQuery, parseMemoryFrontmatter } from "./aipi-tools.js";
+import { aipiMemoryQuery, aipiPromoteMemory, parseMemoryFrontmatter } from "./aipi-tools.js";
 
 const VALID_LAYERS = new Set(["project", "user", "all"]);
 const GRAPH_REL_PATH = ".aipi/state/aipi-graph.json";
 const GRAPH_SQLITE_REL_PATH = ".aipi/state/aipi-graph.sqlite";
+const CANDIDATES_DIR = ".aipi/runtime/memory-candidates";
+
+// Candidate ids are filename stems; reject anything that could escape the candidates dir.
+function safeCandidateId(id) {
+  const clean = String(id ?? "").trim();
+  if (!clean || /[\\/]/.test(clean) || clean.includes("..")) {
+    throw new Error(`invalid candidate id: ${id}`);
+  }
+  return clean.replace(/\.(json|md)$/i, "");
+}
 
 export function parseMemoryArgs(args = "") {
   const tokens = String(args).trim().split(/\s+/).filter(Boolean);
@@ -17,13 +27,81 @@ export function parseMemoryArgs(args = "") {
   if (tokens[0] === "query" || tokens[0] === "search") {
     return parseMemoryOptions(tokens.slice(1), { action: "query", layer: "project", limit: 8, query: "" });
   }
+  if (tokens[0] === "candidates" || tokens[0] === "candidate") {
+    return { action: "candidates" };
+  }
+  if (tokens[0] === "promote") {
+    if (!tokens[1]) throw new Error("/aipi-memory promote requires a candidate id");
+    return { action: "promote", id: tokens[1] };
+  }
+  if (tokens[0] === "discard") {
+    if (!tokens[1]) throw new Error("/aipi-memory discard requires a candidate id");
+    return { action: "discard", id: tokens[1] };
+  }
   throw new Error(`Unknown /aipi-memory action: ${tokens[0]}`);
 }
 
-export async function runMemoryCommand({ args = "", projectRoot } = {}) {
+export async function runMemoryCommand({ args = "", projectRoot, now = () => new Date(), promoteMemory = aipiPromoteMemory } = {}) {
   if (!projectRoot) throw new Error("projectRoot is required");
   const root = path.resolve(projectRoot);
   const command = parseMemoryArgs(args);
+
+  if (command.action === "candidates") {
+    return {
+      schema: "aipi.memory-command.v1",
+      action: "candidates",
+      candidates: await listMemoryCandidates(root),
+    };
+  }
+
+  if (command.action === "promote") {
+    const id = safeCandidateId(command.id);
+    const jsonRel = path.posix.join(CANDIDATES_DIR, `${id}.json`);
+    const jsonAbs = path.join(root, jsonRel);
+    if (!(await pathExists(jsonAbs))) {
+      throw new Error(`no structured candidate '${id}' to promote (only .json candidates are promotable; legacy .md candidates must be re-captured)`);
+    }
+    const candidate = JSON.parse(await fs.readFile(jsonAbs, "utf8"));
+    // Mint a HUMAN approval artifact (source: human-drain) so the hardened approval gate authorizes the write.
+    const approvalRel = path.posix.join(".aipi", "runtime", "approvals", "approved", `${id}-drain.json`);
+    await fs.mkdir(path.dirname(path.join(root, approvalRel)), { recursive: true });
+    await fs.writeFile(
+      path.join(root, approvalRel),
+      `${JSON.stringify({ schema: "aipi.memory-promotion-approval.v1", decision: "APPROVED", source: "human-drain", candidate_id: id, created_at: now().toISOString() }, null, 2)}\n`,
+    );
+    const result = await promoteMemory({
+      projectRoot: root,
+      kind: candidate.kind,
+      title: candidate.title ?? "",
+      content: candidate.content,
+      source_ref: candidate.source_ref,
+      user_memory: Boolean(candidate.user_memory),
+      approval_ref: approvalRel,
+      now,
+    });
+    let drained = false;
+    if (result.status === "promoted") {
+      await fs.rm(jsonAbs, { force: true });
+      if (candidate.md_path) await fs.rm(path.join(root, candidate.md_path), { force: true });
+      drained = true;
+    }
+    return { schema: "aipi.memory-command.v1", action: "promote", id, result, drained };
+  }
+
+  if (command.action === "discard") {
+    const id = safeCandidateId(command.id);
+    const removed = [];
+    for (const ext of ["json", "md"]) {
+      const rel = path.posix.join(CANDIDATES_DIR, `${id}.${ext}`);
+      const abs = path.join(root, rel);
+      if (await pathExists(abs)) {
+        await fs.rm(abs, { force: true });
+        removed.push(rel);
+      }
+    }
+    if (!removed.length) throw new Error(`no candidate '${id}' to discard`);
+    return { schema: "aipi.memory-command.v1", action: "discard", id, removed };
+  }
 
   if (command.action === "status") {
     return {
@@ -108,6 +186,25 @@ export function formatMemoryCommandResult(result) {
       `AIPI memory query: "${result.query}" layer=${result.layer}${filters}`,
       ...result.refs.map((ref) => `- ${ref.path}:${ref.line} score=${ref.score} ${singleLine(ref.text)}`),
     ].join("\n");
+  }
+
+  if (result.action === "candidates") {
+    if (!result.candidates.length) return "AIPI memory candidates: none pending.";
+    return [
+      `AIPI memory candidates: ${result.candidates.length} pending`,
+      ...result.candidates.map((c) => `- ${c.id} [${c.kind ?? "?"}]${c.structured ? "" : " (legacy)"}${c.title ? ` ${c.title}` : ""}${c.source_ref ? ` (${c.source_ref})` : ""}`),
+      "Promote with /aipi-memory promote <id> or discard with /aipi-memory discard <id>.",
+    ].join("\n");
+  }
+
+  if (result.action === "promote") {
+    return result.drained
+      ? `AIPI memory promoted: ${result.id} -> ${result.result.path}${result.result.committed ? " (committed)" : ""}`
+      : `AIPI memory promote did NOT land for ${result.id}: ${result.result.reason ?? result.result.status}`;
+  }
+
+  if (result.action === "discard") {
+    return `AIPI memory candidate discarded: ${result.id} (${result.removed.length} file(s))`;
   }
 
   return "AIPI memory command completed.";
@@ -237,6 +334,36 @@ async function listMarkdownFiles(dir) {
     if (entry.isFile() && entry.name.endsWith(".md")) files.push(full);
   }
   return files;
+}
+
+async function listMemoryCandidates(root) {
+  const dir = path.join(root, CANDIDATES_DIR);
+  const entries = await fs.readdir(dir).catch((error) => {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  });
+  const jsonIds = new Set();
+  const candidates = [];
+  for (const name of entries) {
+    if (!name.endsWith(".json")) continue;
+    const id = name.replace(/\.json$/, "");
+    jsonIds.add(id);
+    try {
+      const c = JSON.parse(await fs.readFile(path.join(dir, name), "utf8"));
+      candidates.push({ id, structured: true, kind: c.kind ?? null, title: c.title ?? null, source_ref: c.source_ref ?? null, status: c.status ?? "candidate", created_at: c.created_at ?? null });
+    } catch {
+      candidates.push({ id, structured: true, kind: null, title: null, source_ref: null, status: "unreadable" });
+    }
+  }
+  // Legacy .md-only candidates (written before the structured sidecar) are listed but not promotable.
+  for (const name of entries) {
+    if (!name.endsWith(".md")) continue;
+    const id = name.replace(/\.md$/, "");
+    if (jsonIds.has(id)) continue;
+    const inferredKind = id.replace(/^[0-9TZ:.\-]+-/, "") || null;
+    candidates.push({ id, structured: false, kind: inferredKind, title: null, source_ref: null, status: "legacy" });
+  }
+  return candidates.sort((a, b) => a.id.localeCompare(b.id));
 }
 
 async function pathExists(filePath) {
