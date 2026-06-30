@@ -4670,7 +4670,26 @@ async function inspectDurableMemoryApproval(root, approvalRef) {
   if (!(await pathExists(abs))) {
     return { ok: false, reason: `approval_ref does not exist: ${normalized}` };
   }
-  return { ok: true, path: normalized };
+  // RC2: validate the artifact's CONTENT, not mere existence — a durable write must be backed by an
+  // explicit APPROVED decision AND a non-empty source. This is what stops a self-minted/blank artifact
+  // from passing, and keeps the source auditable (executor vs human-drain vs deterministic-extractor).
+  let parsed;
+  try {
+    parsed = JSON.parse(await fs.readFile(abs, "utf8"));
+  } catch {
+    return { ok: false, reason: `approval_ref is not valid JSON: ${normalized}` };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, reason: `approval_ref must be a JSON object: ${normalized}` };
+  }
+  if (parsed.decision !== "APPROVED") {
+    return { ok: false, reason: `approval_ref decision must be APPROVED (got ${parsed.decision ?? "none"})` };
+  }
+  const source = typeof parsed.source === "string" ? parsed.source.trim() : "";
+  if (!source) {
+    return { ok: false, reason: "approval_ref must record a non-empty source" };
+  }
+  return { ok: true, path: normalized, decision: parsed.decision, source };
 }
 
 async function insertMemoryEntry({ root, targetRel, entry, kind, timestamp, sourceRef, promotionHash }) {

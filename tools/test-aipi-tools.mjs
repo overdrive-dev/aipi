@@ -1650,8 +1650,33 @@ try {
   await fs.mkdir(path.dirname(path.join(tempRoot, approvalRel)), { recursive: true });
   await fs.writeFile(
     path.join(tempRoot, approvalRel),
-    JSON.stringify({ schema: "aipi.approval.v1", decision: "APPROVED" }),
+    JSON.stringify({ schema: "aipi.approval.v1", decision: "APPROVED", source: "test-human" }),
   );
+
+  // RC2: the approval gate validates the artifact's decision+source (not mere existence). An approval
+  // missing `source`, or one that is not APPROVED, must DEFER — never reach durable memory.
+  const noSourceApprovalRel = ".aipi/runtime/approvals/approved/no-source.json";
+  await fs.writeFile(path.join(tempRoot, noSourceApprovalRel), JSON.stringify({ schema: "aipi.approval.v1", decision: "APPROVED" }));
+  const noSourcePromotion = await aipiPromoteMemory({
+    projectRoot: tempRoot,
+    kind: "decision",
+    content: "No-source approval must not reach durable memory.",
+    source_ref: ".aipi/runtime/runs/run-1/steps/final_verification/VERIFICATION.md",
+    approval_ref: noSourceApprovalRel,
+    now: () => new Date("2026-06-16T04:00:00.000Z"),
+  });
+  assert.equal(noSourcePromotion.status, "deferred", "approval without a source must defer (not existence-only)");
+  const rejectedApprovalRel = ".aipi/runtime/approvals/approved/rejected.json";
+  await fs.writeFile(path.join(tempRoot, rejectedApprovalRel), JSON.stringify({ schema: "aipi.approval.v1", decision: "REJECTED", source: "human" }));
+  const rejectedPromotion = await aipiPromoteMemory({
+    projectRoot: tempRoot,
+    kind: "decision",
+    content: "Rejected approval must not reach durable memory.",
+    source_ref: ".aipi/runtime/runs/run-1/steps/final_verification/VERIFICATION.md",
+    approval_ref: rejectedApprovalRel,
+    now: () => new Date("2026-06-16T04:10:00.000Z"),
+  });
+  assert.equal(rejectedPromotion.status, "deferred", "a non-APPROVED decision must defer");
 
   const promoted = await aipiPromoteMemory({
     projectRoot: tempRoot,
