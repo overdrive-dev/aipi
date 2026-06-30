@@ -80,6 +80,49 @@ try {
   await assert.rejects(() => runMemoryCommand({ projectRoot: tempRoot, args: "promote ../../etc/passwd" }), /invalid candidate id/);
   await assert.rejects(() => runMemoryCommand({ projectRoot: tempRoot, args: "promote does-not-exist" }), /no structured candidate/);
 
+  // --- reconcile grammar + drift lifecycle (RC4 / P2-detect). ---
+  assert.deepEqual(parseMemoryArgs("reconcile"), { action: "reconcile" });
+  assert.deepEqual(parseMemoryArgs("reconcile scan"), { action: "reconcile-scan" });
+  assert.deepEqual(parseMemoryArgs("reconcile dismiss d1"), { action: "reconcile-act", op: "dismiss", id: "d1" });
+  assert.deepEqual(parseMemoryArgs("reconcile resolve d1"), { action: "reconcile-act", op: "resolve", id: "d1" });
+  assert.throws(() => parseMemoryArgs("reconcile dismiss"), /requires a drift id/);
+  assert.throws(() => parseMemoryArgs("reconcile bogus"), /Unknown .* reconcile subcommand/);
+
+  // Nothing drifted yet.
+  const empty = await runMemoryCommand({ projectRoot: tempRoot, args: "reconcile" });
+  assert.equal(empty.action, "reconcile");
+  assert.deepEqual(empty.drifts, []);
+  assert.match(formatMemoryCommandResult(empty), /in sync with code/);
+
+  // reconcile scan with an injected detector that surfaces a drift -> queued + listed.
+  const scan = await runMemoryCommand({
+    projectRoot: tempRoot,
+    args: "reconcile scan",
+    detectDrift: async ({ root }) => {
+      await fs.mkdir(path.join(root, ".aipi", "runtime", "memory-drift"), { recursive: true });
+      await fs.writeFile(
+        path.join(root, ".aipi", "runtime", "memory-drift", "BR-X-abc12345.json"),
+        `${JSON.stringify({ schema: "aipi.memory-drift.v1", id: "BR-X-abc12345", status: "open", rule_id: "BR-X", title: "Pricing rule", signal: "impacted_files_changed", severity: "review", changed: ["pricing.py"], source: "pricing.py:1" })}\n`,
+      );
+      return { schema: "aipi.memory-drift-scan.v1", checked: 1, in_scope: 1, drifts: [{}], queued: [{ id: "BR-X-abc12345", status: "queued" }] };
+    },
+  });
+  assert.equal(scan.action, "reconcile-scan");
+  assert.equal(scan.drifts.length, 1);
+  assert.match(formatMemoryCommandResult(scan), /BR-X-abc12345/);
+
+  // reconcile (list) shows it.
+  const listed = await runMemoryCommand({ projectRoot: tempRoot, args: "reconcile" });
+  assert.equal(listed.drifts.length, 1);
+
+  // dismiss removes it.
+  const dismissed = await runMemoryCommand({ projectRoot: tempRoot, args: "reconcile dismiss BR-X-abc12345", now: () => new Date("2026-06-30T03:00:00.000Z") });
+  assert.equal(dismissed.action, "reconcile-act");
+  assert.equal(dismissed.id, "BR-X-abc12345");
+  assert.match(formatMemoryCommandResult(dismissed), /dismissed/);
+  assert.equal((await runMemoryCommand({ projectRoot: tempRoot, args: "reconcile" })).drifts.length, 0);
+  await assert.rejects(() => runMemoryCommand({ projectRoot: tempRoot, args: "reconcile dismiss does-not-exist" }), /no drift/);
+
   console.log("AIPI_MEMORY_COMMAND_TEST_OK");
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });

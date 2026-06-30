@@ -4708,6 +4708,12 @@ function renderBusinessRuleEntry({ title, content, source_ref, approval_ref, tim
   const statement = extractField(content, "statement") ?? stripMarkdownHeading(content).trim();
   const sourcePath = codePathFromSourceRef(source_ref);
   const links = sourcePath ? `implements:[${sourcePath}], relates:[], decided-by:[]` : "implements:[], relates:[], decided-by:[]";
+  // Rule-as-contract fields (RC4): the code the rule governs (impacted-files), an OPTIONAL executable anchor
+  // that asserts the rule still holds (verify), and when the rule was last confirmed against code
+  // (last-verified). The drift detector reads these — see detectBusinessRuleDrift. impacted-files defaults to
+  // the source code path so even a minimally-stated rule gets code-drift coverage.
+  const impactedFiles = (extractField(content, "impacted-files") || sourcePath || "").trim();
+  const verify = (extractField(content, "verify") || "").trim();
   return [
     `### ${ruleId} - ${ruleTitle}`,
     "- **domain:** project",
@@ -4716,10 +4722,13 @@ function renderBusinessRuleEntry({ title, content, source_ref, approval_ref, tim
     "  - Given the accepted project context, When this rule applies, Then the statement above remains true.",
     `- **status:** ${accepted ? "accepted" : "candidate"}`,
     `- **source:** ${source_ref}`,
+    `- **impacted-files:** ${impactedFiles}`,
+    `- **verify:** ${verify}`,
     `- **rationale:** Promoted through aipi_promote_memory at ${timestamp}.`,
     `- **links:** ${links}`,
     `- **approval-ref:** ${approval_ref}`,
     `- **promotion-hash:** ${promotionHash}`,
+    `- **last-verified:** ${timestamp.slice(0, 10)}`,
     `- **last-reviewed:** ${timestamp.slice(0, 10)}`,
     "",
   ].join("\n");
@@ -4750,6 +4759,273 @@ function renderDecisionEntry({ title, content, source_ref, approval_ref, timesta
     `- **date:** ${timestamp.slice(0, 10)}`,
     "",
   ].join("\n");
+}
+
+// RC4: code-vs-rule drift. Durable business rules are contracts over code (impacted-files + optional verify
+// anchor). When a run changes the code a rule governs, the rule MIGHT be stale — we SURFACE that (queue a
+// drift report + audit-ledger entry) and NEVER mutate business-rules.md. A human reconciles via
+// `/aipi-memory reconcile`. Deterministic by default (no model, no shell on the hot path): the executor wires
+// detection-only (impacted-files ∩ changed). The executable verify anchor is opt-in (inject runVerify) so the
+// engine never runs arbitrary shell from a memory file on autopilot. Honest residual: detection is only as
+// good as a rule's anchor adequacy and its impacted-files recall.
+const MEMORY_DRIFT_DIR = ".aipi/runtime/memory-drift";
+
+// Parse business-rules.md into structured rule contracts. Tolerant of hand-edited files (missing fields → "").
+export function parseBusinessRules(text) {
+  const src = String(text ?? "");
+  const headers = [...src.matchAll(/^### (.+)$/gm)];
+  const rules = [];
+  for (let index = 0; index < headers.length; index += 1) {
+    const start = headers[index].index;
+    const end = index + 1 < headers.length ? headers[index + 1].index : src.length;
+    const block = src.slice(start, end);
+    const header = headers[index][1].trim();
+    const id = header.match(/\bBR-[A-Za-z0-9_-]+\b/)?.[0] ?? null;
+    const titleParts = header.split(/\s+-\s+/);
+    const title = titleParts.length > 1 ? titleParts.slice(1).join(" - ").trim() : header;
+    const impactedRaw = extractField(block, "impacted-files") ?? "";
+    const impacted_files = impactedRaw
+      .split(/[,\s]+/)
+      .map((value) => value.trim())
+      .filter((value) => value && value.toLowerCase() !== "none");
+    rules.push({
+      id,
+      title,
+      statement: extractField(block, "statement") ?? "",
+      source: extractField(block, "source") ?? "",
+      impacted_files,
+      verify: extractField(block, "verify") ?? "",
+      last_verified: extractField(block, "last-verified") ?? "",
+      promotion_hash: extractField(block, "promotion-hash") ?? "",
+    });
+  }
+  return rules;
+}
+
+function normalizeDriftPath(value) {
+  return String(value ?? "")
+    .replaceAll("\\", "/")
+    .replace(/^\.\/+/, "")
+    .replace(/#.*$/, "")
+    .replace(/:\d+(?::\d+)?$/, "")
+    .trim();
+}
+
+function ruleFileMatchesChange(ruleFile, changed) {
+  const a = normalizeDriftPath(ruleFile);
+  if (!a) return false;
+  return changed.some((c) => c === a || c.endsWith(`/${a}`) || a.endsWith(`/${c}`));
+}
+
+// A verify anchor is only runnable if it is a non-empty command that is NOT a markdown field line. Defense in
+// depth: even if a hand-edited file leaves a malformed/field-shaped value in `verify`, we never hand it to the
+// shell runner — we fall back to detection-only (impacted_files_changed) for that rule.
+function isRunnableVerifyAnchor(verify) {
+  const value = String(verify ?? "").trim();
+  return Boolean(value) && !value.startsWith("- **");
+}
+
+// The drift id is the STABLE identity of "this rule has this kind of drift": rule_id + signal + source +
+// statement. It deliberately excludes the changed-file SUBSET — that is evidence (carried as report payload),
+// not identity. Folding `changed` in would mutate the id as a multi-impacted-file rule accrues more matched
+// files across the steps of one run (gitChangedFiles unions all uncommitted), which would defeat dismissal
+// (a fresh id every step) and duplicate open reports. source + statement still separate two DISTINCT rules
+// that share a BR- id (or both parse to null → "BR-UNKNOWN"); no time/run component → same rule re-detected
+// hashes identically and dedupes.
+function computeDriftId(drift) {
+  return `${drift.rule_id ?? "BR-UNKNOWN"}-${contentHash([drift.signal, drift.source ?? "", drift.statement ?? ""].join("|")).slice(0, 8)}`;
+}
+
+// Best-effort union of staged + unstaged + untracked paths, used only when the caller passes no changedFiles.
+function gitChangedFiles(root, git) {
+  const out = new Set();
+  for (const args of [["diff", "--name-only", "HEAD"], ["diff", "--name-only"], ["ls-files", "--others", "--exclude-standard"]]) {
+    try {
+      const result = git(root, args);
+      if (result && result.status === 0) {
+        for (const line of String(result.stdout ?? "").split(/\r?\n/)) {
+          const value = normalizeDriftPath(line);
+          if (value) out.add(value);
+        }
+      }
+    } catch {
+      // git unavailable / not a repo → no code-drift signal (honest limit), never throw
+    }
+  }
+  return [...out];
+}
+
+export async function detectBusinessRuleDrift({
+  root: rootIn,
+  changedFiles = null,
+  now = () => new Date(),
+  git = defaultMemoryGit,
+  runVerify = null,
+  queue = true,
+} = {}) {
+  const root = assertRoot(rootIn);
+  const rulesAbs = path.join(root, ".aipi", "memory", "project", "business-rules.md");
+  const text = await fs.readFile(rulesAbs, "utf8").catch((error) => {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  });
+  const allRules = parseBusinessRules(text);
+  const rules = allRules.filter((rule) => rule.impacted_files.length);
+  const changed = (Array.isArray(changedFiles) ? changedFiles : gitChangedFiles(root, git))
+    .map(normalizeDriftPath)
+    .filter(Boolean);
+
+  const drifts = [];
+  let inScope = 0;
+  for (const rule of rules) {
+    const hit = rule.impacted_files.filter((file) => ruleFileMatchesChange(file, changed));
+    if (!hit.length) continue;
+    inScope += 1;
+    let signal = "impacted_files_changed";
+    let severity = "review";
+    if (isRunnableVerifyAnchor(rule.verify) && typeof runVerify === "function") {
+      let status = 1; // fail-safe: unknown/missing/non-numeric outcome SURFACES drift, never suppresses it
+      try {
+        const result = await runVerify({ cwd: root, command: rule.verify });
+        // Only a REAL numeric exit code may signal "pass". `Number()` would coerce null/false/""/[] to 0 — and
+        // child_process.spawnSync returns `status: null` when the process is killed by a signal (timeout/OOM),
+        // i.e. exactly when a rule is most likely violated. Treating those as 0 would be fail-OPEN; require a
+        // finite number so a missing/signal-killed/garbage result surfaces a high verify_failed drift instead.
+        status = (typeof result?.status === "number" && Number.isFinite(result.status)) ? result.status : 1;
+      } catch {
+        status = 1;
+      }
+      if (status === 0) continue; // anchor passed → the rule still holds → not drift
+      signal = "verify_failed";
+      severity = "high";
+    }
+    drifts.push({
+      rule_id: rule.id,
+      title: rule.title,
+      signal,
+      severity,
+      changed: hit,
+      source: rule.source,
+      statement: rule.statement || "",
+      verify: rule.verify || "",
+    });
+  }
+
+  const queued = [];
+  if (queue) {
+    const currentIds = new Set(drifts.map(computeDriftId));
+    // Reap dismissed/resolved TOMBSTONES whose cause is no longer in the current change set. This scopes a
+    // dismissal to the episode that produced it: it sticks while the rule's files stay dirty (so it does not
+    // re-spam every passed step), but once those changes are committed/reverted the tombstone is cleared, so a
+    // GENUINE future re-violation of the same rule re-surfaces instead of being silently swallowed forever. It
+    // also bounds the queue dir. Open reports are left alone — they are the human's pending queue.
+    await reapStaleDriftTombstones(root, currentIds);
+    for (const drift of drifts) {
+      const id = computeDriftId(drift);
+      const rel = path.posix.join(MEMORY_DRIFT_DIR, `${id}.json`);
+      // pathExists suppresses re-queue for BOTH open reports AND still-relevant dismissed/resolved tombstones,
+      // so a dismissed false positive does not re-surface on every passed step while its files stay dirty.
+      if (await pathExists(path.join(root, rel))) {
+        queued.push({ id, status: "duplicate" });
+        continue;
+      }
+      const detectedAt = now().toISOString();
+      await writeProjectFile(root, rel, `${JSON.stringify({ schema: "aipi.memory-drift.v1", id, status: "open", detected_at: detectedAt, ...drift }, null, 2)}\n`);
+      await appendMemoryAudit(root, {
+        recorded_at: detectedAt,
+        event: "drift_detected",
+        kind: "business-rule",
+        title: drift.title ?? null,
+        source_ref: drift.source,
+        drift_id: id,
+        signal: drift.signal,
+        severity: drift.severity,
+        changed: drift.changed,
+      });
+      queued.push({ id, status: "queued", path: rel });
+    }
+  }
+
+  return { schema: "aipi.memory-drift-scan.v1", checked: rules.length, in_scope: inScope, drifts, queued };
+}
+
+// Delete dismissed/resolved tombstones whose id is NOT in the current scan's active drift set — their cause has
+// cleared, so they should no longer suppress a future re-detection. Filename (not the JSON `id` field) is the
+// path source, so a hand-tampered report can't redirect the unlink. Open reports are never reaped here.
+async function reapStaleDriftTombstones(root, currentIds) {
+  const dir = path.join(root, MEMORY_DRIFT_DIR);
+  const names = await fs.readdir(dir).catch((error) => {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  });
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    const id = name.slice(0, -5);
+    if (currentIds.has(id)) continue; // still an active cause → keep suppressing
+    let status = "open";
+    try {
+      status = JSON.parse(await fs.readFile(path.join(dir, name), "utf8")).status ?? "open";
+    } catch {
+      status = "open"; // unreadable → treat as open and leave it for the human, don't reap
+    }
+    if (status === "dismissed" || status === "resolved") {
+      await fs.rm(path.join(dir, name), { force: true });
+    }
+  }
+}
+
+export async function listBusinessRuleDrifts(rootIn, { includeResolved = false } = {}) {
+  const root = assertRoot(rootIn);
+  const dir = path.join(root, MEMORY_DRIFT_DIR);
+  const entries = await fs.readdir(dir).catch((error) => {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  });
+  const drifts = [];
+  for (const name of entries) {
+    if (!name.endsWith(".json")) continue;
+    try {
+      drifts.push(JSON.parse(await fs.readFile(path.join(dir, name), "utf8")));
+    } catch {
+      drifts.push({ id: name.replace(/\.json$/, ""), status: "unreadable" });
+    }
+  }
+  // The human surface shows only OPEN drifts; dismissed/resolved tombstones stay on disk (so detection won't
+  // re-queue them on a still-dirty tree) but are hidden unless explicitly requested.
+  const visible = includeResolved ? drifts : drifts.filter((d) => (d.status ?? "open") === "open");
+  return visible.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+}
+
+// Tombstone (not delete) a drift: rewrite the queue file with a non-open status so it disappears from the human
+// surface BUT still exists on disk — the detect dedup guard (pathExists) then keeps it suppressed, so a
+// dismissed false positive does not re-surface on every passed step while the working tree is still dirty. The
+// id is run-stable, so a hard delete would let the very next scan re-queue the identical drift.
+export async function resolveBusinessRuleDrift({ root: rootIn, id, action = "dismiss", now = () => new Date() } = {}) {
+  const root = assertRoot(rootIn);
+  const clean = String(id ?? "").trim().replace(/\.json$/i, "");
+  if (!clean || /[\\/]/.test(clean) || clean.includes("..")) {
+    throw new Error(`invalid drift id: ${id}`);
+  }
+  const rel = path.posix.join(MEMORY_DRIFT_DIR, `${clean}.json`);
+  const abs = path.join(root, rel);
+  if (!(await pathExists(abs))) {
+    throw new Error(`no drift '${clean}' to ${action}`);
+  }
+  const resolvedAt = now().toISOString();
+  const status = action === "resolve" ? "resolved" : "dismissed";
+  let report;
+  try {
+    report = JSON.parse(await fs.readFile(abs, "utf8"));
+  } catch {
+    report = { schema: "aipi.memory-drift.v1", id: clean };
+  }
+  await writeProjectFile(root, rel, `${JSON.stringify({ ...report, id: clean, status, resolved_at: resolvedAt }, null, 2)}\n`);
+  await appendMemoryAudit(root, {
+    recorded_at: resolvedAt,
+    event: action === "resolve" ? "drift_resolved" : "drift_dismissed",
+    drift_id: clean,
+  });
+  return { id: clean, action, status, path: rel };
 }
 
 async function inspectDurableMemoryApproval(root, approvalRef) {
@@ -4947,7 +5223,11 @@ function stripMarkdownHeading(content) {
 }
 
 function extractField(content, field) {
-  const pattern = new RegExp(`^- \\*\\*${escapeRegex(field)}:\\*\\*\\s*(.+)$`, "im");
+  // Restrict the pre-value run to spaces/tabs and capture with `(.*)` (which never matches `\n`). With `\s*(.+)`
+  // under the `m` flag, an EMPTY field value (`- **verify:** ` then a newline) let `\s*` swallow the line break
+  // and `(.+)` capture the NEXT line — silently stealing the following field's text. `[ \t]*(.*)` keeps the
+  // match on its own line, so a present-but-empty field returns "" instead of the next line.
+  const pattern = new RegExp(`^- \\*\\*${escapeRegex(field)}:\\*\\*[ \\t]*(.*)$`, "im");
   return String(content ?? "").match(pattern)?.[1]?.trim() ?? null;
 }
 

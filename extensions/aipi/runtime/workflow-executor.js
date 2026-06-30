@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { awaitingUserInputFromStepResult } from "./blocker-input.js";
 import { buildStepContext, ContextMaterializationError } from "./context-builder.js";
-import { aipiPromoteMemory } from "./aipi-tools.js";
+import { aipiPromoteMemory, detectBusinessRuleDrift } from "./aipi-tools.js";
 import { describeModel, resolveStepModel } from "./model-router.js";
 import { recordWorkerModelRoute } from "./lifecycle-hooks.js";
 import { classifyGateKind, validateStepResult } from "./step-result.js";
@@ -230,6 +230,11 @@ export async function executeWorkflowRun({
     const memoryPromotionGate = validation.gatePassed && missingArtifacts.length === 0
       ? await materializeStepMemoryPromotions({ root, state, step, result, now })
       : null;
+    if (validation.gatePassed && missingArtifacts.length === 0) {
+      // RC4: surface (never mutate) business-rule drift introduced by this step. Best-effort + detection-only
+      // (no shell exec on the hot path) — a step is NEVER failed because the drift scan failed.
+      await materializeBusinessRuleDriftCheck({ root, now });
+    }
     await writeStepResult({ root, state, step, result, validation, missingArtifacts });
 
     if (validation.gatePassed && missingArtifacts.length === 0 && !memoryPromotionGate?.error) {
@@ -1205,6 +1210,24 @@ async function writeStepResult({ root, state, step, result, validation, missingA
     internal: true,
     content: renderStepResultMarkdown({ step, result, validation, missingArtifacts }),
   });
+}
+
+function memoryDriftCheckEnabled(env = process.env) {
+  const value = String(env?.AIPI_MEMORY_DRIFT_CHECK ?? "1").toLowerCase();
+  return !["0", "false", "off", "no"].includes(value);
+}
+
+// RC4 hook: after a step passes the authoritative gate, scan for business rules whose governed code this run
+// changed (impacted-files ∩ git-changed) and QUEUE a drift report. Detection-only by default — the executable
+// verify anchor is NOT run here (no arbitrary shell on the hot path); a human runs it via /aipi-memory
+// reconcile. Fully best-effort: any failure (no rules, not a git repo, parse error) returns null silently.
+async function materializeBusinessRuleDriftCheck({ root, now }) {
+  if (!memoryDriftCheckEnabled()) return null;
+  try {
+    return await detectBusinessRuleDrift({ root, now });
+  } catch {
+    return null;
+  }
 }
 
 async function materializeStepMemoryPromotions({ root, state, step, result, now }) {
