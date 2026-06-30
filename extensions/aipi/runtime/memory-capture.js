@@ -45,7 +45,7 @@ export async function captureSettledPlanRules({ projectRoot, plan, promoteMemory
     if (!text) continue;
     const title = deriveTitle(text);
     const content = `- **statement:** ${text}`;
-    const source_ref = String(rule?.source ?? "").trim() || `plan:${plan.plan_id}`;
+    const source_ref = String(rule?.source ?? "").trim() || `plan:${plan?.plan_id ?? "unknown"}`;
     const hash = memoryPromotionHash({ kind: "business-rule", title, content, source_ref });
     if (seen.has(hash)) {
       captured.push({ rule_id: rule.rule_id ?? null, status: "duplicate" });

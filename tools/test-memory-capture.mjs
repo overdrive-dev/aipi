@@ -14,6 +14,10 @@ const nowBase = Date.parse("2026-06-30T00:00:00.000Z");
 const now = () => new Date(nowBase + (tick++) * 1000);
 const fixedRandom = () => Buffer.from("abcdef", "hex");
 
+async function pathExists(p) {
+  try { await fs.access(p); return true; } catch { return false; }
+}
+
 try {
   await initProject({ sourceRoot, targetRoot: tempRoot });
 
@@ -62,6 +66,34 @@ try {
   assert.match(calls[0].content, /\*\*statement:\*\* Some accepted rule/);
   assert.equal(calls[0].source_ref, "x.py:1");
   assert.equal(calls[0].approval_ref ?? "", "", "capture never supplies an approval_ref (stays a candidate)");
+
+  // Multiple rules captured in the SAME millisecond must produce DISTINCT candidate files (no collision).
+  const fixedNow = () => new Date("2026-06-30T09:00:00.000Z");
+  const multiPlan = {
+    plan_id: "plan-multi",
+    business_rules: [
+      { rule_id: "r1", text: "Rule one alpha forbids X", source: "a.py:1" },
+      { rule_id: "r2", text: "Rule two beta requires Y", source: "b.py:2" },
+      { rule_id: "r3", text: "Rule three gamma allows Z", source: "c.py:3" },
+    ],
+  };
+  const multi = await captureSettledPlanRules({ projectRoot: tempRoot, plan: multiPlan, now: fixedNow });
+  assert.equal(multi.captured.filter((c) => c.status === "deferred").length, 3, "3 rules captured");
+  const multiPaths = new Set(multi.captured.map((c) => c.candidate).filter(Boolean));
+  assert.equal(multiPaths.size, 3, "3 distinct candidate files even in the same millisecond (no collision)");
+  for (const rel of multiPaths) {
+    assert.equal(await pathExists(path.join(tempRoot, rel)), true, `candidate survived on disk: ${rel}`);
+  }
+
+  // settlePlan is fail-safe: a throwing capture never fails the settle.
+  const { planId: pFail } = await createPlan({ projectRoot: tempRoot, tasks: ["tarefa failsafe"], now, randomBytes: fixedRandom });
+  const settledDespite = await settlePlan({
+    projectRoot: tempRoot,
+    planId: pFail,
+    now,
+    captureRules: async () => { throw new Error("boom"); },
+  });
+  assert.equal(settledDespite.plan.status, "settled", "settle resolves even when capture throws");
 
   console.log("AIPI_MEMORY_CAPTURE_TEST_OK");
 } finally {

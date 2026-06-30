@@ -976,7 +976,9 @@ export async function aipiPromoteMemory({
   });
 
   if (!approvedForDurableWrite) {
-    const candidateBase = path.posix.join(".aipi", "runtime", "memory-candidates", `${timestamp.replace(/[:.]/g, "-")}-${slug(kind)}`);
+    // Include the promotion hash so distinct candidates never collide on the same filename — even multiple
+    // rules of the same kind captured in the same millisecond (otherwise writeProjectFile would overwrite).
+    const candidateBase = path.posix.join(".aipi", "runtime", "memory-candidates", `${timestamp.replace(/[:.]/g, "-")}-${slug(kind)}-${promotionHash.slice(0, 12)}`);
     const candidateRel = `${candidateBase}.md`;
     const candidateJsonRel = `${candidateBase}.json`;
     await writeProjectFile(root, candidateRel, entry);
