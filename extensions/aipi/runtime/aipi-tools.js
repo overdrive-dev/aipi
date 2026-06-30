@@ -4771,8 +4771,12 @@ function renderDecisionEntry({ title, content, source_ref, approval_ref, timesta
 const MEMORY_DRIFT_DIR = ".aipi/runtime/memory-drift";
 
 // Parse business-rules.md into structured rule contracts. Tolerant of hand-edited files (missing fields → "").
+// Fenced code blocks are blanked first (via stripFencedCodeBlocks) so an EXAMPLE rule inside docs — e.g. the
+// "### BR-001 …" template seeded into every project's business-rules.md — is never parsed as a real rule
+// (which would otherwise be a phantom contract: a spurious doctor warning + a `verify --strict` failure on a
+// fresh project).
 export function parseBusinessRules(text) {
-  const src = String(text ?? "");
+  const src = stripFencedCodeBlocks(text);
   const headers = [...src.matchAll(/^### (.+)$/gm)];
   const rules = [];
   for (let index = 0; index < headers.length; index += 1) {
