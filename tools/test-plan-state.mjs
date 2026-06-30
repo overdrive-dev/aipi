@@ -182,6 +182,28 @@ try {
   await settlePlan({ projectRoot: tempRoot, planId: planCad.plan_id, now });
   await assert.rejects(() => setPlanCadence({ projectRoot: tempRoot, planId: planCad.plan_id, cadence: "checkpoint_per_task", now }), /discovery-phase only/);
 
+  // Atomic create: a kanban write that fails mid-creation must NOT leave a new active plan behind. The kanban
+  // loop runs BEFORE persist + the active pointer, so the failure throws before anything becomes active.
+  const activeBefore = (await readActivePlan(tempRoot, { includeTerminal: true }))?.planId ?? null;
+  let kanbanCalls = 0;
+  await assert.rejects(
+    () =>
+      createPlan({
+        projectRoot: tempRoot,
+        tasks: ["tarefa ok", "tarefa que falha no kanban", "tarefa nunca alcancada"],
+        now,
+        randomBytes: fixedRandom,
+        recordKanban: async () => {
+          kanbanCalls += 1;
+          if (kanbanCalls === 2) throw new Error("kanban disk full");
+        },
+      }),
+    /kanban disk full/,
+  );
+  assert.equal(kanbanCalls, 2, "kanban registration runs first and fails loud on the 2nd task");
+  const activeAfter = (await readActivePlan(tempRoot, { includeTerminal: true }))?.planId ?? null;
+  assert.equal(activeAfter, activeBefore, "a failed creation leaves NO new active plan (no active plan with a partial kanban)");
+
   console.log("AIPI_PLAN_STATE_TEST_OK");
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });
