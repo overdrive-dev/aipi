@@ -88,6 +88,22 @@ try {
   assert.deepEqual(minimal.impacted_files, [], "empty impacted-files parses to [] (no phantom '-' / '**verify:**' tokens)");
   assert.equal(minimal.verify, "", "empty verify parses to ''");
 
+  // A "### BR-…" heading inside a fenced code block (e.g. the seeded rule TEMPLATE) is an example, not a rule.
+  const fenced = parseBusinessRules([
+    "# Business Rules",
+    "## Rule Template",
+    "```text",
+    "### BR-001 - <business-language title>",
+    "- **statement:** <what must be true>",
+    "```",
+    "### BR-REAL - An actual rule",
+    "- **statement:** Real rule statement",
+    "- **impacted-files:** backend/real.py",
+    "",
+  ].join("\n"));
+  assert.equal(fenced.length, 1, "headings inside a fenced code block are ignored");
+  assert.equal(fenced[0].id, "BR-REAL", "only the real (unfenced) rule is parsed");
+
   // --- Detection: a rule whose impacted file changed in this run surfaces as drift (review severity). ---
   const hit = await detectBusinessRuleDrift({ root: tempRoot, changedFiles: ["backend/app/api/v1/endpoints/pricing.py"], now });
   assert.equal(hit.drifts.length, 1, "one rule drifted");

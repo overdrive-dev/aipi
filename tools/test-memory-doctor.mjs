@@ -2,7 +2,21 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { initProject } from "../extensions/aipi/runtime/project-init.js";
 import { runMemoryDoctor, verifyMemory } from "../extensions/aipi/runtime/memory-doctor.js";
+
+// A FRESHLY seeded project (whose business-rules.md ships a "### BR-001" example inside a fenced code block)
+// must have ZERO parsed rules and pass strict verify — the template example must not count as a phantom rule.
+const seededRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-memory-doctor-seed-"));
+try {
+  await initProject({ sourceRoot: path.resolve("templates/.aipi"), targetRoot: seededRoot });
+  const seededDoctor = await runMemoryDoctor({ projectRoot: seededRoot });
+  assert.equal(seededDoctor.counts.rules, 0, "the seeded template's fenced example is not parsed as a rule");
+  assert.equal(seededDoctor.ok, true);
+  assert.equal(verifyMemory(seededDoctor, { strict: true }).ok, true, "a fresh project passes strict verify");
+} finally {
+  await fs.rm(seededRoot, { recursive: true, force: true });
+}
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-memory-doctor-"));
 async function write(rel, content) {
