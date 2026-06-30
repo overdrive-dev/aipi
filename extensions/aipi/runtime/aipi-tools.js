@@ -978,7 +978,11 @@ export async function aipiPromoteMemory({
   if (!approvedForDurableWrite) {
     // Include the promotion hash so distinct candidates never collide on the same filename — even multiple
     // rules of the same kind captured in the same millisecond (otherwise writeProjectFile would overwrite).
-    const candidateBase = path.posix.join(".aipi", "runtime", "memory-candidates", `${timestamp.replace(/[:.]/g, "-")}-${slug(kind)}-${promotionHash.slice(0, 12)}`);
+    // Use ONLY the hex digest (drop the "sha256:" prefix): a colon is a legal filename char on POSIX but on
+    // Windows/NTFS it opens an Alternate Data Stream, so `...-sha256:abcd.json` silently writes a stream on a
+    // truncated file and the candidate vanishes from readdir — breaking the drain on every Windows client.
+    const hashSegment = String(promotionHash).split(":").pop().slice(0, 12);
+    const candidateBase = path.posix.join(".aipi", "runtime", "memory-candidates", `${timestamp.replace(/[:.]/g, "-")}-${slug(kind)}-${hashSegment}`);
     const candidateRel = `${candidateBase}.md`;
     const candidateJsonRel = `${candidateBase}.json`;
     await writeProjectFile(root, candidateRel, entry);
