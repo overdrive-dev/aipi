@@ -34,9 +34,10 @@ const defaultContract = {
   },
 };
 
-// RC2: a memory-promotion SKIP (no_durable_memory_signal) must be backed by a STRUCTURED scan record of this
-// exact schema — not a bare evidence token a worker can mention for free — so "no durable signal" is an
-// auditable claim that the step actually scanned and found nothing, never a silent way to promote zero.
+// Schema of the memory-promotion SKIP scan record. The well-formedness gate here intentionally does NOT enforce
+// it (the worker is never told to emit skip evidence — gating on a worker-supplied token only rejects honest
+// skips). The authoritative, non-forgeable check is in the executor: it authors and reads this record on disk —
+// see materializeMemorySkipScanRecord in workflow-executor.js, which imports this constant.
 export const MEMORY_CANDIDATE_SCAN_SCHEMA = "aipi.memory-candidate-scan.v1";
 
 const evidenceRank = new Map([
@@ -332,6 +333,12 @@ function skipEvidenceRule(result, step, contract, errors) {
     return false;
   }
 
+  // The memory-promotion skip is verified by the EXECUTOR, which authors and reads an on-disk
+  // aipi.memory-candidate-scan.v1 record (see materializeMemorySkipScanRecord) — the authoritative,
+  // non-forgeable check. The worker is never told to emit skip evidence for it, so gating it on a
+  // worker-supplied token/schema here only rejects honest skips. Defer entirely to the executor.
+  if (skipCondition === "no_durable_memory_signal") return true;
+
   const required = Array.isArray(rule.requiresEvidence) ? rule.requiresEvidence : [];
   if (!required.length) return true;
 
@@ -355,20 +362,6 @@ function skipEvidenceRule(result, step, contract, errors) {
   for (const token of required) {
     if (!covered.has(token)) {
       errors.push(`SKIPPED ${skipCondition} requires evidence token: ${token}`);
-      ok = false;
-    }
-  }
-
-  // Scoped strictly to the memory-promotion skip: beyond the token, require a STRUCTURED scan record declaring
-  // the aipi.memory-candidate-scan.v1 schema. This is the RC2 teeth that stop a memory-promotion step from
-  // claiming "no durable signal" with only a free-text token. Other skip conditions keep the token-only rule.
-  if (skipCondition === "no_durable_memory_signal") {
-    const hasScanRecord = (result.evidence ?? []).some((item) =>
-      item?.schema === MEMORY_CANDIDATE_SCAN_SCHEMA
-      || item?.evidence_schema === MEMORY_CANDIDATE_SCAN_SCHEMA
-      || item?.evidence_type === MEMORY_CANDIDATE_SCAN_SCHEMA);
-    if (!hasScanRecord) {
-      errors.push(`SKIPPED ${skipCondition} requires a structured ${MEMORY_CANDIDATE_SCAN_SCHEMA} scan record (an evidence token alone is not enough)`);
       ok = false;
     }
   }
