@@ -5,7 +5,7 @@ import { buildStepContext, ContextMaterializationError } from "./context-builder
 import { aipiPromoteMemory, detectBusinessRuleDrift } from "./aipi-tools.js";
 import { describeModel, resolveStepModel } from "./model-router.js";
 import { recordWorkerModelRoute } from "./lifecycle-hooks.js";
-import { classifyGateKind, validateStepResult } from "./step-result.js";
+import { classifyGateKind, MEMORY_CANDIDATE_SCAN_SCHEMA, validateStepResult } from "./step-result.js";
 
 const terminalActions = new Set([
   "stop",
@@ -415,6 +415,9 @@ function localSkipEvidence({ state, step, contract, skipCondition }) {
     ref: `${baseRef}#${token}`,
     result: `skip_condition ${skipCondition} includes required evidence token ${token}`,
     evidence_token: token,
+    // The memory-promotion skip requires a STRUCTURED scan record (RC2): the deterministic local fallback
+    // stamps the schema so its honest "no durable signal" skip clears the gate without a model in the loop.
+    ...(token === "memory_candidate_scan" ? { schema: MEMORY_CANDIDATE_SCAN_SCHEMA } : {}),
   }));
 }
 
