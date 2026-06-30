@@ -1630,6 +1630,15 @@ try {
   });
   assert.equal(deferred.status, "deferred");
   assert.equal(await pathExists(path.join(tempRoot, deferred.candidate_path)), true);
+  // P1: a deferred candidate also writes a STRUCTURED json sidecar the drain can re-promote from.
+  assert.ok(deferred.candidate_json_path?.endsWith(".json"), "defer writes a structured json sidecar");
+  const candidateJson = JSON.parse(await fs.readFile(path.join(tempRoot, deferred.candidate_json_path), "utf8"));
+  assert.equal(candidateJson.schema, "aipi.memory-candidate.v1");
+  assert.equal(candidateJson.status, "candidate");
+  assert.equal(typeof candidateJson.kind, "string");
+  assert.equal(typeof candidateJson.content, "string");
+  assert.equal(typeof candidateJson.source_ref, "string");
+  assert.equal(typeof candidateJson.promotion_hash, "string");
 
   const selfApproved = await aipiPromoteMemory({
     projectRoot: tempRoot,
@@ -1704,7 +1713,7 @@ try {
   });
   assert.equal(committedPromotion.status, "promoted");
   assert.equal(committedPromotion.committed, true, "injected committer reports committed");
-  assert.deepEqual(commitCalls[0].files, [".aipi/memory/project/decisions.md"], "commits only the written memory file");
+  assert.deepEqual(commitCalls[0].files, [".aipi/memory/project/decisions.md", ".aipi/memory/audit-ledger.jsonl"], "commits the written memory file + the audit ledger");
   const failCommitPromotion = await aipiPromoteMemory({
     projectRoot: tempRoot,
     kind: "decision",
@@ -1725,6 +1734,16 @@ try {
   assert.deepEqual(gitArgsLog[0], ["rev-parse", "--is-inside-work-tree"]);
   assert.equal(gitArgsLog.some((a) => a[0] === "add" && a.includes(".aipi/memory/project/decisions.md")), true);
   assert.equal(gitArgsLog.some((a) => a[0] === "commit"), true);
+
+  // P1: the audit ledger records provenance for promote + defer events.
+  const ledger = (await fs.readFile(path.join(tempRoot, ".aipi", "memory", "audit-ledger.jsonl"), "utf8"))
+    .split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+  assert.ok(ledger.some((e) => e.event === "deferred"), "ledger records deferrals");
+  const promotedLedger = ledger.find((e) => e.event === "promoted");
+  assert.ok(promotedLedger, "ledger records promotions");
+  assert.equal(promotedLedger.schema, "aipi.memory-audit.v1");
+  assert.ok(promotedLedger.source_ref && promotedLedger.promotion_hash, "promoted ledger line carries provenance");
+  assert.ok(promotedLedger.approval && promotedLedger.approval.source, "promoted ledger line records approval source");
   const decisionsText = await fs.readFile(path.join(tempRoot, ".aipi", "memory", "project", "decisions.md"), "utf8");
   assert.match(decisionsText, /### ADR-20260616T030000Z - Keep renewal pricing tied to accepted contract\./);
   assert.match(decisionsText, /\*\*approval-ref:\*\* \.aipi\/runtime\/approvals\/approved\/memory-promotion\.json/);

@@ -928,6 +928,19 @@ export async function commitDurableMemory({ root, files = [], message = "aipi(me
   }
 }
 
+// P1: append-only audit ledger for durable memory — one provenance line per promote/defer so the whole
+// pipeline is inspectable (event, kind, source, approval decision+source, hash). Lives UNDER .aipi/memory so
+// RC5 versioning tracks it. Best-effort: a ledger failure never fails the operation.
+const MEMORY_AUDIT_LEDGER_REL = ".aipi/memory/audit-ledger.jsonl";
+
+async function appendMemoryAudit(root, entry) {
+  try {
+    await appendJsonLine(path.join(root, MEMORY_AUDIT_LEDGER_REL), { schema: "aipi.memory-audit.v1", ...entry });
+  } catch {
+    // ledger is advisory; never break a promotion because the audit append failed
+  }
+}
+
 export async function aipiPromoteMemory({
   projectRoot,
   kind,
@@ -963,13 +976,34 @@ export async function aipiPromoteMemory({
   });
 
   if (!approvedForDurableWrite) {
-    const candidateRel = path.posix.join(
-      ".aipi",
-      "runtime",
-      "memory-candidates",
-      `${timestamp.replace(/[:.]/g, "-")}-${slug(kind)}.md`,
-    );
+    const candidateBase = path.posix.join(".aipi", "runtime", "memory-candidates", `${timestamp.replace(/[:.]/g, "-")}-${slug(kind)}`);
+    const candidateRel = `${candidateBase}.md`;
+    const candidateJsonRel = `${candidateBase}.json`;
     await writeProjectFile(root, candidateRel, entry);
+    // P1: structured sidecar so the drain can re-promote the EXACT fields (the .md is rendered/lossy).
+    await writeProjectFile(root, candidateJsonRel, `${JSON.stringify({
+      schema: "aipi.memory-candidate.v1",
+      status: "candidate",
+      kind,
+      title,
+      content,
+      source_ref,
+      user_memory,
+      promotion_hash: promotionHash,
+      created_at: timestamp,
+      md_path: candidateRel,
+      reason: approval_ref ? approval.reason : "no approval_ref",
+    }, null, 2)}\n`);
+    await appendMemoryAudit(root, {
+      recorded_at: timestamp,
+      event: "deferred",
+      kind,
+      title: title || null,
+      source_ref,
+      promotion_hash: promotionHash,
+      approval: { ok: false, reason: approval_ref ? approval.reason : "no approval_ref" },
+      candidate_path: candidateJsonRel,
+    });
     return {
       schema: "aipi.tool-result.v1",
       tool: "aipi_promote_memory",
@@ -978,6 +1012,7 @@ export async function aipiPromoteMemory({
         ? approval.reason
         : "durable memory promotion requires approval_ref for an existing .aipi/runtime/approvals/approved artifact",
       candidate_path: candidateRel,
+      candidate_json_path: candidateJsonRel,
       approved_ignored: Boolean(approved),
     };
   }
@@ -994,11 +1029,22 @@ export async function aipiPromoteMemory({
     sourceRef: source_ref,
     promotionHash,
   });
+  await appendMemoryAudit(root, {
+    recorded_at: timestamp,
+    event: "promoted",
+    kind,
+    title: title || null,
+    source_ref,
+    promotion_hash: promotionHash,
+    approval: { decision: approval.decision ?? "APPROVED", source: approval.source ?? "unknown" },
+    path: targetRel,
+    changed: insertion.changed,
+  });
   let memoryCommit = { committed: false, reason: "unchanged" };
   if (insertion.changed) {
     memoryCommit = await commitMemory({
       root,
-      files: [targetRel],
+      files: [targetRel, MEMORY_AUDIT_LEDGER_REL],
       message: `aipi(memory): promote ${kind} (${promotionHash.slice(0, 12)}) from ${source_ref}`,
       env,
     });
