@@ -10,6 +10,7 @@ import {
   createLocalWorkflowAdapter,
   createSubagentWorkflowAdapter,
   executeWorkflowRun,
+  materializeMemorySkipScanRecord,
   parseWorkflowDefinition,
   promoteControllerUpdates,
   resolveWriteScope,
@@ -613,6 +614,22 @@ try {
   // The worker SKIPPED survived the coordinator and the executor gate (not downgraded to BLOCKED).
   assert.equal(defaultStepStatus.get("quick_memory")?.status, "skipped");
   assert.equal(defaultStepStatus.get("quick_memory")?.verdict, "SKIPPED");
+  // RC2 follow-up: the SKIP is backed by an EXECUTOR-authored on-disk scan record (not the worker payload).
+  const quickScan = JSON.parse(await fs.readFile(
+    path.join(tempRoot, ".aipi", "runtime", "runs", defaultRun.runId, "steps", "quick_memory", "MEMORY-CANDIDATE-SCAN.json"),
+    "utf8",
+  ));
+  assert.equal(quickScan.schema, "aipi.memory-candidate-scan.v1");
+  assert.equal(quickScan.source, "aipi-workflow-executor");
+  assert.equal(quickScan.undrained_candidate_count, 0);
+  assert.equal(quickScan.verdict, "no_signal");
+  // The scan is VISIBLE in the human-facing step RESULT.md (not just an internal JSON).
+  const quickMemoryMd = await fs.readFile(
+    path.join(tempRoot, ".aipi", "runtime", "runs", defaultRun.runId, "steps", "quick_memory", "RESULT.md"),
+    "utf8",
+  );
+  assert.match(quickMemoryMd, /## Memory Candidate Scan/);
+  assert.match(quickMemoryMd, /verdict: no_signal/);
   // No executed step may carry the local-executor "no executable adapter" / self-stamp-refusal evidence.
   for (const stepId of ["quick_scope", "quick_change", "quick_verify", "quick_review", "quick_memory"]) {
     const resultPath = path.join(tempRoot, ".aipi", "runtime", "runs", defaultRun.runId, "steps", stepId, "RESULT.json");
@@ -1780,6 +1797,54 @@ try {
     );
   }
 
+  // --- RC2 follow-up: executor-authored memory-skip scan record (materializeMemorySkipScanRecord). ---
+  {
+    const skipRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-memskip-"));
+    try {
+      const now = () => new Date("2026-06-30T00:00:00.000Z");
+      const state = { run_id: "run-skip" };
+      const step = { id: "quick_memory", stage: "memory-promotion", produces: [], controller_updates: [] };
+      const scanRel = path.join(".aipi", "runtime", "runs", "run-skip", "steps", "quick_memory", "MEMORY-CANDIDATE-SCAN.json");
+
+      // (a) Honest skip, empty candidate queue -> allow + authoritative record on disk, verdict no_signal.
+      const okResult = { verdict: "SKIPPED", skip_condition: "no_durable_memory_signal", artifacts: [] };
+      const okGate = await materializeMemorySkipScanRecord({ root: skipRoot, state, step, result: okResult, now });
+      assert.equal(okGate.error, null, "honest empty-queue skip is allowed");
+      const okScan = JSON.parse(await fs.readFile(path.join(skipRoot, scanRel), "utf8"));
+      assert.equal(okScan.schema, "aipi.memory-candidate-scan.v1");
+      assert.equal(okScan.source, "aipi-workflow-executor");
+      assert.equal(okScan.verdict, "no_signal");
+      assert.equal(okScan.undrained_candidate_count, 0);
+      assert.ok(okResult.artifacts.includes(scanRel.replaceAll("\\", "/")), "scan record is added to result.artifacts");
+
+      // (b) Self-contradiction: SKIPPED while carrying memory_promotions -> BLOCK, record verdict contradicted.
+      const contraResult = { verdict: "SKIPPED", skip_condition: "no_durable_memory_signal", memory_promotions: [{ kind: "decision", content: "x" }], artifacts: [] };
+      const contraGate = await materializeMemorySkipScanRecord({ root: skipRoot, state, step, result: contraResult, now });
+      assert.match(contraGate.error, /memory_promotions/, "a skip carrying promotions is blocked");
+      assert.equal(JSON.parse(await fs.readFile(path.join(skipRoot, scanRel), "utf8")).verdict, "contradicted");
+
+      // (c) Undrained structured candidate present -> SURFACED (not blocked), verdict candidates_pending.
+      await fs.mkdir(path.join(skipRoot, ".aipi", "runtime", "memory-candidates"), { recursive: true });
+      await fs.writeFile(
+        path.join(skipRoot, ".aipi", "runtime", "memory-candidates", "c1.json"),
+        JSON.stringify({ schema: "aipi.memory-candidate.v1", status: "candidate", kind: "business-rule" }),
+      );
+      const pendResult = { verdict: "SKIPPED", skip_condition: "no_durable_memory_signal", artifacts: [] };
+      const pendGate = await materializeMemorySkipScanRecord({ root: skipRoot, state, step, result: pendResult, now });
+      assert.equal(pendGate.error, null, "undrained candidates are surfaced, not hard-blocked (no cross-run friction)");
+      const pendScan = JSON.parse(await fs.readFile(path.join(skipRoot, scanRel), "utf8"));
+      assert.equal(pendScan.verdict, "candidates_pending");
+      assert.equal(pendScan.undrained_candidate_count, 1);
+
+      // (d) Guards: not a memory step, not SKIPPED, or wrong skip_condition -> no-op (null).
+      assert.equal(await materializeMemorySkipScanRecord({ root: skipRoot, state, step: { id: "quick_change", produces: [], controller_updates: [] }, result: okResult, now }), null);
+      assert.equal(await materializeMemorySkipScanRecord({ root: skipRoot, state, step, result: { verdict: "PASS", artifacts: [] }, now }), null);
+      assert.equal(await materializeMemorySkipScanRecord({ root: skipRoot, state, step, result: { verdict: "SKIPPED", skip_condition: "no_actionable_findings", artifacts: [] }, now }), null);
+    } finally {
+      await fs.rm(skipRoot, { recursive: true, force: true });
+    }
+  }
+
   console.log("AIPI_WORKFLOW_EXECUTOR_TEST_OK");
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });
@@ -2028,8 +2093,6 @@ function testSkipEvidence({ step, contract, skipCondition }) {
     ref: `${step.id}#${token}`,
     result: `test fixture skip evidence ${token} for ${skipCondition}`,
     evidence_token: token,
-    // RC2: the memory-promotion skip requires a structured scan record, not a bare token.
-    ...(token === "memory_candidate_scan" ? { schema: "aipi.memory-candidate-scan.v1" } : {}),
   }));
 }
 
@@ -2059,14 +2122,15 @@ function quickWorkflowRunner({ calls = [], rawWrites = [], root } = {}) {
             agent_ids: [agentId],
             verdict: "SKIPPED",
             skip_condition: "no_durable_memory_signal",
+            // Honest worker shape: buildWorkerPrompt only ever asks for {rung,source,ref,result} — no
+            // evidence_token/schema. The executor authors the authoritative scan record itself, so this
+            // exercises the real no-schema path (and would catch a regression that re-gates on worker evidence).
             evidence: [
               {
                 rung: "written",
                 source: "fake-s0-worker",
                 ref: artifacts.join(", "),
                 result: "no durable memory signal",
-                evidence_token: "memory_candidate_scan",
-                schema: "aipi.memory-candidate-scan.v1",
               },
             ],
             artifacts,

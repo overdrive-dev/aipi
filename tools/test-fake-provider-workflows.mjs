@@ -231,8 +231,6 @@ function testSkipEvidence({ step, contract, skipCondition }) {
     ref: `${step.id}#${token}`,
     result: `test fixture skip evidence ${token} for ${skipCondition}`,
     evidence_token: token,
-    // RC2: the memory-promotion skip requires a structured scan record, not a bare token.
-    ...(token === "memory_candidate_scan" ? { schema: "aipi.memory-candidate-scan.v1" } : {}),
   }));
 }
 

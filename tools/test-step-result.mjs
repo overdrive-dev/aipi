@@ -136,41 +136,25 @@ assert.equal(undeclaredSkip.ok, false);
 assert.equal(undeclaredSkip.gatePassed, false);
 assert.match(undeclaredSkip.errors.join("\n"), /not allowed by pass_verdicts/);
 
-// RC2 (P-gate): a memory-promotion SKIP that carries only the evidence TOKEN — but no structured
-// aipi.memory-candidate-scan.v1 record — must NOT pass. This is what stops a step from claiming
-// "no durable signal" without showing it actually scanned.
-const memorySkipTokenOnly = validateStepResult(
+// RC2 follow-up: the memory-promotion skip is now verified by the EXECUTOR (it authors + reads an on-disk
+// aipi.memory-candidate-scan.v1 record), so the well-formedness gate must NOT gate it on worker-supplied
+// evidence — the worker is never told to produce skip evidence, so a token/schema requirement here would only
+// reject honest skips. A no_durable_memory_signal SKIP with no skip-evidence at all passes the gate; the
+// executor's materializeMemorySkipScanRecord is the authoritative check.
+const memorySkipNoEvidence = validateStepResult(
   {
     ...baseResult,
     verdict: "SKIPPED",
     skip_condition: "no_durable_memory_signal",
-    evidence: [{ rung: "written", source: "worker", ref: "x", result: "no durable memory signal", evidence_token: "memory_candidate_scan" }],
+    evidence: [{ rung: "written", source: "worker", ref: "x", result: "no durable memory signal" }],
   },
   { step: { gate: { pass_verdicts: ["PASS", "SKIPPED"], allow_skip: true, skip_requires: "no_durable_memory_signal" } } },
 );
-assert.equal(memorySkipTokenOnly.gatePassed, false, "token-only memory skip is rejected");
-assert.match(memorySkipTokenOnly.errors.join("\n"), /structured aipi\.memory-candidate-scan\.v1 scan record/);
+assert.equal(memorySkipNoEvidence.gatePassed, true, "an honest memory skip passes the gate without worker skip-evidence (executor verifies on disk)");
+assert.doesNotMatch(memorySkipNoEvidence.errors.join("\n"), /memory_candidate_scan/);
 
-// With the structured scan record present, the same skip passes.
-const memorySkipStructured = validateStepResult(
-  {
-    ...baseResult,
-    verdict: "SKIPPED",
-    skip_condition: "no_durable_memory_signal",
-    evidence: [{
-      rung: "written",
-      source: "worker",
-      ref: "scan.json",
-      result: "scanned the accepted surface, 0 durable candidates",
-      evidence_token: "memory_candidate_scan",
-      schema: "aipi.memory-candidate-scan.v1",
-    }],
-  },
-  { step: { gate: { pass_verdicts: ["PASS", "SKIPPED"], allow_skip: true, skip_requires: "no_durable_memory_signal" } } },
-);
-assert.equal(memorySkipStructured.gatePassed, true, "a structured scan record satisfies the memory skip");
-
-// Scope check: the structured-record requirement is memory-ONLY. Other skips still pass on a token alone.
+// Scope check: deferring the memory skip to the executor does NOT relax other skips — they still require their
+// evidence tokens at the well-formedness gate.
 const reviewSkipTokenOnly = validateStepResult(
   {
     ...baseResult,
@@ -180,7 +164,17 @@ const reviewSkipTokenOnly = validateStepResult(
   },
   { step: { gate: { pass_verdicts: ["PASS", "SKIPPED"], allow_skip: true, skip_requires: "no_actionable_findings" } } },
 );
-assert.equal(reviewSkipTokenOnly.gatePassed, true, "non-memory skips are unchanged (token alone still suffices)");
+assert.equal(reviewSkipTokenOnly.gatePassed, true, "non-memory skips still pass on their token");
+const reviewSkipMissingToken = validateStepResult(
+  {
+    ...baseResult,
+    verdict: "SKIPPED",
+    skip_condition: "no_actionable_findings",
+    evidence: [{ rung: "written", source: "worker", ref: "x", result: "clean review" }],
+  },
+  { step: { gate: { pass_verdicts: ["PASS", "SKIPPED"], allow_skip: true, skip_requires: "no_actionable_findings" } } },
+);
+assert.equal(reviewSkipMissingToken.gatePassed, false, "a non-memory skip without its token is still rejected (executor deferral is memory-only)");
 
 const humanReviewRequired = validateStepResult(
   {

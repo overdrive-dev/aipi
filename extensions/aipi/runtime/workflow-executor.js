@@ -230,6 +230,13 @@ export async function executeWorkflowRun({
     const memoryPromotionGate = validation.gatePassed && missingArtifacts.length === 0
       ? await materializeStepMemoryPromotions({ root, state, step, result, now })
       : null;
+    // RC2 follow-up: a memory-promotion SKIP ("no durable signal") is backed by an EXECUTOR-authored on-disk
+    // aipi.memory-candidate-scan.v1 record — the worker's evidence payload is not trusted (it is never even
+    // told to produce it). The skip is BLOCKED only on the unambiguous self-contradiction of carrying durable
+    // promotions while claiming none; undrained candidates are surfaced in the record, not hard-blocked.
+    const memorySkipGate = validation.gatePassed && missingArtifacts.length === 0
+      ? await materializeMemorySkipScanRecord({ root, state, step, result, now })
+      : null;
     if (validation.gatePassed && missingArtifacts.length === 0) {
       // RC4: surface (never mutate) business-rule drift introduced by this step. Best-effort + detection-only
       // (no shell exec on the hot path) — a step is NEVER failed because the drift scan failed.
@@ -237,7 +244,7 @@ export async function executeWorkflowRun({
     }
     await writeStepResult({ root, state, step, result, validation, missingArtifacts });
 
-    if (validation.gatePassed && missingArtifacts.length === 0 && !memoryPromotionGate?.error) {
+    if (validation.gatePassed && missingArtifacts.length === 0 && !memoryPromotionGate?.error && !memorySkipGate?.error) {
       const status = result.verdict === "SKIPPED" ? "skipped" : "passed";
       // Materialize controller-owned shared artifacts ONLY now that the AUTHORITATIVE gate has passed (and no
       // required artifact is missing) — not on the worker's self-PASS — so a step the executor BLOCKS never
@@ -263,7 +270,7 @@ export async function executeWorkflowRun({
       continue;
     }
 
-    const target = missingArtifacts.length || memoryPromotionGate?.error
+    const target = missingArtifacts.length || memoryPromotionGate?.error || memorySkipGate?.error
       ? step.gate.on_verdict?.FAIL ?? null
       : branchTarget(step, validation);
     const transientProviderError = transientProviderFailureMessage(result);
@@ -271,6 +278,8 @@ export async function executeWorkflowRun({
       ? `missing required artifacts: ${missingArtifacts.join(", ")}`
       : memoryPromotionGate?.error
         ? memoryPromotionGate.error
+      : memorySkipGate?.error
+        ? memorySkipGate.error
       : transientProviderError
         ? transientProviderError
       : validation.errors.length
@@ -415,9 +424,6 @@ function localSkipEvidence({ state, step, contract, skipCondition }) {
     ref: `${baseRef}#${token}`,
     result: `skip_condition ${skipCondition} includes required evidence token ${token}`,
     evidence_token: token,
-    // The memory-promotion skip requires a STRUCTURED scan record (RC2): the deterministic local fallback
-    // stamps the schema so its honest "no durable signal" skip clears the gate without a model in the loop.
-    ...(token === "memory_candidate_scan" ? { schema: MEMORY_CANDIDATE_SCAN_SCHEMA } : {}),
   }));
 }
 
@@ -1233,6 +1239,78 @@ async function materializeBusinessRuleDriftCheck({ root, now }) {
   }
 }
 
+// Count undrained, still-pending memory candidates. The `.json` sidecar IS the structured candidate (legacy
+// candidates are `.md`-only and not promotable), so the file-type check is the structured gate. Best-effort: an
+// unreadable candidate is left for `/aipi-memory doctor` to flag and is not counted here (must never crash).
+async function countUndrainedCandidates(root) {
+  const dir = path.join(root, ".aipi", "runtime", "memory-candidates");
+  const names = await fs.readdir(dir).catch((error) => {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  });
+  let count = 0;
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    try {
+      const candidate = JSON.parse(await fs.readFile(path.join(dir, name), "utf8"));
+      if ((candidate.status ?? "candidate") === "candidate") count += 1;
+    } catch {
+      // unreadable candidate — doctor/verify surfaces it; do not count or crash here
+    }
+  }
+  return count;
+}
+
+// RC2 follow-up: when a memory-promotion step SKIPS with no_durable_memory_signal, the EXECUTOR authors and
+// persists the authoritative aipi.memory-candidate-scan.v1 record on disk (engine-owned, not the worker's
+// forgeable payload), recording what it independently observed. It BLOCKS only on the unambiguous
+// self-contradiction — a SKIP that also carries durable promotions. Undrained candidates are recorded +
+// surfaced (verdict: candidates_pending) but NOT hard-blocked, because candidates are not run-scoped: a hard
+// block would stop every workflow on stale cross-run candidates. Draining pressure stays with the human
+// (/aipi-memory promote|discard) and project-level doctor/verify. Fully best-effort: any fs failure -> allow.
+export async function materializeMemorySkipScanRecord({ root, state, step, result, now }) {
+  if (!isMemoryPromotionStep(step) || result?.verdict !== "SKIPPED" || result?.skip_condition !== "no_durable_memory_signal") {
+    return null;
+  }
+  try {
+    const promotions = Array.isArray(result.memory_promotions) ? result.memory_promotions : [];
+    const undrained = await countUndrainedCandidates(root);
+    const createdAt = now().toISOString();
+    const verdict = promotions.length ? "contradicted" : undrained ? "candidates_pending" : "no_signal";
+    const recordRel = path.join(runRelDir(state), "steps", step.id, "MEMORY-CANDIDATE-SCAN.json").replaceAll("\\", "/");
+    await writeControllerArtifact({
+      root,
+      state,
+      step,
+      relPath: recordRel,
+      internal: true,
+      content: `${JSON.stringify({
+        schema: MEMORY_CANDIDATE_SCAN_SCHEMA,
+        run_id: state.run_id,
+        step_id: step.id,
+        created_at: createdAt,
+        source: "aipi-workflow-executor",
+        scanned: ".aipi/runtime/memory-candidates",
+        undrained_candidate_count: undrained,
+        promotions_in_skip: promotions.length,
+        verdict,
+      }, null, 2)}\n`,
+    });
+    if (!Array.isArray(result.artifacts)) result.artifacts = [];
+    if (!result.artifacts.includes(recordRel)) result.artifacts.push(recordRel);
+    result.memory_candidate_scan = { schema: MEMORY_CANDIDATE_SCAN_SCHEMA, ref: recordRel, undrained_candidate_count: undrained, verdict };
+    if (promotions.length) {
+      return {
+        error: `memory-promotion SKIPPED with no_durable_memory_signal but carries ${promotions.length} memory_promotions — return PASS to promote them or drop them from the skip`,
+        record: recordRel,
+      };
+    }
+    return { error: null, record: recordRel, undrained };
+  } catch {
+    return null; // best-effort: a scan-record failure NEVER blocks the run
+  }
+}
+
 async function materializeStepMemoryPromotions({ root, state, step, result, now }) {
   if (!isMemoryPromotionStep(step) || result?.verdict === "SKIPPED") return null;
   if (result?.verdict !== "PASS") return null;
@@ -1538,6 +1616,21 @@ function renderStepResultMarkdown({ step, result, validation, missingArtifacts }
           `- promoted: ${result.memory_promotion_result.promoted}`,
           `- changed: ${result.memory_promotion_result.changed}`,
           `- result_ref: ${result.memory_promotion_result.result_ref}`,
+          "",
+        ]
+      : []),
+    // Render the memory-skip scan so a "no durable signal" skip is VISIBLE (not silently accepted), and so
+    // candidates_pending nudges the human to drain — otherwise "surface, don't block" surfaces nothing.
+    ...(result?.memory_candidate_scan
+      ? [
+          "## Memory Candidate Scan",
+          "",
+          `- verdict: ${result.memory_candidate_scan.verdict}`,
+          `- undrained_candidate_count: ${result.memory_candidate_scan.undrained_candidate_count}`,
+          `- record: ${result.memory_candidate_scan.ref}`,
+          ...(result.memory_candidate_scan.verdict === "candidates_pending"
+            ? [`- next: ${result.memory_candidate_scan.undrained_candidate_count} undrained candidate(s) — reconcile with /aipi-memory promote <id> or discard <id>`]
+            : []),
           "",
         ]
       : []),
