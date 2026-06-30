@@ -8,6 +8,7 @@ import {
   parseMemoryFrontmatter,
   resolveBusinessRuleDrift,
 } from "./aipi-tools.js";
+import { formatMemoryDoctor, runMemoryDoctor, verifyMemory } from "./memory-doctor.js";
 
 const VALID_LAYERS = new Set(["project", "user", "all"]);
 const GRAPH_REL_PATH = ".aipi/state/aipi-graph.json";
@@ -55,6 +56,14 @@ export function parseMemoryArgs(args = "") {
     }
     throw new Error(`Unknown /aipi-memory reconcile subcommand: ${sub}`);
   }
+  if (tokens[0] === "doctor") {
+    return { action: "doctor" };
+  }
+  if (tokens[0] === "verify") {
+    const extra = tokens.slice(1).filter((t) => t !== "--strict");
+    if (extra.length) throw new Error(`Unexpected /aipi-memory verify argument: ${extra[0]}`);
+    return { action: "verify", strict: tokens.includes("--strict") };
+  }
   throw new Error(`Unknown /aipi-memory action: ${tokens[0]}`);
 }
 
@@ -90,6 +99,15 @@ export async function runMemoryCommand({
   if (command.action === "reconcile-act") {
     const result = await resolveBusinessRuleDrift({ root, id: command.id, action: command.op, now });
     return { schema: "aipi.memory-command.v1", action: "reconcile-act", op: command.op, id: result.id, status: result.status };
+  }
+
+  if (command.action === "doctor") {
+    return { schema: "aipi.memory-command.v1", action: "doctor", doctor: await runMemoryDoctor({ projectRoot: root }) };
+  }
+
+  if (command.action === "verify") {
+    const doctor = await runMemoryDoctor({ projectRoot: root });
+    return { schema: "aipi.memory-command.v1", action: "verify", verify: verifyMemory(doctor, { strict: command.strict }), doctor };
   }
 
   if (command.action === "candidates") {
@@ -268,6 +286,15 @@ export function formatMemoryCommandResult(result) {
 
   if (result.action === "reconcile-act") {
     return `AIPI memory drift ${result.op === "resolve" ? "resolved" : "dismissed"}: ${result.id}`;
+  }
+
+  if (result.action === "doctor") {
+    return formatMemoryDoctor(result.doctor);
+  }
+
+  if (result.action === "verify") {
+    const v = result.verify;
+    return `AIPI memory verify${v.strict ? " --strict" : ""}: ${v.ok ? "OK" : "FAIL"} (${v.errors} error, ${v.warnings} warn)\n${formatMemoryDoctor(result.doctor)}`;
   }
 
   return "AIPI memory command completed.";

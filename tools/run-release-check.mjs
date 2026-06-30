@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { runMemoryDoctor, verifyMemory } from "../extensions/aipi/runtime/memory-doctor.js";
 
 const DEFAULT_TIMEOUT_MS = 180_000;
 const DEFAULT_AUDIT_TIMEOUT_MS = 120_000;
@@ -63,6 +64,7 @@ export async function runReleaseCheck({
   stdout = process.stdout,
   stderr = process.stderr,
   runner = runCommand,
+  memoryVerifier = defaultMemoryVerifier,
 } = {}) {
   let options;
   try {
@@ -133,6 +135,10 @@ export async function runReleaseCheck({
       allowExternalUnavailable: true,
     }));
   }
+
+  // In-process memory-subsystem gate (P3-audit). Fail-safe: a verify that cannot complete is a FAILURE, not a
+  // silent pass. On a project with no durable memory (e.g. the engine repo) it is a clean pass.
+  checks.push(await memoryVerifyCheck({ cwd, strict: options.strict, verifier: memoryVerifier }));
 
   const report = buildReleaseReport({ checks });
   stdout.write(options.json ? `${JSON.stringify(report, null, 2)}\n` : `${formatReleaseReport(report)}\n`);
@@ -234,6 +240,42 @@ function parseAuditOutput(result) {
     };
   } catch {
     return null;
+  }
+}
+
+async function defaultMemoryVerifier({ cwd, strict }) {
+  const doctor = await runMemoryDoctor({ projectRoot: cwd });
+  return verifyMemory(doctor, { strict });
+}
+
+async function memoryVerifyCheck({ cwd, strict, verifier }) {
+  try {
+    const verify = await verifier({ cwd, strict });
+    return {
+      id: "memory_verify",
+      status: verify.ok ? "pass" : "fail",
+      reason: verify.ok
+        ? `memory subsystem healthy (rules=${verify.counts.rules}, open_drifts=${verify.counts.open_drifts})`
+        : `memory verify failed: ${verify.errors} error, ${verify.warnings} warn`,
+      command: ["memory", "verify", strict ? "--strict" : "--lenient"],
+      exit_code: verify.ok ? 0 : 1,
+      signal: null,
+      detail: { schema: verify.schema, ok: verify.ok, strict: verify.strict, counts: verify.counts, problems: verify.problems },
+      stdout_tail: "",
+      stderr_tail: "",
+    };
+  } catch (error) {
+    return {
+      id: "memory_verify",
+      status: "fail",
+      reason: `memory verify could not complete: ${String(error?.message ?? error)}`,
+      command: ["memory", "verify"],
+      exit_code: null,
+      signal: "verify_error",
+      detail: null,
+      stdout_tail: "",
+      stderr_tail: "",
+    };
   }
 }
 
