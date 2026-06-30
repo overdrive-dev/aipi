@@ -86,7 +86,6 @@ export async function createPlan({
   const createdAt = now().toISOString();
   const planId = generatePlanId(now, randomBytes);
   const planRelDir = path.posix.join(".aipi", "runtime", "plans", planId);
-  const planDir = path.join(root, ".aipi", "runtime", "plans", planId);
 
   const plan = {
     schema: "aipi.plan.v1",
@@ -115,12 +114,10 @@ export async function createPlan({
     execution_cadence: DEFAULT_EXECUTION_CADENCE,
   };
 
-  await fs.mkdir(planDir, { recursive: true });
-  await persistPlan(root, plan);
-  await fs.writeFile(path.join(root, ".aipi", "runtime", "plans", "active"), `${planId}\n`);
-
-  // Register EACH task on the kanban individually (status "planned"), so the board tracks them one by one
-  // from the moment the plan is created — before any run starts.
+  // Register EACH task on the kanban FIRST (status "planned"), so the board tracks them one by one from the
+  // moment the plan is created AND the plan only becomes "created + active" after every task is on the board.
+  // A kanban write that fails here throws BEFORE any PLAN.json / active pointer is written, so a failed
+  // creation never leaves an active plan with a partial kanban — it fails loud and the user retries.
   for (const task of plan.tasks) {
     await recordKanban({
       projectRoot: root,
@@ -131,6 +128,11 @@ export async function createPlan({
       now,
     });
   }
+
+  // Persist the plan, then write the active pointer LAST, so readActivePlan only ever resolves a plan whose
+  // tasks are fully registered (persistPlan creates the plan dir).
+  await persistPlan(root, plan);
+  await fs.writeFile(path.join(root, ".aipi", "runtime", "plans", "active"), `${planId}\n`);
 
   return { planId, plan };
 }
