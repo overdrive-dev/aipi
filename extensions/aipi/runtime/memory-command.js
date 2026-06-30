@@ -1,6 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { aipiMemoryQuery, aipiPromoteMemory, parseMemoryFrontmatter } from "./aipi-tools.js";
+import {
+  aipiMemoryQuery,
+  aipiPromoteMemory,
+  detectBusinessRuleDrift,
+  listBusinessRuleDrifts,
+  parseMemoryFrontmatter,
+  resolveBusinessRuleDrift,
+} from "./aipi-tools.js";
 
 const VALID_LAYERS = new Set(["project", "user", "all"]);
 const GRAPH_REL_PATH = ".aipi/state/aipi-graph.json";
@@ -38,13 +45,52 @@ export function parseMemoryArgs(args = "") {
     if (!tokens[1]) throw new Error("/aipi-memory discard requires a candidate id");
     return { action: "discard", id: tokens[1] };
   }
+  if (tokens[0] === "reconcile") {
+    const sub = tokens[1];
+    if (!sub || sub === "list") return { action: "reconcile" };
+    if (sub === "scan") return { action: "reconcile-scan" };
+    if (sub === "dismiss" || sub === "resolve") {
+      if (!tokens[2]) throw new Error(`/aipi-memory reconcile ${sub} requires a drift id`);
+      return { action: "reconcile-act", op: sub, id: tokens[2] };
+    }
+    throw new Error(`Unknown /aipi-memory reconcile subcommand: ${sub}`);
+  }
   throw new Error(`Unknown /aipi-memory action: ${tokens[0]}`);
 }
 
-export async function runMemoryCommand({ args = "", projectRoot, now = () => new Date(), promoteMemory = aipiPromoteMemory } = {}) {
+export async function runMemoryCommand({
+  args = "",
+  projectRoot,
+  now = () => new Date(),
+  promoteMemory = aipiPromoteMemory,
+  detectDrift = detectBusinessRuleDrift,
+} = {}) {
   if (!projectRoot) throw new Error("projectRoot is required");
   const root = path.resolve(projectRoot);
   const command = parseMemoryArgs(args);
+
+  if (command.action === "reconcile") {
+    return {
+      schema: "aipi.memory-command.v1",
+      action: "reconcile",
+      drifts: await listBusinessRuleDrifts(root),
+    };
+  }
+
+  if (command.action === "reconcile-scan") {
+    const scan = await detectDrift({ root, now });
+    return {
+      schema: "aipi.memory-command.v1",
+      action: "reconcile-scan",
+      scan,
+      drifts: await listBusinessRuleDrifts(root),
+    };
+  }
+
+  if (command.action === "reconcile-act") {
+    const result = await resolveBusinessRuleDrift({ root, id: command.id, action: command.op, now });
+    return { schema: "aipi.memory-command.v1", action: "reconcile-act", op: command.op, id: result.id, status: result.status };
+  }
 
   if (command.action === "candidates") {
     return {
@@ -205,6 +251,23 @@ export function formatMemoryCommandResult(result) {
 
   if (result.action === "discard") {
     return `AIPI memory candidate discarded: ${result.id} (${result.removed.length} file(s))`;
+  }
+
+  if (result.action === "reconcile" || result.action === "reconcile-scan") {
+    const drifts = result.drifts ?? [];
+    const header = result.action === "reconcile-scan"
+      ? `AIPI memory reconcile scan: ${result.scan?.in_scope ?? 0} in-scope of ${result.scan?.checked ?? 0} rule(s); ${drifts.length} open drift(s)`
+      : `AIPI memory reconcile: ${drifts.length} open drift(s)`;
+    if (!drifts.length) return `${header} — business rules are in sync with code.`;
+    return [
+      header,
+      ...drifts.map((d) => `- ${d.id} [${d.severity ?? "?"}/${d.signal ?? "?"}]${d.title ? ` ${d.title}` : ""}${Array.isArray(d.changed) && d.changed.length ? ` (changed: ${d.changed.join(", ")})` : ""}`),
+      "Edit the rule, then /aipi-memory reconcile resolve <id> — or dismiss a false positive with /aipi-memory reconcile dismiss <id>.",
+    ].join("\n");
+  }
+
+  if (result.action === "reconcile-act") {
+    return `AIPI memory drift ${result.op === "resolve" ? "resolved" : "dismissed"}: ${result.id}`;
   }
 
   return "AIPI memory command completed.";
