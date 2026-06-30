@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -892,6 +893,41 @@ export async function aipiKanbanUpdate({
   };
 }
 
+// RC5: best-effort durable-memory versioning. After a successful durable write we commit ONLY the written
+// memory file(s) so every promotion is reviewable/revertable. Flag-gated (AIPI_MEMORY_AUTOCOMMIT, default on),
+// degrades SILENTLY when not a git repo or git fails — a promotion NEVER fails because its commit failed.
+// The git runner is injectable for tests.
+function memoryAutocommitEnabled(env = process.env) {
+  const value = String(env?.AIPI_MEMORY_AUTOCOMMIT ?? "1").toLowerCase();
+  return !["0", "false", "off", "no"].includes(value);
+}
+
+function defaultMemoryGit(root, args) {
+  return spawnSync("git", ["-C", root, ...args], { encoding: "utf8" });
+}
+
+export async function commitDurableMemory({ root, files = [], message = "aipi(memory): promote", env = process.env, git = defaultMemoryGit } = {}) {
+  if (!memoryAutocommitEnabled(env)) return { committed: false, reason: "disabled" };
+  if (!files.length) return { committed: false, reason: "no_files" };
+  try {
+    const inside = git(root, ["rev-parse", "--is-inside-work-tree"]);
+    if (!inside || inside.status !== 0 || String(inside.stdout ?? "").trim() !== "true") {
+      return { committed: false, reason: "not_a_git_repo" };
+    }
+    const add = git(root, ["add", "--", ...files]);
+    if (add?.status !== 0) return { committed: false, reason: `git add failed: ${String(add?.stderr ?? "").trim().slice(0, 200)}` };
+    const commit = git(root, ["commit", "-m", message, "--", ...files]);
+    if (commit?.status !== 0) {
+      const out = `${commit?.stdout ?? ""}${commit?.stderr ?? ""}`;
+      if (/nothing to commit|no changes added|nothing added/i.test(out)) return { committed: false, reason: "no_change" };
+      return { committed: false, reason: `git commit failed: ${out.trim().slice(0, 200)}` };
+    }
+    return { committed: true };
+  } catch (error) {
+    return { committed: false, reason: `git error: ${String(error?.message ?? error)}` };
+  }
+}
+
 export async function aipiPromoteMemory({
   projectRoot,
   kind,
@@ -902,6 +938,8 @@ export async function aipiPromoteMemory({
   approval_ref = "",
   user_memory = false,
   run_id = null,
+  env = process.env,
+  commitMemory = commitDurableMemory,
   now = () => new Date(),
 } = {}) {
   const root = assertRoot(projectRoot);
@@ -956,6 +994,15 @@ export async function aipiPromoteMemory({
     sourceRef: source_ref,
     promotionHash,
   });
+  let memoryCommit = { committed: false, reason: "unchanged" };
+  if (insertion.changed) {
+    memoryCommit = await commitMemory({
+      root,
+      files: [targetRel],
+      message: `aipi(memory): promote ${kind} (${promotionHash.slice(0, 12)}) from ${source_ref}`,
+      env,
+    });
+  }
   if (run_id) {
     await aipiKanbanUpdate({
       projectRoot: root,
@@ -974,6 +1021,8 @@ export async function aipiPromoteMemory({
     already_present: !insertion.changed,
     path: targetRel,
     promotion_hash: promotionHash,
+    committed: memoryCommit.committed,
+    commit_reason: memoryCommit.reason ?? null,
   };
 }
 
