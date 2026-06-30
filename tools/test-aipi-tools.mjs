@@ -10,6 +10,7 @@ import {
   aipiKanbanUpdate,
   aipiMemoryQuery,
   aipiPromoteMemory,
+  commitDurableMemory,
   aipiRetrieve,
   aipiRuleGap,
   aipiRuleLookup,
@@ -1689,6 +1690,41 @@ try {
   assert.equal(promoted.status, "promoted");
   assert.equal(promoted.changed, true);
   assert.equal(promoted.already_present, false);
+
+  // RC5: a durable promotion best-effort commits ONLY the written memory file, fail-safe.
+  const commitCalls = [];
+  const committedPromotion = await aipiPromoteMemory({
+    projectRoot: tempRoot,
+    kind: "decision",
+    content: "RC5 commit wiring check.",
+    source_ref: ".aipi/runtime/runs/run-1/steps/final_verification/VERIFICATION.md",
+    approval_ref: approvalRel,
+    commitMemory: async (opts) => { commitCalls.push(opts); return { committed: true }; },
+    now: () => new Date("2026-06-16T05:00:00.000Z"),
+  });
+  assert.equal(committedPromotion.status, "promoted");
+  assert.equal(committedPromotion.committed, true, "injected committer reports committed");
+  assert.deepEqual(commitCalls[0].files, [".aipi/memory/project/decisions.md"], "commits only the written memory file");
+  const failCommitPromotion = await aipiPromoteMemory({
+    projectRoot: tempRoot,
+    kind: "decision",
+    content: "RC5 commit failure is non-fatal.",
+    source_ref: ".aipi/runtime/runs/run-1/steps/final_verification/VERIFICATION.md",
+    approval_ref: approvalRel,
+    commitMemory: async () => ({ committed: false, reason: "git commit failed: simulated" }),
+    now: () => new Date("2026-06-16T05:10:00.000Z"),
+  });
+  assert.equal(failCommitPromotion.status, "promoted", "a failed commit never fails the promotion");
+  assert.equal(failCommitPromotion.committed, false);
+  // commitDurableMemory unit: flag off => skipped; fake git => rev-parse then add+commit only the file.
+  assert.equal((await commitDurableMemory({ root: tempRoot, files: ["x"], env: { AIPI_MEMORY_AUTOCOMMIT: "0" } })).committed, false);
+  const gitArgsLog = [];
+  const fakeGit = (root, gitArgs) => { gitArgsLog.push(gitArgs); return { status: 0, stdout: gitArgs[0] === "rev-parse" ? "true\n" : "", stderr: "" }; };
+  const okCommit = await commitDurableMemory({ root: tempRoot, files: [".aipi/memory/project/decisions.md"], message: "m", env: {}, git: fakeGit });
+  assert.equal(okCommit.committed, true);
+  assert.deepEqual(gitArgsLog[0], ["rev-parse", "--is-inside-work-tree"]);
+  assert.equal(gitArgsLog.some((a) => a[0] === "add" && a.includes(".aipi/memory/project/decisions.md")), true);
+  assert.equal(gitArgsLog.some((a) => a[0] === "commit"), true);
   const decisionsText = await fs.readFile(path.join(tempRoot, ".aipi", "memory", "project", "decisions.md"), "utf8");
   assert.match(decisionsText, /### ADR-20260616T030000Z - Keep renewal pricing tied to accepted contract\./);
   assert.match(decisionsText, /\*\*approval-ref:\*\* \.aipi\/runtime\/approvals\/approved\/memory-promotion\.json/);
