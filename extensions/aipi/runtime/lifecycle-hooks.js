@@ -22,6 +22,7 @@ import {
 } from "./workflow-executor.js";
 import { describeModel, resolveModelClass, resolveStepModel } from "./model-router.js";
 import { aipiHostModelReadiness, modelProvider } from "./pi-subagents.js";
+import { normalizeExecutionCadence, readActivePlan } from "./plan-state.js";
 
 const LIFECYCLE_LOG = ".aipi/runtime/lifecycle.jsonl";
 const TOOL_RESULT_LOG = ".aipi/runtime/tool-results.jsonl";
@@ -2061,6 +2062,28 @@ const PROJECT_GUIDANCE_REFS = Object.freeze([
   ".aipi/memory/project/decisions.md",
 ]);
 
+// Surface the active multi-task plan on the HOST turn so advancing to the plan's OWN next task reads as
+// "continue to the next step", not a new-scope gate — the missing signal that let the agent frame "start the
+// next already-planned ticket" as fresh scope and end the turn asking permission. A plan is surfaced only once
+// it is PAST discovery (settled): before settle its spec is not locked, so its tasks are not yet authorized to
+// execute. Best-effort: any read error (or no active/pending plan) yields null and the pointer omits the line.
+async function buildActivePlanPointer(projectRoot) {
+  const active = await readActivePlan(projectRoot).catch(() => null);
+  if (!active?.plan) return null;
+  const { planId, plan } = active;
+  if (plan.status === "discovery") return null;
+  const pending = (plan.tasks ?? []).filter((task) => task.status === "pending");
+  if (!pending.length) return null;
+  const next = pending[0];
+  return {
+    plan_id: planId,
+    status: plan.status,
+    execution_cadence: normalizeExecutionCadence(plan.execution_cadence),
+    pending_count: pending.length,
+    next_task: { task_id: next.task_id, text: String(next.text ?? "").replace(/\s+/g, " ").trim().slice(0, 160) },
+  };
+}
+
 export async function handleBeforeAgentStart({ event, ctx, pi, projectRoot, coordinator = null }) {
   // Gate on install like the sibling hooks — without this the guidance pointer was injected into EVERY
   // project, including non-AIPI repos (pointing at a .aipi/memory/project/procedures.md that doesn't exist).
@@ -2093,6 +2116,8 @@ export async function handleBeforeAgentStart({ event, ctx, pi, projectRoot, coor
     },
     snapshot,
   });
+  // Read once; used by both the flexible and active-run pointer payloads below.
+  const planPointer = await buildActivePlanPointer(projectRoot);
   if (!snapshot.active) {
     // Flexible flow (no forced workflow): give the agent the project's guidance — conventions, procedures,
     // and the project's own DEFINITION OF DONE — so it carries the task through to the project's close-out
@@ -2107,6 +2132,7 @@ export async function handleBeforeAgentStart({ event, ctx, pi, projectRoot, coor
       memory_refs: PROJECT_GUIDANCE_REFS,
       active_disciplines: [],
       recent_run: recent,
+      plan: planPointer,
     };
     safeAppendEntry(pi, "aipi.context.pointer", details);
     return {
@@ -2132,6 +2158,7 @@ export async function handleBeforeAgentStart({ event, ctx, pi, projectRoot, coor
     run: snapshot,
     memory_refs: PROJECT_GUIDANCE_REFS,
     active_disciplines: activeDisciplines,
+    plan: planPointer,
   };
   safeAppendEntry(pi, "aipi.context.pointer", details);
   return {
@@ -3191,9 +3218,19 @@ function renderContextPointer(details) {
     `- memory_refs: ${details.memory_refs.join(", ")}`,
     "- Follow the project's conventions and its DEFINITION OF DONE in .aipi/memory/project/procedures.md and project.md — they define what FINISHED means for THIS project (e.g. how to test, open a PR, watch CI, merge). Do not stop early if the project's procedure requires more.",
     "- Code graph (PULL, not auto): use aipi_impact (what a change affects) / aipi_callers / aipi_retrieve when you actually need impact analysis — before a substantive change to find affected files, at review to check the blast radius, before closing to catch regressions in related files. Skip it for trivial replies.",
-    "- Autonomous execution: do NOT end a turn with a cadence/checkpoint/permission question ('want me to continue?', 'keep this rhythm?'). Continue to the next step. Stop ONLY for a REAL gate (destructive / secrets / prod / scope / business-rule) — and STRUCTURE it as a blocker, never end as a prose question.",
+    "- Autonomous execution: do NOT end a turn with a cadence/checkpoint/permission question ('want me to continue?', 'keep this rhythm?', 'quer que eu siga?'). Continue to the next step. Stop ONLY for a REAL gate — and STRUCTURE it as a blocker, never end as a prose question.",
+    "- What a REAL gate is: a destructive/irreversible action, secrets, a production action, a NEW decision OUTSIDE the approved request/plan, or a business-rule question. Scope means work OUTSIDE what was approved — continuing to the approved request's or the plan's OWN next step is NOT a scope gate and needs no permission to start.",
+    "- Budget is never a stop reason: running low on tokens/effort, or being unable to fully implement AND test something in a single turn, is NEVER grounds to stop and ask. Make incremental, verifiable progress and report the rung you reached — 'partial' and 'blocked' are legitimate reported outcomes; refusing to start authorized work is not.",
     `- active_disciplines: ${activeDisciplines.map((discipline) => discipline.id).join(", ") || "none"}`,
   );
+  if (details.plan?.next_task) {
+    const plan = details.plan;
+    lines.push(
+      `- Active plan (PRE-APPROVED scope): ${plan.pending_count} task(s) already accepted in plan ${plan.plan_id} [cadence: ${plan.execution_cadence}]. ` +
+        `The next task ${plan.next_task.task_id} ("${plan.next_task.text}") is authorized work — advancing to it is 'continue to the next step', NOT a new-scope gate. ` +
+        "Do not end the turn asking permission to start an already-planned task.",
+    );
+  }
   if (details.recent_run) {
     lines.push("", renderRecentRunSummary(details.recent_run));
   }
