@@ -27,6 +27,7 @@ import {
   safeProviderHeaders,
   summarizeProviderPayload,
 } from "../extensions/aipi/runtime/lifecycle-hooks.js";
+import { createPlan, settlePlan } from "../extensions/aipi/runtime/plan-state.js";
 
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-lifecycle-hooks-"));
 const sourceRoot = path.resolve("templates/.aipi");
@@ -1401,6 +1402,46 @@ try {
     });
     assert.equal(hbasNon, undefined, "#4: a non-AIPI project gets no guidance pointer");
     await fs.rm(nonAipiRoot, { recursive: true, force: true });
+    // ── Host courtesy/scope/budget hardening (fix/host-courtesy-scope-preapproval) ──────────────────
+    // Regression for the recurring HOST-turn stop where the agent asks permission to advance to the next
+    // already-planned work and rationalizes it as lacking "budget". The flexible-flow context pointer must:
+    // (1) forbid budget/effort as a stop reason, (2) redefine scope so continuing the approved plan's OWN
+    // next step is not a new-scope gate, and (3) when a SETTLED multi-task plan is active, surface its next
+    // pending task as PRE-APPROVED scope so the agent does not stop to ask permission to start it.
+    const cadenceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-host-cadence-"));
+    await fs.mkdir(path.join(cadenceRoot, ".aipi"), { recursive: true });
+    await fs.writeFile(path.join(cadenceRoot, ".aipi", "runtime-contract.json"), "{}"); // AIPI-installed
+    const hbasCadence = () =>
+      handleBeforeAgentStart({
+        event: { type: "before_agent_start", prompt: "continue" },
+        ctx: { model: { provider: "anthropic", id: "claude-opus-4-8" }, ui: { notify() {} } },
+        pi: { appendEntry() {} },
+        projectRoot: cadenceRoot,
+        coordinator: { setHostModel() {}, getHostModel: () => null },
+      });
+    // Lever 1 — prose teeth present on every host turn (no active plan required).
+    const hbasNoPlan = await hbasCadence();
+    assert.match(hbasNoPlan.message.content, /Budget is never a stop reason/, "budget/effort is declared to never be a stop reason");
+    assert.match(hbasNoPlan.message.content, /NOT a scope gate/, "scope is redefined to exclude the approved next step");
+    assert.match(hbasNoPlan.message.content, /quer que eu siga\?/, "the concrete PT courtesy phrasing is forbidden by name");
+    // Lever 2 — with NO active plan, the pre-approved-scope line is absent.
+    assert.doesNotMatch(hbasNoPlan.message.content, /PRE-APPROVED scope/, "no active plan => no pre-approved-scope line");
+    // Create + settle a two-task plan; the active plan's next pending task is surfaced as pre-approved.
+    await createPlan({
+      projectRoot: cadenceRoot,
+      tasks: [
+        { text: "implement the access component", workflow: "planning" },
+        { text: "implement the announcement sub-epic", workflow: "planning" },
+      ],
+      recordKanban: async () => {},
+    });
+    await settlePlan({ projectRoot: cadenceRoot, captureRules: async () => {} });
+    const hbasWithPlan = await hbasCadence();
+    assert.match(hbasWithPlan.message.content, /Active plan \(PRE-APPROVED scope\)/, "a settled plan surfaces pre-approved scope on the host turn");
+    assert.match(hbasWithPlan.message.content, /2 task\(s\) already accepted/, "the pending task count is surfaced");
+    assert.match(hbasWithPlan.message.content, /t1 \("implement the access component"\)/, "the next pending task is named as authorized work");
+    assert.match(hbasWithPlan.message.content, /already-planned task/, "the agent is told not to ask permission to start a planned task");
+    await fs.rm(cadenceRoot, { recursive: true, force: true });
     // A run older than the recency window is not surfaced.
     const aged = await buildRecentRunSummary(recentRoot, { maxAgeMs: 1, now: () => Date.now() + 10_000 });
     assert.equal(aged, null, "a stale run beyond the recency window is not surfaced");
