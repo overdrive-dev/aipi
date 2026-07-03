@@ -113,7 +113,15 @@ export async function runGuardedCommand({
   let signal = null;
 
   try {
-    child = spawnFn(commandText, {
+    // win32: console programs emit output in the OEM codepage (850 on pt-BR)
+    // while the engine reads UTF-8 — localized messages came back as U+FFFD in
+    // every tool result ("INFORMA??ES..."). chcp 65001 switches the child
+    // console to UTF-8, which fixes external tools (where, ping, tasklist…);
+    // cmd BUILTINS piped from the same instance (echo/dir) keep OEM — a known
+    // cmd limitation, acceptable since builtins rarely emit non-ASCII. The
+    // parens keep &/&& chains grouped under the original command.
+    const spawnCommand = platform === "win32" ? `chcp 65001>nul & (${commandText})` : commandText;
+    child = spawnFn(spawnCommand, {
       cwd: resolvedCwd,
       env,
       shell: true,

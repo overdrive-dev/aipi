@@ -337,6 +337,56 @@ try {
     assert.equal(sparedByAgent.killed, false);
   }
 
+  // ── win32 child console runs UTF-8 (OEM codepage mojibake fix) ──────────
+  {
+    const capturedSpawns = [];
+    const fakeSpawn = (command) => {
+      capturedSpawns.push(command);
+      return {
+        pid: 4242,
+        stdout: null,
+        stderr: null,
+        on(name, handler) {
+          if (name === "close") setTimeout(() => handler(0, null), 5);
+        },
+      };
+    };
+    await runGuardedCommand({
+      projectRoot: tempRoot,
+      cwd: tempRoot,
+      command: "type arquivo.txt",
+      platform: "win32",
+      minRuntimeMs: 0,
+      spawnFn: fakeSpawn,
+      recordTrace: false,
+    });
+    assert.equal(capturedSpawns.at(-1), "chcp 65001>nul & (type arquivo.txt)", "win32 child console switches to UTF-8");
+    await runGuardedCommand({
+      projectRoot: tempRoot,
+      cwd: tempRoot,
+      command: "cat arquivo.txt",
+      platform: "linux",
+      minRuntimeMs: 0,
+      spawnFn: fakeSpawn,
+      recordTrace: false,
+    });
+    assert.equal(capturedSpawns.at(-1), "cat arquivo.txt", "posix command spawns unmodified");
+    // Real smoke on Windows dev machines: EXTERNAL console tools (where.exe —
+    // the exact field mojibake case) emit localized messages in the OEM
+    // codepage; with the child console on UTF-8 they round-trip clean. cmd
+    // builtins (echo) still write OEM when piped — known cmd limitation, out
+    // of scope here.
+    if (process.platform === "win32") {
+      const localized = await runGuardedCommand({
+        projectRoot: tempRoot,
+        cwd: tempRoot,
+        command: "where arquivo_inexistente_aipi_xyz",
+        minRuntimeMs: 0,
+      });
+      assert.doesNotMatch(localized.stderr, /�/, "no replacement characters in localized tool output");
+    }
+  }
+
   // ── Persisted traces are redacted excerpts; in-memory result stays raw ───
   {
     const secretRun = await runGuardedCommand({
