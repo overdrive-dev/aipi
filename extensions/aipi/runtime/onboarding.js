@@ -588,7 +588,10 @@ async function runOnboardingInvestigation({ root, coordinator, hostModel, invent
       owned_files: [artifact],
       expected_artifacts: [artifact],
       artifact_target: path.posix.dirname(artifact),
-      budget: { timeout_ms: 120000, max_tool_calls: 20 },
+      // 120s proved too tight in the field: the stack dimension hit the budget
+      // while a hung environment probe was still inside the 60s watchdog
+      // silence window, killing an otherwise-progressing worker 2s early.
+      budget: { timeout_ms: 240000, max_tool_calls: 30 },
     });
     spawned.push({ ...dimension, agent_id: agentId, artifact });
     await emitOnboardingProgress(onProgress, {
@@ -663,6 +666,13 @@ async function runOnboardingInvestigation({ root, coordinator, hostModel, invent
 }
 
 function onboardingDimensionInstruction(dimension) {
+  if (dimension?.id === "stack-validation") {
+    return [
+      "Derive the stack, build, test, and CI picture from FILES: package.json scripts, lockfiles, pyproject/requirements, Dockerfiles, compose files, Makefile, and CI workflow/buildspec configs.",
+      "Do NOT execute environment or version probe commands (node/python/docker/git --version, docker info, installers): they hang on machines where the tool is absent or stopped, and workstation verification is `aipi setup`'s job, not onboarding's.",
+      "Only run a shell command when a file alone cannot answer, and prefer fast bounded commands.",
+    ].join(" ");
+  }
   if (dimension?.id !== "domain-rules") return null;
   return [
     "For domain-rules, mine actual source code for concrete candidate rules.",
@@ -719,7 +729,9 @@ function parseCandidateRulesFromText(text, artifact) {
   return rules;
 }
 
-async function waitForCoordinatorDone(coordinator, agentId, { timeoutMs = 180000 } = {}) {
+// Must stay ABOVE the worker budget (240s) or the wait gives up while the
+// coordinator would still let the worker finish.
+async function waitForCoordinatorDone(coordinator, agentId, { timeoutMs = 270000 } = {}) {
   const startedAt = Date.now();
   while (Date.now() - startedAt <= timeoutMs) {
     const status = coordinator.status(agentId);
