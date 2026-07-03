@@ -16,6 +16,7 @@ import {
   aipiRuleLookup,
   aipiSemanticSearch,
   checkSemanticEmbeddingReadiness,
+  embedText,
   rebuildCodeGraph,
   registerAipiRuntimeTools,
   resolveEmbeddingDimensions,
@@ -2101,6 +2102,43 @@ try {
     // A throwing host onUpdate is swallowed (a render hiccup must not break the tool run).
     const safe = __aipiTestInternals.runtimeToolProgress(() => { throw new Error("render boom"); });
     safe({ message: "x" }); // must not throw
+  }
+
+  // embedText retries ONE transient server-side failure (Ollama's first embed
+  // after boot can 500 while the model runner loads) but treats 4xx as
+  // permanent — a whole graph build must not degrade to lexical off one 500.
+  {
+    const delays = [];
+    let flakyCalls = 0;
+    const vector = new Array(1024).fill(0.5);
+    const flakyFetch = async () => {
+      flakyCalls += 1;
+      if (flakyCalls === 1) return { ok: false, status: 500 };
+      return { ok: true, status: 200, json: async () => ({ embeddings: [vector] }) };
+    };
+    const recovered = await embedText("retry probe", {
+      root: tempRoot,
+      env: {},
+      fetchFn: flakyFetch,
+      retryDelayMs: 1,
+      delayFn: async (ms) => { delays.push(ms); },
+    });
+    assert.equal(flakyCalls, 2, "a transient 500 is retried once");
+    assert.deepEqual(delays, [1]);
+    assert.equal(recovered.length, 1024);
+
+    let notFoundCalls = 0;
+    await assert.rejects(
+      embedText("permanent failure probe", {
+        root: tempRoot,
+        env: {},
+        fetchFn: async () => { notFoundCalls += 1; return { ok: false, status: 404 }; },
+        retryDelayMs: 1,
+        delayFn: async () => {},
+      }),
+      /HTTP 404/,
+    );
+    assert.equal(notFoundCalls, 1, "a 4xx failure is NOT retried");
   }
 
   console.log("AIPI_TOOLS_TEST_OK");

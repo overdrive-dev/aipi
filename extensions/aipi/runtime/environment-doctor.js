@@ -156,7 +156,9 @@ function checkPi({ piProbe }) {
     return checkResult("env.pi", {
       state: "pass",
       required: true,
-      evidence: `pi ${probe.version ?? "?"} resolved from ${probe.source ?? "unknown source"}`,
+      evidence: probe.version
+        ? `pi ${probe.version} resolved from ${probe.source ?? "unknown source"}`
+        : `pi resolved from ${probe.source ?? "unknown source"}`,
     });
   }
   return checkResult("env.pi", {

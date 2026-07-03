@@ -4103,6 +4103,8 @@ export async function embedText(text, {
   env = process.env,
   fetchFn = globalThis.fetch,
   cache = null,
+  retryDelayMs = 5_000,
+  delayFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 } = {}) {
   const input = String(text ?? "");
   const config = await resolveSemanticEmbeddingConfig({ root, env });
@@ -4112,24 +4114,43 @@ export async function embedText(text, {
     throw semanticUnavailableError("Ollama embedding fetch API is unavailable.", config);
   }
 
-  let response;
-  try {
-    response = await fetchFn(ollamaEmbedUrl(config.host), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: config.model,
-        input: [input],
-      }),
-    });
-  } catch (error) {
-    throw semanticUnavailableError(`Ollama embedding request failed: ${String(error?.message ?? error)}`, config);
-  }
+  // Ollama's FIRST embed after boot can 500 while the model runner is still
+  // coming up (field evidence: an entire 1802-file graph build degraded to
+  // lexical off one transient 500; the identical request succeeded 5s later).
+  // Retry once for server-side/transport failures before declaring the
+  // semantic backend unavailable.
+  const requestOnce = async () => {
+    let response;
+    try {
+      response = await fetchFn(ollamaEmbedUrl(config.host), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: config.model,
+          input: [input],
+        }),
+      });
+    } catch (error) {
+      return { retriable: true, error: `Ollama embedding request failed: ${String(error?.message ?? error)}` };
+    }
+    if (!response?.ok) {
+      const status = response?.status ? `HTTP ${response.status}` : "unknown HTTP status";
+      // 5xx = server-side (model still loading, runner crash) -> retriable.
+      // 4xx = our request is wrong (model missing, bad payload) -> permanent.
+      return { retriable: (response?.status ?? 500) >= 500, error: `Ollama embedding request failed with ${status}.` };
+    }
+    return { response };
+  };
 
-  if (!response?.ok) {
-    const status = response?.status ? `HTTP ${response.status}` : "unknown HTTP status";
-    throw semanticUnavailableError(`Ollama embedding request failed with ${status}.`, config);
+  let attempt = await requestOnce();
+  if (!attempt.response && attempt.retriable) {
+    await delayFn(retryDelayMs);
+    attempt = await requestOnce();
   }
+  if (!attempt.response) {
+    throw semanticUnavailableError(attempt.error, config);
+  }
+  const response = attempt.response;
 
   let body;
   try {
