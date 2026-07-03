@@ -1220,6 +1220,12 @@ if (!extensionIndex.includes("./runtime/probe-a-prime.js")) {
 if (!extensionIndex.includes('pi.registerCommand("aipi-probe-a-prime"')) {
   errors.push("extensions/aipi/index.js must register /aipi-probe-a-prime");
 }
+if (!extensionIndex.includes('pi.registerCommand("aipi-setup"')) {
+  errors.push("extensions/aipi/index.js must register /aipi-setup (in-session environment doctor)");
+}
+if (!extensionIndex.includes("./runtime/environment-doctor.js")) {
+  errors.push("extensions/aipi/index.js must load runtime/environment-doctor.js");
+}
 if (!fs.existsSync(path.join(root, "extensions/aipi/runtime/step-result.js"))) {
   errors.push("extensions/aipi/runtime/step-result.js is required");
 }

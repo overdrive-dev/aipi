@@ -52,6 +52,10 @@ import {
   formatProbeAPrimeResult,
   runProbeAPrime,
 } from "./runtime/probe-a-prime.js";
+import {
+  buildEnvironmentReport,
+  formatEnvironmentReport,
+} from "./runtime/environment-doctor.js";
 
 export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowCommand, planCommandRunner = runPlanCommand } = {}) {
   const coordinator = new SubagentCoordinator(pi);
@@ -259,6 +263,23 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
         ctx.ui.notify(formatAipiStatus(report), aipiStatusKind(report));
       } catch (error) {
         ctx.ui.notify(`AIPI status failed: ${error.message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("aipi-setup", {
+    description: "Verify the workstation environment (Node, Git, Pi, Docker, Playwright, Ollama embedding model) per .aipi/environment.json. Fixes run from the console: aipi setup --fix.",
+    handler: async (_args, ctx) => {
+      try {
+        const projectRoot = resolveProjectRoot(ctx);
+        const report = await buildEnvironmentReport({
+          targetDir: projectRoot,
+          // Running inside an interactive Pi session IS the proof Pi resolves.
+          piProbe: () => ({ ok: true, version: null, source: "this interactive Pi session" }),
+        });
+        ctx.ui.notify(formatEnvironmentReport(report), report.ok ? "info" : "warning");
+      } catch (error) {
+        ctx.ui.notify(`AIPI setup failed: ${error.message}`, "error");
       }
     },
   });

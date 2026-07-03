@@ -129,6 +129,7 @@ the raw Pi flag reference. Point at a specific Pi with `AIPI_PI_CLI_JS` or
 |---|---|
 | `/aipi-init [--dry-run] [--force] [--reset-memory] [--target <dir>]` | Scaffold the `.aipi/` overlay into a repo. Preserves existing files by default; `--force` still protects `.aipi/memory/project/**` unless `--reset-memory` is also present. |
 | `/aipi-status` | Report project install, Anthropic auth/sidecar, capability states, readiness blockers/evidence gaps, and the subagent backend (no credentials printed). |
+| `/aipi-setup` | In-session environment doctor: Node, Git, Pi, Docker, Playwright, and the Ollama embedding model, per `.aipi/environment.json`. Fixes run from the console: `aipi setup --fix`. |
 | `/aipi-workflow [list \| status \| start <name> \| run <name> \| execute]` | List, inspect, start, execute the active run, or run any installed workflow through the current executor. |
 | `/aipi-memory [status \| refs \| query <terms>]` | Inspect Markdown memory and generated code graph state without writing durable memory. |
 | `/aipi-mcp` | Report MCP server connection state, bridged tool count, and last errors for `.aipi/mcp.json`. |
