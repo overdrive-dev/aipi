@@ -15,7 +15,8 @@ import {
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-command-watchdog-"));
 
 try {
-  assert.equal(AIPI_RUNTIME_TOOL_NAMES.includes("aipi_guarded_bash"), true);
+  assert.equal(AIPI_RUNTIME_TOOL_NAMES.includes("aipi_shell"), true);
+  assert.equal(AIPI_RUNTIME_TOOL_NAMES.includes("aipi_guarded_bash"), true, "deprecated alias stays registered");
 
   const traps = [
     ["python3 -", "python_repl"],
@@ -173,8 +174,16 @@ try {
       registeredTools.set(tool.name, tool);
     },
   }, { projectRootResolver: () => tempRoot });
-  assert.equal(registeredTools.has("aipi_guarded_bash"), true);
-  const toolResult = await registeredTools.get("aipi_guarded_bash").execute(
+  assert.equal(registeredTools.has("aipi_shell"), true, "canonical guarded shell registered");
+  assert.equal(registeredTools.has("aipi_guarded_bash"), true, "deprecated alias registered for installed projects");
+  assert.match(registeredTools.get("aipi_guarded_bash").description, /Deprecated alias of aipi_shell/);
+  // The canonical name's description adapts to the platform so the model
+  // writes the right shell dialect.
+  assert.match(
+    registeredTools.get("aipi_shell").description,
+    process.platform === "win32" ? /cmd\.exe on this Windows machine/ : /POSIX sh/,
+  );
+  const toolResult = await registeredTools.get("aipi_shell").execute(
     "tool-1",
     {
       command: nodeCommand("console.log('guarded tool ok');"),
@@ -190,6 +199,15 @@ try {
   const parsedToolResult = JSON.parse(toolResult.content[0].text);
   assert.equal(parsedToolResult.status, "completed");
   assert.match(parsedToolResult.stdout, /guarded tool ok/);
+  // Alias executes the same guarded implementation.
+  const aliasResult = await registeredTools.get("aipi_guarded_bash").execute(
+    "tool-2",
+    { command: nodeCommand("console.log('alias ok');"), cwd: tempRoot, min_runtime_ms: 10 },
+    null,
+    null,
+    { cwd: tempRoot },
+  );
+  assert.match(JSON.parse(aliasResult.content[0].text).stdout, /alias ok/);
 
   // piStreamingUpdate adapts raw {type,text} chunks into Pi's partial-result {content:[...]} shape. A chunk
   // without `content` crashes the host renderer (getTextOutput -> result.content.filter) — an uncaught

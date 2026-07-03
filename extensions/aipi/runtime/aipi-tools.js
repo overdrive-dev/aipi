@@ -13,6 +13,7 @@ export const AIPI_RUNTIME_TOOL_NAMES = [
   "aipi_impact",
   "aipi_retrieve",
   "aipi_semantic_search",
+  "aipi_shell",
   "aipi_guarded_bash",
   "aipi_kanban_update",
   "aipi_promote_memory",
@@ -456,35 +457,49 @@ export function registerAipiRuntimeTools(pi, { projectRootResolver = () => proce
     },
   });
 
+  // aipi_shell is the canonical guarded system shell; aipi_guarded_bash stays
+  // registered as a deprecated alias so installed projects, catalogs, and
+  // prompts that reference the old name keep working. The description adapts
+  // to the platform so the model writes the right shell dialect.
+  const guardedShellDescription = process.platform === "win32"
+    ? "Run a non-interactive command through the AIPI watchdog-guarded system shell (cmd.exe on this Windows machine — use cmd/PowerShell syntax, NOT unix utilities like ls/tail/cat). Refuses interactive traps and corrupted quoting before spawning, spares silent-but-working commands via a process liveness probe, kills genuinely stuck ones, and records a redacted diagnostic trace."
+    : "Run a non-interactive command through the AIPI watchdog-guarded system shell (POSIX sh on this machine). Refuses interactive REPL/editor traps before spawning, spares silent-but-working commands via a process liveness probe, kills genuinely stuck ones, and records a redacted diagnostic trace.";
+  const guardedShellParameters = {
+    type: "object",
+    required: ["command"],
+    properties: {
+      command: { type: "string" },
+      cwd: { type: "string" },
+      min_runtime_ms: { type: "number" },
+      silence_timeout_ms: { type: "number" },
+      hard_cap_ms: { type: "number" },
+      allow_interactive: { type: "boolean" },
+    },
+  };
+  const executeGuardedShell = async (_id, params, _signal, onUpdate, ctx) => {
+    const projectRoot = projectRootResolver(ctx);
+    return jsonResult(await runGuardedCommand({
+      projectRoot,
+      cwd: params.cwd ?? projectRoot,
+      command: params.command,
+      minRuntimeMs: params.min_runtime_ms,
+      silenceTimeoutMs: params.silence_timeout_ms,
+      hardCapMs: params.hard_cap_ms,
+      allowInteractive: params.allow_interactive === true,
+      onUpdate: piStreamingUpdate(onUpdate),
+    }));
+  };
+  pi.registerTool({
+    name: "aipi_shell",
+    description: guardedShellDescription,
+    parameters: guardedShellParameters,
+    execute: executeGuardedShell,
+  });
   pi.registerTool({
     name: "aipi_guarded_bash",
-    description:
-      "Run a non-interactive shell command through the AIPI command watchdog. Refuses common REPL/editor traps, kills stuck silent commands, and records a diagnostic trace.",
-    parameters: {
-      type: "object",
-      required: ["command"],
-      properties: {
-        command: { type: "string" },
-        cwd: { type: "string" },
-        min_runtime_ms: { type: "number" },
-        silence_timeout_ms: { type: "number" },
-        hard_cap_ms: { type: "number" },
-        allow_interactive: { type: "boolean" },
-      },
-    },
-    async execute(_id, params, _signal, onUpdate, ctx) {
-      const projectRoot = projectRootResolver(ctx);
-      return jsonResult(await runGuardedCommand({
-        projectRoot,
-        cwd: params.cwd ?? projectRoot,
-        command: params.command,
-        minRuntimeMs: params.min_runtime_ms,
-        silenceTimeoutMs: params.silence_timeout_ms,
-        hardCapMs: params.hard_cap_ms,
-        allowInteractive: params.allow_interactive === true,
-        onUpdate: piStreamingUpdate(onUpdate),
-      }));
-    },
+    description: "Deprecated alias of aipi_shell — prefer aipi_shell. Same watchdog-guarded system shell.",
+    parameters: guardedShellParameters,
+    execute: executeGuardedShell,
   });
 
   pi.registerTool({

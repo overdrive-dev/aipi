@@ -9,7 +9,7 @@ export const PI_SUBAGENTS_ISOLATION = "pi_subagents";
 export const PI_SUBAGENTS_LIVE_SPIKE_SCHEMA = "aipi.pi-subagents-spike.v1";
 export const AIPI_SUBAGENTS_RUNTIME_ROOT = ".aipi/runtime/subagents";
 export const AIPI_SUBAGENTS_AGENT_NAME = "aipi-worker";
-export const AIPI_SUBAGENTS_ALLOWED_TOOLS = ["read", "grep", "find", "ls", "write", "aipi_guarded_bash"];
+export const AIPI_SUBAGENTS_ALLOWED_TOOLS = ["read", "grep", "find", "ls", "write", "aipi_shell"];
 export const AIPI_SUBAGENTS_READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
 export const AIPI_SUBAGENTS_GUARDED_WRITE_EXTENSION = "extensions/aipi/runtime/aipi-guarded-write-child.js";
 export const AIPI_SUBAGENTS_GUARDED_BASH_EXTENSION = "extensions/aipi/runtime/aipi-guarded-bash-child.js";
@@ -364,13 +364,14 @@ function loadForkedRunSync() {
 }
 
 export function createAipiWorkerAgentConfig({ thinking = undefined, allowShell = true } = {}) {
-  // Shell (aipi_guarded_bash) is granted ONLY to single-lead, sequential workers — NOT to parallel fanout
-  // (review_swarm) workers. A shell bypasses the owned-file/controller-path write guards (it can write
-  // outside its owned files, touch .git or .aipi/memory), so giving it to PARALLEL workers would void
-  // write-disjointness and controller-path protection. A single-lead worker runs alone (same trust as the
-  // main agent), so its shell is acceptable; parallel reviewers stay shell-less and read the verify step's
-  // evidence instead. (Validator/tests still see both names in source — they are conditionally included.)
-  const shellTools = allowShell ? ["aipi_guarded_bash", guardedBashExtensionPath] : [];
+  // Shell (aipi_shell, formerly aipi_guarded_bash) is granted ONLY to single-lead, sequential workers —
+  // NOT to parallel fanout (review_swarm) workers. A shell bypasses the owned-file/controller-path write
+  // guards (it can write outside its owned files, touch .git or .aipi/memory), so giving it to PARALLEL
+  // workers would void write-disjointness and controller-path protection. A single-lead worker runs alone
+  // (same trust as the main agent), so its shell is acceptable; parallel reviewers stay shell-less and
+  // read the verify step's evidence instead. (Validator/tests still see both names in source — they are
+  // conditionally included.)
+  const shellTools = allowShell ? ["aipi_shell", guardedBashExtensionPath] : [];
   return {
     name: AIPI_SUBAGENTS_AGENT_NAME,
     package: "aipi",
@@ -399,7 +400,7 @@ export function createAipiWorkerAgentConfig({ thinking = undefined, allowShell =
       "You are an AIPI worker running inside the project-scoped AIPI subagent runtime.",
       "Use only the allowed project tools. The write tool is guarded by AIPI owned-file scope.",
       allowShell
-        ? "For shell (tests, typecheck, build, git, lint) use aipi_guarded_bash — your only shell; do not use raw bash/exec. Prefer running the real verification (e.g. the project's test command) over claiming a result."
+        ? "For shell (tests, typecheck, build, git, lint) use aipi_shell — your only shell; do not use raw bash/exec. Prefer running the real verification (e.g. the project's test command) over claiming a result."
         : "You have NO shell in this parallel review step; review by reading the code and the verify step's test evidence, and do not claim a result you did not see verified.",
       "Do not use a provider/model other than the selected worker model.",
       "Follow the task exactly and return the requested output format.",

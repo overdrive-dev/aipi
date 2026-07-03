@@ -197,10 +197,10 @@ try {
   const spawnedArgs = realRuntimeCalls[0].args;
   assert.equal(spawnedArgs.includes("--model"), true);
   assert.equal(spawnedArgs[spawnedArgs.indexOf("--model") + 1], "anthropic/claude-opus-4-8");
-  // The production --tools allowlist MUST include "write" (guarded-write extension) AND "aipi_guarded_bash"
-  // (guarded-bash extension) so both registered tools survive the child's allowlist filter. Raw bash/shell/
-  // exec stay ABSENT — the worker's only shell is the watchdog-wrapped aipi_guarded_bash.
-  assert.deepEqual(spawnedTools(spawnedArgs), ["read", "grep", "find", "ls", "write", "aipi_guarded_bash"]);
+  // The production --tools allowlist MUST include "write" (guarded-write extension) AND "aipi_shell"
+  // (guarded-shell extension) so both registered tools survive the child's allowlist filter. Raw bash/shell/
+  // exec stay ABSENT — the worker's only shell is the watchdog-wrapped aipi_shell.
+  assert.deepEqual(spawnedTools(spawnedArgs), ["read", "grep", "find", "ls", "write", "aipi_shell"]);
   assert.equal(spawnedTools(spawnedArgs).some((tool) => /^(bash|shell|exec|user_bash)$/i.test(tool)), false);
   assert.equal(spawnedArgs.includes("--no-extensions"), true);
   assert.equal(
@@ -398,8 +398,8 @@ try {
   process.env.AIPI_SUBAGENTS_AGENT_ID = "guarded:bash";
   const bashTools = [];
   registerAipiGuardedBashChild({ registerTool(tool) { bashTools.push(tool); } });
-  const bash = bashTools.find((tool) => tool.name === "aipi_guarded_bash");
-  assert.ok(bash, "guarded-bash child registers an aipi_guarded_bash tool");
+  const bash = bashTools.find((tool) => tool.name === "aipi_shell");
+  assert.ok(bash, "guarded-bash child registers the aipi_shell tool (canonical name)");
   // Runs a real command and captures its output.
   const ran = await bash.execute("ok", { command: `node -e "process.stdout.write('GUARDED_BASH_OK')"` });
   assert.notEqual(ran.isError, true);
@@ -428,16 +428,16 @@ try {
   await fs.rm(guardedBashRoot, { recursive: true, force: true });
 }
 
-// Shell gating (security, fix #2): single-lead workers get aipi_guarded_bash; parallel fanout workers
+// Shell gating (security, fix #2): single-lead workers get aipi_shell; parallel fanout workers
 // (allowShell:false, set by executeFanoutSubagentStep) get NO shell — preserving write-disjointness +
 // .git/.aipi/memory protection across concurrent workers.
 const leadCfg = createAipiWorkerAgentConfig({ allowShell: true });
-assert.ok(leadCfg.tools.includes("aipi_guarded_bash"), "single-lead worker has the guarded shell");
+assert.ok(leadCfg.tools.includes("aipi_shell"), "single-lead worker has the guarded shell");
 assert.ok(leadCfg.tools.some((tool) => String(tool).includes("aipi-guarded-bash-child")), "single-lead worker loads the bash extension");
 const defaultCfg = createAipiWorkerAgentConfig({});
-assert.ok(defaultCfg.tools.includes("aipi_guarded_bash"), "shell defaults ON for an unspecified (single-lead) worker");
+assert.ok(defaultCfg.tools.includes("aipi_shell"), "shell defaults ON for an unspecified (single-lead) worker");
 const fanoutCfg = createAipiWorkerAgentConfig({ allowShell: false });
-assert.ok(!fanoutCfg.tools.includes("aipi_guarded_bash"), "parallel fanout worker has NO guarded shell");
+assert.ok(!fanoutCfg.tools.includes("aipi_shell"), "parallel fanout worker has NO guarded shell");
 assert.ok(!fanoutCfg.tools.some((tool) => String(tool).includes("aipi-guarded-bash-child")), "fanout worker does NOT load the bash extension");
 assert.ok(fanoutCfg.tools.includes("write"), "fanout worker still has the guarded write");
 assert.match(fanoutCfg.systemPrompt, /NO shell/);

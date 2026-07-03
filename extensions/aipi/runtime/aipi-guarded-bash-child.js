@@ -12,10 +12,13 @@ const AGENT_ID_ENV = "AIPI_SUBAGENTS_AGENT_ID";
 
 export default function registerAipiGuardedBashChild(pi) {
   pi.registerTool?.({
-    name: "aipi_guarded_bash",
-    label: "Guarded bash",
+    // Canonical name aipi_shell (aipi_guarded_bash is the deprecated host-side
+    // alias). Workers see exactly ONE shell tool — the child --tools allowlist
+    // filters registrations by name, so this must match AIPI_SUBAGENTS_ALLOWED_TOOLS.
+    name: "aipi_shell",
+    label: "Guarded shell",
     description:
-      "Run a non-interactive shell command (tests, typecheck, build, git, etc.) through the AIPI command " +
+      "Run a non-interactive command (tests, typecheck, build, git, etc.) through the AIPI command " +
       "watchdog, from the project root. Refuses interactive REPL/editor traps and kills stuck/silent commands. " +
       "Use this for any shell the task needs — there is no raw bash in this worker.",
     parameters: {

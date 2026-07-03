@@ -23,7 +23,8 @@ const READ_ONLY_TOOLS = new Set([
   // Watchdog-wrapped, project-root-scoped worker shell (aipi-guarded-bash-child). The owned-file guard
   // cannot police writes a shell makes, so worker write-disjointness is BEST-EFFORT once a worker has it —
   // a deliberate trade for letting workers actually run tests/build to verify. Raw bash/user_bash stay
-  // OPAQUE-denied below.
+  // OPAQUE-denied below. aipi_guarded_bash is the deprecated alias of aipi_shell.
+  "aipi_shell",
   "aipi_guarded_bash",
 ]);
 

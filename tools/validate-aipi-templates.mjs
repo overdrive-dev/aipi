@@ -2006,11 +2006,11 @@ for (const requiredToolToken of [
   "...AIPI_SUBAGENTS_READ_ONLY_TOOLS",
   "\"write\"",
   "guardedWriteExtensionPath",
-  "\"aipi_guarded_bash\"",
+  "\"aipi_shell\"",
   "guardedBashExtensionPath",
 ]) {
   if (!piSubagentsRuntime.includes(requiredToolToken)) {
-    errors.push(`runtime/pi-subagents.js worker tools must include ${requiredToolToken} (read-only builtins + the guarded write AND guarded bash extensions)`);
+    errors.push(`runtime/pi-subagents.js worker tools must include ${requiredToolToken} (read-only builtins + the guarded write AND guarded shell extensions)`);
   }
 }
 if (!piSubagentsRuntime.includes("extensions: []")) {
@@ -2032,7 +2032,7 @@ for (const requiredText of [
 }
 const guardedBashChild = read("extensions/aipi/runtime/aipi-guarded-bash-child.js");
 for (const requiredText of [
-  "name: \"aipi_guarded_bash\"",
+  "name: \"aipi_shell\"",
   "runGuardedCommand",
   "AIPI_SUBAGENTS_PROJECT_ROOT",
   "cwd escapes the project root", // fail-closed cwd confinement guard must not regress

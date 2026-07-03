@@ -11,7 +11,7 @@ incomplete until you have re-derived the result yourself.
 Verify the change INDEPENDENTLY against its acceptance criteria; do not trust the author's summary. For each
 criterion, find the actual code that makes it true (or prove it missing). Try to REFUTE the fix: hunt for
 forgotten call sites, hidden edge cases, and regressions the happy path hides. Run the REAL verification
-(tests / typecheck / build via `aipi_guarded_bash`) — a "passes/fixed/done" claim with no `ran` rung does
+(tests / typecheck / build via `aipi_shell`) — a "passes/fixed/done" claim with no `ran` rung does
 not count.
 
 ## The check (per change)
@@ -22,7 +22,7 @@ not count.
    but was not fixed? Grep for the pattern, not just the reported site.
 3. **Correctness + edge cases** — missing/invalid inputs, BOTH directions of a toggle, native vs web, no
    infinite loop, the mapping matches the source of truth.
-4. **Verification credibility** — RUN the affected tests yourself (`aipi_guarded_bash`). Separate NEW
+4. **Verification credibility** — RUN the affected tests yourself (`aipi_shell`). Separate NEW
    regressions from pre-existing test-debt (re-run with the change reverted: a suite red in BOTH is debt,
    not your regression). Confirm the new tests are non-vacuous — they must fail on the pre-fix code.
 

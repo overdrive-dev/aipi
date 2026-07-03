@@ -2076,7 +2076,8 @@ try {
       "aipi_impact",
       "aipi_retrieve",
       "aipi_semantic_search",
-      "aipi_guarded_bash",
+      "aipi_shell",
+      "aipi_guarded_bash", // deprecated alias of aipi_shell, kept for installed projects
       "aipi_kanban_update",
       "aipi_promote_memory",
     ]),

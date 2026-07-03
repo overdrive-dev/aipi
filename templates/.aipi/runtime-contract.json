@@ -286,6 +286,7 @@
       "aipi_impact",
       "aipi_retrieve",
       "aipi_semantic_search",
+      "aipi_shell",
       "aipi_guarded_bash",
       "aipi_kanban_update",
       "aipi_promote_memory"
@@ -294,7 +295,8 @@
   },
   "commandWatchdog": {
     "schema": "aipi.command-watchdog.v1",
-    "tool": "aipi_guarded_bash",
+    "tool": "aipi_shell",
+    "deprecatedToolAlias": "aipi_guarded_bash",
     "traceLog": ".aipi/runtime/command-watchdog.jsonl",
     "configPath": ".aipi/command-watchdog.json",
     "env": [
@@ -305,7 +307,7 @@
       "AIPI_CMD_HARD_CAP_MS",
       "AIPI_CMD_MIN_RUNTIME_MS"
     ],
-    "rule": "AIPI shell execution should route through aipi_guarded_bash for agent-run commands. The guard refuses common interactive REPL/editor traps and pathological recursive project-root searches before spawning, including raw grep/find scans that would traverse .aipi/state, .git, or node_modules without real exclude/prune flags, and steers AIPI-internal runtime strings toward extensions/aipi/runtime or aipi_retrieve/aipi_callers instead of full-tree scans. On Windows it also lints unix-only utilities under cmd.exe and quoting corruption (truncated $() literals, unbalanced quotes) before execution, with actionable PowerShell equivalents. It tracks start time, last stdout/stderr time, total runtime, command, pid, and process tree, kills stuck commands on silence timeout or hard cap, invokes a background stuck-vs-working check only for ambiguous long-running build/test commands — a built-in process-tree CPU liveness probe by default (verdicts working/unknown only; it can spare a silent-but-busy command, never rule stuck on its own), with an injected checkAgent as the final word when present — records a diagnostic note, and appends aipi.command-watchdog.v1 traces as redacted excerpts (full raw stdout/stderr stays in the in-memory result only). The user_bash hook remains observational and must not reintroduce broad input blocking."
+    "rule": "AIPI shell execution should route through aipi_shell (deprecated alias: aipi_guarded_bash) for agent-run commands. The guard refuses common interactive REPL/editor traps and pathological recursive project-root searches before spawning, including raw grep/find scans that would traverse .aipi/state, .git, or node_modules without real exclude/prune flags, and steers AIPI-internal runtime strings toward extensions/aipi/runtime or aipi_retrieve/aipi_callers instead of full-tree scans. On Windows it also lints unix-only utilities under cmd.exe and quoting corruption (truncated $() literals, unbalanced quotes) before execution, with actionable PowerShell equivalents. It tracks start time, last stdout/stderr time, total runtime, command, pid, and process tree, kills stuck commands on silence timeout or hard cap, invokes a background stuck-vs-working check only for ambiguous long-running build/test commands — a built-in process-tree CPU liveness probe by default (verdicts working/unknown only; it can spare a silent-but-busy command, never rule stuck on its own), with an injected checkAgent as the final word when present — records a diagnostic note, and appends aipi.command-watchdog.v1 traces as redacted excerpts (full raw stdout/stderr stays in the in-memory result only). The user_bash hook remains observational and must not reintroduce broad input blocking."
   },
   "lifecycleHooks": {
     "implementationPath": "extensions/aipi/runtime/lifecycle-hooks.js",
@@ -355,7 +357,7 @@
     "projectRuntimeRoot": ".aipi/runtime/subagents",
     "deferred": [],
     "failClosedRule": "Any worker descriptor requesting an isolation other than pi_subagents is rejected before owned-file allocation instead of silently downgrading. Workers always run with cwd set to the project root and runtime paths under .aipi/runtime/subagents.",
-    "rule": "AIPI has one worker runtime: the AIPI-owned fork of pi-subagents. It is not an npm dependency, not loaded as a separate Pi extension, and not selected by an environment flag. AIPI supervises spawn/status/collect/cancel/cleanup/steer, owned-file allocation, timeout/tool-count budgets, model provenance, a guarded-shell policy (workers get aipi_guarded_bash; raw bash/user_bash denied), and project-scoped runtime directories around the fork."
+    "rule": "AIPI has one worker runtime: the AIPI-owned fork of pi-subagents. It is not an npm dependency, not loaded as a separate Pi extension, and not selected by an environment flag. AIPI supervises spawn/status/collect/cancel/cleanup/steer, owned-file allocation, timeout/tool-count budgets, model provenance, a guarded-shell policy (workers get aipi_shell, formerly aipi_guarded_bash; raw bash/user_bash denied), and project-scoped runtime directories around the fork."
   },
   "workerToolPolicy": {
     "singleWorktreeSessionAgents": {
@@ -364,7 +366,7 @@
         "user_bash"
       ],
       "unknownToolDefault": "BLOCK",
-      "shellRule": "SINGLE-LEAD (non-fanout) forked pi_subagents workers receive aipi_guarded_bash — the AIPI command-watchdog shell (refuses interactive REPL/editor traps, kills stuck/silent commands, cwd confined fail-closed to the project root) — so they can run tests/typecheck/build/lint/git to actually VERIFY a change instead of only documenting it. PARALLEL fanout (review_swarm) workers receive NO shell (allow_shell:false): a shell bypasses the owned-file/controller-path write guards, so granting it concurrently would void write-disjointness and .git/.aipi/memory protection — those parallel workers review by reading the code and the verify step's evidence. Raw bash/user_bash/exec are never given to any worker (they remain in denyTools). A single-lead worker runs alone (same trust level as the main flexible agent), so its guarded shell is acceptable.",
+      "shellRule": "SINGLE-LEAD (non-fanout) forked pi_subagents workers receive aipi_shell (formerly aipi_guarded_bash) — the AIPI command-watchdog shell (refuses interactive REPL/editor traps, kills stuck/silent commands, cwd confined fail-closed to the project root) — so they can run tests/typecheck/build/lint/git to actually VERIFY a change instead of only documenting it. PARALLEL fanout (review_swarm) workers receive NO shell (allow_shell:false): a shell bypasses the owned-file/controller-path write guards, so granting it concurrently would void write-disjointness and .git/.aipi/memory protection — those parallel workers review by reading the code and the verify step's evidence. Raw bash/user_bash/exec are never given to any worker (they remain in denyTools). A single-lead worker runs alone (same trust level as the main flexible agent), so its guarded shell is acceptable.",
       "writeScopeRule": "Each worker's write tool is scoped by step. Analysis/review/planning steps are artifacts-only: they may write only their declared owned files. Code-writing steps (stage implementation, fix, or tdd, or an explicit write_scope: project) get a project write scope so the worker can create or edit the actual source/test files its change requires, since a root-cause fix cannot pre-declare every file it touches. Controller-owned state (.aipi/memory, .aipi/runtime/runs non-artifact paths, .git) stays blocked under every scope. The scope is carried on the spawn descriptor write_scope, enforced host-side by OwnedFileRegistry.grantProjectScope/owns and worker-side by AIPI_SUBAGENTS_WRITE_SCOPE in aipi-guarded-write-child. Project write scope is granted only to single-lead code-writing steps that run sequentially; parallel review fanout stays artifact-disjoint."
     }
   },
