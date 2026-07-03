@@ -87,9 +87,9 @@ try {
   assert.match(state.awaiting_user_input.question, /nenhum executor esta configurado|Como voce quer seguir/);
   // gate_kind FLOOR: the no-adapter Sink A is `infra` (work did NOT run) — never `courtesy`, so it can never be auto-continued.
   assert.equal(state.awaiting_user_input.gate_kind, "infra");
+  // FIX 2c: no-adapter blocks only offer freestyle + cancel; retry is meaningless when no adapter is configured.
   assert.deepEqual(state.awaiting_user_input.options, [
     "Continuar fora do workflow automatico nesta conversa",
-    "Tentar executar este workflow novamente",
     "Cancelar este run",
   ]);
   assert.equal(state.awaiting_user_input.allow_free_text, true);
@@ -227,6 +227,7 @@ try {
   const bugfixMemoryRun = await runWorkflowCommand({
     args: "run bugfix",
     projectRoot: tempRoot,
+    params: { bug: "Null pointer in memory-promotion codepath when no promotions returned" },
     adapter: createMemoryPromotionWorkflowAdapter({
       memory_promotion: [
         {
@@ -252,13 +253,14 @@ try {
     projectRoot: tempRoot,
     adapter: createMemoryPromotionWorkflowAdapter({ quick_memory: [] }),
   });
-  assert.equal(emptyMemoryRun.execution.status, "blocked");
+  // FIX 1: PASS-with-no-promotions is auto-coerced to SKIPPED/no_durable_memory_signal so the run completes
+  // instead of blocking on a gate error that is semantically just a skip.
+  assert.equal(emptyMemoryRun.execution.status, "completed");
   const emptyMemoryStep = emptyMemoryRun.execution.state.steps.find((step) => step.id === "quick_memory");
-  assert.equal(emptyMemoryStep.status, "failed");
-  assert.match(emptyMemoryStep.error, /PASS requires memory_promotions/);
-  assert.equal(emptyMemoryRun.execution.state.awaiting_user_input.step_id, "quick_memory");
-  assert.match(emptyMemoryRun.execution.state.awaiting_user_input.question, /quick_memory/);
-  assert.equal(emptyMemoryRun.execution.state.awaiting_user_input.options.length, 3);
+  assert.equal(emptyMemoryStep.status, "skipped");
+  assert.equal(emptyMemoryStep.verdict, "SKIPPED");
+  assert.equal(emptyMemoryStep.skip_condition, "no_durable_memory_signal");
+  assert.ok(!emptyMemoryRun.execution.state.awaiting_user_input, "completed run has no pending user input");
   const emptyMemoryRecord = JSON.parse(await fs.readFile(
     path.join(
       tempRoot,
@@ -273,11 +275,13 @@ try {
     "utf8",
   ));
   assert.equal(emptyMemoryRecord.promoted, 0);
-  assert.match(emptyMemoryRecord.errors.join("\n"), /memory_promotions/);
+  assert.equal(emptyMemoryRecord.status, "coerced_to_skipped");
+  assert.equal(emptyMemoryRecord.coerced_from, "PASS");
 
   const opsRunStarted = await startWorkflowRun({
     projectRoot: tempRoot,
     workflow: "ops",
+    params: { objective: "deploy hotfix v2.1.3 to staging environment" },
     now: () => fixedDate,
     randomBytes: fixedRandom,
   });
@@ -310,6 +314,7 @@ try {
   const blockerRun = await startWorkflowRun({
     projectRoot: tempRoot,
     workflow: "planning",
+    params: { request: "plan the user-auth refactor" },
     now: () => fixedDate,
     randomBytes: fixedRandom,
   });
@@ -643,6 +648,7 @@ try {
   const bugfixReviewRun = await startWorkflowRun({
     projectRoot: tempRoot,
     workflow: "bugfix",
+    params: { bug: "Fanout test: review step must spawn all four specialized reviewer agents" },
     now: () => fixedDate,
     randomBytes: fixedRandom,
   });
@@ -701,6 +707,7 @@ try {
   const xfReviewRun = await startWorkflowRun({
     projectRoot: tempRoot,
     workflow: "bugfix",
+    params: { bug: "cross-family model labelling repro for review fanout" },
     now: () => fixedDate,
     randomBytes: fixedRandom,
   });
@@ -1762,7 +1769,7 @@ try {
   // its deliverable, passes the AUTHORITATIVE gate, and the main loop promotes it to the run-root surface.
   // Closes the wiring-coverage gap (the unit tests above stop at executeSubagentStep / call promote directly).
   {
-    const e2eRun = await startWorkflowRun({ projectRoot: tempRoot, workflow: "planning", now: () => fixedDate, randomBytes: fixedRandom });
+    const e2eRun = await startWorkflowRun({ projectRoot: tempRoot, workflow: "planning", params: { request: "e2e controller-updates promotion test" }, now: () => fixedDate, randomBytes: fixedRandom });
     const e2eCoordinator = new SubagentCoordinator(
       { appendEntry() {} },
       { root: tempRoot, maxConcurrent: 1, piSubagentsRunner: fakeWorkflowRunner({ root: tempRoot }) },
@@ -1836,12 +1843,169 @@ try {
       assert.equal(pendScan.verdict, "candidates_pending");
       assert.equal(pendScan.undrained_candidate_count, 1);
 
+      // (c.2) FIX 5: a legacy .md-only memory-candidate file (no companion .json) is counted as undrained.
+      await fs.writeFile(
+        path.join(skipRoot, ".aipi", "runtime", "memory-candidates", "legacy-candidate.md"),
+        "## Legacy candidate\n\nMemory candidate written by older engine version without a JSON sidecar.\n",
+      );
+      const legacyResult = { verdict: "SKIPPED", skip_condition: "no_durable_memory_signal", artifacts: [] };
+      const legacyGate = await materializeMemorySkipScanRecord({ root: skipRoot, state, step, result: legacyResult, now });
+      assert.equal(legacyGate.error, null, "legacy .md-only candidate is surfaced, not hard-blocked");
+      const legacyScan = JSON.parse(await fs.readFile(path.join(skipRoot, scanRel), "utf8"));
+      assert.equal(legacyScan.undrained_candidate_count, 2, "1 json candidate + 1 md-only candidate = 2 undrained");
+
+      // (c.3) FIX 5: a .md file WITH a companion .json is NOT double-counted.
+      await fs.writeFile(
+        path.join(skipRoot, ".aipi", "runtime", "memory-candidates", "c1.md"),
+        "## Companion .md — has c1.json sidecar, should not be counted again\n",
+      );
+      const noDblGate = await materializeMemorySkipScanRecord({ root: skipRoot, state, step, result: legacyResult, now });
+      const noDblScan = JSON.parse(await fs.readFile(path.join(skipRoot, scanRel), "utf8"));
+      assert.equal(noDblScan.undrained_candidate_count, 2, ".md with companion .json is not double-counted (still 2)");
+
       // (d) Guards: not a memory step, not SKIPPED, or wrong skip_condition -> no-op (null).
       assert.equal(await materializeMemorySkipScanRecord({ root: skipRoot, state, step: { id: "quick_change", produces: [], controller_updates: [] }, result: okResult, now }), null);
       assert.equal(await materializeMemorySkipScanRecord({ root: skipRoot, state, step, result: { verdict: "PASS", artifacts: [] }, now }), null);
       assert.equal(await materializeMemorySkipScanRecord({ root: skipRoot, state, step, result: { verdict: "SKIPPED", skip_condition: "no_actionable_findings", artifacts: [] }, now }), null);
     } finally {
       await fs.rm(skipRoot, { recursive: true, force: true });
+    }
+  }
+
+  // --- FIX 2a: preflight() on createSubagentWorkflowAdapter returns uncovered steps in restrict mode ---
+  {
+    const fakeCoordinator = {
+      spawn: async () => ({}),
+      collect: async () => ({ done: true }),
+    };
+    const quickWorkflowText = await fs.readFile(path.join(tempRoot, ".aipi", "workflows", "quick.yaml"), "utf8");
+    const quickWorkflow = parseWorkflowDefinition(quickWorkflowText, "quick");
+    // Restrict mode with only quick_memory allowed → all agent-bearing non-fanout steps are blocked.
+    const restrictAdapter = createSubagentWorkflowAdapter(fakeCoordinator, { workerStepIds: ["quick_memory"] });
+    const preflightBlocked = restrictAdapter.preflight(quickWorkflow.steps);
+    // quick_scope, quick_change, quick_verify, quick_review all have agents but are not quick_memory.
+    assert.ok(preflightBlocked.length >= 1, "restrict-mode preflight returns uncovered agent-bearing steps");
+    assert.ok(
+      preflightBlocked.some((s) => s.id === "quick_change"),
+      "quick_change is in the preflight-blocked list",
+    );
+    // Auto mode (no workerStepIds) → no blocked steps.
+    const autoAdapter = createSubagentWorkflowAdapter(fakeCoordinator);
+    assert.deepEqual(autoAdapter.preflight(quickWorkflow.steps), []);
+  }
+
+  // --- FIX 3: worker crash is treated as infra block; step_visits rolled back; consecutive_failures unchanged ---
+  {
+    const crashRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-workercr-"));
+    try {
+      await initProject({ sourceRoot: path.resolve("templates/.aipi"), targetRoot: crashRoot });
+      const crashRunStarted = await startWorkflowRun({
+        projectRoot: crashRoot, workflow: "quick",
+        now: () => fixedDate, randomBytes: fixedRandom,
+      });
+      const pass = createTestPassWorkflowAdapter();
+      const crashExecution = await executeWorkflowRun({
+        projectRoot: crashRoot,
+        runId: crashRunStarted.runId,
+        now: () => fixedDate,
+        adapter: {
+          async executeStep(args) {
+            if (args.step.id !== "quick_scope") return pass.executeStep(args);
+            // Simulate a subagent worker crash: spawned but did not finish.
+            return {
+              schema: "aipi.step-result.v1",
+              step_id: args.step.id,
+              agent_ids: ["subagent-worker-1"],
+              verdict: "BLOCKED",
+              evidence: [{
+                rung: "blocked",
+                source: "aipi-subagent-workflow-adapter",
+                ref: "worker-1",
+                result: "worker did not finish: exit code 137",
+              }],
+              artifacts: [],
+            };
+          },
+        },
+      });
+      assert.equal(crashExecution.status, "blocked", "worker crash blocks the run");
+      const crashStep = crashExecution.state.steps.find((s) => s.id === "quick_scope");
+      assert.equal(crashStep.failure_class, "infra", "worker crash gets failure_class=infra");
+      assert.equal(crashExecution.state.consecutive_failures, 0, "worker crash does not increment consecutive_failures");
+      assert.equal(crashExecution.state.step_visits.quick_scope ?? 0, 0, "worker crash rolls back step_visits");
+    } finally {
+      await fs.rm(crashRoot, { recursive: true, force: true });
+    }
+  }
+
+  // --- FIX 4: gate_failure_feedback from a review FAIL is forwarded to the fix step's context ---
+  {
+    const gfRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-gffb-"));
+    try {
+      await initProject({ sourceRoot: path.resolve("templates/.aipi"), targetRoot: gfRoot });
+      const gfRunStarted = await startWorkflowRun({
+        projectRoot: gfRoot, workflow: "quick",
+        now: () => fixedDate, randomBytes: fixedRandom,
+      });
+      const pass = createTestPassWorkflowAdapter();
+      let reviewVisits = 0;
+      let quickChangeRemediationOnRetry = undefined;
+
+      const gfExecution = await executeWorkflowRun({
+        projectRoot: gfRoot,
+        runId: gfRunStarted.runId,
+        now: () => fixedDate,
+        adapter: {
+          async executeStep(args) {
+            if (args.step.id === "quick_review") {
+              reviewVisits += 1;
+              if (reviewVisits === 1) {
+                // First review visit: FAIL with a HIGH severity finding.
+                const relPath = renderTestTemplate(
+                  ".aipi/runtime/runs/{{ run_id }}/steps/quick_review/CODE-REVIEW.md",
+                  args.state, args.step,
+                );
+                await writeControllerArtifact({
+                  root: args.root, state: args.state, step: args.step, relPath,
+                  content: "## Code Review\n\nHIGH: SQL injection in user-supplied path parameter — must sanitize\n",
+                });
+                return {
+                  schema: "aipi.step-result.v1",
+                  step_id: args.step.id,
+                  agent_ids: args.step.agents,
+                  verdict: "FAIL",
+                  evidence: [{ rung: "ran", source: "test-review", ref: relPath, result: "high finding" }],
+                  artifacts: [relPath],
+                };
+              }
+              // Second review visit: PASS (finding addressed).
+              return pass.executeStep(args);
+            }
+            if (args.step.id === "quick_change" && reviewVisits >= 1) {
+              // Capture gate_failure_remediation on the retry visit (after first review failure).
+              quickChangeRemediationOnRetry = args.context?.gate_failure_remediation ?? null;
+            }
+            return pass.executeStep(args);
+          },
+        },
+      });
+
+      assert.equal(gfExecution.status, "completed", "run completes after review-fail-then-pass loop");
+      assert.ok(
+        Array.isArray(quickChangeRemediationOnRetry) && quickChangeRemediationOnRetry.length >= 1,
+        "gate_failure_remediation is injected into quick_change context on the retry visit",
+      );
+      assert.equal(quickChangeRemediationOnRetry[0].from_step, "quick_review");
+      assert.match(quickChangeRemediationOnRetry[0].finding.preview, /HIGH/);
+      assert.equal(quickChangeRemediationOnRetry[0].finding.severity, "HIGH");
+      // After quick_change passes, gate_failure_feedback for it is cleared.
+      const remainingFeedback = gfExecution.state.gate_failure_feedback?.quick_change;
+      assert.ok(
+        !remainingFeedback || remainingFeedback.length === 0,
+        "gate_failure_feedback for quick_change is cleared after step passes",
+      );
+    } finally {
+      await fs.rm(gfRoot, { recursive: true, force: true });
     }
   }
 

@@ -29,7 +29,17 @@ async function readTextOrMissing(abs) {
   }
 }
 
-export async function runMemoryDoctor({ projectRoot } = {}) {
+// FIX 4: parse the ISO-ish timestamp embedded in a candidate filename stem back to a Date.
+// Candidate filenames use timestamp.replace(/[:.]/g, "-") which turns "2026-06-15T10:00:00.000Z"
+// into "2026-06-15T10-00-00-000Z". Reconstruct by restoring the colons and dot.
+function parseCandidateFilenameTimestamp(stem) {
+  const m = stem.match(/^(\d{4}-\d{2}-\d{2}T\d{2})-(\d{2})-(\d{2})-(\d{3}Z)/);
+  if (!m) return null;
+  const d = new Date(`${m[1]}:${m[2]}:${m[3]}.${m[4]}`);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+export async function runMemoryDoctor({ projectRoot, now = () => new Date() } = {}) {
   const root = path.resolve(projectRoot ?? ".");
   const problems = [];
   const add = (severity, code, message) => problems.push({ severity, code, message });
@@ -49,18 +59,58 @@ export async function runMemoryDoctor({ projectRoot } = {}) {
     }
   }
 
-  // --- Candidates: count pending; an unreadable candidate is a hard problem (the drain depends on parsing it). ---
+  // --- Candidates: count pending (.json + legacy .md-only); unreadable json is a hard problem. ---
+  const nowMs = now().getTime();
   let pendingCandidates = 0;
   let unreadableCandidates = 0;
-  for (const name of await readDirNames(path.join(root, CANDIDATES_DIR))) {
-    if (!name.endsWith(".json")) continue;
+  let legacyCandidates = 0;
+  let oldestCandidateAgeDays = null;
+
+  const allCandEntries = await readDirNames(path.join(root, CANDIDATES_DIR));
+  const jsonCandFiles = new Set(allCandEntries.filter((n) => n.endsWith(".json")));
+  const mdCandFiles = allCandEntries.filter((n) => n.endsWith(".md"));
+
+  for (const name of jsonCandFiles) {
     pendingCandidates += 1;
+    let parsedCand = null;
     try {
-      JSON.parse(await fs.readFile(path.join(root, CANDIDATES_DIR, name), "utf8"));
+      parsedCand = JSON.parse(await fs.readFile(path.join(root, CANDIDATES_DIR, name), "utf8"));
     } catch {
       unreadableCandidates += 1;
       add("error", "candidate_unreadable", `candidate ${name} is not parseable JSON`);
     }
+    // Age: prefer created_at from JSON, fall back to filename timestamp prefix
+    const createdAt = parsedCand?.created_at ? new Date(parsedCand.created_at) : null;
+    const refDate = (createdAt && !Number.isNaN(createdAt.getTime()))
+      ? createdAt
+      : parseCandidateFilenameTimestamp(name.replace(/\.json$/, ""));
+    if (refDate) {
+      const ageDays = Math.floor((nowMs - refDate.getTime()) / 86400000);
+      if (oldestCandidateAgeDays === null || ageDays > oldestCandidateAgeDays) {
+        oldestCandidateAgeDays = ageDays;
+      }
+    }
+  }
+
+  // FIX 4a: also count legacy .md-only candidates (no .json sibling) as pending
+  for (const name of mdCandFiles) {
+    const stem = name.replace(/\.md$/, "");
+    if (jsonCandFiles.has(`${stem}.json`)) continue; // has a json sibling → already counted
+    legacyCandidates += 1;
+    pendingCandidates += 1;
+    const refDate = parseCandidateFilenameTimestamp(stem);
+    if (refDate) {
+      const ageDays = Math.floor((nowMs - refDate.getTime()) / 86400000);
+      if (oldestCandidateAgeDays === null || ageDays > oldestCandidateAgeDays) {
+        oldestCandidateAgeDays = ageDays;
+      }
+    }
+  }
+
+  // FIX 4b: warn when there are pending candidates (any kind); strict gate will fail, lenient passes
+  if (pendingCandidates > 0) {
+    const ageStr = oldestCandidateAgeDays !== null ? `, oldest: ${oldestCandidateAgeDays} day(s)` : "";
+    add("warn", "candidates_pending", `${pendingCandidates} pending memory candidate(s)${ageStr}`);
   }
 
   // --- Drift queue: open drifts are unreconciled (a warning); an unreadable report is a hard problem. ---
@@ -107,6 +157,7 @@ export async function runMemoryDoctor({ projectRoot } = {}) {
       rules_missing_impacted_files: rulesMissingImpacted,
       pending_candidates: pendingCandidates,
       unreadable_candidates: unreadableCandidates,
+      legacy_candidates: legacyCandidates,
       open_drifts: openDrifts,
       unreadable_drifts: unreadableDrifts,
       ledger_lines: ledgerLines,

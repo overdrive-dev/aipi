@@ -286,7 +286,10 @@ try {
     executeRun: async (opts) => ({
       status: opts.runId === "re-t1" ? "blocked" : "completed",
       state: opts.runId === "re-t1"
-        ? { blocked_reason: "AIPI parou em quick_memory: PASS requires memory_promotions. Como voce quer seguir?", awaiting_user_input: { gate_kind: "courtesy", question: "Como voce quer seguir?" } }
+        // FIX 1: "PASS requires memory_promotions" is no longer generatable (coerced to SKIPPED instead).
+        // Use a gate-failure string that fires GATE_FAILURE_SIGNAL (has "verdict" and "memory_promotions")
+        // so the stop classifier's defaultStopClassifier still returns "stop" even with a courtesy question.
+        ? { blocked_reason: "AIPI parou em quick_memory: memory promotion gate verdict FAIL — memory_promotions missing. Como voce quer seguir?", awaiting_user_input: { gate_kind: "courtesy", question: "Como voce quer seguir?" } }
         : {},
     }),
     recordUserInput: async () => {},

@@ -364,4 +364,24 @@ const malformed = validateStepResult("not an object");
 assert.equal(malformed.ok, false);
 assert.match(malformed.errors.join("\n"), /must be an object/);
 
+// FIX 3e: validateStepResult accepts failure_class as an optional metadata field (never rejects it).
+// Note: validateStepResult validates SCHEMA STRUCTURE — ok:true means the fields are well-formed,
+// not that the gate passes. A FAIL verdict with failure_class is structurally valid.
+const withFailureClass = validateStepResult({
+  ...baseResult,
+  verdict: "FAIL",
+  failure_class: "gate_rejection",
+});
+assert.equal(withFailureClass.ok, true, "FAIL result with failure_class is structurally valid (schema ok)");
+assert.ok(!withFailureClass.errors.some((e) => /failure_class/i.test(e)), "failure_class does not generate a validation error");
+
+const withInfraFailureClass = validateStepResult({
+  ...baseResult,
+  verdict: "BLOCKED",
+  failure_class: "infra",
+  evidence: [{ rung: "blocked", source: "test", ref: "ref", result: "crash" }],
+});
+assert.equal(withInfraFailureClass.ok, true, "BLOCKED result with infra failure_class is structurally valid");
+assert.ok(!withInfraFailureClass.errors.some((e) => /failure_class/i.test(e)), "infra failure_class does not generate a validation error");
+
 console.log("AIPI_STEP_RESULT_TEST_OK");

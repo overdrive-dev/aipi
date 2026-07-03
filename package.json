@@ -56,6 +56,9 @@
     "test:memory-lifecycle": "node tools/test-memory-lifecycle.mjs",
     "test:model-class": "node tools/test-model-class-fallback.mjs",
     "test:diagnose": "node tools/test-diagnose.mjs",
+    "test:environment-doctor": "node tools/test-environment-doctor.mjs",
+    "test:redact": "node tools/test-redact.mjs",
+    "test:runtime-log": "node tools/test-runtime-log.mjs",
     "test:probe-a": "node tools/test-probe-a.mjs",
     "test:probe-a-prime": "node tools/test-probe-a-prime.mjs",
     "test:subagents": "node tools/test-subagents.mjs",
@@ -77,14 +80,18 @@
     "test:release-fixture": "node tools/test-release-fixture.mjs",
     "test:step-result": "node tools/test-step-result.mjs",
     "test:stop-classifier": "node tools/test-stop-classifier.mjs",
-    "test": "npm run validate && npm run test:owned-files && npm run test:bin && npm run test:mcp && npm run test:update && npm run test:init && npm run test:onboarding && npm run test:provider-auth && npm run test:permission-removal && npm run test:command-watchdog && npm run test:lifecycle-hooks && npm run test:blocker-picker && npm run test:provider-pricing && npm run test:npm-audit-check && npm run test:release-check && npm run test:aipi-tools && npm run test:context-builder && npm run test:model-router && npm run test:models-command && npm run test:memory-command && npm run test:memory-capture && npm run test:memory-drift && npm run test:memory-doctor && npm run test:memory-lifecycle && npm run test:model-class && npm run test:diagnose && npm run test:probe-a && npm run test:probe-a-prime && npm run test:subagents && npm run test:subagents-real-sdk && npm run test:run-state && npm run test:plan-state && npm run test:plan-command && npm run test:plan-executor && npm run test:plan-policy && npm run test:plan-routing && npm run test:workflow-command && npm run test:workflow-executor && npm run test:fake-provider-workflows && npm run test:workflow-fixtures && npm run test:pressure-evals && npm run test:model-pressure-evals && npm run test:credentialed-readiness && npm run test:adversarial-readiness && npm run test:release-fixture && npm run test:step-result && npm run test:stop-classifier",
+    "test": "npm run validate && npm run test:owned-files && npm run test:bin && npm run test:mcp && npm run test:update && npm run test:init && npm run test:onboarding && npm run test:provider-auth && npm run test:permission-removal && npm run test:command-watchdog && npm run test:lifecycle-hooks && npm run test:blocker-picker && npm run test:provider-pricing && npm run test:npm-audit-check && npm run test:release-check && npm run test:aipi-tools && npm run test:context-builder && npm run test:model-router && npm run test:models-command && npm run test:memory-command && npm run test:memory-capture && npm run test:memory-drift && npm run test:memory-doctor && npm run test:memory-lifecycle && npm run test:model-class && npm run test:diagnose && npm run test:environment-doctor && npm run test:redact && npm run test:runtime-log && npm run test:probe-a && npm run test:probe-a-prime && npm run test:subagents && npm run test:subagents-real-sdk && npm run test:run-state && npm run test:plan-state && npm run test:plan-command && npm run test:plan-executor && npm run test:plan-policy && npm run test:plan-routing && npm run test:workflow-command && npm run test:workflow-executor && npm run test:fake-provider-workflows && npm run test:workflow-fixtures && npm run test:pressure-evals && npm run test:model-pressure-evals && npm run test:credentialed-readiness && npm run test:adversarial-readiness && npm run test:release-fixture && npm run test:step-result && npm run test:stop-classifier",
     "readiness:credentialed": "node tools/run-credentialed-readiness.mjs",
     "release:check": "node tools/run-release-check.mjs --strict",
     "release:audit": "node tools/check-npm-audit.mjs --strict",
     "smoke:subagent-live": "node tools/smoke-live-subagent.mjs",
     "smoke:pi-subagents": "node tools/smoke-pi-subagents.mjs"
   },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.79.8",
     "@ersintarhan/pi-toolkit": "0.5.12",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@sinclair/typebox": "^0.34.49",

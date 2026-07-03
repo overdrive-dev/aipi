@@ -192,6 +192,12 @@ export async function startWorkflowRun({
     })),
   };
 
+  // FIX 6: validate required params BEFORE creating the run directory so a missing param fails fast
+  // without leaving a partially-created run dir on disk. A param is required when its declared
+  // default is the empty string AND it is referenced as {{ key }} in the workflow YAML (meaning it
+  // is intentionally a user-supplied value, not an internal binding like run_id).
+  validateRequiredWorkflowParams(workflowDefinition.params, workflowDefinition.text, params, workflowName);
+
   if (!dryRun) {
     await fs.mkdir(path.join(runDir, "steps"), { recursive: true });
     await fs.writeFile(path.join(runDir, "state.json"), `${JSON.stringify(state, null, 2)}\n`);
@@ -501,7 +507,29 @@ async function readWorkflowDefinition(workflowAbsPath, workflowName) {
   }
 
   if (!steps.length) throw new Error(`AIPI workflow has no steps: ${workflowName}`);
-  return { name, mode, steps, params: parseWorkflowParams(text) };
+  // Include the raw YAML text so validateRequiredWorkflowParams can scan for {{ key }} references.
+  return { name, mode, steps, params: parseWorkflowParams(text), text };
+}
+
+// FIX 6: throw before creating the run directory when a required param is missing or empty.
+// A param is "required" when its declared default is the empty string AND the YAML text contains
+// at least one {{ key }} reference (meaning it is genuinely user-supplied, not a system binding).
+function validateRequiredWorkflowParams(declaredParams, workflowText, suppliedParams, workflowName) {
+  const supplied = suppliedParams && typeof suppliedParams === "object" ? suppliedParams : {};
+  for (const [key, defaultValue] of Object.entries(declaredParams ?? {})) {
+    if (defaultValue !== "") continue; // non-empty default → not required
+    // System-bound params that the executor always resolves need no caller value.
+    if (key === "run_id" || key === "contract_path") continue;
+    // Only require the param if it is actually referenced in step prompts / names via {{ key }}.
+    const templateRef = new RegExp(`\\{\\{\\s*${key}\\s*\\}\\}`);
+    if (!templateRef.test(String(workflowText ?? ""))) continue;
+    const value = supplied[key];
+    if (value === undefined || value === null || String(value).trim() === "") {
+      throw new Error(
+        `workflow ${workflowName} requires param "${key}" — start the run with a non-empty ${key} description`,
+      );
+    }
+  }
 }
 
 // Parse a workflow's top-level `params:` block into { key: defaultValue }. Declared defaults (e.g.

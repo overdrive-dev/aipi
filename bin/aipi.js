@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const currentFile = fileURLToPath(import.meta.url);
 const defaultPackageRoot = path.dirname(path.dirname(currentFile));
@@ -342,11 +342,16 @@ export function piCliJsCandidates({
   env = process.env,
   homeDir = os.homedir(),
   platform = process.platform,
+  packageRoot = defaultPackageRoot,
 } = {}) {
   const candidates = [];
   const rel = path.join("node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
 
   if (env.AIPI_PI_CLI_JS) candidates.push(env.AIPI_PI_CLI_JS);
+  // Local-first: npm install in the aipi package root already materializes the
+  // pinned Pi — an end user must not need a separate global Pi install. Env
+  // overrides above keep dev workflows intact.
+  if (packageRoot) candidates.push(path.join(packageRoot, rel));
   if (env.npm_config_prefix) candidates.push(path.join(env.npm_config_prefix, rel));
 
   if (platform === "win32") {
@@ -397,6 +402,7 @@ export function createPiSpawnSpec({
     nodeExecPath,
     platform,
     userArgs: piArgs,
+    packageRoot,
   });
 }
 
@@ -407,16 +413,22 @@ export function createRawPiSpawnSpec({
   nodeExecPath = process.execPath,
   platform = process.platform,
   userArgs = process.argv.slice(2),
+  packageRoot = defaultPackageRoot,
 } = {}) {
   if (env.AIPI_PI_BIN) {
     return createCommandSpawnSpec(env.AIPI_PI_BIN, userArgs, platform);
   }
 
-  const cliJs = piCliJsCandidates({ env, homeDir, platform }).find((candidate) => existsSync(candidate));
+  const cliJs = piCliJsCandidates({ env, homeDir, platform, packageRoot }).find((candidate) => existsSync(candidate));
   if (cliJs) {
     return {
       command: nodeExecPath,
       args: [cliJs, ...userArgs],
+      // Every consumer that spawns Pi children (the vendored pi-subagents
+      // worker runtime resolves Pi separately, and weaker) must see the SAME
+      // Pi this wrapper chose — export it so the whole tree agrees.
+      childEnv: { AIPI_PI_CLI_JS: cliJs },
+      piCliJs: cliJs,
     };
   }
 
@@ -459,8 +471,123 @@ export function classifyAipiInvocation(userArgs = []) {
   if (first === "effort" || first === "models" || first === "model") return { kind: "aipi-models", args: userArgs.slice(1) };
   if (first === "onboard" || first === "onboarding") return { kind: "aipi-onboard", args: userArgs.slice(1) };
   if (first === "diagnose" || first === "diagnostics") return { kind: "aipi-diagnose", args: userArgs.slice(1) };
+  if (first === "setup") return { kind: "aipi-setup", args: userArgs.slice(1) };
   if (first === "update") return { kind: "aipi-update", args: userArgs.slice(1) };
   return { kind: "pass-through" };
+}
+
+export function parseAipiSetupArgs(userArgs = [], { cwd = process.cwd() } = {}) {
+  const options = { json: false, fix: false, target: cwd };
+  for (let index = 0; index < userArgs.length; index += 1) {
+    const arg = userArgs[index];
+    if (arg === "--json") {
+      options.json = true;
+      continue;
+    }
+    if (arg === "--fix") {
+      options.fix = true;
+      continue;
+    }
+    if (arg === "--target") {
+      const target = userArgs[index + 1];
+      if (!target) throw new Error("aipi setup --target requires a directory");
+      options.target = path.resolve(cwd, target);
+      index += 1;
+      continue;
+    }
+    throw new Error(`unknown aipi setup option: ${arg}`);
+  }
+  return options;
+}
+
+// `aipi setup` — environment doctor: verifies the workstation can run projects
+// the way AIPI drives them (Node/Git/Pi always; Docker/Playwright/Ollama
+// embedding model per the project's .aipi/environment.json declaration).
+export async function runAipiSetup({
+  packageRoot = defaultPackageRoot,
+  env = process.env,
+  homeDir = os.homedir(),
+  cwd = process.cwd(),
+  platform = process.platform,
+  userArgs = [],
+  log = console.log,
+  errorLog = console.error,
+  spawnSyncFn = spawnSync,
+  doctorFns = null,
+} = {}) {
+  let options;
+  try {
+    options = parseAipiSetupArgs(userArgs, { cwd });
+  } catch (error) {
+    errorLog(`aipi setup failed: ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const doctor = doctorFns ?? await import(
+    pathToFileURL(path.join(packageRoot, "extensions", "aipi", "runtime", "environment-doctor.js")).href
+  );
+  const piProbe = () => {
+    const version = readPiVersion({ env, homeDir, platform, spawnSyncFn });
+    if (!version.ok) return { ok: false, error: version.error ?? "pi not resolvable" };
+    const spec = createRawPiSpawnSpec({ env, homeDir, platform, userArgs: [], packageRoot });
+    const source = env.AIPI_PI_BIN
+      ? "AIPI_PI_BIN override"
+      : env.AIPI_PI_CLI_JS
+        ? "AIPI_PI_CLI_JS override"
+        : spec.piCliJs?.startsWith(packageRoot)
+          ? "package-local node_modules (pinned dependency)"
+          : spec.piCliJs
+            ? `global install (${spec.piCliJs})`
+            : "PATH";
+    return { ok: true, version: version.version, source };
+  };
+
+  const buildReport = () => doctor.buildEnvironmentReport({
+    targetDir: options.target,
+    piProbe,
+    env,
+    platform,
+    homeDir,
+    spawnSyncFn,
+  });
+  let report = await buildReport();
+
+  if (options.fix) {
+    const fixed = [];
+    for (const check of report.checks) {
+      if (check.state === "pass" || !check.fix_available) continue;
+      if (check.id === "env.playwright") {
+        const npx = platform === "win32" ? "npx.cmd" : "npx";
+        log("aipi setup --fix: npx playwright install");
+        const result = spawnSyncFn(
+          platform === "win32" ? toShellCommandLine(npx, ["playwright", "install"]) : npx,
+          platform === "win32" ? undefined : ["playwright", "install"],
+          { stdio: "inherit", env, cwd: options.target, ...(platform === "win32" ? { shell: true } : {}) },
+        );
+        fixed.push({ id: check.id, ok: !result.error && result.status === 0 });
+      }
+      if (check.id === "env.ollama.embeddings") {
+        log(`aipi setup --fix: ollama pull ${doctor.REQUIRED_EMBEDDING_MODEL} (streamed; ~1.2GB on first pull)`);
+        const result = spawnSyncFn("ollama", ["pull", doctor.REQUIRED_EMBEDDING_MODEL], { stdio: "inherit", env });
+        fixed.push({ id: check.id, ok: !result.error && result.status === 0 });
+      }
+    }
+    if (fixed.length) {
+      report = await buildReport();
+      report.fixes_applied = fixed;
+    }
+  }
+
+  if (options.json) {
+    log(JSON.stringify(report, null, 2));
+  } else {
+    log(doctor.formatEnvironmentReport(report));
+    if (report.fixes_applied?.length) {
+      log(`fixes applied: ${report.fixes_applied.map((fix) => `${fix.id}=${fix.ok ? "ok" : "failed"}`).join(", ")}`);
+    }
+  }
+  if (!report.ok) process.exitCode = 1;
 }
 
 export function readPiVersion({
@@ -506,10 +633,20 @@ export function buildAipiUpdatePlan({
   existsSync = fs.existsSync,
   repoInfo = null,
   platform = process.platform,
+  env = process.env,
 } = {}) {
-  const steps = [
-    { label: "pi", kind: "pi", args: ["update", "--self"], note: "update the Pi runtime" },
-  ];
+  const steps = [];
+  // When Pi runs from the package-local node_modules (the pinned dependency),
+  // it is lockfile-managed: `npm ci` below updates it, and `pi update --self`
+  // would fight the pin (and abort the whole aipi self-update when Pi is
+  // missing). Only an env-override/global Pi still self-updates.
+  const localPiCliJs = path.join(packageRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+  const usesLocalPi = !env?.AIPI_PI_BIN && !env?.AIPI_PI_CLI_JS && existsSync(localPiCliJs);
+  if (usesLocalPi) {
+    steps.push({ label: "pi", kind: "manual", message: "pi runs from the packaged dependency; npm ci below updates it with the lockfile" });
+  } else {
+    steps.push({ label: "pi", kind: "pi", args: ["update", "--self"], note: "update the Pi runtime" });
+  }
 
   const effectiveRepoInfo = repoInfo ?? {
     isGitCheckout: existsSync(path.join(packageRoot, ".git")),
@@ -552,7 +689,7 @@ export async function runAipiUpdate({
   }
 
   const repoInfo = inspectAipiRepo({ packageRoot, existsSync, spawnSyncFn });
-  for (const step of buildAipiUpdatePlan({ packageRoot, existsSync, repoInfo, platform })) {
+  for (const step of buildAipiUpdatePlan({ packageRoot, existsSync, repoInfo, platform, env })) {
     if (step.kind === "manual") {
       log(`aipi update [${step.label}] skipped: ${step.message}`);
       continue;
@@ -845,6 +982,10 @@ export function formatAipiHelp({ aipiVersion }) {
     "  aipi status [--target <dir>] [--json] [--strict]",
     "                  Show AIPI readiness outside a Pi session",
     "  aipi doctor      Alias for aipi status",
+    "  aipi setup [--target <dir>] [--json] [--fix]",
+    "                  Verify the workstation (Node/Git/Pi + Docker/Playwright/Ollama",
+    "                  embedding model per .aipi/environment.json); --fix installs",
+    "                  Playwright browsers / pulls the embedding model",
     "  aipi workflow [--target <dir>] [--json] [list|status|start <name>|run <name>|execute]",
     "                  Inspect or drive AIPI workflow state outside a Pi session",
     "  aipi memory [--target <dir>] [--json] [status|refs|query <terms>]",
@@ -925,12 +1066,20 @@ export async function main() {
     return;
   }
 
+  if (invocation.kind === "aipi-setup") {
+    await runAipiSetup({ userArgs: invocation.args });
+    return;
+  }
+
   const spec = invocation.kind === "raw-pi"
     ? createRawPiSpawnSpec({ userArgs: invocation.args })
     : createPiSpawnSpec({ userArgs });
   const child = spawn(spec.command, spec.args, {
     stdio: "inherit",
-    env: process.env,
+    // childEnv pins AIPI_PI_CLI_JS to the Pi this wrapper resolved, so worker
+    // runtimes inside the session (vendored pi-subagents) spawn the SAME Pi
+    // instead of re-resolving a possibly different global/PATH copy.
+    env: { ...process.env, ...(spec.childEnv ?? {}) },
   });
 
   child.on("error", (error) => {

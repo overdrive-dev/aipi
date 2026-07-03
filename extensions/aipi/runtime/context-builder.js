@@ -103,6 +103,15 @@ export async function buildStepContext({
     provenance.push({ kind: "user_input", ref: userInputs.path, line: ref.line, step_id: ref.step_id });
   }
 
+  // FIX 4d: forward gate-failure feedback from a prior review FAIL so the step knows which
+  // HIGH/CRITICAL findings it must address. ABSENT (not null) when no feedback has been recorded,
+  // so workers that do not need it never see the field at all.
+  const gfFeedback = state.gate_failure_feedback?.[step.id];
+  const hasGfFeedback = Array.isArray(gfFeedback) && gfFeedback.length > 0;
+  if (hasGfFeedback) {
+    provenance.push({ kind: "gate_failure_remediation", count: gfFeedback.length });
+  }
+
   const context = {
     schema: "aipi.context-packet.v1",
     run_id: state.run_id,
@@ -117,6 +126,7 @@ export async function buildStepContext({
     code_graph: graph,
     blast_radius: blastRadius,
     user_inputs: userInputs,
+    ...(hasGfFeedback ? { gate_failure_remediation: gfFeedback } : {}),
     provenance,
   };
 

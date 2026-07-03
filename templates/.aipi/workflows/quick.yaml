@@ -49,7 +49,7 @@ steps:
       Apply the smallest change inside the owned-file set. If the change widens
       scope, stop and escalate to the full planning or feature workflow.
     requires: [quick_scope]
-    context_from: [quick_scope]
+    context_from: [quick_scope, quick_review]
     produces:
       - .aipi/runtime/runs/{{ run_id }}/steps/quick_change/IMPLEMENTATION.md
       - .aipi/runtime/runs/{{ run_id }}/steps/quick_change/FIXES.md

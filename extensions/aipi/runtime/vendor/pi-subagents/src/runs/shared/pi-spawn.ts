@@ -40,6 +40,8 @@ export interface PiSpawnDeps {
 	resolvePackageJson?: () => string;
 	resolvePackageEntry?: () => string;
 	piPackageRoot?: string;
+	// AIPI patch: environment consulted for AIPI_PI_BIN / AIPI_PI_CLI_JS overrides.
+	env?: NodeJS.ProcessEnv;
 }
 
 interface PiSpawnCommand {
@@ -101,6 +103,26 @@ export function resolveWindowsPiCliScript(deps: PiSpawnDeps = {}): string | unde
 
 export function getPiSpawnCommand(args: string[], deps: PiSpawnDeps = {}): PiSpawnCommand {
 	const platform = deps.platform ?? process.platform;
+
+	// AIPI patch: worker children must run the SAME Pi the aipi wrapper resolved.
+	// The wrapper exports AIPI_PI_CLI_JS on spawn; without honoring it here,
+	// non-Windows workers fell back to a bare `pi` from PATH — a potentially
+	// DIFFERENT Pi version than the host session (documented split-brain risk).
+	const env = deps.env ?? process.env;
+	if (env.AIPI_PI_BIN) {
+		return { command: env.AIPI_PI_BIN, args };
+	}
+	if (env.AIPI_PI_CLI_JS) {
+		const existsSync = deps.existsSync ?? fs.existsSync;
+		const overridePath = normalizePath(env.AIPI_PI_CLI_JS);
+		if (isRunnableNodeScript(overridePath, existsSync)) {
+			return {
+				command: deps.execPath ?? process.execPath,
+				args: [overridePath, ...args],
+			};
+		}
+	}
+
 	if (platform === "win32") {
 		const piCliPath = resolveWindowsPiCliScript(deps);
 		if (piCliPath) {

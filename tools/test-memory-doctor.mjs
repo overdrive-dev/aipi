@@ -97,6 +97,24 @@ try {
   assert.equal(doc.ok, false);
   await fs.rm(path.join(root, ".aipi/runtime/memory-drift/BR-2-bad.json"));
 
+  // FIX 4: legacy .md-only candidates are counted as pending and produce a candidates_pending warn.
+  // State here: healthy rule, one open drift (warn), no candidates, no bad ledger.
+  const legacyCandRel = ".aipi/runtime/memory-candidates/2026-06-15T10-00-00-000Z-business-rule-abcdef.md";
+  await write(legacyCandRel, "### BR-LEGACY\n\nA legacy candidate without a JSON sidecar.\n");
+  // Use a deterministic now that is 7 days after the legacy candidate's embedded timestamp
+  const legacyNow = () => new Date("2026-06-22T10:00:00.000Z");
+  doc = await runMemoryDoctor({ projectRoot: root, now: legacyNow });
+  assert.equal(doc.counts.pending_candidates, 1, "legacy md-only candidate counted as pending");
+  assert.equal(doc.counts.legacy_candidates, 1, "legacy md-only candidate counted separately as legacy");
+  const pendingWarn = doc.problems.find((p) => p.code === "candidates_pending");
+  assert.ok(pendingWarn, "candidates_pending warn is emitted when pending > 0");
+  assert.equal(pendingWarn.severity, "warn", "candidates_pending has warn severity");
+  assert.match(pendingWarn.message, /7/, "candidates_pending warn includes age in days");
+  assert.equal(doc.ok, true, "legacy candidate alone is a warn (ok stays true, no error)");
+  assert.equal(verifyMemory(doc, { strict: false }).ok, true, "lenient verify passes with only candidates_pending warn");
+  assert.equal(verifyMemory(doc, { strict: true }).ok, false, "strict verify fails on candidates_pending warn");
+  await fs.rm(path.join(root, legacyCandRel));
+
   // An invalid audit-ledger line corrupts the provenance trail → hard error.
   await write(".aipi/memory/audit-ledger.jsonl", `${JSON.stringify({ event: "promoted" })}\nNOT JSON\n`);
   doc = await runMemoryDoctor({ projectRoot: root });

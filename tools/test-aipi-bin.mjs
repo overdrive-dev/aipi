@@ -107,6 +107,42 @@ const candidates = piCliJsCandidates({
 assert.equal(candidates[0], cliJs);
 assert.ok(candidates.some((candidate) => candidate.endsWith(path.join("npm", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"))));
 
+// Standalone install: the package-local pinned Pi is the FIRST candidate after
+// the explicit env override — no global Pi install required.
+{
+  const packageRoot = path.join("C:", "aipi-pkg");
+  const localCandidates = piCliJsCandidates({
+    env: {
+      AIPI_PI_CLI_JS: cliJs,
+      npm_config_prefix: path.join("C:", "npm-prefix"),
+    },
+    homeDir: path.join("C:", "Users", "u"),
+    platform: "win32",
+    packageRoot,
+  });
+  assert.equal(localCandidates[0], cliJs, "explicit env override stays first");
+  assert.equal(
+    localCandidates[1],
+    path.join(packageRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"),
+    "package-local pinned Pi comes before global prefixes",
+  );
+  // The resolved cli.js is exported to children as AIPI_PI_CLI_JS so worker
+  // runtimes spawn the SAME Pi as the wrapper.
+  const localCliJs = localCandidates[1];
+  const spec = createRawPiSpawnSpec({
+    env: {},
+    existsSync: (candidate) => candidate === localCliJs,
+    homeDir: path.join("C:", "Users", "u"),
+    nodeExecPath: "node.exe",
+    platform: "win32",
+    userArgs: ["--version"],
+    packageRoot,
+  });
+  assert.equal(spec.command, "node.exe");
+  assert.equal(spec.args[0], localCliJs);
+  assert.deepEqual(spec.childEnv, { AIPI_PI_CLI_JS: localCliJs });
+}
+
 assert.deepEqual(classifyAipiInvocation([]), { kind: "pass-through" });
 assert.deepEqual(classifyAipiInvocation(["--version"]), { kind: "aipi-version" });
 assert.deepEqual(classifyAipiInvocation(["-v"]), { kind: "aipi-version" });
@@ -127,6 +163,7 @@ assert.deepEqual(classifyAipiInvocation(["model", "check"]), { kind: "aipi-model
 assert.deepEqual(classifyAipiInvocation(["onboard", "--no-questions"]), { kind: "aipi-onboard", args: ["--no-questions"] });
 assert.deepEqual(classifyAipiInvocation(["onboarding"]), { kind: "aipi-onboard", args: [] });
 assert.deepEqual(classifyAipiInvocation(["diagnose", "run-1"]), { kind: "aipi-diagnose", args: ["run-1"] });
+assert.deepEqual(classifyAipiInvocation(["setup", "--fix"]), { kind: "aipi-setup", args: ["--fix"] });
 assert.deepEqual(classifyAipiInvocation(["diagnostics", "--json"]), { kind: "aipi-diagnose", args: ["--json"] });
 assert.deepEqual(classifyAipiInvocation(["--", "--version"]), { kind: "pass-through" });
 assert.deepEqual(parseAipiStatusArgs(["--target", "project", "--json", "--strict"], { cwd: path.join("C:", "repo") }), {
@@ -196,7 +233,10 @@ const installationDoc = fs.readFileSync(path.join("docs", "installation.md"), "u
 const wrapperDoc = fs.readFileSync(path.join("docs", "aipi-cli-wrapper.md"), "utf8");
 assert.match(readme, /docs\/installation\.md`\]\(docs\/installation\.md\)/);
 assert.match(readme, /aipi\s+# starts an interactive Pi session with AIPI preloaded/);
-assert.match(installationDoc, /npm install -g @earendil-works\/pi-coding-agent/);
+// Standalone story: Pi ships as a pinned dependency; the docs must NOT tell
+// users to globally install Pi as a prerequisite anymore.
+assert.doesNotMatch(installationDoc, /npm install -g @earendil-works\/pi-coding-agent/);
+assert.match(installationDoc, /No separate global Pi install is required/);
 assert.match(installationDoc, /npm link/);
 assert.match(installationDoc, /npm install -g \./);
 assert.match(installationDoc, /Bare `aipi` is the primary entry point/);

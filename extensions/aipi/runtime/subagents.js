@@ -557,10 +557,13 @@ export class SubagentCoordinator {
     return null;
   }
 
-  #persist() {
-    // Survives reload/compaction; not in LLM context. Mirror to .aipi/runtime in
-    // the run-state module (spike S4).
-    this.#pi?.appendEntry?.(SUBAGENT_STATE_ENTRY, {
+  // Public state snapshot: the exact payload #persist serializes. Exposed so the
+  // session_shutdown hook can write it to disk — session-transcript entries do
+  // NOT survive into a new session's manager, so a transcript-only persist means
+  // restore never finds state after a restart (field evidence: 45/45 restores
+  // reported "no state" across 13 days of real use).
+  snapshot() {
+    return {
       jobs: [...this.#jobs.values()].map((j) => ({
         agentId: j.agentId,
         state: j.state,
@@ -600,7 +603,13 @@ export class SubagentCoordinator {
           : null,
       })),
       ownedFiles: this.#registry.snapshot(),
-    });
+    };
+  }
+
+  #persist() {
+    // Survives reload/compaction; not in LLM context. Mirror to .aipi/runtime in
+    // the run-state module (spike S4).
+    this.#pi?.appendEntry?.(SUBAGENT_STATE_ENTRY, this.snapshot());
   }
 
   // ===================================================================

@@ -5,9 +5,11 @@ import path from "node:path";
 import { registerAipiRuntimeTools, AIPI_RUNTIME_TOOL_NAMES } from "../extensions/aipi/runtime/aipi-tools.js";
 import {
   detectInteractiveTrap,
+  detectWindowsShellLint,
   isAmbiguousLongRunningCommand,
   piStreamingUpdate,
   runGuardedCommand,
+  splitShellSegments,
 } from "../extensions/aipi/runtime/command-watchdog.js";
 
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-command-watchdog-"));
@@ -228,6 +230,127 @@ try {
     for (const p of streamed) {
       assert.ok(Array.isArray(p?.content), "guarded command streams only content-shaped partials");
     }
+  }
+
+  // ── Windows shell lint ─────────────────────────────────────────────────
+  {
+    const tailPipe = detectInteractiveTrap("npx playwright test --project=chromium | tail -50", { platform: "win32" });
+    assert.equal(tailPipe.action, "refuse");
+    assert.equal(tailPipe.pattern, "unix_utility_windows_shell");
+    assert.match(tailPipe.recommendation, /Get-Content|Select-Object -Last/);
+    assert.equal(
+      detectInteractiveTrap("npx playwright test --project=chromium | tail -50", { platform: "linux" }).action,
+      "allow",
+    );
+    const lsChain = detectInteractiveTrap("ls frontend && ls backend", { platform: "win32" });
+    assert.equal(lsChain.pattern, "unix_utility_windows_shell");
+    assert.match(lsChain.recommendation, /Get-ChildItem|dir/);
+    const corrupted = detectInteractiveTrap(
+      "powershell -Command \"Remove-Item -LiteralPath '$(Test-Path' -Force\"",
+      { platform: "win32" },
+    );
+    assert.equal(corrupted.pattern, "corrupted_subexpression_literal");
+    const unbalanced = detectInteractiveTrap('echo "unclosed', { platform: "win32" });
+    assert.equal(unbalanced.pattern, "unbalanced_quotes");
+    assert.equal(
+      detectInteractiveTrap('powershell -NoProfile -Command "Get-ChildItem x"', { platform: "win32" }).action,
+      "allow",
+      "interpreter wrappers execute their own payload",
+    );
+    // Trap ordering: recursive project-root searches stay owned by the search trap.
+    assert.equal(
+      detectInteractiveTrap("grep -rn \"login\" . | head", { platform: "win32" }).pattern,
+      "recursive_search_heavy_dirs",
+    );
+    assert.deepEqual(splitShellSegments('ls a && echo "x | y" | tail -2'), ["ls a", 'echo "x | y"', "tail -2"]);
+    assert.equal(detectWindowsShellLint("ls -la", { platform: "linux" }).action, "allow");
+    // End-to-end: the refusal reaches runGuardedCommand result + diagnose note.
+    const lintedRun = await runGuardedCommand({
+      projectRoot: tempRoot,
+      cwd: tempRoot,
+      command: "ls frontend | tail -5",
+      platform: "win32",
+      minRuntimeMs: 10,
+    });
+    assert.equal(lintedRun.status, "refused");
+    assert.equal(lintedRun.verdict, "interactive_trap");
+    assert.equal(lintedRun.interactive_trap.pattern, "unix_utility_windows_shell");
+    assert.equal(lintedRun.diagnose_note.schema, "aipi.command-watchdog-diagnose.v1");
+  }
+
+  // ── Ambiguous long-running command coverage (field false-positive shapes) ──
+  assert.equal(isAmbiguousLongRunningCommand("wsl --install -d Ubuntu"), true);
+  assert.equal(isAmbiguousLongRunningCommand("winget install Docker.DockerDesktop"), true);
+  assert.equal(isAmbiguousLongRunningCommand("Get-ChildItem -Path . -Recurse -Filter *.ts"), true);
+  assert.equal(isAmbiguousLongRunningCommand("npx playwright test"), true);
+  assert.equal(isAmbiguousLongRunningCommand("pip install -r requirements.txt"), true);
+  assert.equal(isAmbiguousLongRunningCommand("echo hi"), false);
+
+  // ── Built-in liveness probe arbitration (no checkAgent injected) ─────────
+  {
+    // Silent-but-busy: a fake probe proving CPU activity spares the command
+    // even though NO checkAgent was passed — the regression the dead
+    // arbitration hid (silence-timeout killed working commands).
+    const sparedByProbe = await runGuardedCommand({
+      projectRoot: tempRoot,
+      cwd: tempRoot,
+      command: `${nodeCommand("setTimeout(() => process.exit(0), 300);", ["npm test"])}`,
+      minRuntimeMs: 20,
+      silenceTimeoutMs: 50,
+      hardCapMs: 5_000,
+      killGraceMs: 100,
+      livenessProbe: async () => ({ verdict: "working", reason: "fake cpu delta" }),
+    });
+    assert.equal(sparedByProbe.status, "completed");
+    assert.equal(sparedByProbe.killed, false);
+    assert.equal(sparedByProbe.check_agent_invocations > 0, true, "probe invocations are recorded");
+
+    // Probe unknown + no checkAgent: silence timeout still decides, and the
+    // trace records why the command was not spared.
+    const unknownProbe = await runGuardedCommand({
+      projectRoot: tempRoot,
+      cwd: tempRoot,
+      command: `${nodeCommand("setInterval(()=>{},1000);", ["npm test"])}`,
+      minRuntimeMs: 20,
+      silenceTimeoutMs: 50,
+      hardCapMs: 1_000,
+      killGraceMs: 100,
+      livenessProbe: async () => ({ verdict: "unknown", reason: "no cpu delta" }),
+    });
+    assert.equal(unknownProbe.status, "killed");
+    assert.match(unknownProbe.reason, /silence_timeout_exceeded/);
+    assert.match(unknownProbe.reason, /liveness=no cpu delta/);
+
+    // Probe unknown + injected checkAgent working: fallback ordering spares it.
+    const sparedByAgent = await runGuardedCommand({
+      projectRoot: tempRoot,
+      cwd: tempRoot,
+      command: `${nodeCommand("setTimeout(() => process.exit(0), 300);", ["npm test"])}`,
+      minRuntimeMs: 20,
+      silenceTimeoutMs: 50,
+      hardCapMs: 5_000,
+      killGraceMs: 100,
+      livenessProbe: async () => ({ verdict: "unknown", reason: "no cpu delta" }),
+      checkAgent: async () => ({ verdict: "working", reason: "agent says busy" }),
+    });
+    assert.equal(sparedByAgent.status, "completed");
+    assert.equal(sparedByAgent.killed, false);
+  }
+
+  // ── Persisted traces are redacted excerpts; in-memory result stays raw ───
+  {
+    const secretRun = await runGuardedCommand({
+      projectRoot: tempRoot,
+      cwd: tempRoot,
+      command: nodeCommand("console.log('token=SECRETSECRET12345 and AKIAIOSFODNN7EXAMPLE');"),
+      minRuntimeMs: 0,
+    });
+    assert.equal(secretRun.status, "completed");
+    assert.match(secretRun.stdout, /SECRETSECRET12345/, "agent-facing result keeps raw output");
+    const secretTrace = await fs.readFile(path.join(tempRoot, ".aipi", "runtime", "command-watchdog.jsonl"), "utf8");
+    assert.doesNotMatch(secretTrace, /SECRETSECRET12345/, "persisted trace never carries the raw secret");
+    assert.doesNotMatch(secretTrace, /AKIAIOSFODNN7EXAMPLE/);
+    assert.match(secretTrace, /\[REDACTED\]/);
   }
 
   console.log("AIPI_COMMAND_WATCHDOG_TEST_OK");

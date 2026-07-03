@@ -84,7 +84,7 @@ steps:
       Fix the root cause, not just the symptom, under an owned-file scope and
       keep behavior aligned with the cited rule.
     requires: [regression_test]
-    context_from: [triage, rule_impact, regression_test]
+    context_from: [triage, rule_impact, regression_test, review]
     produces:
       - .aipi/runtime/runs/{{ run_id }}/steps/fix/FIXES.md
       - .aipi/runtime/runs/{{ run_id }}/steps/fix/IMPLEMENTATION.md

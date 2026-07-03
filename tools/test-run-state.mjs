@@ -201,6 +201,60 @@ try {
   assert.match(recoveredState.abandon_reason, /auto-detached stale workflow-blocked decision run/);
   assert.equal(typeof recoveredState.abandoned_at, "string");
 
+  // --- FIX 6: required param validation at run creation ---
+  {
+    const paramRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-params-"));
+    try {
+      await initProject({ sourceRoot, targetRoot: paramRoot });
+
+      // (a) Empty required param rejected BEFORE run dir exists.
+      // bugfix.yaml declares `bug: ""` which is referenced as {{ bug }} in the triage prompt — required.
+      const bugfixParamError = await startWorkflowRun({
+        projectRoot: paramRoot, workflow: "bugfix",
+        now: () => fixedDate, randomBytes: fixedRandom,
+        params: {},
+      }).then(() => null).catch((err) => err);
+      assert.ok(bugfixParamError instanceof Error, "missing required param throws before run dir is created");
+      assert.match(bugfixParamError.message, /workflow bugfix requires param "bug"/);
+      assert.match(bugfixParamError.message, /non-empty bug description/);
+      // Verify no run dir was created (fail-fast, no fs side-effects).
+      const abortedRunId = `${fixedDate.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z")}-abcdef`;
+      const abortedRunDir = path.join(paramRoot, ".aipi", "runtime", "runs", abortedRunId);
+      await assert.rejects(
+        () => fs.access(abortedRunDir),
+        /ENOENT/,
+        "no run dir was created for the aborted run",
+      );
+
+      // (b) Run with required param provided proceeds normally (no throw).
+      const bugfixWithParam = await startWorkflowRun({
+        projectRoot: paramRoot, workflow: "bugfix", dryRun: true,
+        now: () => fixedDate, randomBytes: fixedRandom,
+        params: { bug: "The login button does not respond on mobile Safari" },
+      });
+      assert.equal(bugfixWithParam.state.workflow, "bugfix", "run with required param starts normally");
+      assert.equal(bugfixWithParam.dryRun, true);
+
+      // (c) A param with a non-empty default is not required and does not throw when absent.
+      const featureNoParam = await startWorkflowRun({
+        projectRoot: paramRoot, workflow: "feature", dryRun: true,
+        now: () => fixedDate, randomBytes: fixedRandom,
+        params: {},
+      });
+      assert.equal(featureNoParam.state.workflow, "feature", "feature run without params starts normally");
+
+      // (d) quick workflow: request: "" is declared but {{ request }} not used in any step prompt → not required.
+      const quickNoParam = await startWorkflowRun({
+        projectRoot: paramRoot, workflow: "quick", dryRun: true,
+        now: () => fixedDate, randomBytes: fixedRandom,
+        params: {},
+      });
+      assert.equal(quickNoParam.state.workflow, "quick", "quick run without params starts (request not used in prompts)");
+    } finally {
+      await fs.rm(paramRoot, { recursive: true, force: true });
+    }
+  }
+
   console.log("AIPI_RUN_STATE_TEST_OK");
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });

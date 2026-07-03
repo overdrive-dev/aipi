@@ -2,14 +2,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { buildAipiStatusReport } from "./provider-auth.js";
+import { redactSecrets } from "./redact.js";
 
 const FAILURE_STATUSES = new Set(["failed", "blocked", "approval_required", "escalated_to_human", "escalated_to_planning"]);
-const SECRET_PATTERNS = [
-  /\b(sk-[A-Za-z0-9_-]{8,})\b/g,
-  /\b(gh[pousr]_[A-Za-z0-9_]{8,})\b/g,
-  /\b(api[_-]?key|token|secret|password|authorization|refresh_token|access_token)\s*[:=]\s*["']?([A-Za-z0-9._/+=-]{8,})["']?/gi,
-  /\b(Bearer)\s+[A-Za-z0-9._~+/=-]{8,}/gi,
-];
 
 export function parseDiagnoseArgs(args = "") {
   const tokens = Array.isArray(args) ? [...args] : String(args).trim().split(/\s+/).filter(Boolean);
@@ -605,19 +600,7 @@ function redactJson(value) {
   return out;
 }
 
-export function redactSecrets(text) {
-  let value = String(text ?? "");
-  for (const pattern of SECRET_PATTERNS) {
-    value = value.replace(pattern, (match, first) => {
-      if (String(first).toLowerCase() === "bearer") return "Bearer [REDACTED]";
-      if (/api|token|secret|password|authorization|refresh|access/i.test(String(first))) return `${first}=[REDACTED]`;
-      if (match.startsWith("gh")) return "gh_[REDACTED]";
-      if (match.startsWith("sk-")) return "sk-[REDACTED]";
-      return "[REDACTED]";
-    });
-  }
-  return value;
-}
+export { redactSecrets };
 
 function percent(value) {
   return `${Math.round(Number(value ?? 0) * 100)}%`;

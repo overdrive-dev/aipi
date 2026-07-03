@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const PROBE_NAME = "tool-call-attribution";
 const WORKERS = ["worker-a", "worker-b"];
@@ -351,6 +351,21 @@ export function piSdkImportCandidates({
   for (const key of ["AIPI_PI_SDK_PATH", "PI_CODING_AGENT_SDK_PATH"]) {
     if (env[key]?.trim()) candidates.push(path.resolve(env[key].trim()));
   }
+
+  // The aipi wrapper exports AIPI_PI_CLI_JS for the Pi it resolved (the
+  // package-local pinned dependency first) — the SDK entry lives beside it.
+  if (env.AIPI_PI_CLI_JS?.trim()) {
+    candidates.push(path.join(path.dirname(path.resolve(env.AIPI_PI_CLI_JS.trim())), "index.js"));
+  }
+  // Package-local pinned Pi (standalone install: no global Pi required).
+  // This file lives at <packageRoot>/extensions/aipi/runtime/probe-a.js.
+  candidates.push(
+    path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "..", "..", "..",
+      "node_modules", "@earendil-works", "pi-coding-agent", "dist", "index.js",
+    ),
+  );
 
   const argvEntrypoint = argv[1] ? path.resolve(argv[1]) : null;
   if (argvEntrypoint?.endsWith(path.join("dist", "cli.js"))) {

@@ -13,26 +13,35 @@ const sourceRoot = path.resolve("templates/.aipi");
 const fixtures = [
   {
     workflow: "planning",
+    // FIX 6: planning.yaml requires `request` — referenced as {{ request }} in step prompts.
+    params: { request: "plan the checkout flow refactor for the payments module" },
     expectedStatus: "completed",
     artifact: "steps/contract/RESULT.md",
   },
   {
     workflow: "feature",
+    params: {},
     expectedStatus: "completed",
     artifact: "steps/final_verification/VERIFICATION.md",
   },
   {
     workflow: "bugfix",
+    // FIX 6: bugfix.yaml requires `bug` — referenced as {{ bug }} in the triage prompt.
+    params: { bug: "Null pointer exception in checkout when cart is empty" },
     expectedStatus: "completed",
     artifact: "steps/verify/VERIFICATION.md",
   },
   {
     workflow: "research",
+    // FIX 6: research.yaml requires `topic` — referenced as {{ topic }} in step prompts.
+    params: { topic: "best practices for distributed tracing in microservices" },
     expectedStatus: "completed",
     artifact: "steps/synthesis/RESEARCH-SYNTHESIS.md",
   },
   {
     workflow: "ops",
+    // FIX 6: ops.yaml requires `objective` — referenced as {{ objective }} in step prompts.
+    params: { objective: "deploy v2.3.1 to staging after green CI" },
     expectedStatus: "approval_required",
     artifact: "steps/human_review/HUMAN-REVIEW.md",
   },
@@ -54,6 +63,7 @@ try {
     const result = await runWorkflowCommand({
       args: `run ${fixture.workflow}`,
       projectRoot,
+      params: fixture.params ?? {},
       adapter:
         fixture.workflow === "ops"
           ? createOpsApprovalRequiredWorkflowAdapter()

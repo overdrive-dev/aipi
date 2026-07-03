@@ -1858,8 +1858,28 @@ if (packageJson.scripts?.["test:subagents-real-sdk"] !== "node tools/test-subage
 if (!packageJson.scripts?.test?.includes("npm run test:subagents-real-sdk")) {
   errors.push("package.json test script must run test:subagents-real-sdk");
 }
-if (packageJson.dependencies?.["@earendil-works/pi-coding-agent"] || packageJson.devDependencies?.["@earendil-works/pi-coding-agent"]) {
-  errors.push("package.json must not package @earendil-works/pi-coding-agent; real-SDK smoke loads the ambient Pi SDK");
+// Distribution decision (reversed from the earlier ambient-Pi posture): AIPI
+// ships Pi as an exact-pinned direct dependency so `npm install` yields a
+// working `aipi` with no separate global Pi install. package.json, the
+// lockfile, and the contract's piRuntime block must agree in lockstep.
+{
+  const piRuntime = contract.piRuntime ?? {};
+  const declaredPi = packageJson.dependencies?.["@earendil-works/pi-coding-agent"];
+  if (!declaredPi) {
+    errors.push("package.json must pin @earendil-works/pi-coding-agent as a direct dependency (standalone install)");
+  } else if (!/^\d+\.\d+\.\d+$/.test(declaredPi)) {
+    errors.push(`package.json must pin @earendil-works/pi-coding-agent to an exact version, got ${declaredPi}`);
+  }
+  if (piRuntime.package !== "@earendil-works/pi-coding-agent" || !piRuntime.version || !piRuntime.bumpRule) {
+    errors.push("runtime-contract.json must declare the piRuntime block (package, version, bumpRule) for the pinned Pi dependency");
+  }
+  if (declaredPi && piRuntime.version && declaredPi !== piRuntime.version) {
+    errors.push(`piRuntime version drift: package.json pins ${declaredPi} but runtime-contract piRuntime declares ${piRuntime.version}`);
+  }
+  const lockedPi = packageLock.packages?.["node_modules/@earendil-works/pi-coding-agent"]?.version;
+  if (declaredPi && lockedPi && declaredPi !== lockedPi) {
+    errors.push(`piRuntime version drift: package.json pins ${declaredPi} but package-lock resolves ${lockedPi}`);
+  }
 }
 if (packageJson.optionalDependencies?.["pi-subagents"] || packageJson.dependencies?.["pi-subagents"]) {
   errors.push("package.json must not depend on npm pi-subagents; AIPI vendors the source under extensions/aipi/runtime/vendor/pi-subagents");
@@ -1882,13 +1902,15 @@ if (packageJson.dependencies?.["@earendil-works/pi-tui"] ||
   packageJson.devDependencies?.["@earendil-works/pi-tui"]) {
   errors.push("package.json must not keep @earendil-works/pi-tui as a direct AIPI dependency; the separate pi-subagents extension is not loaded");
 }
+// pi-coding-agent is deliberately excluded here: it is now the pinned direct
+// dependency (see the piRuntime lockstep check above). The remaining Pi peers
+// still resolve from that pinned install and must not be bundled separately.
 for (const peer of [
   "@earendil-works/pi-agent-core",
   "@earendil-works/pi-ai",
-  "@earendil-works/pi-coding-agent",
 ]) {
   if (packageJson.dependencies?.[peer] || packageJson.optionalDependencies?.[peer] || packageJson.devDependencies?.[peer]) {
-    errors.push(`package.json must not bundle pi-subagents peer ${peer}; it belongs to the host Pi runtime`);
+    errors.push(`package.json must not bundle pi-subagents peer ${peer}; it resolves from the pinned Pi dependency`);
   }
 }
 const piSubagentsVendorRoot = "extensions/aipi/runtime/vendor/pi-subagents";
@@ -1929,8 +1951,13 @@ for (const requiredText of ["pi-subagents", "nicobailon/pi-subagents", "MIT"]) {
   }
 }
 const ciWorkflow = read(".github/workflows/aipi-templates.yml");
-if (!ciWorkflow.includes("npm install -g @earendil-works/pi-coding-agent@0.79.5")) {
-  errors.push("CI must install ambient @earendil-works/pi-coding-agent@0.79.5 for test:subagents-real-sdk");
+// CI must exercise the same standalone path end users get: npm ci provides the
+// pinned Pi; a global install would mask local-resolution regressions.
+if (ciWorkflow.includes("npm install -g @earendil-works/pi-coding-agent")) {
+  errors.push("CI must not global-install @earendil-works/pi-coding-agent; npm ci provides the pinned dependency (standalone install path)");
+}
+if (!ciWorkflow.includes("npm ci --ignore-scripts --legacy-peer-deps")) {
+  errors.push("CI must install with npm ci --ignore-scripts --legacy-peer-deps");
 }
 if (packageJson.scripts?.["smoke:subagent-live"] !== "node tools/smoke-live-subagent.mjs") {
   errors.push("package.json must include smoke:subagent-live for explicit credentialed worker smoke");

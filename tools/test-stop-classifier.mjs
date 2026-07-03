@@ -15,8 +15,11 @@ assert.equal((await classifyStop({ ...courtesy, env: OFF, classifier: yes })).re
 assert.equal((await classifyStop({ ...courtesy, env: {} })).decision, "continue");
 assert.equal((await classifyStop({ ...courtesy, env: {} })).reason, "courtesy_downgrade");
 // ...but keeps blocked when the reason reads like a real gate FAILURE (no flag, no model, deterministic default).
+// NOTE: "PASS requires memory_promotions" is no longer generatable after FIX 1 (coerced to SKIPPED instead).
+// Using "memory_promotions verdict FAIL" which still fires GATE_FAILURE_SIGNAL (matches "memory_promotions"
+// and "verdict") so defaultStopClassifier returns "stop" even when the question has a courtesy signal.
 assert.equal(
-  (await classifyStop({ gateKind: "courtesy", reason: "PASS requires memory_promotions", question: "Como voce quer seguir?", env: {} })).decision,
+  (await classifyStop({ gateKind: "courtesy", reason: "memory promotion gate verdict FAIL: memory_promotions required", question: "Como voce quer seguir?", env: {} })).decision,
   "stop",
 );
 

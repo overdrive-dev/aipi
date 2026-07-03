@@ -148,7 +148,8 @@
       "blocker_question",
       "awaiting_user_input",
       "memory_promotions",
-      "memory_promotion_result"
+      "memory_promotion_result",
+      "failure_class"
     ],
     "verdictRule": "Only PASS satisfies a normal gate. FAIL, BLOCKED, and BLOCKED_TO_PLANNING never pass. SKIPPED passes only when the step declares allow_skip: true.",
     "evidenceRule": "A PASS result needs at least one evidence item with rung ran or verified unless the gate explicitly allows written evidence.",
@@ -304,7 +305,7 @@
       "AIPI_CMD_HARD_CAP_MS",
       "AIPI_CMD_MIN_RUNTIME_MS"
     ],
-    "rule": "AIPI shell execution should route through aipi_guarded_bash for agent-run commands. The guard refuses common interactive REPL/editor traps and pathological recursive project-root searches before spawning, including raw grep/find scans that would traverse .aipi/state, .git, or node_modules without real exclude/prune flags, and steers AIPI-internal runtime strings toward extensions/aipi/runtime or aipi_retrieve/aipi_callers instead of full-tree scans. It tracks start time, last stdout/stderr time, total runtime, command, pid, and process tree, kills stuck commands on silence timeout or hard cap, invokes a background stuck-vs-working check only for ambiguous long-running build/test commands, records a diagnostic note, and appends aipi.command-watchdog.v1 traces. The user_bash hook remains observational and must not reintroduce broad input blocking."
+    "rule": "AIPI shell execution should route through aipi_guarded_bash for agent-run commands. The guard refuses common interactive REPL/editor traps and pathological recursive project-root searches before spawning, including raw grep/find scans that would traverse .aipi/state, .git, or node_modules without real exclude/prune flags, and steers AIPI-internal runtime strings toward extensions/aipi/runtime or aipi_retrieve/aipi_callers instead of full-tree scans. On Windows it also lints unix-only utilities under cmd.exe and quoting corruption (truncated $() literals, unbalanced quotes) before execution, with actionable PowerShell equivalents. It tracks start time, last stdout/stderr time, total runtime, command, pid, and process tree, kills stuck commands on silence timeout or hard cap, invokes a background stuck-vs-working check only for ambiguous long-running build/test commands — a built-in process-tree CPU liveness probe by default (verdicts working/unknown only; it can spare a silent-but-busy command, never rule stuck on its own), with an injected checkAgent as the final word when present — records a diagnostic note, and appends aipi.command-watchdog.v1 traces as redacted excerpts (full raw stdout/stderr stays in the in-memory result only). The user_bash hook remains observational and must not reintroduce broad input blocking."
   },
   "lifecycleHooks": {
     "implementationPath": "extensions/aipi/runtime/lifecycle-hooks.js",
@@ -387,5 +388,12 @@
       },
       "rule": "AIPI keeps @ersintarhan/pi-toolkit pinned as the upstream source of the Anthropic OAuth adapter, but does not autoload the package's broad index.ts by default. The default provider extension is an AIPI-owned wrapper that imports only src/claude-oauth-adapter.ts. The wrapper intentionally inherits the adapter's disclosed Claude Code identity-block handling, x-anthropic-billing-header injection/preservation, Pi docs context handling, and provider hook mutations. AIPI still owns model-class routing, workflow gates, memory, and policy."
     }
+  },
+  "piRuntime": {
+    "package": "@earendil-works/pi-coding-agent",
+    "version": "0.79.8",
+    "minNode": "22.19.0",
+    "resolution": "AIPI ships Pi as an exact-pinned direct dependency; bin/aipi.js resolves the package-local dist/cli.js first (after AIPI_PI_BIN/AIPI_PI_CLI_JS env overrides) and exports the resolved path as AIPI_PI_CLI_JS so worker runtimes spawn the same Pi. No global Pi install is required.",
+    "bumpRule": "Pi ships breaking changes in 0.x minors (0.72.0 provider API, 0.75.0 Node floor, 0.80.0 /compat entrypoint reorg). Every version bump must update package.json, package-lock.json, and this piRuntime block in lockstep (the validator enforces agreement), review the upstream changelog for extension-API/CLI-flag breaks, re-run test:subagents-real-sdk, and re-run the pi-toolkit adapter diff review because its peers float at *."
   }
 }

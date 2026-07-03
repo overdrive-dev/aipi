@@ -1,0 +1,7 @@
+{
+  "schema": "aipi.environment-requirements.v1",
+  "comment": "Which workstation capabilities `aipi setup` treats as blocking for THIS project. Levels: required (missing blocks setup), optional (missing warns), off (not checked). Node/Git/Pi are always required and not declarable here.",
+  "docker": "optional",
+  "playwright": "off",
+  "ollama_embeddings": "optional"
+}

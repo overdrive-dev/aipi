@@ -601,6 +601,30 @@ try {
       }
     }
   }
+  // FIX 1: sqlite-specific assertions (no dead index; lexical search still works; size_bytes reported)
+  if (graph.sqlite.status === "available") {
+    const sqliteForFix1 = await import("node:sqlite").catch(() => null);
+    if (sqliteForFix1) {
+      const fix1Db = new sqliteForFix1.DatabaseSync(path.join(tempRoot, graph.sqlite.path), { readOnly: true });
+      try {
+        // FIX 1a: the leading-wildcard LIKE index must be gone (it wasted ~8% of DB space)
+        const deadIdx = fix1Db.prepare(
+          "SELECT name FROM sqlite_master WHERE type='index' AND name='code_lines_text_idx'"
+        ).get();
+        assert.equal(deadIdx, undefined, "code_lines_text_idx must not exist (dead B-tree index removed)");
+        // Lexical search must still work without the index
+        const lexRows = fix1Db.prepare(
+          "SELECT path, line, text FROM code_lines WHERE text LIKE ? ESCAPE '\\' LIMIT 5"
+        ).all("%renewSubscription%");
+        assert.equal(lexRows.length > 0, true, "lexical search on code_lines.text still returns rows without the index");
+      } finally {
+        fix1Db.close();
+      }
+      // FIX 1b: size_bytes is a positive integer in the returned sqlite status
+      assert.equal(typeof graph.sqlite.size_bytes, "number", "graph.sqlite.size_bytes is a number");
+      assert.equal(graph.sqlite.size_bytes > 0, true, "graph.sqlite.size_bytes is a positive integer");
+    }
+  }
   assert.equal(graph.vector.engine, "sqlite-vec");
   assert.equal(graph.vector.dimensions, 1024);
   assert.equal(graph.vector.embedding_model, "bge-m3");
@@ -1621,6 +1645,66 @@ try {
   assert.equal(kanban.event.status, "in_progress");
   assert.match(await fs.readFile(path.join(tempRoot, ".aipi", "runtime", "kanban.jsonl"), "utf8"), /billing renewal/);
 
+  // FIX 2: kanban run_id auto-fill + status normalization warning
+  {
+    // (a) run_id auto-filled from .aipi/runtime/runs/active when not provided
+    const activeRunsDir = path.join(tempRoot, ".aipi", "runtime", "runs");
+    await fs.mkdir(activeRunsDir, { recursive: true });
+    await fs.writeFile(path.join(activeRunsDir, "active"), "run-auto\n");
+    const kanbanAutoRunId = await aipiKanbanUpdate({
+      projectRoot: tempRoot,
+      task: "auto-run task",
+      status: "in_progress",
+      now: () => new Date("2026-06-16T01:10:00.000Z"),
+    });
+    assert.equal(kanbanAutoRunId.event.run_id, "run-auto", "run_id auto-filled from runs/active");
+    // The run-specific events file should have been written
+    assert.ok(
+      await pathExists(path.join(tempRoot, ".aipi", "runtime", "runs", "run-auto", "events.jsonl")),
+      "events.jsonl written for auto-filled run_id",
+    );
+    // (a2) explicit run_id must NEVER be stomped
+    const kanbanExplicit = await aipiKanbanUpdate({
+      projectRoot: tempRoot,
+      task: "explicit run task",
+      status: "done",
+      run_id: "run-explicit",
+      now: () => new Date("2026-06-16T01:11:00.000Z"),
+    });
+    assert.equal(kanbanExplicit.event.run_id, "run-explicit", "explicit run_id is preserved");
+    // Remove the active pointer so subsequent tests are not affected
+    await fs.rm(path.join(activeRunsDir, "active"), { force: true });
+    // (b) "mostly-done" is non-standard → status_warning: "non-standard"
+    const kanbanNonStandard = await aipiKanbanUpdate({
+      projectRoot: tempRoot,
+      task: "non-standard status task",
+      status: "mostly-done",
+      run_id: "run-1",
+      now: () => new Date("2026-06-16T01:12:00.000Z"),
+    });
+    assert.equal(kanbanNonStandard.event.status, "mostly-done", "original status is stored unchanged");
+    assert.equal(kanbanNonStandard.event.status_warning, "non-standard", "non-standard status gets status_warning");
+    // (b2) "done" is core → no status_warning
+    const kanbanDone = await aipiKanbanUpdate({
+      projectRoot: tempRoot,
+      task: "standard done",
+      status: "done",
+      run_id: "run-1",
+      now: () => new Date("2026-06-16T01:13:00.000Z"),
+    });
+    assert.equal(kanbanDone.event.status_warning, undefined, '"done" must not get status_warning');
+    // (b3) "in-review" normalizes to "in_review" (space/hyphen→underscore for check) → core → no warning
+    const kanbanInReview = await aipiKanbanUpdate({
+      projectRoot: tempRoot,
+      task: "in-review status",
+      status: "in-review",
+      run_id: "run-1",
+      now: () => new Date("2026-06-16T01:14:00.000Z"),
+    });
+    assert.equal(kanbanInReview.event.status, "in-review", "original hyphen-status stored unchanged");
+    assert.equal(kanbanInReview.event.status_warning, undefined, '"in-review" maps to core in_review → no warning');
+  }
+
   const deferred = await aipiPromoteMemory({
     projectRoot: tempRoot,
     kind: "decision",
@@ -1708,6 +1792,82 @@ try {
   assert.equal(promoted.changed, true);
   assert.equal(promoted.already_present, false);
 
+  // FIX 3c: drain — the deferred candidate with the same promotion_hash must have been removed
+  assert.equal(
+    await pathExists(path.join(tempRoot, deferred.candidate_path)),
+    false,
+    "candidate .md removed by drain after direct promotion",
+  );
+  assert.equal(
+    await pathExists(path.join(tempRoot, deferred.candidate_json_path)),
+    false,
+    "candidate .json removed by drain after direct promotion",
+  );
+  {
+    const drainLedger = (await fs.readFile(path.join(tempRoot, ".aipi", "memory", "audit-ledger.jsonl"), "utf8"))
+      .split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+    assert.ok(drainLedger.some((e) => e.event === "candidate_drained"), "audit ledger records candidate_drained event");
+  }
+
+  // FIX 3a: millisecond-precision IDs — two promotions 1ms apart in the same second must get distinct BR ids
+  {
+    const msRoot = path.join(tempRoot, "ms-precision-test");
+    await fs.mkdir(path.join(msRoot, "src"), { recursive: true });
+    await initProject({ sourceRoot: path.resolve("templates/.aipi"), targetRoot: msRoot });
+    await fs.mkdir(path.dirname(path.join(msRoot, approvalRel)), { recursive: true });
+    await fs.writeFile(path.join(msRoot, approvalRel), JSON.stringify({ schema: "aipi.approval.v1", decision: "APPROVED", source: "test-human" }));
+    await aipiPromoteMemory({
+      projectRoot: msRoot,
+      kind: "business-rule",
+      content: "- **statement:** First millisecond-precision rule.",
+      source_ref: "src/ms.js:1",
+      approval_ref: approvalRel,
+      now: () => new Date("2026-06-21T21:02:23.000Z"),
+    });
+    await aipiPromoteMemory({
+      projectRoot: msRoot,
+      kind: "business-rule",
+      content: "- **statement:** Second millisecond-precision rule.",
+      source_ref: "src/ms.js:2",
+      approval_ref: approvalRel,
+      now: () => new Date("2026-06-21T21:02:23.001Z"),
+    });
+    const msRulesText = await fs.readFile(path.join(msRoot, ".aipi", "memory", "project", "business-rules.md"), "utf8");
+    assert.match(msRulesText, /BR-20260621T210223000Z/, "first rule gets millisecond-precision id ...000Z");
+    assert.match(msRulesText, /BR-20260621T210223001Z/, "second rule gets millisecond-precision id ...001Z — distinct from first");
+    await fs.rm(msRoot, { recursive: true, force: true });
+  }
+
+  // FIX 3b: collision guard — same-millisecond promotions with different content get suffixed IDs
+  {
+    const collRoot = path.join(tempRoot, "collision-guard-test");
+    await fs.mkdir(path.join(collRoot, "src"), { recursive: true });
+    await initProject({ sourceRoot: path.resolve("templates/.aipi"), targetRoot: collRoot });
+    await fs.mkdir(path.dirname(path.join(collRoot, approvalRel)), { recursive: true });
+    await fs.writeFile(path.join(collRoot, approvalRel), JSON.stringify({ schema: "aipi.approval.v1", decision: "APPROVED", source: "test-human" }));
+    const collisionNow = () => new Date("2026-06-21T21:05:00.000Z"); // same timestamp for both
+    await aipiPromoteMemory({
+      projectRoot: collRoot,
+      kind: "business-rule",
+      content: "- **statement:** Collision rule A — occupies the base ID.",
+      source_ref: "src/coll.js:1",
+      approval_ref: approvalRel,
+      now: collisionNow,
+    });
+    const collB = await aipiPromoteMemory({
+      projectRoot: collRoot,
+      kind: "business-rule",
+      content: "- **statement:** Collision rule B — different hash, same timestamp.",
+      source_ref: "src/coll.js:2",
+      approval_ref: approvalRel,
+      now: collisionNow, // same millisecond → same base ID generated
+    });
+    assert.equal(collB.status, "promoted");
+    const collRulesText = await fs.readFile(path.join(collRoot, ".aipi", "memory", "project", "business-rules.md"), "utf8");
+    assert.match(collRulesText, /BR-20260621T210500000Z-[0-9a-f]{6}/, "collision guard appends 6-hex suffix to the second rule's ID");
+    await fs.rm(collRoot, { recursive: true, force: true });
+  }
+
   // RC5: a durable promotion best-effort commits ONLY the written memory file, fail-safe.
   const commitCalls = [];
   const committedPromotion = await aipiPromoteMemory({
@@ -1753,7 +1913,7 @@ try {
   assert.ok(promotedLedger.source_ref && promotedLedger.promotion_hash, "promoted ledger line carries provenance");
   assert.ok(promotedLedger.approval && promotedLedger.approval.source, "promoted ledger line records approval source");
   const decisionsText = await fs.readFile(path.join(tempRoot, ".aipi", "memory", "project", "decisions.md"), "utf8");
-  assert.match(decisionsText, /### ADR-20260616T030000Z - Keep renewal pricing tied to accepted contract\./);
+  assert.match(decisionsText, /### ADR-20260616T030000000Z - Keep renewal pricing tied to accepted contract\./);
   assert.match(decisionsText, /\*\*approval-ref:\*\* \.aipi\/runtime\/approvals\/approved\/memory-promotion\.json/);
   assert.match(decisionsText, /memory_promoted: true/);
   assert.match(decisionsText, /memory_promoted_at: 2026-06-16/);
@@ -1787,7 +1947,7 @@ try {
   assert.equal(promotedRule.status, "promoted");
   assert.equal(promotedRule.changed, true);
   const businessRulesText = await fs.readFile(path.join(tempRoot, ".aipi", "memory", "project", "business-rules.md"), "utf8");
-  assert.match(businessRulesText, /### BR-20260616T033000Z - Renewal source of truth/);
+  assert.match(businessRulesText, /### BR-20260616T033000000Z - Renewal source of truth/);
   assert.match(businessRulesText, /\*\*statement:\*\* Subscriptions renew at the accepted contract price\./);
   assert.match(businessRulesText, /\*\*status:\*\* accepted/);
   assert.match(businessRulesText, /memory_promoted: true/);
@@ -1808,9 +1968,9 @@ try {
   });
   assert.equal(acceptedCandidateRule.status, "promoted");
   assert.equal(acceptedCandidateRule.changed, true);
-  const acceptedRuleId = "BR-20260616T034000Z";
+  const acceptedRuleId = "BR-20260616T034000000Z";
   const businessRulesAfterAccepted = await fs.readFile(path.join(tempRoot, ".aipi", "memory", "project", "business-rules.md"), "utf8");
-  assert.match(businessRulesAfterAccepted, /### BR-20260616T034000Z - Billing candidate acceptance/);
+  assert.match(businessRulesAfterAccepted, /### BR-20260616T034000000Z - Billing candidate acceptance/);
   assert.match(businessRulesAfterAccepted, /\*\*statement:\*\* Billing renewal must preserve the accepted source price\./);
   assert.match(businessRulesAfterAccepted, /\*\*status:\*\* accepted/);
   assert.match(businessRulesAfterAccepted, /\*\*source:\*\* src\/billing\.js:2/);
@@ -1834,7 +1994,7 @@ try {
   assert.equal(repeatedAcceptedCandidateRule.changed, false);
   assert.equal(repeatedAcceptedCandidateRule.already_present, true);
   const businessRulesAfterAcceptedRepeat = await fs.readFile(path.join(tempRoot, ".aipi", "memory", "project", "business-rules.md"), "utf8");
-  assert.equal(countOccurrences(businessRulesAfterAcceptedRepeat, "### BR-20260616T034000Z - Billing candidate acceptance"), 1);
+  assert.equal(countOccurrences(businessRulesAfterAcceptedRepeat, "### BR-20260616T034000000Z - Billing candidate acceptance"), 1);
 
   const deferredCandidateRule = await aipiPromoteMemory({
     projectRoot: tempRoot,

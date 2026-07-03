@@ -23,6 +23,8 @@ import {
 import { describeModel, resolveModelClass, resolveStepModel } from "./model-router.js";
 import { aipiHostModelReadiness, modelProvider } from "./pi-subagents.js";
 import { normalizeExecutionCadence, readActivePlan } from "./plan-state.js";
+import { redactSecrets } from "./redact.js";
+import { appendRotatedJsonlLine } from "./runtime-log.js";
 
 const LIFECYCLE_LOG = ".aipi/runtime/lifecycle.jsonl";
 const TOOL_RESULT_LOG = ".aipi/runtime/tool-results.jsonl";
@@ -106,11 +108,19 @@ export function createAipiLifecycleHandlers({
       projectRoot: rootFor(ctx, event),
       coordinator,
     }),
-    session_shutdown: async (event, ctx) => recordLifecycleEvent({
-      projectRoot: rootFor(ctx, event),
-      hook: "session_shutdown",
-      event: compactEvent(event),
-    }),
+    session_shutdown: async (event, ctx) => {
+      const projectRoot = rootFor(ctx, event);
+      const persisted = await saveSubagentCoordinatorState({ coordinator, projectRoot }).catch(() => null);
+      return recordLifecycleEvent({
+        projectRoot,
+        hook: "session_shutdown",
+        event: {
+          ...compactEvent(event),
+          subagent_state_persisted: persisted?.persisted ?? false,
+          subagent_state_jobs: persisted?.jobs ?? 0,
+        },
+      });
+    },
     before_agent_start: async (event, ctx) => handleBeforeAgentStart({
       event,
       ctx,
@@ -188,8 +198,14 @@ export function createAipiLifecycleHandlers({
       handleEndDisciplineAudit({ event, ctx, pi, projectRoot: rootFor(ctx, event), hook: "agent_end" }),
     turn_end: async (event, ctx) =>
       handleEndDisciplineAudit({ event, ctx, pi, projectRoot: rootFor(ctx, event), hook: "turn_end" }),
-    message_end: async (event, ctx) =>
-      handleEndDisciplineAudit({ event, ctx, pi, projectRoot: rootFor(ctx, event), hook: "message_end" }),
+    message_end: async (event, ctx) => {
+      const projectRoot = rootFor(ctx, event);
+      // Usage lives on the finalized assistant message — the provider HTTP hook
+      // only sees status+headers on streamed requests. Capture is best-effort
+      // and must never affect the audit result contract.
+      await recordProviderUsageFromMessageEnd({ event, ctx, projectRoot }).catch(() => null);
+      return handleEndDisciplineAudit({ event, ctx, pi, projectRoot, hook: "message_end" });
+    },
     model_select: async (event, ctx) => handleModelSelect({
       event,
       ctx,
@@ -441,7 +457,7 @@ export async function handleSessionStart({ event, ctx, pi, projectRoot, coordina
     ctx,
     source: "session_start",
   });
-  const subagents = await restoreSubagentCoordinatorFromSession({ coordinator, ctx, pi });
+  const subagents = await restoreSubagentCoordinatorFromSession({ coordinator, ctx, pi, projectRoot });
   await recordLifecycleEvent({
     projectRoot,
     hook: "session_start",
@@ -464,15 +480,53 @@ export async function handleSessionStart({ event, ctx, pi, projectRoot, coordina
   return undefined;
 }
 
-export async function restoreSubagentCoordinatorFromSession({ coordinator = null, ctx = {}, pi = null } = {}) {
+// Session-transcript entries do not survive into a new session's manager, so a
+// transcript-only persist can never be restored after a restart. The shutdown
+// hook mirrors the coordinator snapshot to this file; session_start falls back
+// to it when the transcript has no state.
+const SUBAGENT_COORDINATOR_STATE_REL_PATH = ".aipi/runtime/subagents-coordinator-state.json";
+
+export async function saveSubagentCoordinatorState({ coordinator = null, projectRoot } = {}) {
+  if (!projectRoot || typeof coordinator?.snapshot !== "function") {
+    return { persisted: false, reason: "no coordinator snapshot" };
+  }
+  const statePath = path.join(projectRoot, SUBAGENT_COORDINATOR_STATE_REL_PATH);
+  const state = coordinator.snapshot();
+  const jobs = Array.isArray(state?.jobs) ? state.jobs.length : 0;
+  if (!jobs) {
+    // Nothing to restore — remove any stale file so a later restore can't
+    // resurrect state from a previous, unrelated session.
+    await fs.rm(statePath, { force: true }).catch(() => null);
+    return { persisted: false, reason: "no jobs", jobs: 0 };
+  }
+  await fs.mkdir(path.dirname(statePath), { recursive: true });
+  await fs.writeFile(statePath, `${JSON.stringify({ saved_at: new Date().toISOString(), ...state }, null, 2)}\n`);
+  return { persisted: true, jobs, path: SUBAGENT_COORDINATOR_STATE_REL_PATH };
+}
+
+export async function restoreSubagentCoordinatorFromSession({ coordinator = null, ctx = {}, pi = null, projectRoot = null } = {}) {
   if (!coordinator?.restore) {
     return { restored: false, reason: "no coordinator" };
   }
 
   const entries = await readSessionEntries(ctx);
-  const state = latestSubagentStateFromEntries(entries);
+  let state = latestSubagentStateFromEntries(entries);
+  let source = "session";
+  let diskLoadError = null;
+  const statePath = projectRoot ? path.join(projectRoot, SUBAGENT_COORDINATOR_STATE_REL_PATH) : null;
+  if (!state && statePath) {
+    try {
+      state = JSON.parse(await fs.readFile(statePath, "utf8"));
+      source = "disk";
+    } catch (error) {
+      state = null;
+      if (error?.code !== "ENOENT") diskLoadError = String(error?.message ?? error);
+    }
+  }
   if (!state) {
-    return { restored: false, reason: "no state" };
+    return diskLoadError
+      ? { restored: false, reason: "disk_load_failed", error: diskLoadError }
+      : { restored: false, reason: "no_state_existed" };
   }
 
   try {
@@ -480,14 +534,20 @@ export async function restoreSubagentCoordinatorFromSession({ coordinator = null
     const entry = {
       schema: "aipi.subagents.restore.v1",
       restored_at: new Date().toISOString(),
+      source,
       ...(summary ?? { restored: false, reason: "empty summary" }),
     };
     safeAppendEntry(pi, "aipi.subagents.restore", entry);
+    if (source === "disk" && entry.restored !== false && statePath) {
+      // Consume the snapshot so a second restart cannot re-apply stale state.
+      await fs.rm(statePath, { force: true }).catch(() => null);
+    }
     return entry;
   } catch (error) {
     const entry = {
       schema: "aipi.subagents.restore.v1",
       restored_at: new Date().toISOString(),
+      source,
       restored: false,
       reason: "restore_failed",
       error: String(error?.message ?? error),
@@ -602,7 +662,13 @@ export async function handleInput({
     }
   }
   if (codePipeline.trace && !route?.autoDispatch) {
-    await recordCodePipelineTrace({ projectRoot, pi, activeRun: active, pipeline: codePipeline }).catch(() => null);
+    // A classifier that decided auto_dispatch_workflow while auto-dispatch is
+    // disabled must say so — dispatch:null in the trace is indistinguishable
+    // from a dispatch that silently failed to launch.
+    const pipelineForTrace = codePipeline.default_action === "auto_dispatch_workflow"
+      ? codePipelineWithDispatch({ pipeline: codePipeline, route: route ?? {}, skipped: "auto_dispatch_disabled" })
+      : codePipeline;
+    await recordCodePipelineTrace({ projectRoot, pi, activeRun: active, pipeline: pipelineForTrace }).catch(() => null);
   }
 
   const adapter = buildExecutableWorkflowAdapter({ coordinator, ctx });
@@ -1273,6 +1339,13 @@ async function resolveAipiHostInputReadiness({ event = null, ctx = null, coordin
   return aipiHostModelReadiness(eventModel ?? coordinatorModel, { requireProvider: false });
 }
 
+// One blocked user turn used to fan out into up to 6 near-identical error
+// records (input + before_agent_start + model_select hooks, each mirrored into
+// two files). Coalesce per project: a new canonical errors.jsonl record is
+// written on each new user turn (input hook) or when the blocked host/code
+// changes; follow-up hooks of the same turn reference it via coalesced_with.
+const lastUnsupportedHostBlock = new Map();
+
 async function blockUnsupportedHostTurn({
   hook,
   event = null,
@@ -1286,23 +1359,37 @@ async function blockUnsupportedHostTurn({
 } = {}) {
   if (unsupportedHostGuardBypassed({ hook, event, ctx })) return null;
   const readiness = await resolveAipiHostInputReadiness({ event, ctx, coordinator });
-  if (readiness.ok) return null;
+  if (readiness.ok) {
+    lastUnsupportedHostBlock.delete(projectRoot);
+    return null;
+  }
 
   const runSnapshot = snapshot ?? await buildRunSnapshot(projectRoot).catch(() => ({ active: false }));
-  const diagnosticError = new Error(readiness.message);
-  diagnosticError.name = "AipiUnsupportedHostError";
-  diagnosticError.code = readiness.code;
-  diagnosticError.readiness = readiness;
-  const errorEntry = await recordRuntimeError({
-    projectRoot,
-    hook,
-    event: {
-      ...compactEvent(event),
-      unsupported_host_model: readiness.model_id,
-      unsupported_host_provider: readiness.provider,
-    },
-    error: diagnosticError,
-  }).catch(() => null);
+  const blockKey = `${readiness.code}|${readiness.model_id ?? ""}|${readiness.provider ?? ""}`;
+  const prior = lastUnsupportedHostBlock.get(projectRoot) ?? null;
+  const needsCanonicalRecord = hook === "input" || prior?.key !== blockKey;
+  let errorEntry = null;
+  if (needsCanonicalRecord) {
+    const diagnosticError = new Error(readiness.message);
+    diagnosticError.name = "AipiUnsupportedHostError";
+    diagnosticError.code = readiness.code;
+    diagnosticError.readiness = readiness;
+    errorEntry = await recordRuntimeError({
+      projectRoot,
+      hook,
+      event: {
+        ...compactEvent(event),
+        unsupported_host_model: readiness.model_id,
+        unsupported_host_provider: readiness.provider,
+      },
+      error: diagnosticError,
+      expected: true,
+    }).catch(() => null);
+    if (errorEntry) {
+      lastUnsupportedHostBlock.set(projectRoot, { key: blockKey, recorded_at: errorEntry.recorded_at });
+    }
+  }
+  const canonicalRef = errorEntry?.recorded_at ?? (prior?.key === blockKey ? prior.recorded_at : null);
 
   const entry = {
     schema: "aipi.unsupported-host-block.v1",
@@ -1316,7 +1403,8 @@ async function blockUnsupportedHostTurn({
     code: readiness.code,
     message: readiness.message,
     runtime_error_recorded: Boolean(errorEntry),
-    runtime_error_ref: errorEntry?.recorded_at ?? null,
+    runtime_error_ref: canonicalRef,
+    coalesced_with: errorEntry ? null : canonicalRef,
     pipeline_classification: codePipeline?.classification ?? null,
   };
   safeAppendEntry(pi, "aipi.host.unsupported", entry);
@@ -1610,14 +1698,17 @@ function auditEndDisciplineEvent({ event, hook, activeDisciplines = [] } = {}) {
   // only the agent actually asserting it finished ("corrigi", "fixed", "tudo passou", "safe to deploy")
   // without an evidence rung surfaces.
   const completionClaim = claims.length > 0 && isCompletionClaim(text);
-  const checks = [
-    {
+  const checks = [];
+  // The finish-turn entry was hardcoded state:"recorded" for every message —
+  // inert by construction. Record it only when the discipline is actually active.
+  if (activeDisciplines.some((discipline) => discipline.id === "finish-turn")) {
+    checks.push({
       id: "finish-turn",
       state: "recorded",
-      evidence: activeDisciplines.some((discipline) => discipline.id === "finish-turn")
-        ? "finish-turn discipline activated for end-of-turn hook"
-        : "finish-turn discipline not active for inferred role/stage",
-    },
+      evidence: "finish-turn discipline activated for end-of-turn hook",
+    });
+  }
+  checks.push(
     {
       id: "outcome-first",
       state: outcome ? "warn" : "pass",
@@ -1630,7 +1721,7 @@ function auditEndDisciplineEvent({ event, hook, activeDisciplines = [] } = {}) {
         ? `unsupported completion claim(s): ${claims.map((claim) => claim.term).join(", ")}`
         : "no unsupported completion claim (fixed/passed/done) without an evidence rung",
     },
-  ];
+  );
   const state = hook === "message_end" && completionClaim ? "warn" : "pass";
   return {
     state,
@@ -2171,6 +2262,12 @@ export async function handleBeforeAgentStart({ event, ctx, pi, projectRoot, coor
   };
 }
 
+// The context hook is a stateless per-turn filter over the FULL conversation
+// history, so truncated_tool_results is a per-call rescan total that grows with
+// the session (100, 102, 103…), not "new work this call". Track a watermark per
+// project so the log can also report the delta.
+const contextTruncationWatermarks = new Map();
+
 export async function handleContext({ event, projectRoot }) {
   if (!(await isAipiInstalled(projectRoot))) return undefined;
   const snapshot = await buildRunSnapshot(projectRoot);
@@ -2188,6 +2285,11 @@ export async function handleContext({ event, projectRoot }) {
 
   if (!result.modified) return undefined;
 
+  const watermarkKey = `${projectRoot}:${snapshot.run_id ?? "none"}`;
+  const previousTruncations = contextTruncationWatermarks.get(watermarkKey) ?? 0;
+  const newTruncations = Math.max(0, result.truncatedToolResults - previousTruncations);
+  contextTruncationWatermarks.set(watermarkKey, result.truncatedToolResults);
+
   const entry = {
     schema: "aipi.context-event.v1",
     recorded_at: new Date().toISOString(),
@@ -2197,7 +2299,9 @@ export async function handleContext({ event, projectRoot }) {
     step_id: snapshot.step_id ?? null,
     removed_context_pointers: result.removedPointers,
     truncated_tool_results: result.truncatedToolResults,
+    new_truncations_this_call: newTruncations,
     injected_context_pointer: result.injectedPointer,
+    injection_candidates_evaluated: result.injectionCandidatesEvaluated,
     message_count_before: result.beforeCount,
     message_count_after: result.messages.length,
   };
@@ -2215,10 +2319,44 @@ export async function handleDisciplineHook({ event, ctx, pi, projectRoot, hook }
   return undefined;
 }
 
+// Per-project counters of message_end audits since the last turn boundary.
+// turn_end/agent_end collapse into ONE summary record instead of re-auditing
+// the same text message_end already covered (field evidence: 97% of a 15MB
+// audit log was duplicate pass records that could never warn).
+const disciplineAuditTurnCounters = new Map();
+
 export async function handleEndDisciplineAudit({ event, ctx, pi, projectRoot, hook }) {
   if (!(await isAipiInstalled(projectRoot))) return undefined;
+  if (hook === "message_end") {
+    // Non-assistant messages (tool results, custom pointers, user text) can
+    // never warn — skip the snapshot and any persistence outright.
+    const role = event?.message?.role ?? event?.role ?? null;
+    if (role !== "assistant") return undefined;
+  }
   const snapshot = await buildRunSnapshot(projectRoot);
   const activeDisciplines = await loadAndRecordActiveDisciplines({ projectRoot, snapshot, event, ctx, pi, hook });
+
+  if (hook === "turn_end" || hook === "agent_end") {
+    const counters = disciplineAuditTurnCounters.get(projectRoot) ?? { pass_count: 0, warn_count: 0 };
+    disciplineAuditTurnCounters.delete(projectRoot);
+    const summary = {
+      schema: "aipi.end-discipline-audit-summary.v1",
+      audited_at: new Date().toISOString(),
+      hook,
+      run_id: snapshot.run_id ?? null,
+      workflow: snapshot.workflow ?? null,
+      step_id: snapshot.step_id ?? null,
+      agent_id: eventAgentId(event, ctx),
+      active_disciplines: activeDisciplines.map((discipline) => discipline.id),
+      pass_count: counters.pass_count,
+      warn_count: counters.warn_count,
+    };
+    safeAppendEntry(pi, "aipi.discipline.end_audit", summary);
+    await appendRuntimeEvent(projectRoot, DISCIPLINE_AUDIT_LOG, summary);
+    if (snapshot.active) await appendRuntimeEvent(projectRoot, runScopedLog(snapshot.run_id, "discipline-audit.jsonl"), summary);
+    return undefined;
+  }
+
   const audit = auditEndDisciplineEvent({ event, hook, activeDisciplines });
   const entry = {
     schema: "aipi.end-discipline-audit.v1",
@@ -2227,12 +2365,22 @@ export async function handleEndDisciplineAudit({ event, ctx, pi, projectRoot, ho
     run_id: snapshot.run_id ?? null,
     workflow: snapshot.workflow ?? null,
     step_id: snapshot.step_id ?? null,
+    agent_id: eventAgentId(event, ctx),
     active_disciplines: activeDisciplines.map((discipline) => discipline.id),
     ...audit,
   };
-  safeAppendEntry(pi, "aipi.discipline.end_audit", entry);
-  await appendRuntimeEvent(projectRoot, DISCIPLINE_AUDIT_LOG, entry);
-  if (snapshot.active) await appendRuntimeEvent(projectRoot, runScopedLog(snapshot.run_id, "discipline-audit.jsonl"), entry);
+  const counters = disciplineAuditTurnCounters.get(projectRoot) ?? { pass_count: 0, warn_count: 0 };
+  if (audit.state === "pass") counters.pass_count += 1;
+  else counters.warn_count += 1;
+  disciplineAuditTurnCounters.set(projectRoot, counters);
+  // Persist the full record only when it carries signal: a non-pass state or an
+  // actually-active discipline. Plain pass-with-no-disciplines only increments
+  // the per-turn counter above.
+  if (audit.state !== "pass" || activeDisciplines.length > 0) {
+    safeAppendEntry(pi, "aipi.discipline.end_audit", entry);
+    await appendRuntimeEvent(projectRoot, DISCIPLINE_AUDIT_LOG, entry);
+    if (snapshot.active) await appendRuntimeEvent(projectRoot, runScopedLog(snapshot.run_id, "discipline-audit.jsonl"), entry);
+  }
   // B2 — the flexible-agent finish gate (anti-self-deception). Pi's message_end hook cannot hard-block the
   // main agent (only the forked-worker step-result gate can, via verifyWorkerPassEvidence), so instead of
   // recording the claim-evidence audit silently we SURFACE it: a "fixed/passed/done" claim with no evidence
@@ -2630,6 +2778,13 @@ export async function handleAfterProviderResponse({ event, projectRoot }) {
   if (!(await isAipiInstalled(projectRoot))) return undefined;
   const snapshot = await buildRunSnapshot(projectRoot);
   const usage = normalizeProviderUsage(event);
+  if (!usage) providerUsageHealthFor(projectRoot).nullResponses += 1;
+  const rateLimit = parseUnifiedRateLimitHeaders(event?.headers ?? {});
+  if (rateLimit) {
+    const state = providerRateLimitState.get(projectRoot) ?? { warned: new Set() };
+    state.parsed = rateLimit;
+    providerRateLimitState.set(projectRoot, state);
+  }
   const pricing = usage ? await loadProviderPricing(projectRoot) : null;
   const estimatedCost = usage && usage.cost_usd == null ? estimateProviderUsageCost(usage, pricing) : null;
   const usageForBudget = usage ? usageWithEstimatedCost(usage, estimatedCost) : null;
@@ -2643,6 +2798,7 @@ export async function handleAfterProviderResponse({ event, projectRoot }) {
     step_id: snapshot.step_id ?? null,
     status: event?.status ?? null,
     headers: safeProviderHeaders(event?.headers ?? {}),
+    rate_limit: rateLimit,
     usage: usageForBudget,
     budget,
   };
@@ -2860,6 +3016,153 @@ export function normalizeProviderUsage(event = {}) {
   };
 }
 
+// Pi delivers token usage on the finalized assistant message (message_end), not
+// on the after_provider_response HTTP hook — for streaming requests that hook
+// carries only status+headers, so normalizeProviderUsage returns null on every
+// one of them (field evidence: 6,303/6,303 responses with usage:null while every
+// assistant session entry carried a full usage block). Normalize the Pi message
+// shape ({input, output, cacheRead, cacheWrite, cost:{total}}) here.
+export function normalizePiMessageEndUsage(event = {}) {
+  const message = event?.message ?? null;
+  if ((message?.role ?? null) !== "assistant") return null;
+  const usage = message?.usage;
+  if (!usage || typeof usage !== "object") return null;
+  const inputTokens = numberOrNull(usage.input ?? usage.inputTokens ?? usage.input_tokens);
+  const outputTokens = numberOrNull(usage.output ?? usage.outputTokens ?? usage.output_tokens);
+  const cacheReadTokens = numberOrNull(usage.cacheRead ?? usage.cache_read_input_tokens ?? usage.cache_read);
+  const cacheWriteTokens = numberOrNull(usage.cacheWrite ?? usage.cache_creation_input_tokens ?? usage.cache_write);
+  const totalTokens = numberOrNull(
+    usage.totalTokens ??
+      usage.total_tokens ??
+      (inputTokens != null || outputTokens != null
+        ? (inputTokens ?? 0) + (outputTokens ?? 0) + (cacheReadTokens ?? 0) + (cacheWriteTokens ?? 0)
+        : null),
+  );
+  const costUsd = numberOrNull(usage.cost?.total ?? usage.cost_usd ?? usage.costUsd);
+  if (inputTokens == null && outputTokens == null && totalTokens == null && costUsd == null) return null;
+  return {
+    provider: stringOrNull(message.provider ?? event.provider),
+    model: stringOrNull(message.model ?? event.model),
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: totalTokens,
+    cache_read_tokens: cacheReadTokens,
+    cache_write_tokens: cacheWriteTokens,
+    cost_usd: costUsd,
+    source: "pi_message_usage",
+  };
+}
+
+export function parseUnifiedRateLimitHeaders(headers = {}) {
+  const lower = {};
+  for (const [key, value] of Object.entries(headers ?? {})) lower[key.toLowerCase()] = value;
+  // Header values arrive as strings — coerce before the numeric checks.
+  const headerNumber = (value) => {
+    const numeric = typeof value === "number" ? value : Number.parseFloat(String(value ?? ""));
+    return Number.isFinite(numeric) ? numeric : null;
+  };
+  const utilization5h = headerNumber(lower["anthropic-ratelimit-unified-5h-utilization"]);
+  const utilization7d = headerNumber(lower["anthropic-ratelimit-unified-7d-utilization"]);
+  const overageStatus = stringOrNull(lower["anthropic-ratelimit-unified-overage-status"]);
+  const overageDisabledReason = stringOrNull(lower["anthropic-ratelimit-unified-overage-disabled-reason"]);
+  const unifiedStatus = stringOrNull(lower["anthropic-ratelimit-unified-status"]);
+  if (utilization5h == null && utilization7d == null && !overageStatus && !overageDisabledReason && !unifiedStatus) {
+    return null;
+  }
+  return {
+    utilization_5h: utilization5h,
+    utilization_7d: utilization7d,
+    overage_status: overageStatus,
+    overage_disabled_reason: overageDisabledReason,
+    status: unifiedStatus,
+  };
+}
+
+const PROVIDER_USAGE_INACTIVE_THRESHOLD = 20;
+const RATE_LIMIT_WARN_UTILIZATION = 0.85;
+const providerUsageHealth = new Map(); // projectRoot -> { nullResponses, captured, warnedInactive }
+const providerRateLimitState = new Map(); // projectRoot -> { parsed, warned: Set }
+
+function providerUsageHealthFor(projectRoot) {
+  let health = providerUsageHealth.get(projectRoot);
+  if (!health) {
+    health = { nullResponses: 0, captured: 0, warnedInactive: false };
+    providerUsageHealth.set(projectRoot, health);
+  }
+  return health;
+}
+
+function surfaceRateLimitWarnings({ ctx, projectRoot }) {
+  const state = providerRateLimitState.get(projectRoot);
+  if (!state?.parsed) return;
+  const parsed = state.parsed;
+  state.warned ??= new Set();
+  if (parsed.overage_disabled_reason === "out_of_credits") {
+    if (!state.warned.has("out_of_credits")) {
+      state.warned.add("out_of_credits");
+      safeNotify(ctx, "AIPI provider quota: overage disabled (out_of_credits) — provider requests may start failing.", "warning");
+    }
+  } else {
+    state.warned.delete("out_of_credits");
+  }
+  const utilization = Math.max(parsed.utilization_5h ?? 0, parsed.utilization_7d ?? 0);
+  if (utilization >= RATE_LIMIT_WARN_UTILIZATION) {
+    if (!state.warned.has("utilization")) {
+      state.warned.add("utilization");
+      const window = (parsed.utilization_5h ?? 0) >= (parsed.utilization_7d ?? 0) ? "5h" : "7d";
+      safeNotify(ctx, `AIPI provider quota: rate-limit utilization at ${Math.round(utilization * 100)}% of the ${window} window.`, "warning");
+    }
+  } else if (utilization < 0.8) {
+    state.warned.delete("utilization");
+  }
+}
+
+export async function recordProviderUsageFromMessageEnd({ event, ctx = null, projectRoot }) {
+  if (!(await isAipiInstalled(projectRoot))) return null;
+  const health = providerUsageHealthFor(projectRoot);
+  const usage = normalizePiMessageEndUsage(event);
+  if (!usage) {
+    if (!health.warnedInactive && health.captured === 0 && health.nullResponses >= PROVIDER_USAGE_INACTIVE_THRESHOLD) {
+      health.warnedInactive = true;
+      safeNotify(
+        ctx,
+        `AIPI usage tracking inactive: ${health.nullResponses} provider responses carried no usage metadata and no assistant message exposed usage — token/cost reporting is off.`,
+        "warning",
+      );
+    }
+    return null;
+  }
+  health.captured += 1;
+  const snapshot = await buildRunSnapshot(projectRoot).catch(() => ({ active: false }));
+  const pricing = usage.cost_usd == null ? await loadProviderPricing(projectRoot) : null;
+  const estimatedCost = usage.cost_usd == null ? estimateProviderUsageCost(usage, pricing) : null;
+  await appendProviderUsage(projectRoot, snapshot, {
+    schema: "aipi.provider-usage.v1",
+    recorded_at: new Date().toISOString(),
+    run_id: snapshot?.run_id ?? null,
+    workflow: snapshot?.workflow ?? null,
+    step_id: snapshot?.step_id ?? null,
+    provider: usage.provider,
+    model: usage.model,
+    input_tokens: usage.input_tokens,
+    output_tokens: usage.output_tokens,
+    total_tokens: usage.total_tokens,
+    cache_read_tokens: usage.cache_read_tokens,
+    cache_write_tokens: usage.cache_write_tokens,
+    cost_usd: usage.cost_usd ?? estimatedCost?.cost_usd ?? null,
+    cost_source: usage.cost_usd != null ? usage.source : estimatedCost?.source ?? null,
+    pricing_ref: estimatedCost?.pricing_ref ?? null,
+    pricing_checked_at: estimatedCost?.pricing_checked_at ?? null,
+    pricing_source_url: estimatedCost?.pricing_source_url ?? null,
+    source: usage.source,
+  });
+  const usageForBudget = usageWithEstimatedCost(usage, estimatedCost);
+  const budget = await buildProviderBudgetReport({ projectRoot, usage: usageForBudget }).catch(() => null);
+  if (budget) await appendProviderBudget(projectRoot, snapshot, budget);
+  surfaceRateLimitWarnings({ ctx, projectRoot });
+  return usage;
+}
+
 export async function buildRunSnapshot(projectRoot) {
   const active = await readActiveRun(projectRoot).catch(() => null);
   if (!active?.state) {
@@ -3014,6 +3317,11 @@ export function pruneAipiContextMessages(messages = [], {
     removedPointers,
     truncatedToolResults,
     injectedPointer,
+    // Injection is a safety net for "active run but no pointer anywhere" (e.g.
+    // a compaction wiped them). It has never fired in the field because
+    // before_agent_start always pre-injects a pointer — count candidates so a
+    // real dead-path bug is distinguishable from "condition never arises".
+    injectionCandidatesEvaluated: snapshot.active && keepPointerIndex < 0 ? 1 : 0,
     modified: removedPointers > 0 || truncatedToolResults > 0 || injectedPointer,
   };
 }
@@ -3099,6 +3407,7 @@ export async function recordRuntimeError({
   hook,
   event = {},
   error,
+  expected = false,
   now = () => new Date(),
 } = {}) {
   if (!(await isAipiInstalled(projectRoot))) return null;
@@ -3110,8 +3419,11 @@ export async function recordRuntimeError({
     run_id: snapshot?.run_id ?? null,
     workflow: snapshot?.workflow ?? null,
     step_id: snapshot?.step_id ?? null,
+    expected,
     event: compactEvent(event),
-    error: serializeRuntimeError(error),
+    // Expected policy decisions carry no stack: the readiness code+message are
+    // the diagnosis, and the synthetic stack only bloated the log.
+    error: serializeRuntimeError(error, { includeStack: !expected }),
   };
   await appendRuntimeEvent(projectRoot, RUNTIME_ERROR_LOG, entry);
   if (snapshot?.active) {
@@ -3626,28 +3938,43 @@ function messageTextExcerpt(message, maxChars) {
   return truncateSummaryText(redactSecrets(String(text).replace(/\s+/g, " ").trim()), maxChars);
 }
 
+// Prompt bodies (user text, agent prompt, full system prompt) must not be
+// persisted into runtime jsonl logs — a single blocked turn used to embed the
+// entire ~3KB system prompt per hook. Persist char counts instead, mirroring
+// the prompt_chars convention of the lifecycle events.
+const COMPACT_EVENT_PROMPT_KEYS = new Set(["text", "prompt", "systemPrompt", "system_prompt"]);
+const COMPACT_EVENT_MAX_STRING_CHARS = 480;
+
 function compactEvent(event = {}) {
   const result = {};
   for (const [key, value] of Object.entries(event ?? {})) {
     if (key === "signal" || key === "payload" || key === "headers") continue;
-    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean" || value == null) {
+    if (typeof value === "string") {
+      if (COMPACT_EVENT_PROMPT_KEYS.has(key) || value.length > COMPACT_EVENT_MAX_STRING_CHARS) {
+        result[`${key}_chars`] = value.length;
+      } else {
+        result[key] = value;
+      }
+      continue;
+    }
+    if (typeof value === "number" || typeof value === "boolean" || value == null) {
       result[key] = value;
     }
   }
   return result;
 }
 
-function serializeRuntimeError(error) {
+function serializeRuntimeError(error, { includeStack = true } = {}) {
   return {
     name: String(error?.name ?? "Error"),
     message: String(error?.message ?? error ?? "unknown error"),
     code: error?.code ?? null,
-    stack: typeof error?.stack === "string" ? redactSecrets(error.stack) : null,
+    stack: includeStack && typeof error?.stack === "string" ? redactSecrets(error.stack) : null,
     cause: error?.cause
       ? {
           name: String(error.cause?.name ?? "Error"),
           message: String(error.cause?.message ?? error.cause),
-          stack: typeof error.cause?.stack === "string" ? redactSecrets(error.cause.stack) : null,
+          stack: includeStack && typeof error.cause?.stack === "string" ? redactSecrets(error.cause.stack) : null,
         }
       : null,
   };
@@ -3702,7 +4029,8 @@ function truncateMessageText(message, maxChars) {
 }
 
 function truncateText(text, maxChars) {
-  const omitted = Math.max(0, text.length - maxChars);
+  if (text.length <= maxChars) return text;
+  const omitted = text.length - maxChars;
   return `${text.slice(0, maxChars)}\n[AIPI context pruned ${omitted} chars from an older tool result]`;
 }
 
@@ -3721,13 +4049,6 @@ function insertAfterLastUser(messages, message) {
     }
   }
   messages.push(message);
-}
-
-function redactSecrets(text) {
-  return String(text)
-    .replace(/\b(sk-[A-Za-z0-9_-]{12,})\b/g, "sk-[REDACTED]")
-    .replace(/\b(gh[pousr]_[A-Za-z0-9_]{12,})\b/g, "gh_[REDACTED]")
-    .replace(/\b(api[_-]?key|token|secret|password)\s*[:=]\s*["']?([A-Za-z0-9._/+=-]{8,})["']?/gi, "$1=[REDACTED]");
 }
 
 function redactProviderPayloadValue(value, seen = new WeakSet()) {
@@ -4257,8 +4578,7 @@ function usageWithEstimatedCost(usage, estimatedCost) {
 
 async function appendRuntimeEvent(projectRoot, relPath, entry) {
   const absPath = path.join(projectRoot, relPath);
-  await fs.mkdir(path.dirname(absPath), { recursive: true });
-  await fs.appendFile(absPath, `${JSON.stringify(entry)}\n`);
+  await appendRotatedJsonlLine(absPath, entry);
 }
 
 async function isAipiInstalled(projectRoot) {

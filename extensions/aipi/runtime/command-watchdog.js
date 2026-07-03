@@ -2,6 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
+import { redactSecrets } from "./redact.js";
+import { appendRotatedJsonlLine } from "./runtime-log.js";
 
 const COMMAND_WATCHDOG_SCHEMA = "aipi.command-watchdog.v1";
 const COMMAND_WATCHDOG_LOG = ".aipi/runtime/command-watchdog.jsonl";
@@ -13,8 +15,12 @@ const DEFAULT_HARD_CAP_MS = 600_000;
 const DEFAULT_CHECK_AGENT_TIMEOUT_MS = 15_000;
 const DEFAULT_KILL_GRACE_MS = 500;
 
+// Conservative allowlist of command shapes that legitimately run long in
+// silence. Field evidence added installers (wsl --install killed at its 600s
+// hard silence), playwright e2e, and recursive filesystem scans (a
+// working-but-silent Get-ChildItem -Recurse killed at 61s).
 const LONG_RUNNING_COMMAND_RE =
-  /\b(npm\s+(test|run|install|ci|build)|pnpm\s+(test|run|install|build)|yarn\s+(test|run|install|build)|pytest|cargo\s+(test|build)|go\s+test|dotnet\s+test|mvn\s+test|gradle|docker\s+build|make(\s|$))\b/i;
+  /\b(npm\s+(test|run|install|ci|build)|pnpm\s+(test|run|install|build)|yarn\s+(test|run|install|build)|pytest|cargo\s+(test|build)|go\s+test|dotnet\s+test|mvn\s+test|gradle|docker\s+build|make(\s|$)|winget\s+install|choco\s+install|wsl\s+--install|apt(-get)?\s+install|pip3?\s+install|(npx\s+)?playwright\s+(test|install)|get-childitem[^|;&]*\s-recurse|robocopy)\b/i;
 
 // Adapt runGuardedCommand's raw streaming chunks ({type:"stdout"|"stderr", text}) into the partial-result
 // shape a Pi host renders. Pi feeds every onUpdate value straight into its tool-result renderer, which does
@@ -50,6 +56,7 @@ export async function runGuardedCommand({
   killGraceMs = null,
   allowInteractive = false,
   checkAgent = null,
+  livenessProbe = undefined,
   onUpdate = null,
   spawnFn = spawn,
   spawnSyncFn = spawnSync,
@@ -167,6 +174,13 @@ export async function runGuardedCommand({
     closePromise,
     config,
     checkAgent,
+    // Default arbitration: a cheap process-tree CPU probe. The external
+    // checkAgent hook was never wired by any production caller, so ambiguous
+    // silent commands went straight to the silence-timeout kill (field
+    // evidence: a working-but-silent recursive scan killed at 61s).
+    livenessProbe: livenessProbe === undefined
+      ? createProcessLivenessProbe({ platform, spawnSyncFn })
+      : livenessProbe,
     now,
     output: () => ({ stdout, stderr }),
     getLastOutputAtMs: () => lastOutputAtMs,
@@ -229,6 +243,7 @@ async function monitorCommand({
   closePromise,
   config,
   checkAgent,
+  livenessProbe = null,
   now,
   output,
   getLastOutputAtMs,
@@ -259,26 +274,49 @@ async function monitorCommand({
 
     const partial = output();
     const ambiguous = isAmbiguousLongRunningCommand(command);
-    if (ambiguous && typeof checkAgent === "function") {
-      onCheckAgentInvocation?.();
-      const check = await runCheckAgent({
-        checkAgent,
-        command,
-        partialOutput: `${partial.stdout}\n${partial.stderr}`.trim().slice(-MAX_EXCERPT_CHARS),
-        runtimeMs,
-        silenceMs,
-        timeoutMs: config.checkAgentTimeoutMs,
-      });
-      if (check.verdict === "working") {
-        setLastOutputAtMs(now());
-        continue;
+    if (ambiguous) {
+      // Arbitration order: cheap built-in liveness probe first (no model call);
+      // only when it can't prove the tree is busy does the injected checkAgent
+      // (when present) get the final word. Neither can declare "stuck" alone
+      // faster than the silence timeout would.
+      let check = null;
+      if (typeof livenessProbe === "function") {
+        onCheckAgentInvocation?.();
+        check = await runLivenessProbe({ livenessProbe, pid: child?.pid, command, runtimeMs, silenceMs });
+        if (check.verdict === "working") {
+          setLastOutputAtMs(now());
+          continue;
+        }
       }
-      return {
-        verdict: "stuck",
-        reason: `check_agent_${check.verdict}: ${check.reason}`,
-        check_agent: check,
-        suggestion: check.suggestion ?? "Re-run with explicit progress output or a non-interactive bounded command.",
-      };
+      if (typeof checkAgent === "function") {
+        onCheckAgentInvocation?.();
+        check = await runCheckAgent({
+          checkAgent,
+          command,
+          partialOutput: `${partial.stdout}\n${partial.stderr}`.trim().slice(-MAX_EXCERPT_CHARS),
+          runtimeMs,
+          silenceMs,
+          timeoutMs: config.checkAgentTimeoutMs,
+        });
+        if (check.verdict === "working") {
+          setLastOutputAtMs(now());
+          continue;
+        }
+        return {
+          verdict: "stuck",
+          reason: `check_agent_${check.verdict}: ${check.reason}`,
+          check_agent: check,
+          suggestion: check.suggestion ?? "Re-run with explicit progress output or a non-interactive bounded command.",
+        };
+      }
+      if (check) {
+        return {
+          verdict: "stuck",
+          reason: `silence_timeout_exceeded silence=${silenceMs}ms runtime=${runtimeMs}ms liveness=${check.reason}`,
+          check_agent: check,
+          suggestion: "Use a non-interactive form, add progress output, or split the command into bounded steps.",
+        };
+      }
     }
 
     return {
@@ -287,6 +325,127 @@ async function monitorCommand({
       suggestion: "Use a non-interactive form, add progress output, or split the command into bounded steps.",
     };
   }
+}
+
+async function runLivenessProbe({ livenessProbe, pid, command, runtimeMs, silenceMs }) {
+  try {
+    const result = await livenessProbe({ pid, command, runtime_ms: runtimeMs, silence_ms: silenceMs });
+    const verdict = result?.verdict === "working" ? "working" : "unknown";
+    return {
+      verdict,
+      reason: String(result?.reason ?? "no reason returned"),
+      suggestion: null,
+      source: "process_liveness_probe",
+    };
+  } catch (error) {
+    return { verdict: "unknown", reason: String(error?.message ?? error), suggestion: null, source: "process_liveness_probe" };
+  }
+}
+
+// Samples the cumulative CPU time of the command's process tree twice ~1s apart:
+// a tree that burns CPU while silent is WORKING (compile, scan, install), one at
+// ~zero delta stays UNKNOWN — the probe never rules "stuck" on its own, it only
+// spares commands the silence-timeout kill. Returns the closed check-agent
+// vocabulary ({verdict: "working"|"unknown", reason}).
+export function createProcessLivenessProbe({
+  platform = process.platform,
+  spawnSyncFn = spawnSync,
+  sampleIntervalMs = 1_000,
+  delayFn = delay,
+  workingCpuDeltaMs = 25,
+} = {}) {
+  return async ({ pid }) => {
+    if (!pid) return { verdict: "unknown", reason: "missing_pid" };
+    const first = sampleProcessTreeCpuMs(pid, { platform, spawnSyncFn });
+    if (first == null) return { verdict: "unknown", reason: "cpu_sample_unavailable" };
+    await delayFn(sampleIntervalMs);
+    const second = sampleProcessTreeCpuMs(pid, { platform, spawnSyncFn });
+    if (second == null) return { verdict: "unknown", reason: "cpu_sample_unavailable" };
+    const deltaMs = second - first;
+    if (deltaMs >= workingCpuDeltaMs) {
+      return { verdict: "working", reason: `process_tree_cpu_delta_ms=${Math.round(deltaMs)}` };
+    }
+    return { verdict: "unknown", reason: `process_tree_cpu_delta_ms=${Math.round(deltaMs)}` };
+  };
+}
+
+function sampleProcessTreeCpuMs(rootPid, { platform, spawnSyncFn }) {
+  const rows = listProcessCpuRows({ platform, spawnSyncFn });
+  if (!rows?.length) return null;
+  const byPid = new Map();
+  const byParent = new Map();
+  for (const row of rows) {
+    byPid.set(row.pid, row);
+    const siblings = byParent.get(row.ppid) ?? [];
+    siblings.push(row);
+    byParent.set(row.ppid, siblings);
+  }
+  let total = 0;
+  let found = false;
+  const queue = [rootPid];
+  const seen = new Set();
+  while (queue.length) {
+    const pid = queue.shift();
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    const row = byPid.get(pid);
+    if (row) {
+      found = true;
+      total += row.cpuMs;
+    }
+    for (const childRow of byParent.get(pid) ?? []) queue.push(childRow.pid);
+  }
+  return found ? total : null;
+}
+
+function listProcessCpuRows({ platform, spawnSyncFn }) {
+  try {
+    if (platform === "win32") {
+      const result = spawnSyncFn(
+        "powershell",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,KernelModeTime,UserModeTime | ConvertTo-Csv -NoTypeInformation",
+        ],
+        { windowsHide: true, encoding: "utf8", timeout: 8_000 },
+      );
+      if (result.status !== 0 || !result.stdout) return null;
+      const lines = String(result.stdout).split(/\r?\n/).slice(1).filter(Boolean);
+      return lines.map((line) => {
+        const [pid, ppid, kernel, user] = line.replaceAll('"', "").split(",");
+        return {
+          pid: Number.parseInt(pid, 10),
+          ppid: Number.parseInt(ppid, 10),
+          // Win32_Process times are in 100ns units.
+          cpuMs: (Number.parseFloat(kernel || "0") + Number.parseFloat(user || "0")) / 10_000,
+        };
+      }).filter((row) => Number.isFinite(row.pid));
+    }
+    const result = spawnSyncFn("ps", ["-Ao", "pid=,ppid=,time="], { encoding: "utf8", timeout: 8_000 });
+    if (result.status !== 0 || !result.stdout) return null;
+    return String(result.stdout).split("\n").map((line) => {
+      const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)$/);
+      if (!match) return null;
+      return { pid: Number.parseInt(match[1], 10), ppid: Number.parseInt(match[2], 10), cpuMs: parsePsCpuTimeMs(match[3]) };
+    }).filter(Boolean);
+  } catch {
+    return null;
+  }
+}
+
+function parsePsCpuTimeMs(value) {
+  // ps TIME formats: [[dd-]hh:]mm:ss
+  const text = String(value ?? "").trim();
+  const dayMatch = text.match(/^(\d+)-(.+)$/);
+  const days = dayMatch ? Number.parseInt(dayMatch[1], 10) : 0;
+  const clock = dayMatch ? dayMatch[2] : text;
+  const parts = clock.split(":").map((part) => Number.parseFloat(part));
+  if (parts.some((part) => !Number.isFinite(part))) return 0;
+  let seconds = 0;
+  for (const part of parts) seconds = seconds * 60 + part;
+  return (days * 86_400 + seconds) * 1000;
 }
 
 async function runCheckAgent({ checkAgent, command, partialOutput, runtimeMs, silenceMs, timeoutMs }) {
@@ -333,6 +492,9 @@ export function detectInteractiveTrap(command, { platform = process.platform } =
   const searchTrap = detectPathologicalSearchTrap({ text, first, args });
   if (searchTrap.action !== "allow") return searchTrap;
 
+  const windowsLint = detectWindowsShellLint(text, { platform, first });
+  if (windowsLint.action !== "allow") return windowsLint;
+
   if (["python", "python3", "py"].includes(first) && isPythonInteractiveArgs(first, args)) {
     return refuseTrap("python_repl", "Python was invoked without a script or with stdin `-`.", "Use `python -c`, a temporary .py file, or an explicit script path.");
   }
@@ -372,6 +534,103 @@ export function detectInteractiveTrap(command, { platform = process.platform } =
 
 export function isAmbiguousLongRunningCommand(command) {
   return LONG_RUNNING_COMMAND_RE.test(String(command ?? ""));
+}
+
+// ── Windows shell lint ────────────────────────────────────────────────────
+// spawn(..., {shell:true}) runs cmd.exe on win32; unix coreutils are simply
+// absent there. Field evidence: "'tail' não é reconhecido", "'ls' não é
+// reconhecido", and a kill of the corrupted literal `'$(Test-Path'` executed
+// as a path. Catch these BEFORE execution with an actionable equivalent.
+// grep/egrep/fgrep/find stay owned by detectPathologicalSearchTrap.
+const WIN32_ABSENT_UTILITY_EQUIVALENTS = new Map([
+  ["tail", "PowerShell `Get-Content <file> -Tail N` (or `| Select-Object -Last N`)"],
+  ["head", "PowerShell `Get-Content <file> -TotalCount N` (or `| Select-Object -First N`)"],
+  ["ls", "`dir` (cmd) or PowerShell `Get-ChildItem`"],
+  ["cat", "`type <file>` (cmd) or PowerShell `Get-Content <file>`"],
+  ["touch", "PowerShell `New-Item -ItemType File <path>`"],
+  ["which", "`where <name>` (cmd) or PowerShell `Get-Command <name>`"],
+  ["wc", "PowerShell `Measure-Object -Line/-Word/-Character`"],
+  ["sed", "PowerShell `-replace` over `Get-Content`"],
+  ["awk", "PowerShell `ForEach-Object` with `-split`"],
+  ["uniq", "PowerShell `Select-Object -Unique` / `Group-Object`"],
+  ["xargs", "PowerShell `ForEach-Object`"],
+  ["chmod", "not applicable on Windows; use `icacls` only if ACL changes are required"],
+  ["ln", "PowerShell `New-Item -ItemType SymbolicLink`"],
+]);
+
+const WIN32_INTERPRETER_WRAPPERS = new Set(["powershell", "pwsh", "cmd", "bash", "sh", "wsl"]);
+
+export function splitShellSegments(command) {
+  const segments = [];
+  let current = "";
+  let quote = null;
+  const text = String(command ?? "");
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (quote) {
+      current += char;
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      current += char;
+      continue;
+    }
+    if (char === "|" || char === "&") {
+      if (text[index + 1] === char) index += 1;
+      segments.push(current);
+      current = "";
+      continue;
+    }
+    if (char === ";") {
+      segments.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  segments.push(current);
+  return segments.map((segment) => segment.trim()).filter(Boolean);
+}
+
+export function detectWindowsShellLint(text, { platform = process.platform, first = null } = {}) {
+  if (platform !== "win32") return allowTrap();
+
+  // Quoting corruption applies to the raw text even under interpreter wrappers.
+  if (/'\$\([^')]*'/.test(text)) {
+    return refuseTrap(
+      "corrupted_subexpression_literal",
+      "A PowerShell $() subexpression appears truncated inside a single-quoted literal — the command was corrupted during quoting.",
+      "Rebuild the command keeping $() intact inside a double-quoted `powershell -Command \"...\"` string.",
+    );
+  }
+  const doubleQuoteCount = (text.match(/"/g) ?? []).length;
+  if (doubleQuoteCount % 2 === 1) {
+    return refuseTrap(
+      "unbalanced_quotes",
+      "The command contains an odd number of double quotes.",
+      "Re-quote the command with balanced double quotes; on Windows prefer `powershell -NoProfile -Command \"...\"`.",
+    );
+  }
+
+  // Explicit interpreter wrappers execute the inner string themselves — the
+  // cmd.exe utility lint does not apply to their payload.
+  const head = first ?? normalizeCommandName(shellWords(text)[0]);
+  if (WIN32_INTERPRETER_WRAPPERS.has(head)) return allowTrap();
+
+  for (const segment of splitShellSegments(text)) {
+    const segmentHead = normalizeCommandName(shellWords(segment)[0]);
+    const equivalent = WIN32_ABSENT_UTILITY_EQUIVALENTS.get(segmentHead);
+    if (equivalent) {
+      return refuseTrap(
+        "unix_utility_windows_shell",
+        `'${segmentHead}' is not available under cmd.exe on Windows (guarded commands run via the system shell).`,
+        `Use ${equivalent}. If GNU coreutils are intentionally on PATH, re-run with allow_interactive: true.`,
+      );
+    }
+  }
+  return allowTrap();
 }
 
 export async function killProcessTree(pid, {
@@ -519,8 +778,43 @@ function suggestedFixForCommand(command) {
 async function appendCommandWatchdogTrace(projectRoot, entry) {
   if (!projectRoot) return;
   const logPath = path.join(projectRoot, COMMAND_WATCHDOG_LOG);
-  await fs.mkdir(path.dirname(logPath), { recursive: true });
-  await fs.appendFile(logPath, `${JSON.stringify(entry)}\n`);
+  await appendRotatedJsonlLine(logPath, sanitizeWatchdogTraceEntry(entry));
+}
+
+// The in-memory result handed back to the agent keeps the full 64KB capture;
+// the persisted trace stores redacted excerpts only — full raw stdout/stderr
+// from arbitrary project commands (env dumps, connection strings) must not
+// accumulate in a jsonl that syncs to cloud drives. Keys stay identical to
+// aipi.command-watchdog.v1 so trace readers are unaffected.
+export function sanitizeWatchdogTraceEntry(entry) {
+  const stdoutExcerpt = redactSecrets(excerpt(entry?.stdout ?? ""));
+  const stderrExcerpt = redactSecrets(excerpt(entry?.stderr ?? ""));
+  const sanitized = {
+    ...entry,
+    command: redactSecrets(entry?.command ?? ""),
+    reason: entry?.reason == null ? entry?.reason : redactSecrets(entry.reason),
+    stdout: stdoutExcerpt,
+    stderr: stderrExcerpt,
+    stdout_excerpt: stdoutExcerpt,
+    stderr_excerpt: stderrExcerpt,
+  };
+  if (entry?.check_agent && typeof entry.check_agent === "object") {
+    sanitized.check_agent = {
+      ...entry.check_agent,
+      reason: entry.check_agent.reason == null ? entry.check_agent.reason : redactSecrets(entry.check_agent.reason),
+      suggestion: entry.check_agent.suggestion == null ? entry.check_agent.suggestion : redactSecrets(entry.check_agent.suggestion),
+    };
+  }
+  if (entry?.diagnose_note && typeof entry.diagnose_note === "object") {
+    sanitized.diagnose_note = {
+      ...entry.diagnose_note,
+      partial_output_excerpt: redactSecrets(entry.diagnose_note.partial_output_excerpt ?? ""),
+      suggested_fix: entry.diagnose_note.suggested_fix == null
+        ? entry.diagnose_note.suggested_fix
+        : redactSecrets(entry.diagnose_note.suggested_fix),
+    };
+  }
+  return sanitized;
 }
 
 function appendCaptured(current, next) {

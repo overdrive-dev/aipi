@@ -72,14 +72,16 @@ unless a reviewed JSON command adapter is configured.
 ## Installation
 
 `aipi` keeps Pi as the runtime and starts it with the AIPI extensions preloaded.
-For the full numbered walkthrough, including prerequisites and global install
-options, see [`docs/installation.md`](docs/installation.md).
+The Pi runtime is a **pinned dependency**: `npm install` materializes the exact
+tested `@earendil-works/pi-coding-agent` version inside the package, and the
+wrapper resolves that copy first — no separate global Pi install is needed.
+For the full numbered walkthrough see
+[`docs/installation.md`](docs/installation.md).
 
 ```bash
 git clone <this-repo-url>
 cd aipi
 npm install
-npm install -g @earendil-works/pi-coding-agent
 npm link          # dev install: exposes the `aipi` CLI on PATH
 aipi --version
 aipi --help
@@ -266,9 +268,11 @@ only canonical vocabulary, that session writers carry no denied tools, and more.
 - Memory/query tools are operational, and approved promotions can write
   Markdown memory. The code graph writes a rebuildable JSON manifest plus a
   `node:sqlite` sidecar with files, symbols, searchable lines, relationship
-  edges, and deterministic local code-line vectors when `sqlite-vec` loads;
-  it falls back to lexical search when unavailable and detects stale manifests
-  from file hashes before reusing an index.
+  edges, and semantic vectors embedded through a local Ollama server
+  (`bge-m3`, 1024 dims, with an `embedding_cache` resume table; onboarding
+  offers to pull the model). When Ollama or `sqlite-vec` is unavailable it
+  degrades loudly to lexical search, and it detects stale manifests from file
+  hashes before reusing an index.
 - Worker writes are guarded. Executor-owned controller artifact writes are
   limited to declared step outputs. The parent-session permission policy and
   profiles were removed by design; AIPI no longer blocks ordinary interactive

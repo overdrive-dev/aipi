@@ -14,7 +14,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
+          # Pi requires Node >= 22.19.0 (engines); 22 tracks the latest 22.x.
+          node-version: 22
+      # npm ci installs the pinned @earendil-works/pi-coding-agent from the
+      # lockfile — no separate global Pi install (this is the same standalone
+      # path end users get, so CI proves local resolution works).
+      - run: npm ci --ignore-scripts --legacy-peer-deps
+      - run: npm test
+
+  validate-windows:
+    # Three distinct win32 spawn/quoting paths are test-pinned (cmd wrapping,
+    # shell:true single-string, direct spawn); Linux-only CI let Windows
+    # regressions rot silently on a Windows-first user base.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
           node-version: 22
       - run: npm ci --ignore-scripts --legacy-peer-deps
-      - run: npm install -g @earendil-works/pi-coding-agent@0.79.5
       - run: npm test

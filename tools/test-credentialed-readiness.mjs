@@ -54,6 +54,7 @@ try {
       '  S7: "yes",',
       '  S8: "remove inline shrink",',
       '  S9: "continue and run the focused check to finish the in-scope work",',
+      '  S10: "proceed to the next task",',
       "};",
       'process.stdout.write(phase === "verify" ? pass[scenario] : "assume default fixed");',
     ].join("\n"),

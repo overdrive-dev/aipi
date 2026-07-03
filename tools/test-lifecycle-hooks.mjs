@@ -517,6 +517,7 @@ try {
             message: "AIPI host model is unavailable to the AIPI orchestrator turn. Current host model: openai-codex/gpt-5.5. Host provider openai-codex is not in AIPI_HOST_PROVIDERS (anthropic). Remove the restriction or set the host to an allowed provider.",
             runtime_error_recorded: true,
             runtime_error_ref: unsupportedHostEntries.at(-1)?.data?.runtime_error_ref,
+            coalesced_with: null,
             pipeline_classification: "root_cause_bugfix",
           },
         },
@@ -537,11 +538,24 @@ try {
     assert.equal(unsupportedBeforeAgent.action, "blocked");
     assert.equal(unsupportedBeforeAgent.block_reason, "AIPI_HOST_MODEL_UNSUPPORTED");
     assert.equal(unsupportedBeforeAgent.message.customType, "aipi.unsupported-host");
+    // Same blocked turn: before_agent_start coalesces onto the canonical input
+    // record instead of writing a second near-identical errors.jsonl entry.
+    assert.equal(unsupportedBeforeAgent.message.details.runtime_error_recorded, false);
+    assert.equal(
+      unsupportedBeforeAgent.message.details.coalesced_with,
+      unsupportedBeforeAgent.message.details.runtime_error_ref,
+    );
     const unsupportedHostErrorLog = await fs.readFile(path.join(routerRoot, ".aipi", "runtime", "errors.jsonl"), "utf8");
     assert.match(unsupportedHostErrorLog, /"hook":"input"/);
-    assert.match(unsupportedHostErrorLog, /"hook":"before_agent_start"/);
+    assert.doesNotMatch(unsupportedHostErrorLog, /"hook":"before_agent_start"/);
     assert.match(unsupportedHostErrorLog, /AipiUnsupportedHostError/);
-    assert.match(unsupportedHostErrorLog, /"stack":"AipiUnsupportedHostError: AIPI host model is unavailable/);
+    // Expected policy blocks persist no stack and no prompt bodies — the
+    // readiness code+message are the diagnosis.
+    assert.match(unsupportedHostErrorLog, /"expected":true/);
+    assert.match(unsupportedHostErrorLog, /"stack":null/);
+    assert.doesNotMatch(unsupportedHostErrorLog, /"systemPrompt":"/);
+    assert.doesNotMatch(unsupportedHostErrorLog, /"text":"corrigir bug no login"/);
+    assert.match(unsupportedHostErrorLog, /"text_chars":/);
 
     assert.deepEqual(
       await routerHandlers.input({ type: "input", text: "deploy no CI", source: "interactive" }, routerCtx),
@@ -804,7 +818,7 @@ try {
     assert.equal(routerRunnerCalls.at(-1).args, "execute");
     assert.equal((await readActiveRun(routerRoot)).runId, activeForContinuation.runId);
 
-    const explicit = await runWorkflowCommand({ args: "run bugfix", projectRoot: routerRoot });
+    const explicit = await runWorkflowCommand({ args: "run bugfix", projectRoot: routerRoot, params: { bug: "login quebrado no app" } });
     assert.equal(explicit.action, "run");
     // routerRoot has no executable adapter, so `run bugfix` dead-ends on the workflow
     // freestyle/retry/cancel meta-decision (status:blocked, kind:workflow_blocked_decision).
@@ -897,6 +911,129 @@ try {
   );
   const disciplineAuditLog = await fs.readFile(path.join(tempRoot, ".aipi", "runtime", "discipline-audit.jsonl"), "utf8");
   assert.match(disciplineAuditLog, /AIPI_MESSAGE_END_CLAIM_EVIDENCE_REQUIRED/);
+  // turn_end/agent_end no longer re-audit the text message_end already covered:
+  // they persist ONE per-turn summary record instead.
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.type === "aipi.discipline.end_audit" &&
+        entry.data.schema === "aipi.end-discipline-audit-summary.v1" &&
+        entry.data.hook === "turn_end" &&
+        typeof entry.data.pass_count === "number" &&
+        typeof entry.data.warn_count === "number",
+    ),
+    "turn_end writes a summary record, not a duplicate full audit",
+  );
+  assert.equal(
+    entries.some(
+      (entry) =>
+        entry.type === "aipi.discipline.end_audit" &&
+        entry.data.schema === "aipi.end-discipline-audit.v1" &&
+        (entry.data.hook === "turn_end" || entry.data.hook === "agent_end"),
+    ),
+    false,
+    "no full audit records for turn_end/agent_end",
+  );
+  // Full audit records carry agent attribution even when run_id is null.
+  assert.ok(
+    entries
+      .filter((entry) => entry.type === "aipi.discipline.end_audit" && entry.data.schema === "aipi.end-discipline-audit.v1")
+      .every((entry) => "agent_id" in entry.data),
+    "full audit records carry agent_id",
+  );
+  // Non-assistant message_end events persist nothing at all.
+  const auditEntryCountBefore = entries.filter((entry) => entry.type === "aipi.discipline.end_audit").length;
+  await invokeMessageEndWithHostContract(handlers.message_end, {
+    type: "message_end",
+    message: { role: "toolResult", content: "fix(login): commit landed — all done and fixed" },
+  }, ctx);
+  assert.equal(
+    entries.filter((entry) => entry.type === "aipi.discipline.end_audit").length,
+    auditEntryCountBefore,
+    "non-assistant message_end writes no audit record",
+  );
+  // truncateText no longer stamps a bogus "[AIPI context pruned 0 chars ...]"
+  // suffix on excerpts that were never truncated.
+  assert.doesNotMatch(disciplineAuditLog, /pruned 0 chars/);
+
+  // ── Context pointer injection safety net + counters ─────────────────────
+  {
+    // Active run with NO pointer anywhere: the safety net injects one and the
+    // candidate counter records that the condition arose.
+    const injected = pruneAipiContextMessages(
+      [{ role: "user", content: "oi" }],
+      { snapshot: { active: true, run_id: "test-run-123", workflow: "bugfix" }, activeDisciplines: [] },
+    );
+    assert.equal(injected.injectedPointer, true, "injection fires for an active run with no pointer");
+    assert.equal(injected.injectionCandidatesEvaluated, 1);
+    // Normal flow (pointer already present): injection blocked, zero candidates.
+    const blocked = pruneAipiContextMessages(
+      [
+        { role: "user", content: "oi" },
+        { role: "custom", customType: "aipi.context-pointer", content: "ptr", display: false },
+      ],
+      { snapshot: { active: true, run_id: "test-run-123", workflow: "bugfix" }, activeDisciplines: [] },
+    );
+    assert.equal(blocked.injectedPointer, false);
+    assert.equal(blocked.injectionCandidatesEvaluated, 0);
+    // Per-call truncation counts are rescans, not cumulative sums: the same
+    // message set yields the same count on every call.
+    const longToolResults = [
+      { role: "toolResult", toolName: "aipi_retrieve", content: "A".repeat(1300), details: {} },
+      { role: "toolResult", toolName: "aipi_retrieve", content: "B".repeat(1300), details: {} },
+      { role: "toolResult", toolName: "aipi_retrieve", content: "C".repeat(1300), details: {} },
+    ];
+    const first = pruneAipiContextMessages(longToolResults, { snapshot: { active: false } });
+    const second = pruneAipiContextMessages(longToolResults, { snapshot: { active: false } });
+    assert.equal(first.truncatedToolResults, second.truncatedToolResults);
+  }
+
+  // ── Provider usage capture at message_end ──────────────────────────────
+  // Streamed provider responses carry no usage metadata; after 20 of them with
+  // zero captures, the engine warns once that usage tracking is inactive.
+  for (let index = 0; index < 20; index += 1) {
+    await handlers.after_provider_response({ type: "after_provider_response", status: 200, headers: {} }, ctx);
+  }
+  await invokeMessageEndWithHostContract(handlers.message_end, {
+    type: "message_end",
+    message: { role: "assistant", content: "resposta sem metadata de usage" },
+  }, ctx);
+  assert.ok(
+    notifications.some((note) => note.kind === "warning" && /usage tracking inactive/i.test(note.message ?? "")),
+    "null-usage responses surface a one-time inactive warning",
+  );
+
+  // Usage on the finalized assistant message lands in provider-usage.jsonl.
+  await handlers.after_provider_response({
+    type: "after_provider_response",
+    status: 200,
+    headers: { "anthropic-ratelimit-unified-5h-utilization": "0.93" },
+  }, ctx);
+  await invokeMessageEndWithHostContract(handlers.message_end, {
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: "ok",
+      model: "claude-opus-4-8",
+      provider: "anthropic",
+      usage: { input: 100, output: 200, cacheRead: 50, cacheWrite: 10, cost: { total: 0.005 } },
+    },
+  }, ctx);
+  const piMessageUsageLog = await fs.readFile(path.join(tempRoot, ".aipi", "runtime", "provider-usage.jsonl"), "utf8");
+  const usageEntry = JSON.parse(piMessageUsageLog.trim().split("\n").at(-1));
+  assert.equal(usageEntry.schema, "aipi.provider-usage.v1");
+  assert.equal(usageEntry.input_tokens, 100);
+  assert.equal(usageEntry.output_tokens, 200);
+  assert.equal(usageEntry.cache_read_tokens, 50);
+  assert.equal(usageEntry.cache_write_tokens, 10);
+  assert.equal(usageEntry.cost_usd, 0.005);
+  assert.equal(usageEntry.model, "claude-opus-4-8");
+  assert.equal(usageEntry.source, "pi_message_usage");
+  // Rate-limit headers observed on provider responses surface a quota warning.
+  assert.ok(
+    notifications.some((note) => note.kind === "warning" && /utilization at 93%/.test(note.message ?? "")),
+    "high rate-limit utilization surfaces a quota warning",
+  );
 
   const longA = "A".repeat(1300);
   const longB = "B".repeat(1300);
@@ -1708,6 +1845,36 @@ try {
     assert.notEqual(agnosticBefore?.block_reason, "AIPI_HOST_MODEL_UNSUPPORTED", "agnostic default: a non-Anthropic host is NOT blocked");
     assert.equal(agnosticEntries.some((e) => e.type === "aipi.host.unsupported"), false, "agnostic default: no unsupported-host block recorded");
     process.env.AIPI_HOST_PROVIDERS = "anthropic"; // restore for any trailing assertions
+  }
+
+  // ── Subagent coordinator state: shutdown persist → disk restore roundtrip ──
+  {
+    const savedPayload = { jobs: [{ agentId: "worker:abc", state: "running", descriptor: { step_id: "fix" } }], ownedFiles: [] };
+    const restoreCalls = [];
+    const fakeCoordinator = {
+      snapshot: () => savedPayload,
+      restore(state) {
+        restoreCalls.push(state);
+        return { restored: true, restored_jobs: state.jobs.length, interrupted_jobs: 1 };
+      },
+      captureHostModel() { return null; },
+    };
+    const roundtripHandlers = createAipiLifecycleHandlers({
+      pi: { appendEntry() {} },
+      projectRootResolver: () => tempRoot,
+      coordinator: fakeCoordinator,
+    });
+    const emptySessionCtx = { cwd: tempRoot, sessionManager: { getEntries: () => [] }, ui: { notify() {} } };
+    await roundtripHandlers.session_shutdown({ type: "session_shutdown", reason: "quit" }, emptySessionCtx);
+    const statePath = path.join(tempRoot, ".aipi", "runtime", "subagents-coordinator-state.json");
+    const persistedState = JSON.parse(await fs.readFile(statePath, "utf8"));
+    assert.equal(persistedState.jobs.length, 1, "shutdown persists the coordinator snapshot to disk");
+    await roundtripHandlers.session_start({ type: "session_start", reason: "startup" }, emptySessionCtx);
+    assert.equal(restoreCalls.length, 1, "session_start restores from disk when the transcript has no state");
+    assert.equal(restoreCalls[0].jobs[0].agentId, "worker:abc");
+    await assert.rejects(fs.access(statePath), "the disk snapshot is consumed after a successful restore");
+    const lifecycleLogText = await fs.readFile(path.join(tempRoot, ".aipi", "runtime", "lifecycle.jsonl"), "utf8");
+    assert.match(lifecycleLogText, /"subagent_state_persisted":true/);
   }
 
   console.log("AIPI_LIFECYCLE_HOOKS_TEST_OK");

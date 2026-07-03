@@ -37,13 +37,28 @@ allocation.
 
 End users do not run `pi install npm:pi-subagents`.
 
+## AIPI local patches (MUST be re-applied on every re-sync)
+
+Replacing this directory with a fresh tarball silently drops these in-place
+patches; re-apply each one and keep this list current:
+
+1. `src/shared/types.ts` / `src/shared/utils.ts` — `AIPI_SUBAGENTS_RUNTIME_DIR`
+   / `AIPI_SUBAGENTS_AGENT_DIR` env redirection of runtime/agent state dirs.
+2. `src/runs/shared/pi-spawn.ts` — `getPiSpawnCommand` honors `AIPI_PI_BIN` and
+   `AIPI_PI_CLI_JS` (exported by `bin/aipi.js` on spawn) BEFORE the
+   argv[1]/import.meta.resolve/bare-`pi` fallbacks, so worker children run the
+   same Pi the wrapper resolved (kills the wrapper/worker split-brain). The
+   `PiSpawnDeps.env` field is part of this patch. Guarded by the
+   `getPiSpawnCommand honors AIPI_PI_CLI_JS` tripwire in
+   `tools/test-subagents.mjs` — if a re-sync loses the patch, that test fails.
+
 ## Re-sync procedure
 
 1. Review the target upstream release and its changelog.
 2. Run `npm pack pi-subagents@<version> --json`.
 3. Verify the tarball integrity from npm metadata.
 4. Replace this directory with the new tarball contents.
-5. Restore this `VENDOR.md` and `LICENSE` if the new tarball still omits a standalone license file.
+5. Restore this `VENDOR.md` and `LICENSE` if the new tarball still omits a standalone license file, and re-apply every patch in "AIPI local patches" above.
 6. Update pinned dependency versions in root `package.json` for `jiti` and
    `typebox` as needed. Do not add `@earendil-works/pi-tui` as a direct AIPI
    dependency unless the separately-loaded TUI extension surface is deliberately

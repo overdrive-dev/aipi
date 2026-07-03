@@ -15,6 +15,11 @@ const terminalActions = new Set([
   "escalate_to_planning",
 ]);
 
+// FIX 2: tag that identifies the default local-only adapter so the subagent adapter's preflight can
+// distinguish it from a custom test/fallback adapter. Only the local adapter blocks agent steps; a
+// custom fallback (e.g., a test pass-through) is trusted to handle them itself.
+const LOCAL_FALLBACK_TAG = Symbol("aipi.local-fallback");
+
 const PROGRESS_PHASE_LABELS = {
   running: "running…",
   passed: "passed",
@@ -130,6 +135,19 @@ export async function executeWorkflowRun({
   state.step_runs ??= {}; // COMPLETED executions per step in this dispatch — used for the planner label
   state.consecutive_failures ??= 0;
   state.policy_decisions ??= [];
+  // FIX 4: gate-failure feedback keyed by target step id; populated when a review step FAILs with
+  // a HIGH/CRITICAL finding and loops back to a fix step so the fix step knows what to address.
+  state.gate_failure_feedback ??= {};
+
+  // FIX 2b: fail fast before entering the execution loop if the adapter pre-declares it cannot
+  // execute some steps. This surfaces the issue at run-start instead of mid-run BLOCKED.
+  const preflightBlocked = adapter.preflight?.(workflow.steps) ?? [];
+  if (preflightBlocked.length) {
+    const ids = preflightBlocked.map((s) => s.id).join(", ");
+    throw new Error(
+      `adapter preflight: no executable adapter is configured for steps [${ids}]; refusing to start run ${activeRunId}`,
+    );
+  }
 
   // try/finally so the progress spinner's setInterval is torn down on EVERY exit — including a thrown
   // buildStepContext / executeStep / persistRunState after a step armed the spinner. Without this the
@@ -263,6 +281,11 @@ export async function executeWorkflowRun({
       events.push({ type: status, step_id: step.id, verdict: result.verdict });
       emitProgress(step.id, status);
       state.consecutive_failures = 0;
+      // FIX 4c: clear any pending gate-failure feedback for this step now that it has passed —
+      // the step addressed the prior review findings, so carry-forward is no longer needed.
+      if (state.gate_failure_feedback?.[step.id]) {
+        delete state.gate_failure_feedback[step.id];
+      }
       if (state.awaiting_user_input?.step_id === step.id) state.awaiting_user_input = null;
       state.current_step = nextStepId(workflow, step);
       if (!state.current_step) state.status = "completed";
@@ -288,7 +311,18 @@ export async function executeWorkflowRun({
     const failedStatus = gateFailureStatus(result, validation);
     const structuralNoAdapter = isStructuralNoExecutableAdapterBlock(result, error, validation);
     const transientProviderBlock = isTransientProviderFailureBlock(result, validation);
+    // FIX 3: detect subagent worker crashes (spawned but did not finish) as an infra block so
+    // they don't consume the step-visit budget or count toward consecutive gate failures.
+    const workerCrash = isWorkerCrashBlock(result, validation);
+    const infraBlock = structuralNoAdapter || transientProviderBlock || workerCrash;
     const finishedAt = now().toISOString();
+    // FIX 3d: record failure_class so plan-executor and analytics can distinguish infra noise
+    // (no worker signal) from real gate rejections (worker ran but review found issues).
+    const failureClass = infraBlock
+      ? "infra"
+      : failedStatus === "failed"
+      ? "gate_rejection"
+      : "blocked";
     markStep(state, step.id, {
       status: failedStatus,
       verdict: result?.verdict ?? null,
@@ -296,10 +330,14 @@ export async function executeWorkflowRun({
       finished_at: finishedAt,
       result_path: resultPathFor(state, step),
       artifacts: result?.artifacts ?? [],
+      failure_class: failureClass,
     });
     events.push({ type: failedStatus, step_id: step.id, verdict: validation.verdict, error, target });
 
-    if (structuralNoAdapter || transientProviderBlock) {
+    if (infraBlock) {
+      // FIX 3c: roll back the step visit consumed above so an infra block doesn't silently eat
+      // the per-step retry budget — a worker that never produced a result is not a real attempt.
+      state.step_visits[step.id] = Math.max(0, (state.step_visits[step.id] ?? 1) - 1);
       state.status = "blocked";
       state.current_step = step.id;
       state.blocked_reason = error;
@@ -311,7 +349,11 @@ export async function executeWorkflowRun({
         infra: true,
       });
       events.push({
-        type: transientProviderBlock ? "transient_provider_failure" : "structural_no_executable_adapter",
+        type: transientProviderBlock
+          ? "transient_provider_failure"
+          : workerCrash
+          ? "worker_crash"
+          : "structural_no_executable_adapter",
         step_id: step.id,
         reason: error,
       });
@@ -338,6 +380,33 @@ export async function executeWorkflowRun({
     }
 
     if (target && !terminalActions.has(target)) {
+      // FIX 4a: record gate-failure feedback for the target step so it knows which HIGH/CRITICAL
+      // review finding it must address on the next visit.
+      const failFeedback = await extractReviewGateFailureFeedback({ root, result, step, state, now });
+      if (failFeedback) {
+        state.gate_failure_feedback ??= {};
+        const prevEntries = state.gate_failure_feedback[target] ?? [];
+        // FIX 4b: fingerprint-escalate on a repeated identical finding — a fix step that looped back
+        // once but still surfaces the exact same HIGH/CRITICAL finding is structurally stuck.
+        const fingerprint = (e) => `${e.finding?.artifact ?? ""}|${(e.finding?.preview ?? "").slice(0, 120)}`;
+        const newFp = fingerprint(failFeedback);
+        if (prevEntries.length >= 1 && newFp && fingerprint(prevEntries[prevEntries.length - 1]) === newFp) {
+          exhaustRunLimit(
+            state,
+            contract,
+            `repeated gate finding at ${target}: ${failFeedback.finding?.preview?.slice(0, 120) ?? "unresolved HIGH finding"}`,
+          );
+          events.push({
+            type: "run_limit_exhausted",
+            limit: "repeated_gate_finding",
+            step_id: target,
+            reason: failFeedback.finding?.preview?.slice(0, 120) ?? "unresolved HIGH finding",
+          });
+          await persistRunState(root, state);
+          break;
+        }
+        state.gate_failure_feedback[target] = [...prevEntries, failFeedback];
+      }
       // Surface the failure + loop in the planner: the step renders ✗ and its run-count makes the retry
       // visible, instead of a silently-incrementing `running…` that reads as forward progress.
       emitProgress(step.id, failedStatus);
@@ -377,6 +446,7 @@ export async function executeWorkflowRun({
 
 export function createLocalWorkflowAdapter() {
   return {
+    [LOCAL_FALLBACK_TAG]: true, // FIX 2: marks this as the default local-only adapter (blocks agent steps)
     async executeStep({ state, step, contract }) {
       const skipCondition = localSkipCondition(step);
       const policyDecision = skipCondition ? null : localPolicyDecision(step);
@@ -468,6 +538,25 @@ export function createSubagentWorkflowAdapter(coordinator, {
     return !workerRestrict && step.stage === "review";
   };
   return {
+    // FIX 2a: report steps the adapter cannot execute BEFORE the run starts. In default auto mode
+    // every agent-bearing step is routed to a real subagent so there are no blocked steps. In
+    // restrict mode (explicit workerStepIds) only named steps run as workers; any agent-bearing
+    // step not in the allow-list and not fanout-eligible falls to the fallback adapter. We only
+    // flag those steps as unexecutable when the fallback is the DEFAULT local adapter (which would
+    // return BLOCKED for all agent-bearing steps). A custom fallback (e.g., a test pass-through)
+    // is trusted to handle those steps and is not flagged.
+    preflight(steps) {
+      if (!workerRestrict) return []; // auto mode: all agent-bearing steps are handled
+      // Non-local fallbacks (custom adapters) handle uncovered steps themselves.
+      if (!fallback[LOCAL_FALLBACK_TAG]) return [];
+      return (steps ?? []).filter((step) => {
+        const agentCount = step.agents?.length ?? 0;
+        if (agentCount === 0) return false; // no agents → handled by fallback (skip/policy)
+        if (shouldFanout(step)) return false; // review fanout → handled
+        if (workerSteps.has(step.id)) return false; // in the explicit allow-list → handled
+        return true; // has agents, not in allow-list, not fanout → local fallback would BLOCK it
+      });
+    },
     async executeStep(args) {
       const agentCount = args.step.agents?.length ?? 0;
       if (shouldFanout(args.step)) return runFanout(args);
@@ -1250,6 +1339,14 @@ async function countUndrainedCandidates(root) {
   });
   let count = 0;
   for (const name of names) {
+    // FIX 5: legacy memory-candidates written by older engine versions may have only a .md file with
+    // no companion .json sidecar. Count them as pending candidates so the scan record reflects reality
+    // and the user is prompted to promote or discard them via /aipi-memory.
+    if (name.endsWith(".md")) {
+      const jsonSidecar = `${name.slice(0, -3)}.json`;
+      if (!names.includes(jsonSidecar)) count += 1;
+      continue;
+    }
     if (!name.endsWith(".json")) continue;
     try {
       const candidate = JSON.parse(await fs.readFile(path.join(dir, name), "utf8"));
@@ -1259,6 +1356,49 @@ async function countUndrainedCandidates(root) {
     }
   }
   return count;
+}
+
+// FIX 4: Extract the first unresolved HIGH/CRITICAL finding from a review-stage step's artifacts.
+// Returns a feedback entry suitable for state.gate_failure_feedback[targetStepId], or null if no
+// actionable finding can be identified. Pure read — does not modify any files or state.
+async function extractReviewGateFailureFeedback({ root, result, step, state, now }) {
+  if (!Array.isArray(result?.artifacts) || !result.artifacts.length) return null;
+  // Only review-stage artifacts carry structured findings; skip implementation/memory/etc.
+  const reviewArtifactPattern =
+    /(?:^|[/\\])(?:CODE-REVIEW|SECURITY|DEV-REVIEW|HUMAN-REVIEW|COMPLEXITY-REVIEW|INTEGRATION|BLAST-RADIUS|PLAN-REVIEW)(?:\.[A-Za-z0-9_-]*)?\.[A-Za-z]+$/i;
+  const highSeverityLinePattern =
+    /\b(?:CRITICAL|HIGH|BLOCKER|P0|P1)\b\s*(?:[:\]-]|finding|issue|risk|vulnerability|bug)/i;
+  const resolvedContextPattern =
+    /\b(?:resolved|fixed|mitigated|closed|not\s+applicable|none|no)\b.*\b(?:CRITICAL|HIGH|BLOCKER|P0|P1)\b|\b(?:CRITICAL|HIGH|BLOCKER|P0|P1)\b.*\b(?:resolved|fixed|mitigated|closed|none|0)\b/i;
+  for (const artifact of result.artifacts) {
+    if (!reviewArtifactPattern.test(String(artifact ?? ""))) continue;
+    let content;
+    try {
+      content = await fs.readFile(path.join(root, artifact), "utf8");
+    } catch {
+      continue; // artifact not yet written or unreadable — skip silently
+    }
+    const lines = content.split(/\r?\n/);
+    for (const [index, line] of lines.entries()) {
+      if (!highSeverityLinePattern.test(line)) continue;
+      const severityMatch = line.match(/\b(CRITICAL|HIGH|BLOCKER|P0|P1)\b/i);
+      if (!severityMatch) continue;
+      // Look at a small surrounding window to detect "resolved/fixed" context.
+      const window = lines.slice(Math.max(0, index - 1), Math.min(lines.length, index + 3)).join(" ");
+      if (resolvedContextPattern.test(window)) continue;
+      return {
+        from_step: step.id,
+        visit: state.step_visits?.[step.id] ?? 1,
+        finding: {
+          artifact,
+          preview: line.trim().slice(0, 180),
+          severity: severityMatch[1].toUpperCase(),
+        },
+        recorded_at: now().toISOString(),
+      };
+    }
+  }
+  return null;
 }
 
 // RC2 follow-up: when a memory-promotion step SKIPS with no_durable_memory_signal, the EXECUTOR authors and
@@ -1334,7 +1474,47 @@ async function materializeStepMemoryPromotions({ root, state, step, result, now 
   const outputs = [];
   const errors = [];
   if (!promotions.length) {
-    errors.push("memory-promotion PASS requires memory_promotions; return SKIPPED with no_durable_memory_signal when there is no durable fact");
+    // FIX 1: Coerce PASS-with-no-promotions to SKIPPED rather than blocking the run.
+    // A worker that returns PASS without memory_promotions has no durable signal — auto-coerce to
+    // SKIPPED/no_durable_memory_signal so the run completes instead of trapping in a gate error
+    // that is semantically just a skip. SKIPPED is already in pass_verdicts for memory_promotion
+    // in all workflow YAMLs, so the run will complete normally.
+    result.verdict = "SKIPPED";
+    result.skip_condition = "no_durable_memory_signal";
+    const coercionRecord = {
+      schema: "aipi.memory-promotion-result.v1",
+      run_id: state.run_id,
+      step_id: step.id,
+      result_ref: resultRel,
+      created_at: createdAt,
+      status: "coerced_to_skipped",
+      coerced_from: "PASS",
+      coerce_reason:
+        "memory-promotion PASS returned no memory_promotions; executor auto-coerced to SKIPPED/no_durable_memory_signal",
+      promoted: 0,
+      changed: 0,
+      errors: [],
+      promotions: [],
+    };
+    await writeControllerArtifact({
+      root,
+      state,
+      step,
+      relPath: resultRel,
+      internal: true,
+      content: `${JSON.stringify(coercionRecord, null, 2)}\n`,
+    });
+    result.memory_promotion_result = {
+      schema: coercionRecord.schema,
+      status: "coerced_to_skipped",
+      result_ref: resultRel,
+      promoted: 0,
+      changed: 0,
+      errors: [],
+    };
+    if (!Array.isArray(result.artifacts)) result.artifacts = [];
+    if (!result.artifacts.includes(resultRel)) result.artifacts.push(resultRel);
+    return null; // no gate error — the coerced SKIPPED will be handled by the pass branch
   } else {
     await writeControllerArtifact({
       root,
@@ -1823,6 +2003,18 @@ function isTransientProviderFailureBlock(result, validation = {}) {
   return result?.verdict === "BLOCKED" && Boolean(result?.transient_provider_failure);
 }
 
+// FIX 3: a worker crash is a subagent that was spawned (so it's not "no adapter") but terminated
+// without writing a valid result. Detected by the subagent adapter's "did not finish:" evidence item.
+function isWorkerCrashBlock(result, validation = {}) {
+  if (validation?.policyDecision) return false;
+  if (result?.verdict !== "BLOCKED") return false;
+  const evidence = Array.isArray(result?.evidence) ? result.evidence : [];
+  return evidence.some((item) =>
+    item?.source === "aipi-subagent-workflow-adapter" &&
+      /did not finish:/i.test(String(item?.result ?? "")),
+  );
+}
+
 function shouldAskUserOnGateStop({ target, failedStatus } = {}) {
   if (target === "stop_for_user_question") return true;
   if (target === "stop" || !target) return ["blocked", "failed"].includes(failedStatus);
@@ -1840,7 +2032,7 @@ function awaitingUserDecisionForBlockedGate({ step, result = null, reason = "", 
     ? result
     : {
         ...(result ?? {}),
-        blocker_question: defaultBlockedGateQuestion({ step, reason }),
+        blocker_question: defaultBlockedGateQuestion({ step, reason, result }),
       };
   const awaiting = awaitingUserInputFromStepResult({
     step,
@@ -1895,18 +2087,31 @@ export function isWorkflowBlockedDecisionOptions(options) {
     normalized.some((option) => option.includes("continuar fora do workflow automatico"));
 }
 
-function defaultBlockedGateQuestion({ step, reason = "" } = {}) {
+function defaultBlockedGateQuestion({ step, reason = "", result = null } = {}) {
   const stepId = step?.id ?? "current step";
-  const noAdapter = /no executable adapter|refusing to self-stamp/i.test(reason);
+  // Check both the reason string and the result's evidence items for no-adapter signals so the
+  // detection works regardless of how `error` was assembled (the adapter message may be in evidence).
+  const evidenceText = Array.isArray(result?.evidence)
+    ? result.evidence.map((e) => String(e?.result ?? "")).join("\n")
+    : "";
+  const noAdapter = /no executable adapter|refusing to self-stamp/i.test(`${reason}\n${evidenceText}`);
   return {
     question: noAdapter
       ? `AIPI nao conseguiu executar ${stepId} automaticamente porque nenhum executor esta configurado. Como voce quer seguir?`
       : `AIPI parou em ${stepId}: ${reason || "o gate nao passou"}. Como voce quer seguir?`,
-    options: [
-      "Continuar fora do workflow automatico nesta conversa",
-      "Tentar executar este workflow novamente",
-      "Cancelar este run",
-    ],
+    // FIX 2c: when there is no executable adapter the retry option is meaningless (the adapter
+    // configuration won't change mid-session), so only offer the freestyle/cancel pair. The full
+    // three-option set is kept for transient/gate failures where a retry can actually succeed.
+    options: noAdapter
+      ? [
+          "Continuar fora do workflow automatico nesta conversa",
+          "Cancelar este run",
+        ]
+      : [
+          "Continuar fora do workflow automatico nesta conversa",
+          "Tentar executar este workflow novamente",
+          "Cancelar este run",
+        ],
     allow_free_text: true,
   };
 }

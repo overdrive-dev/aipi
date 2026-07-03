@@ -4,19 +4,24 @@ This guide installs the AIPI wrapper so the `aipi` command is available in a
 terminal. `aipi` does not replace Pi; it launches Pi with the AIPI provider and
 runtime extensions preloaded.
 
+AIPI is standalone: `npm install` in the checkout brings the **pinned** Pi
+runtime (`@earendil-works/pi-coding-agent`, exact version from `package.json`)
+into the package's own `node_modules`, and the wrapper resolves that copy
+first. **No separate global Pi install is required.**
+
 ## Prerequisites
 
-1. Install Node.js and npm. This checkout is smoke-checked with Node
-   `v24.17.0`; use Node 22 or newer for the current runtime surface.
+1. Install Node.js and npm. Pi requires Node `>= 22.19.0` (enforced via
+   `engines`); this checkout is smoke-checked with Node 24.
 2. Install Git so you can clone and update the repository.
-3. Install the Pi coding-agent package:
 
-   ```bash
-   npm install -g @earendil-works/pi-coding-agent
-   ```
+### Optional: using your own Pi instead of the packaged one
 
-   The wrapper finds Pi through `AIPI_PI_CLI_JS`, `AIPI_PI_BIN`, npm's global
-   prefix, or a `pi` executable on `PATH`.
+The wrapper resolves Pi in this order: `AIPI_PI_BIN` (executable/shim),
+`AIPI_PI_CLI_JS` (a `dist/cli.js` path), the **package-local pinned Pi**,
+npm's global prefix, then a `pi` executable on `PATH`. Set one of the env
+overrides to point AIPI at a development Pi. Note: extensions are tested
+against the pinned version — a different Pi may silently change hook behavior.
 
 ## Install From A Clone
 

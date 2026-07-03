@@ -1133,6 +1133,30 @@ assert.equal(sfCollect.step_result.model_cross_family, false);
 assert.equal(sfCollect.step_result.model_family, "anthropic");
 await fs.rm(xfRoot, { recursive: true, force: true });
 
+// ── Vendored pi-spawn honors the wrapper's Pi resolution (AIPI patch tripwire) ──
+// bin/aipi.js exports AIPI_PI_CLI_JS for the resolved Pi; the vendored worker
+// spawn MUST honor it or host and workers can run different Pi versions. This
+// test fails loudly if a pi-subagents re-sync drops the in-place patch
+// (documented in extensions/aipi/runtime/vendor/pi-subagents/VENDOR.md).
+{
+  const { getPiSpawnCommand } = jiti("../extensions/aipi/runtime/vendor/pi-subagents/src/runs/shared/pi-spawn.ts");
+  const overriddenCli = getPiSpawnCommand(["--version"], {
+    platform: "linux",
+    env: { AIPI_PI_CLI_JS: "/opt/aipi/node_modules/@earendil-works/pi-coding-agent/dist/cli.js" },
+    existsSync: () => true,
+    execPath: "/usr/bin/node",
+  });
+  assert.equal(overriddenCli.command, "/usr/bin/node", "AIPI_PI_CLI_JS override must be honored on non-Windows");
+  assert.equal(overriddenCli.args[0], "/opt/aipi/node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
+  const overriddenBin = getPiSpawnCommand(["--version"], {
+    platform: "linux",
+    env: { AIPI_PI_BIN: "/usr/local/bin/pi-pinned" },
+  });
+  assert.equal(overriddenBin.command, "/usr/local/bin/pi-pinned");
+  const fallback = getPiSpawnCommand(["--version"], { platform: "linux", env: {} });
+  assert.equal(fallback.command, "pi", "no override falls back to PATH pi");
+}
+
 console.log("AIPI_SUBAGENTS_TEST_OK");
 
 function latestPiState(entries) {

@@ -857,6 +857,12 @@ export async function aipiSemanticSearch({
   };
 }
 
+// FIX 2: closed set of core kanban statuses for normalization check (stored value is NEVER transformed)
+const KANBAN_CORE_STATUSES = new Set([
+  "planned", "in_progress", "done", "skipped", "blocked", "failed",
+  "todo", "backlog", "closed", "queued", "in_review",
+]);
+
 export async function aipiKanbanUpdate({
   projectRoot,
   task,
@@ -868,19 +874,36 @@ export async function aipiKanbanUpdate({
   const root = assertRoot(projectRoot);
   if (!task?.trim()) throw new Error("aipi_kanban_update requires task");
   if (!status?.trim()) throw new Error("aipi_kanban_update requires status");
+
+  // FIX 2a: best-effort read the active run pointer when run_id not explicitly provided
+  let resolvedRunId = run_id;
+  if (!resolvedRunId) {
+    try {
+      const active = (await fs.readFile(path.join(root, ".aipi", "runtime", "runs", "active"), "utf8")).trim();
+      if (active) resolvedRunId = active;
+    } catch {
+      // best-effort: ignore missing/unreadable active file
+    }
+  }
+
+  // FIX 2b: warn on non-standard status (CHECK ONLY — store the original status value unchanged)
+  const normalizedForCheck = status.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  const statusWarning = KANBAN_CORE_STATUSES.has(normalizedForCheck) ? undefined : "non-standard";
+
   const event = {
     schema: "aipi.kanban-event.v1",
     task,
     status,
-    run_id,
+    run_id: resolvedRunId,
     notes,
     recorded_at: now().toISOString(),
+    ...(statusWarning ? { status_warning: statusWarning } : {}),
   };
   const runtimeDir = path.join(root, ".aipi", "runtime");
   await fs.mkdir(runtimeDir, { recursive: true });
   await appendJsonLine(path.join(runtimeDir, "kanban.jsonl"), event);
-  if (run_id) {
-    await appendJsonLine(path.join(runtimeDir, "runs", run_id, "events.jsonl"), {
+  if (resolvedRunId) {
+    await appendJsonLine(path.join(runtimeDir, "runs", resolvedRunId, "events.jsonl"), {
       ...event,
       type: "kanban_update",
     });
@@ -964,6 +987,29 @@ export async function aipiPromoteMemory({
   const approval = await inspectDurableMemoryApproval(root, approval_ref);
   const approvedForDurableWrite = approval.ok;
   const promotionHash = memoryPromotionHash({ kind, title, content, source_ref });
+
+  // FIX 3b: compute targetRel early so we can read the existing file ONCE for the collision guard.
+  // This value is also used by the promoted path below (previously defined there); the deferred path
+  // does NOT reference targetRel, so moving it here is safe.
+  const targetRel = user_memory
+    ? ".aipi/memory/user.local.md"
+    : path.posix.join(".aipi", "memory", "project", projectMemoryFileForKind(kind));
+
+  // Read the existing target text once; used by the collision guard AND reused by insertMemoryEntry
+  // to avoid a second file-system read on the promoted path.
+  const existingTargetText = await fs.readFile(path.join(root, targetRel), "utf8").catch(() => "");
+
+  // Apply collision guard: if a DIFFERENT-hash entry already occupies the generated id, suffix it.
+  const normalizedKindForId = slug(kind);
+  let overrideId = null;
+  if (normalizedKindForId === "business-rule" || normalizedKindForId === "business-rules") {
+    const baseId = extractBusinessRuleId(content) ?? generatedBusinessRuleId(timestamp);
+    overrideId = ensureUniqueMemoryEntryId(existingTargetText, baseId, promotionHash);
+  } else if (normalizedKindForId === "decision" || normalizedKindForId === "decisions") {
+    const baseId = generatedDecisionId(timestamp);
+    overrideId = ensureUniqueMemoryEntryId(existingTargetText, baseId, promotionHash);
+  }
+
   const entry = renderMemoryEntry({
     kind,
     title,
@@ -973,6 +1019,7 @@ export async function aipiPromoteMemory({
     timestamp,
     promotionHash,
     accepted: approvedForDurableWrite,
+    overrideId,
   });
 
   if (!approvedForDurableWrite) {
@@ -1023,9 +1070,7 @@ export async function aipiPromoteMemory({
     };
   }
 
-  const targetRel = user_memory
-    ? ".aipi/memory/user.local.md"
-    : path.posix.join(".aipi", "memory", "project", projectMemoryFileForKind(kind));
+  // targetRel is already computed above (moved early for FIX 3b)
   const insertion = await insertMemoryEntry({
     root,
     targetRel,
@@ -1034,6 +1079,7 @@ export async function aipiPromoteMemory({
     timestamp,
     sourceRef: source_ref,
     promotionHash,
+    existingText: existingTargetText, // reuse the pre-read text — no second file-system read
   });
   await appendMemoryAudit(root, {
     recorded_at: timestamp,
@@ -1054,6 +1100,35 @@ export async function aipiPromoteMemory({
       message: `aipi(memory): promote ${kind} (${promotionHash.slice(0, 12)}) from ${source_ref}`,
       env,
     });
+    // FIX 3c: drain matching deferred candidates — best-effort, never fails the promotion
+    try {
+      const candidatesDir = path.join(root, ".aipi", "runtime", "memory-candidates");
+      const candEntries = await fs.readdir(candidatesDir).catch(() => []);
+      for (const candName of candEntries) {
+        if (!candName.endsWith(".json")) continue;
+        try {
+          const raw = await fs.readFile(path.join(candidatesDir, candName), "utf8");
+          const cand = JSON.parse(raw);
+          if (cand.promotion_hash !== promotionHash) continue;
+          await fs.rm(path.join(candidatesDir, candName), { force: true });
+          if (cand.md_path) {
+            await fs.rm(path.join(root, cand.md_path), { force: true });
+          }
+          await appendMemoryAudit(root, {
+            recorded_at: timestamp,
+            event: "candidate_drained",
+            kind,
+            promotion_hash: promotionHash,
+            drained_json: path.posix.join(".aipi", "runtime", "memory-candidates", candName),
+            drained_md: cand.md_path ?? null,
+          });
+        } catch {
+          // best-effort per-candidate
+        }
+      }
+    } catch {
+      // best-effort drain
+    }
   }
   if (run_id) {
     await aipiKanbanUpdate({
@@ -3411,7 +3486,6 @@ async function writeSqliteGraph({
       CREATE INDEX symbols_path_idx ON symbols(path);
       CREATE TABLE code_lines (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL, line INTEGER NOT NULL, text TEXT NOT NULL);
       CREATE INDEX code_lines_path_idx ON code_lines(path);
-      CREATE INDEX code_lines_text_idx ON code_lines(text);
       CREATE TABLE relationships (
         source_kind TEXT NOT NULL,
         source_ref TEXT NOT NULL,
@@ -3725,6 +3799,9 @@ async function writeSqliteGraph({
     metaInsert.run("source", source);
     commitWrite();
 
+    // FIX 1b: report file size after write (fs is available in this scope)
+    const sqliteSize = await fs.stat(sqlitePath).then((s) => s.size).catch(() => null);
+
     return {
       ...status,
       source,
@@ -3734,6 +3811,7 @@ async function writeSqliteGraph({
       vector,
       embedding_pull: embeddingPull,
       sqlite_recovery: sqliteRecovery,
+      ...(sqliteSize !== null && sqliteSize > 0 ? { size_bytes: sqliteSize } : {}),
     };
   } catch (error) {
     if (transactionOpen) {
@@ -4680,13 +4758,13 @@ export function memoryPromotionHash({ kind, title, content, source_ref } = {}) {
   ].join("\n")).slice(0, 16)}`;
 }
 
-function renderMemoryEntry({ kind, title, content, source_ref, approval_ref, timestamp, promotionHash, accepted = false }) {
+function renderMemoryEntry({ kind, title, content, source_ref, approval_ref, timestamp, promotionHash, accepted = false, overrideId = null }) {
   const normalizedKind = slug(kind);
   if (normalizedKind === "business-rule" || normalizedKind === "business-rules") {
-    return renderBusinessRuleEntry({ title, content, source_ref, approval_ref, timestamp, promotionHash, accepted });
+    return renderBusinessRuleEntry({ title, content, source_ref, approval_ref, timestamp, promotionHash, accepted, overrideId });
   }
   if (normalizedKind === "decision" || normalizedKind === "decisions") {
-    return renderDecisionEntry({ title, content, source_ref, approval_ref, timestamp, promotionHash });
+    return renderDecisionEntry({ title, content, source_ref, approval_ref, timestamp, promotionHash, overrideId });
   }
   return [
     `## ${title?.trim() || kind}`,
@@ -4702,8 +4780,8 @@ function renderMemoryEntry({ kind, title, content, source_ref, approval_ref, tim
   ].join("\n");
 }
 
-function renderBusinessRuleEntry({ title, content, source_ref, approval_ref, timestamp, promotionHash, accepted = false }) {
-  const ruleId = extractBusinessRuleId(content) ?? generatedBusinessRuleId(timestamp);
+function renderBusinessRuleEntry({ title, content, source_ref, approval_ref, timestamp, promotionHash, accepted = false, overrideId = null }) {
+  const ruleId = overrideId ?? (extractBusinessRuleId(content) ?? generatedBusinessRuleId(timestamp));
   const ruleTitle = title?.trim() || firstContentLine(content) || "Promoted business rule";
   const statement = extractField(content, "statement") ?? stripMarkdownHeading(content).trim();
   const sourcePath = codePathFromSourceRef(source_ref);
@@ -4744,8 +4822,8 @@ function codePathFromSourceRef(sourceRef) {
   return withoutLine;
 }
 
-function renderDecisionEntry({ title, content, source_ref, approval_ref, timestamp, promotionHash }) {
-  const decisionId = generatedDecisionId(timestamp);
+function renderDecisionEntry({ title, content, source_ref, approval_ref, timestamp, promotionHash, overrideId = null }) {
+  const decisionId = overrideId ?? generatedDecisionId(timestamp);
   const decisionTitle = title?.trim() || firstContentLine(content) || "Promoted decision";
   return [
     `### ${decisionId} - ${decisionTitle}`,
@@ -5073,10 +5151,11 @@ async function inspectDurableMemoryApproval(root, approvalRef) {
   return { ok: true, path: normalized, decision: parsed.decision, source };
 }
 
-async function insertMemoryEntry({ root, targetRel, entry, kind, timestamp, sourceRef, promotionHash }) {
+async function insertMemoryEntry({ root, targetRel, entry, kind, timestamp, sourceRef, promotionHash, existingText = null }) {
   const abs = path.join(root, targetRel);
   await fs.mkdir(path.dirname(abs), { recursive: true });
-  const existing = await fs.readFile(abs, "utf8").catch((error) => {
+  // FIX 3b: reuse pre-read existingText when provided (avoids a second file read in the promoted path)
+  const existing = existingText ?? await fs.readFile(abs, "utf8").catch((error) => {
     if (error.code === "ENOENT") return "";
     throw error;
   });
@@ -5207,12 +5286,22 @@ function extractBusinessRuleId(content) {
   return String(content ?? "").match(/\bBR-[A-Za-z0-9_-]+\b/)?.[0]?.toUpperCase() ?? null;
 }
 
+// FIX 3a: use full millisecond precision so two promotions within the same second get distinct IDs
 function generatedBusinessRuleId(timestamp) {
-  return `BR-${timestamp.replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z")}`;
+  return `BR-${timestamp.replace(/[-:.]/g, "")}`;
 }
 
 function generatedDecisionId(timestamp) {
-  return `ADR-${timestamp.replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z")}`;
+  return `ADR-${timestamp.replace(/[-:.]/g, "")}`;
+}
+
+// FIX 3b: collision guard — if `id` already appears in the target file text associated with a DIFFERENT
+// promotion hash, suffix the id with 6 hex chars of sha256(promotionHash) to make it unique.
+function ensureUniqueMemoryEntryId(existingText, id, promotionHash) {
+  if (!existingText.includes(id)) return id;
+  if (existingText.includes(promotionHash)) return id; // same hash → idempotent re-promotion
+  const suffix = crypto.createHash("sha256").update(promotionHash).digest("hex").slice(0, 6);
+  return `${id}-${suffix}`;
 }
 
 function firstContentLine(content) {

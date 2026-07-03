@@ -17,6 +17,10 @@ const defaultContract = {
       "awaiting_user_input",
       "aipi_shell_less",
       "gate_kind",
+      // FIX 3e: additive metadata — classifies the failure cause (infra / gate_rejection / blocked)
+      // so plan-executor and analytics can distinguish infra noise from real gate failures without
+      // re-inspecting the full result. Workers may also return this on a BLOCKED/FAIL result.
+      "failure_class",
     ],
   },
   stepVerdicts: ["PASS", "FAIL", "SKIPPED", "BLOCKED", "BLOCKED_TO_PLANNING"],

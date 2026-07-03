@@ -16,6 +16,7 @@ try {
   const started = await startWorkflowRun({
     projectRoot: tempRoot,
     workflow: "planning",
+    params: { request: "plan the blocker-picker fixture epic" },
     now: () => fixedDate,
     randomBytes: () => Buffer.from("b10c43", "hex"),
   });

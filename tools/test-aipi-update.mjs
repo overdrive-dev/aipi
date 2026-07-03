@@ -82,6 +82,33 @@ const winPlan = buildAipiUpdatePlan({
 assert.equal(winPlan[2].command, "npm.cmd");
 assert.equal(winPlan[1].command, "git");
 
+// Bundled-Pi mode: when Pi resolves from the package-local node_modules (and no
+// env override points elsewhere), `pi update --self` is skipped — the lockfile
+// (npm ci) owns the Pi version. This also fixes the old bug where a missing Pi
+// aborted aipi's own self-update.
+const localPiCliJs = path.join(packageRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
+const localPiPlan = buildAipiUpdatePlan({
+  packageRoot,
+  repoInfo: cleanRepoInfo,
+  platform: "linux",
+  env: {},
+  existsSync: (candidate) => candidate === localPiCliJs || candidate.endsWith(".git"),
+});
+assert.equal(localPiPlan[0].label, "pi");
+assert.equal(localPiPlan[0].kind, "manual");
+assert.match(localPiPlan[0].message, /packaged dependency/);
+assert.deepEqual(localPiPlan.map((step) => step.label), ["pi", "aipi", "aipi-deps"]);
+// An explicit override keeps the classic self-update path.
+const overriddenPiPlan = buildAipiUpdatePlan({
+  packageRoot,
+  repoInfo: cleanRepoInfo,
+  platform: "linux",
+  env: { AIPI_PI_CLI_JS: "/elsewhere/cli.js" },
+  existsSync: (candidate) => candidate === localPiCliJs || candidate.endsWith(".git"),
+});
+assert.equal(overriddenPiPlan[0].kind, "pi");
+assert.deepEqual(overriddenPiPlan[0].args, ["update", "--self"]);
+
 const inspectedDirtyRepo = inspectAipiRepo({
   packageRoot,
   existsSync: (candidate) => candidate.endsWith(".git"),
