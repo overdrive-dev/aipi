@@ -1,7 +1,15 @@
 {
-  "name": "aipi-templates",
-  "private": true,
+  "name": "@overdrive-dev/aipi",
   "version": "0.2.0",
+  "description": "BDD-contract agent harness for the Pi coding agent: staged workflow gates, specialist worker swarm, Markdown memory, and a standalone pinned Pi runtime.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/overdrive-dev/aipi.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "bin": {
     "aipi": "./bin/aipi.js"
@@ -27,7 +35,8 @@
     "extensions/**",
     "templates/**",
     "docs/**",
-    "NOTICE.md"
+    "NOTICE.md",
+    "LICENSE"
   ],
   "scripts": {
     "validate": "node tools/validate-aipi-templates.mjs",
