@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { rebuildCodeGraph } from "./aipi-tools.js";
+import { ensureCodeGraph } from "./aipi-tools.js";
 import { assertAipiHostScopedModel, modelToPiModelId } from "./pi-subagents.js";
 
 export const ONBOARDING_MEMORY_FILES = [
@@ -102,6 +102,7 @@ export function parseOnboardArgs(args = "") {
     targetRoot: null,
     noQuestions: false,
     noPullEmbeddings: false,
+    rebuildGraph: false,
   };
 
   for (let index = 0; index < tokens.length; index += 1) {
@@ -115,6 +116,10 @@ export function parseOnboardArgs(args = "") {
     }
     if (token === "--no-questions") {
       options.noQuestions = true;
+      continue;
+    }
+    if (token === "--rebuild-graph") {
+      options.rebuildGraph = true;
       continue;
     }
     if (token === "--no-pull-embeddings") {
@@ -177,7 +182,10 @@ export async function runProjectOnboarding({
   hostModel = null,
   source = "manual",
   now = () => new Date(),
-  graphBuilder = rebuildCodeGraph,
+  // Freshness-gated by default: a fresh manifest is reused; stale or
+  // semantic-recoverable graphs rebuild; rebuildGraph forces a full rebuild.
+  graphBuilder = ensureCodeGraph,
+  rebuildGraph = false,
   materializeGraph = true,
   runWorker = Boolean(coordinator && hostModel),
   onProgress = null,
@@ -209,14 +217,18 @@ export async function runProjectOnboarding({
       projectRoot: root,
       now,
       env,
+      rebuild: rebuildGraph,
       pullEmbeddings: shouldPullEmbeddings,
       platform,
       onProgress: (event) => emitOnboardingProgress(onProgress, event, now),
     });
+    const graphBuildNote = graph.graph_build?.startsWith("reused")
+      ? `reused fresh index (${graph.graph_build})`
+      : "built";
     await emitOnboardingProgress(onProgress, {
       phase: "graph",
       status: "done",
-      message: `AIPI onboarding: code graph built (${graph.files?.length ?? 0} files, semantic ${graph.vector?.status ?? "unknown"}).`,
+      message: `AIPI onboarding: code graph ${graphBuildNote} (${graph.files?.length ?? 0} files, semantic ${graph.vector?.status ?? "unknown"}).`,
     }, now);
   }
   const investigation = await runOnboardingInvestigation({

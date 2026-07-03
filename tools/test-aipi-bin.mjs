@@ -191,8 +191,10 @@ assert.deepEqual(parseAipiOnboardArgs(["--target", "project", "--json", "--no-qu
   json: true,
   noQuestions: true,
   noPullEmbeddings: false,
+  rebuildGraph: false,
   onboardArgs: ["--target", "project", "--no-questions"],
 });
+assert.equal(parseAipiOnboardArgs(["--rebuild-graph"]).rebuildGraph, true);
 assert.deepEqual(parseAipiDiagnoseArgs(["--target", "project", "--json", "--share", "run-1"], { cwd: path.join("C:", "repo") }), {
   target: path.resolve(path.join("C:", "repo"), "project"),
   json: true,

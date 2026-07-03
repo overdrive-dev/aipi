@@ -165,7 +165,7 @@ export function parseAipiModelsArgs(userArgs = [], { cwd = process.cwd() } = {})
 }
 
 export function parseAipiOnboardArgs(userArgs = [], { cwd = process.cwd() } = {}) {
-  const options = { json: false, target: cwd, noQuestions: false, noPullEmbeddings: false, onboardArgs: [] };
+  const options = { json: false, target: cwd, noQuestions: false, noPullEmbeddings: false, rebuildGraph: false, onboardArgs: [] };
   for (let index = 0; index < userArgs.length; index += 1) {
     const arg = userArgs[index];
     if (arg === "--json") {
@@ -187,6 +187,11 @@ export function parseAipiOnboardArgs(userArgs = [], { cwd = process.cwd() } = {}
     }
     if (arg === "--no-pull-embeddings") {
       options.noPullEmbeddings = true;
+      options.onboardArgs.push(arg);
+      continue;
+    }
+    if (arg === "--rebuild-graph") {
+      options.rebuildGraph = true;
       options.onboardArgs.push(arg);
       continue;
     }
@@ -907,6 +912,7 @@ export async function runAipiOnboard({
       askUser: false,
       runWorker: false,
       pullEmbeddings: !options.noPullEmbeddings,
+      rebuildGraph: options.rebuildGraph,
       onProgress: options.json ? null : (event) => log(event.message),
     });
     log(options.json ? JSON.stringify(result, null, 2) : fns.formatOnboardingResult(result));

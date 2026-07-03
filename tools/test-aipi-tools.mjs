@@ -17,6 +17,7 @@ import {
   aipiSemanticSearch,
   checkSemanticEmbeddingReadiness,
   embedText,
+  ensureCodeGraph,
   rebuildCodeGraph,
   registerAipiRuntimeTools,
   resolveEmbeddingDimensions,
@@ -2102,6 +2103,70 @@ try {
     // A throwing host onUpdate is swallowed (a render hiccup must not break the tool run).
     const safe = __aipiTestInternals.runtimeToolProgress(() => { throw new Error("render boom"); });
     safe({ message: "x" }); // must not throw
+  }
+
+  // ── ensureCodeGraph: freshness gate, degraded-cache preservation, recovery ──
+  // The full field cycle: fresh graphs are REUSED (no more unconditional
+  // rebuild per onboard/init); a build degraded by a down backend PRESERVES
+  // the embedding cache; and once the backend answers again the next ensure
+  // rebuilds ONCE, resuming from that cache instead of re-embedding the world.
+  {
+    const backendDown = async () => {
+      throw new Error("backend down (fixture)");
+    };
+    const cyclesBase = await rebuildCodeGraph({
+      projectRoot: tempRoot,
+      now: () => new Date("2026-06-16T00:10:00.000Z"),
+      ...semanticOptions,
+    });
+    if (cyclesBase.vector.status === "available") {
+      const callsBefore = embeddingCalls.length;
+      const reused = await ensureCodeGraph({
+        projectRoot: tempRoot,
+        env: semanticOptions.env,
+        embeddingFetch: semanticOptions.embeddingFetch,
+      });
+      assert.equal(reused.graph_build, "reused", "fresh semantic graph is reused, not rebuilt");
+      assert.equal(reused.built_at, cyclesBase.built_at);
+      assert.equal(embeddingCalls.length, callsBefore, "reuse makes zero embedding calls");
+
+      const degraded = await rebuildCodeGraph({
+        projectRoot: tempRoot,
+        now: () => new Date("2026-06-16T00:15:00.000Z"),
+        env: semanticOptions.env,
+        embeddingFetch: backendDown,
+        pullEmbeddings: false,
+      });
+      assert.notEqual(degraded.vector.status, "available");
+      assert.equal(
+        degraded.vector.embedding_cache_preserved > 0,
+        true,
+        "a degraded build carries the previous embedding cache instead of destroying it",
+      );
+
+      const stillDown = await ensureCodeGraph({
+        projectRoot: tempRoot,
+        env: semanticOptions.env,
+        embeddingFetch: backendDown,
+      });
+      assert.equal(stillDown.graph_build, "reused_lexical", "backend still down: lexical graph reused, no rebuild loop");
+
+      const recoveryCallsBefore = embeddingCalls.length;
+      const recovered = await ensureCodeGraph({
+        projectRoot: tempRoot,
+        env: semanticOptions.env,
+        embeddingFetch: semanticOptions.embeddingFetch,
+      });
+      assert.equal(recovered.graph_build, "rebuilt", "backend recovered: one rebuild to upgrade lexical -> semantic");
+      if (recovered.vector.status === "available") {
+        assert.equal(
+          recovered.vector.embedding_cache_reuse.reused_item_count > 0,
+          true,
+          "recovery resumes from the preserved cache",
+        );
+        assert.equal(embeddingCalls.length, recoveryCallsBefore, "no re-embedding of unchanged content after recovery");
+      }
+    }
   }
 
   // embedText retries ONE transient server-side failure (Ollama's first embed

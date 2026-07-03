@@ -1313,6 +1313,59 @@ async function graphSidecarReady(root, graph) {
   return pathExists(path.join(root, graph.sqlite.path ?? GRAPH_SQLITE_REL_PATH));
 }
 
+// Freshness-gated graph builder for callers that used to force a full rebuild
+// (onboarding, including the post-init auto run — field evidence: every
+// onboard/init rebuilt an 1802-file graph even when nothing changed). Reuses
+// the existing index when the manifest is fresh; rebuilds when stale, when
+// `rebuild` is explicitly requested, or when a previously degraded semantic
+// index can now be upgraded (the Ollama backend answers again — cheap
+// /api/tags probe, only attempted while the stored index is lexical-only).
+export async function ensureCodeGraph({
+  projectRoot,
+  rebuild = false,
+  env = process.env,
+  embeddingFetch = globalThis.fetch,
+  onProgress = null,
+  pullEmbeddings = true,
+  platform = process.platform,
+  now = () => new Date(),
+} = {}) {
+  const root = assertRoot(projectRoot);
+  const existing = await readJson(path.join(root, GRAPH_REL_PATH)).catch(() => null);
+  if (!rebuild && existing?.schema === "aipi.code-graph.v1" && !existing.stale && (await graphSidecarReady(root, existing))) {
+    const freshness = await inspectGraphFreshness(root, existing, { env });
+    if (!freshness.stale) {
+      const vectorStatus = existing.vector?.status ?? existing.sqlite?.vector?.status ?? null;
+      if (vectorStatus === "available") {
+        return { ...existing, stale: false, freshness, graph_build: "reused" };
+      }
+      const config = await resolveSemanticEmbeddingConfig({ root, env });
+      const readiness = await checkSemanticEmbeddingReadiness({ config, fetchFn: embeddingFetch, platform });
+      if (readiness.status !== "ready") {
+        return {
+          ...existing,
+          stale: false,
+          freshness,
+          graph_build: "reused_lexical",
+          semantic_readiness: readiness.status,
+        };
+      }
+      // Backend recovered — fall through to rebuild for the semantic upgrade.
+    }
+  }
+  const rebuilt = await rebuildCodeGraph({
+    projectRoot: root,
+    previousGraph: existing,
+    env,
+    embeddingFetch,
+    onProgress,
+    pullEmbeddings,
+    platform,
+    now,
+  });
+  return { ...rebuilt, graph_build: "rebuilt" };
+}
+
 async function graphRefs({ root, graph, query, limit, semanticOnly = false, env = process.env, embeddingFetch = globalThis.fetch }) {
   const sqlite = await sqliteRefs({ root, query, limit, semanticOnly, env, embeddingFetch });
   if (sqlite) return sqlite;
@@ -3473,6 +3526,14 @@ async function writeSqliteGraph({
       graph,
       embeddingConfig: resolvedEmbeddingConfig,
     });
+    // A degraded (lexical) build recreates the sqlite WITHOUT running the embed
+    // loop, which used to destroy the embedding_cache — so the eventual
+    // semantic recovery re-embedded the whole codebase from scratch (field
+    // evidence: one transient failure cost a 16k-embedding cache). Carry the
+    // raw rows across the rebuild so recovery resumes instead.
+    const preservedCacheRows = semanticReadiness.status !== "ready"
+      ? await readRawEmbeddingCacheRows({ sqlite, sqlitePath, embeddingConfig: resolvedEmbeddingConfig })
+      : [];
     await removeSqliteSidecarFiles(sqlitePath);
     db = new sqlite.DatabaseSync(sqlitePath, { allowExtension: true });
     db.exec(`
@@ -3795,6 +3856,18 @@ async function writeSqliteGraph({
       });
     }
 
+    if (preservedCacheRows.length && vector.status !== "available") {
+      const preserveInsert = db.prepare(
+        "INSERT OR IGNORE INTO embedding_cache(item_key, path, file_hash, dimensions, model, host, embedding) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      );
+      beginWrite();
+      for (const row of preservedCacheRows) {
+        preserveInsert.run(row.item_key, row.path, row.file_hash, row.dimensions, row.model, row.host, row.embedding);
+      }
+      commitWrite();
+      vector.embedding_cache_preserved = preservedCacheRows.length;
+    }
+
     const source = vector.status === "available" ? "sqlite+sqlite-vec+lexical" : "sqlite+lexical";
     if (vector.status === "available") {
       vector.item_count = vectorChunkCount;
@@ -3942,6 +4015,34 @@ async function readReusableEmbeddingCache({
       reason: failures.map((failure) => `${failure.open_mode}: ${failure.reason}`).join("; "),
     },
   };
+}
+
+// Raw row carry-over for degraded builds: returns embedding_cache rows for the
+// configured model/host/dims verbatim (BLOBs included) so a lexical rebuild
+// preserves them for the eventual semantic recovery build.
+async function readRawEmbeddingCacheRows({ sqlite, sqlitePath, embeddingConfig } = {}) {
+  if (!sqlite || !(await pathExists(sqlitePath))) return [];
+  for (const openMode of ["read_only", "immutable"]) {
+    let db;
+    try {
+      const location = openMode === "immutable" ? sqliteImmutableUri(sqlitePath) : sqlitePath;
+      db = new sqlite.DatabaseSync(location, { readOnly: true, timeout: 1 });
+      return db.prepare(`
+        SELECT item_key, path, file_hash, dimensions, model, host, embedding
+        FROM embedding_cache
+        WHERE dimensions = ? AND model = ? AND host = ?
+      `).all(embeddingConfig.dimensions, embeddingConfig.model, embeddingConfig.host);
+    } catch {
+      /* try the next open mode; preservation is best-effort */
+    } finally {
+      try {
+        db?.close();
+      } catch {
+        /* best-effort close */
+      }
+    }
+  }
+  return [];
 }
 
 async function readReusableEmbeddingCacheWithOpenMode({
