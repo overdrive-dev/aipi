@@ -218,6 +218,39 @@ function sortRuns(runs: AsyncRunSummary[]): AsyncRunSummary[] {
 	});
 }
 
+/**
+ * Build the structured summary for a single async run directory (reconcile +
+ * nested projection + statusToSummary). Returns null when no status is readable.
+ * Extracted so callers (listAsyncRuns, durable history snapshots) share one path.
+ */
+export function summarizeAsyncRunDir(
+	asyncDir: string,
+	options: Pick<AsyncRunListOptions, "resultsDir" | "kill" | "now" | "reconcile"> = {},
+): AsyncRunSummary | null {
+	const reconciliation = options.reconcile === false
+		? undefined
+		: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now });
+	const status = (reconciliation?.status ?? readStatus(asyncDir)) as (AsyncStatus & { cwd?: string }) | null;
+	if (!status) return null;
+	const nestedWarnings: string[] = [];
+	try {
+		const nestedRoute = findNestedRouteForRootId(status.runId || path.basename(asyncDir));
+		if (nestedRoute) reconcileNestedAsyncDescendants(nestedRoute, { resultsDir: options.resultsDir, kill: options.kill, now: options.now });
+	} catch (error) {
+		nestedWarnings.push(`Nested status unavailable: ${getErrorMessage(error)}`);
+	}
+	return statusToSummary(asyncDir, status, nestedWarnings);
+}
+
+/** Sort runs newest-activity-first (for history / recent views). */
+export function sortAsyncRunsByRecency(runs: AsyncRunSummary[]): AsyncRunSummary[] {
+	return [...runs].sort((a, b) => {
+		const aTime = a.endedAt ?? a.lastUpdate ?? a.startedAt;
+		const bTime = b.endedAt ?? b.lastUpdate ?? b.startedAt;
+		return bTime - aTime;
+	});
+}
+
 export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions = {}): AsyncRunSummary[] {
 	let entries: string[];
 	try {
@@ -233,19 +266,8 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 	const runs: AsyncRunSummary[] = [];
 	for (const entry of entries) {
 		const asyncDir = path.join(asyncDirRoot, entry);
-		const reconciliation = options.reconcile === false
-			? undefined
-			: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now });
-		const status = (reconciliation?.status ?? readStatus(asyncDir)) as (AsyncStatus & { cwd?: string }) | null;
-		if (!status) continue;
-		const nestedWarnings: string[] = [];
-		try {
-			const nestedRoute = findNestedRouteForRootId(status.runId || path.basename(asyncDir));
-			if (nestedRoute) reconcileNestedAsyncDescendants(nestedRoute, { resultsDir: options.resultsDir, kill: options.kill, now: options.now });
-		} catch (error) {
-			nestedWarnings.push(`Nested status unavailable: ${getErrorMessage(error)}`);
-		}
-		const summary = statusToSummary(asyncDir, status, nestedWarnings);
+		const summary = summarizeAsyncRunDir(asyncDir, options);
+		if (!summary) continue;
 		if (allowedStates && !allowedStates.has(summary.state)) continue;
 		if (options.sessionId && summary.sessionId !== options.sessionId) continue;
 		runs.push(summary);

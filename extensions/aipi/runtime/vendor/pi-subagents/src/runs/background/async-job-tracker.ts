@@ -17,6 +17,7 @@ import { readStatus } from "../../shared/utils.ts";
 import { normalizeParallelGroups } from "./parallel-groups.ts";
 import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
 import { hasLiveNestedDescendants, updateAsyncJobNestedProjection } from "../shared/nested-events.ts";
+import { snapshotRunToHistory } from "./history-store.ts";
 
 interface AsyncJobTrackerOptions {
 	completionRetentionMs?: number;
@@ -47,6 +48,10 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	};
 	const scheduleCleanup = (asyncId: string) => {
 		cancelCleanup(asyncId);
+		// Snapshot the terminal run into durable history before the in-memory job
+		// and (eventually) its tmp result file disappear. Best-effort; never throws.
+		const job = state.asyncJobs.get(asyncId);
+		if (job) snapshotRunToHistory({ asyncDir: job.asyncDir, runId: job.asyncId, resultsDir, now: options.now });
 		const timer = setTimeout(() => {
 			state.cleanupTimers.delete(asyncId);
 			state.asyncJobs.delete(asyncId);

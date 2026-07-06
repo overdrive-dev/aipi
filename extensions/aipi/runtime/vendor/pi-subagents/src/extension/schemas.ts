@@ -238,6 +238,13 @@ export const SubagentParams = Type.Object({
 	dir: Type.Optional(Type.String({
 		description: "Async run directory for action='status' or action='resume'."
 	})),
+	format: Type.Optional(Type.String({
+		enum: ["text", "json"],
+		description: "action='status' output format. 'json' returns structured AsyncRunSummary data (live + durable history) for tooling and the subagent view; defaults to human-readable text.",
+	})),
+	history: Type.Optional(Type.Boolean({
+		description: "action='status' text mode: also list recently finished runs from durable history (default: false).",
+	})),
 	index: Type.Optional(Type.Integer({ minimum: 0, description: "Zero-based child index for actions that target a specific child." })),
 	message: Type.Optional(Type.String({ description: "Follow-up message for action='resume'. Use index to choose a child from multi-child runs." })),
 	// Chain identifier for management (can't reuse 'chain' — that's the execution array)

@@ -1,7 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { formatAsyncRunList, formatAsyncRunOutputPath, formatAsyncRunProgressLabel, listAsyncRuns } from "./async-status.ts";
+import { type AsyncRunSummary, formatAsyncRunList, formatAsyncRunOutputPath, formatAsyncRunProgressLabel, listAsyncRuns } from "./async-status.ts";
+import { listHistoryRuns } from "./history-store.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
 import { formatModelThinking } from "../../shared/formatters.ts";
 import { formatActivityLabel } from "../../shared/status-format.ts";
@@ -18,6 +19,47 @@ interface RunStatusParams {
 	id?: string;
 	runId?: string;
 	dir?: string;
+	/** "json" returns structured AsyncRunSummary data (live + durable history) instead of text. */
+	format?: "text" | "json";
+	/** Text mode only: also list recently finished runs from durable history. */
+	history?: boolean;
+}
+
+/** Merge live runs with durable history, de-duped by id (live wins). */
+function mergeLiveAndHistory(live: AsyncRunSummary[], history: AsyncRunSummary[]): AsyncRunSummary[] {
+	const liveIds = new Set(live.map((run) => run.id));
+	return [...live, ...history.filter((run) => !liveIds.has(run.id))];
+}
+
+/** Structured JSON surface for action='status' (drives the subagent view / tooling). */
+function jsonSubagentStatus(
+	params: RunStatusParams,
+	deps: { asyncDirRoot: string; resultsDir: string; kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean; now?: () => number },
+): AgentToolResult<Details> {
+	try {
+		const live = listAsyncRuns(deps.asyncDirRoot, { resultsDir: deps.resultsDir, kill: deps.kill, now: deps.now });
+		const runs = mergeLiveAndHistory(live, listHistoryRuns());
+		const requestedId = params.id ?? params.runId;
+		if (requestedId) {
+			const run = runs.find((candidate) => candidate.id === requestedId)
+				?? runs.find((candidate) => candidate.id.startsWith(requestedId));
+			return {
+				content: [{ type: "text", text: JSON.stringify(run ? { run } : { run: null, error: `Async run not found: ${requestedId}` }, null, 2) }],
+				...(run ? {} : { isError: true as const }),
+				details: { mode: "single", results: [] },
+			};
+		}
+		return {
+			content: [{ type: "text", text: JSON.stringify({ runs }, null, 2) }],
+			details: { mode: "single", results: [] },
+		};
+	} catch (error) {
+		return {
+			content: [{ type: "text", text: JSON.stringify({ error: error instanceof Error ? error.message : String(error) }) }],
+			isError: true,
+			details: { mode: "single", results: [] },
+		};
+	}
 }
 
 interface RunStatusDeps {
@@ -106,6 +148,9 @@ function formatNestedExactStatus(rootRunId: string, run: NestedRunSummary): stri
 export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDeps = {}): AgentToolResult<Details> {
 	const asyncDirRoot = deps.asyncDirRoot ?? ASYNC_DIR;
 	const resultsDir = deps.resultsDir ?? RESULTS_DIR;
+	if (params.format === "json") {
+		return jsonSubagentStatus(params, { asyncDirRoot, resultsDir, kill: deps.kill, now: deps.now });
+	}
 	if (!params.id && !params.runId && !params.dir) {
 		if (deps.nested) {
 			return {
@@ -116,8 +161,14 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 		}
 		try {
 			const runs = listAsyncRuns(asyncDirRoot, { states: ["queued", "running"], resultsDir, kill: deps.kill, now: deps.now });
+			let text = formatAsyncRunList(runs);
+			if (params.history) {
+				const liveIds = new Set(runs.map((run) => run.id));
+				const recent = listHistoryRuns().filter((run) => !liveIds.has(run.id)).slice(0, 10);
+				if (recent.length) text += `\n\n${formatAsyncRunList(recent, "Recent finished runs")}`;
+			}
 			return {
-				content: [{ type: "text", text: formatAsyncRunList(runs) }],
+				content: [{ type: "text", text }],
 				details: { mode: "single", results: [] },
 			};
 		} catch (error) {

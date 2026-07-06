@@ -7,6 +7,8 @@ import { discoverAgents, discoverAgentsAll, type ChainConfig } from "../agents/a
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { isDynamicParallelStep, isParallelStep, type ChainStep } from "../shared/settings.ts";
 import { assertJsonSchemaObject } from "../runs/shared/structured-output.ts";
+import { loadSubagentRuns } from "../runs/background/history-store.ts";
+import { SubagentViewComponent } from "../tui/subagent-view.ts";
 import type { SlashSubagentResponse, SlashSubagentUpdate } from "./slash-bridge.ts";
 import {
 	applySlashUpdate,
@@ -560,6 +562,23 @@ export function registerSlashCommands(
 		description: "Show subagent diagnostics",
 		handler: async (_args, ctx) => {
 			await runSlashSubagent(pi, ctx, { action: "doctor" });
+		},
+	});
+
+	pi.registerCommand("subagents", {
+		description: "Open the interactive subagent view (live + history). /subagents <runId> prints one run.",
+		handler: async (args, ctx) => {
+			const id = args.trim();
+			if (!id && ctx.hasUI && ctx.mode === "tui") {
+				await ctx.ui.custom<void>(
+					(tui, theme, _kb, done) => new SubagentViewComponent(tui, theme, () => loadSubagentRuns(), done),
+					{ overlay: true, overlayOptions: { anchor: "center", width: 108, maxHeight: "85%" } },
+				);
+				return;
+			}
+			await runSlashSubagent(pi, ctx, id
+				? { action: "status", id, history: true }
+				: { action: "status", history: true });
 		},
 	});
 

@@ -114,6 +114,8 @@ export interface SubagentParamsLike {
 	id?: string;
 	runId?: string;
 	dir?: string;
+	format?: "text" | "json";
+	history?: boolean;
 	index?: number;
 	agent?: string;
 	task?: string;
