@@ -355,9 +355,14 @@
     "v1": "pi_subagents",
     "singleWorkerRuntime": "pi_subagents",
     "projectRuntimeRoot": ".aipi/runtime/subagents",
+    "workerIsolation": "per_worker_worktree",
+    "supportedIsolations": [
+      "pi_subagents",
+      "per_worker_worktree"
+    ],
     "deferred": [],
-    "failClosedRule": "Any worker descriptor requesting an isolation other than pi_subagents is rejected before owned-file allocation instead of silently downgrading. Workers always run with cwd set to the project root and runtime paths under .aipi/runtime/subagents.",
-    "rule": "AIPI has one worker runtime: the AIPI-owned fork of pi-subagents. It is not an npm dependency, not loaded as a separate Pi extension, and not selected by an environment flag. AIPI supervises spawn/status/collect/cancel/cleanup/steer, owned-file allocation, timeout/tool-count budgets, model provenance, a guarded-shell policy (workers get aipi_shell, formerly aipi_guarded_bash; raw bash/user_bash denied), and project-scoped runtime directories around the fork."
+    "failClosedRule": "A worker descriptor may request isolation pi_subagents (default; cwd at the project root, runtime paths under .aipi/runtime/subagents) or per_worker_worktree (a cwd-isolation mode of the same pi_subagents backend: the worker runs in an isolated git worktree branched from HEAD, require-clean tracked tree, the branch diff is the evidence and review surface, and for write_scope: project on a passing verdict the diff is merged back into the project working tree). Any other isolation is rejected before owned-file allocation instead of silently downgrading. When a descriptor sets no isolation the default is isolationModel.workerIsolation, and the shipped template default is per_worker_worktree. A default (non-explicit) worktree job that cannot provision an isolated worktree — dirty tree, not a git repo, or a provision error — gracefully falls back to the pi_subagents behavior at the project root rather than failing the worker; an explicit descriptor per_worker_worktree request instead fails loud on an unclean tree. Isolation is never selected by an environment flag.",
+    "rule": "AIPI has one worker backend: the AIPI-owned fork of pi-subagents. It is not an npm dependency, not loaded as a separate Pi extension, and not selected by an environment flag. per_worker_worktree is a cwd-isolation MODE of that single backend (not a separate spawn backend; spawnBackends stays [pi_subagents]), enabled per project via isolationModel.workerIsolation in .aipi/runtime-contract.json. AIPI supervises spawn/status/collect/cancel/cleanup/steer, owned-file allocation, timeout/tool-count budgets, model provenance, a guarded-shell policy (workers get aipi_shell, formerly aipi_guarded_bash; raw bash/user_bash denied), and project-scoped runtime directories around the fork."
   },
   "workerToolPolicy": {
     "singleWorktreeSessionAgents": {

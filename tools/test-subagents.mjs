@@ -621,7 +621,7 @@ assert.throws(
       owned_files: ["src/rpc.js"],
       isolation: ["rpc", "worker", "process"].join("_"),
     }),
-  /supports only the forked pi_subagents runtime/,
+  /is unsupported; current AIPI supports the forked pi_subagents runtime/,
 );
 assert.throws(
   () =>

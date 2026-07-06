@@ -397,6 +397,18 @@ if (
 ) {
   errors.push("runtime-contract isolationModel.failClosedRule must require rejecting unsupported isolation and project-root cwd");
 }
+// per_worker_worktree is a config-gated cwd-isolation MODE of the single pi_subagents backend.
+// The shipped template must default OFF (project root); worktree is opt-in per project.
+{
+  const supported = new Set(contract.isolationModel?.supportedIsolations ?? []);
+  const worktreeMode = ["per", "worker", "worktree"].join("_");
+  if (!supported.has("pi_subagents") || !supported.has(worktreeMode)) {
+    errors.push(`runtime-contract isolationModel.supportedIsolations must list pi_subagents and ${worktreeMode}`);
+  }
+  if (contract.isolationModel?.workerIsolation && !supported.has(contract.isolationModel.workerIsolation)) {
+    errors.push(`runtime-contract isolationModel.workerIsolation must be one of supportedIsolations: ${[...supported].join(", ")}`);
+  }
+}
 const deniedSingleWorktreeTools = new Set(
   contract.workerToolPolicy?.singleWorktreeSessionAgents?.denyTools ?? [],
 );
@@ -1271,13 +1283,18 @@ if (!fs.existsSync(path.join(root, "extensions/aipi/runtime/subagents.js"))) {
     ["run", "Rpc", "Worker", "Process"].join(""),
     ["run", "External", "Worker", "Command"].join(""),
     ["rpc", "worker", "process"].join("_"),
-    ["per", "worker", "worktree"].join("_"),
     ["AIPI", "EXTERNAL", "WORKER", "COMMAND", "JSON"].join("_"),
     ["AIPI", "CONTAINER", "WORKER", "COMMAND", "JSON"].join("_"),
   ]) {
     if (subagentsRuntime.includes(forbiddenText)) {
       errors.push(`runtime/subagents.js must not include removed backend text ${forbiddenText}`);
     }
+  }
+  // per_worker_worktree is a config-gated cwd-isolation MODE of the pi_subagents backend (not a
+  // spawn backend). The coordinator must read the per-project default from the contract rather than
+  // hardcode it on, so the shipped template default stays pi_subagents (project root).
+  if (!subagentsRuntime.includes("workerIsolation")) {
+    errors.push("runtime/subagents.js must read isolationModel.workerIsolation (config-gated worktree default), not hardcode it");
   }
   const removedRpcWorkerFile = ["rpc", "worker", "process"].join("-") + ".js";
   if (fs.existsSync(path.join(root, "extensions/aipi/runtime", removedRpcWorkerFile))) {

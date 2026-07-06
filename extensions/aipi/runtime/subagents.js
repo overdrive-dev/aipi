@@ -30,9 +30,19 @@ import {
   normalizePiSubagentsBackend,
   normalizePiSubagentsRunner,
 } from "./pi-subagents.js";
+import {
+  applyWorktreeDiffToRoot,
+  captureWorktreeDiff,
+  provisionWorkerWorktree,
+  removeWorkerWorktree,
+} from "./worktree-isolation.js";
 
 const DEFAULT_CONCURRENCY = Math.max(1, os.cpus().length - 2);
 const STEP_RESULT_SCHEMA = "aipi.step-result.v1";
+// Opt-in per-worker git worktree isolation (base = HEAD, require-clean). When a spawn
+// descriptor requests it, the worker runs in an isolated worktree, its diff is the
+// evidence + review surface, and write-scope workers merge back on a passing verdict.
+const WORKTREE_ISOLATION = "per_worker_worktree";
 export const SUBAGENT_STATE_ENTRY = "aipi.subagents.state";
 export const SUBAGENT_EVENT_ENTRY = "aipi.subagents.event";
 export const AIPI_ANTHROPIC_OAUTH_EXTENSION_PATH = path.resolve(
@@ -64,6 +74,7 @@ export class SubagentCoordinator {
   #knownModelClasses;
   #hostModel;
   #env;
+  #defaultIsolation;
 
   constructor(
     pi,
@@ -87,6 +98,9 @@ export class SubagentCoordinator {
         : (loadKnownModelClassesSync(this.#root) ?? new Set(BUILTIN_MODEL_CLASSES));
     this.#hostModel = hostModel;
     this.#env = env;
+    // Per-project isolation default from .aipi/runtime-contract.json isolationModel.workerIsolation
+    // (pi_subagents unless the project opts into per_worker_worktree). Never an environment flag.
+    this.#defaultIsolation = loadConfiguredWorkerIsolation(this.#root);
   }
 
   get registry() {
@@ -128,7 +142,8 @@ export class SubagentCoordinator {
   }
 
   #spawnNew(descriptor) {
-    const isolation = normalizeIsolation(descriptor, this.#env);
+    const isolation = normalizeIsolation(descriptor, { defaultIsolation: this.#defaultIsolation });
+    const isolationExplicit = Boolean(descriptor.isolation ?? descriptor.isolation_mode);
     if (descriptor.cwd) {
       throw new Error(
         "AIPI forked subagents always run with cwd set to the project root; per-worker cwd is unsupported.",
@@ -174,6 +189,7 @@ export class SubagentCoordinator {
       agentId,
       descriptor: workerDescriptor,
       isolation,
+      isolationExplicit,
       modelResolution,
       state: JobState.QUEUED,
       startedAt: null,
@@ -378,8 +394,24 @@ export class SubagentCoordinator {
     this.#persist();
     const budgetTimer = this.#startBudgetTimer(job);
     try {
+      if (job.isolation === WORKTREE_ISOLATION) {
+        try {
+          this.#provisionJobWorktree(job);
+        } catch (provisionErr) {
+          // An explicit worktree request fails loud (require-clean, manual). The default (config or
+          // built-in) gracefully falls back to the shared-root pi_subagents behavior — the worker
+          // still runs; job.worktree stays unset so no diff/merge/cleanup happens.
+          if (job.isolationExplicit) throw provisionErr;
+          job.isolation = PI_SUBAGENTS_ISOLATION;
+          job.worktree = null;
+          job.evidenceRoot = null;
+          this.#trace("worktree_isolation_fallback", job, { reason: String(provisionErr?.message ?? provisionErr) });
+        }
+      }
       const raw = await this.#spawnWorkerSession(job, job.controller.signal);
+      if (job.worktree) this.#captureJobWorktreeDiff(job);
       job.result = this.#parseResult(job, raw);
+      if (job.worktree) this.#mergeBackWorktree(job);
       job.state = JobState.DONE;
       this.#trace("done", job, { verdict: job.lastSummary, ...finishTraceData(job) });
     } catch (err) {
@@ -394,6 +426,13 @@ export class SubagentCoordinator {
     } finally {
       if (budgetTimer) clearTimeout(budgetTimer);
       job.finishedAt = Date.now();
+      if (job.worktree) {
+        try {
+          removeWorkerWorktree({ worktree: job.worktree });
+        } catch (cleanupErr) {
+          this.#trace("worktree_cleanup_failed", job, { error: String(cleanupErr?.message ?? cleanupErr) });
+        }
+      }
       // Release the worker's owned-file allocation as soon as it is terminal — DONE included, not only
       // FAILED/CANCELLED. A worker that returns a FAIL *verdict* finishes DONE; the gate then loops the
       // step (e.g. `fix` -> `fix`) and the re-dispatched worker must be able to re-allocate the same
@@ -404,6 +443,69 @@ export class SubagentCoordinator {
       this.#persist();
       this.#pump();
     }
+  }
+
+  #provisionJobWorktree(job) {
+    const worktree = provisionWorkerWorktree({ root: this.#root, runId: job.agentId });
+    job.worktree = worktree;
+    // `git worktree add` rewrites mtimes, so a root-taken baseline would false-positive on
+    // every owned file. Re-snapshot from the worktree and point evidence there; the git diff
+    // (captured post-run) is the authoritative change signal for worktree jobs.
+    job.evidenceRoot = worktree.agentCwd;
+    job.ownedFileBaseline = snapshotOwnedFiles(worktree.agentCwd, job.descriptor?.owned_files);
+    this.#trace("worktree_provisioned", job, {
+      branch: worktree.branch,
+      base_commit: worktree.baseCommit,
+      worktree_path: worktree.path,
+    });
+  }
+
+  #captureJobWorktreeDiff(job) {
+    try {
+      job.worktreeDiff = captureWorktreeDiff({ worktree: job.worktree });
+      this.#trace("worktree_diff", job, {
+        files_changed: job.worktreeDiff.changedFiles.length,
+        has_changes: job.worktreeDiff.hasChanges,
+      });
+    } catch (err) {
+      job.worktreeDiff = { changedFiles: [], patch: "", hasChanges: false };
+      this.#trace("worktree_diff_failed", job, { error: String(err?.message ?? err) });
+    }
+  }
+
+  #mergeBackWorktree(job) {
+    const stepResult = job.result?.stepResult;
+    const passed = stepResult?.verdict === "PASS";
+    const writesProject = job.descriptor?.write_scope === "project";
+    // Non-writing or non-passing workers keep their changes isolated on the branch; only a
+    // passing write-scope worker's diff lands in the real project (atomic branch-based patch).
+    if (!passed || !writesProject) {
+      this.#trace("worktree_merge_skipped", job, {
+        verdict: stepResult?.verdict ?? null,
+        write_scope: job.descriptor?.write_scope ?? null,
+      });
+      return;
+    }
+    if (!job.worktreeDiff?.hasChanges) {
+      this.#trace("worktree_merge_empty", job, {});
+      return;
+    }
+    const outcome = applyWorktreeDiffToRoot({ root: this.#root, patch: job.worktreeDiff.patch });
+    if (outcome.applied) {
+      stepResult.aipi_worktree_merged = { branch: job.worktree.branch, files: job.worktreeDiff.changedFiles };
+      this.#trace("worktree_merged", job, {
+        branch: job.worktree.branch,
+        files: job.worktreeDiff.changedFiles.length,
+      });
+      return;
+    }
+    // The verdict was PASS but the branch could not land cleanly — downgrade so the
+    // orchestrator never treats un-merged work as applied to the project.
+    downgradeWorkerPass(stepResult, {
+      reason: `worktree merge-back failed: ${outcome.reason ?? (outcome.empty ? "empty patch" : "conflict")}`,
+    });
+    job.lastSummary = stepResult.verdict;
+    this.#trace("worktree_merge_conflict", job, { reason: outcome.reason ?? null });
   }
 
   #parseResult(job, raw) {
@@ -435,7 +537,7 @@ export class SubagentCoordinator {
     }
     if (stepResult?.verdict === "PASS") {
       const evidence = verifyWorkerPassEvidence({
-        root: this.#root,
+        root: job.evidenceRoot ?? this.#root,
         job,
         raw,
         stepResult,
@@ -616,8 +718,8 @@ export class SubagentCoordinator {
   // Worker runtime seam - the ONLY place that creates worker sessions.
   // ===================================================================
   async #spawnWorkerSession(job, signal) {
-    if (job.isolation !== PI_SUBAGENTS_ISOLATION) {
-      throw new Error(`AIPI only supports ${PI_SUBAGENTS_ISOLATION} worker isolation; got ${job.isolation}`);
+    if (job.isolation !== PI_SUBAGENTS_ISOLATION && job.isolation !== WORKTREE_ISOLATION) {
+      throw new Error(`AIPI supports ${PI_SUBAGENTS_ISOLATION} and ${WORKTREE_ISOLATION} worker isolation; got ${job.isolation}`);
     }
     return this.#spawnPiSubagentsWorker(job, signal);
   }
@@ -652,7 +754,10 @@ export class SubagentCoordinator {
 
   async #spawnPiSubagentsWorker(job, signal) {
     if (signal?.aborted) throw new Error(`${job.agentId} was aborted before start`);
-    const runner = normalizePiSubagentsRunner(this.#piSubagentsRunner, this.#pi, { root: this.#root });
+    // Worktree jobs run the forked worker with root = the isolated worktree, so it reads/writes
+    // source there and its (gitignored) .aipi/runtime artifacts live under the worktree.
+    const runnerRoot = job.worktree?.agentCwd ?? this.#root;
+    const runner = normalizePiSubagentsRunner(this.#piSubagentsRunner, this.#pi, { root: runnerRoot });
     await this.#materializeWorkerRetrievalContext(job);
     const prompt = buildWorkerPrompt(job);
     const spawnParams = {
@@ -681,7 +786,7 @@ export class SubagentCoordinator {
     const raw = await runner.spawn(spawnParams, {
       signal,
       job: serializeWorkerJob(job),
-      ctx: { aipi_backend: PI_SUBAGENTS_ISOLATION, project_root: this.#root },
+      ctx: { aipi_backend: job.isolation, project_root: runnerRoot },
     });
 
     job.promptEndedAt = Date.now();
@@ -1005,11 +1110,31 @@ function sameFileList(left, right) {
   return left.every((value, index) => value === right[index]);
 }
 
-function normalizeIsolation(descriptor = {}, env = process.env) {
+function loadConfiguredWorkerIsolation(root) {
+  try {
+    const contract = JSON.parse(fsSync.readFileSync(path.join(root, ".aipi", "runtime-contract.json"), "utf8"));
+    const configured = contract?.isolationModel?.workerIsolation;
+    if (configured === PI_SUBAGENTS_ISOLATION) return PI_SUBAGENTS_ISOLATION;
+    if (configured === WORKTREE_ISOLATION) return WORKTREE_ISOLATION;
+  } catch {
+    /* best-effort: a missing/invalid contract falls through to the default below */
+  }
+  // Default ON: worker jobs use worktree isolation. It is safe as a blanket default because a job
+  // that cannot provision a worktree (dirty tree, not a git repo, provision error) gracefully falls
+  // back to the shared-root pi_subagents behavior in #runJob rather than failing.
+  return WORKTREE_ISOLATION;
+}
+
+function normalizeIsolation(descriptor = {}, options = {}) {
+  const defaultIsolation = options.defaultIsolation ?? PI_SUBAGENTS_ISOLATION;
   const explicit = descriptor.isolation ?? descriptor.isolation_mode;
+  if (explicit === WORKTREE_ISOLATION) return WORKTREE_ISOLATION;
   const requested = normalizePiSubagentsBackend(explicit ?? "");
   if (requested) return requested;
-  return PI_SUBAGENTS_ISOLATION;
+  // No explicit descriptor backend -> the per-project configured default
+  // (isolationModel.workerIsolation; pi_subagents unless the project enables per_worker_worktree).
+  // Never an environment flag.
+  return defaultIsolation;
 }
 
 function assertSupportedIsolation(isolationOrDescriptor = {}) {
@@ -1017,10 +1142,10 @@ function assertSupportedIsolation(isolationOrDescriptor = {}) {
     typeof isolationOrDescriptor === "string"
       ? isolationOrDescriptor
       : normalizeIsolation(isolationOrDescriptor);
-  if (normalized === PI_SUBAGENTS_ISOLATION) return;
+  if (normalized === PI_SUBAGENTS_ISOLATION || normalized === WORKTREE_ISOLATION) return;
   throw new Error(
     `AIPI worker isolation ${normalized} is unsupported; ` +
-      `current AIPI supports only the forked ${PI_SUBAGENTS_ISOLATION} runtime.`,
+      `current AIPI supports the forked ${PI_SUBAGENTS_ISOLATION} runtime and ${WORKTREE_ISOLATION}.`,
   );
 }
 
@@ -1072,7 +1197,17 @@ function verifyWorkerPassEvidence({ root, job, raw, stepResult }) {
     ...(Array.isArray(stepResult?.artifacts) ? stepResult.artifacts : []),
   ]);
   const existingArtifacts = artifactRefs.filter((file) => pathExistsUnderRoot(root, file));
-  const changedOwnedFiles = changedOwnedFilesSinceSnapshot(root, job.descriptor?.owned_files, job.ownedFileBaseline);
+  // Worktree jobs: the captured git diff is the authoritative change signal (mtime stat
+  // comparison is unreliable because `git worktree add` rewrites mtimes). Intersect with
+  // owned files when the worker declared them; otherwise any tracked change counts.
+  let changedOwnedFiles;
+  if (job.worktreeDiff) {
+    const owned = new Set(normalizedFileList(job.descriptor?.owned_files));
+    const changedInDiff = normalizedFileList(job.worktreeDiff.changedFiles);
+    changedOwnedFiles = owned.size ? changedInDiff.filter((file) => owned.has(file)) : changedInDiff;
+  } else {
+    changedOwnedFiles = changedOwnedFilesSinceSnapshot(root, job.descriptor?.owned_files, job.ownedFileBaseline);
+  }
   const passed = existingArtifacts.length > 0 || changedOwnedFiles.length > 0;
   return {
     passed,
