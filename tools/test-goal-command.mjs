@@ -7,6 +7,7 @@ import {
   formatGoalCommandResult,
   parseGoalArgs,
   parseGoalSpec,
+  registerGoalTools,
   runGoalCommand,
 } from "../extensions/aipi/runtime/goal-command.js";
 
@@ -95,6 +96,44 @@ try {
   const achieved = await runGoalCommand({ args: "achieve", projectRoot: tempRoot, now });
   assert.equal(achieved.achieved, true);
   assert.match(formatGoalCommandResult(achieved), /ACHIEVED/);
+
+  // --- model-callable tools: natural-language binding (no /aipi-goal typing) ---
+  const registered = new Map();
+  registerGoalTools({ registerTool: (def) => registered.set(def.name, def) }, { projectRootResolver: () => tempRoot });
+  for (const name of ["aipi_set_goal", "aipi_goal_status", "aipi_criterion_met", "aipi_achieve_goal"]) {
+    assert.ok(registered.has(name), `tool ${name} must be registered`);
+  }
+  // aipi_set_goal carries the model nudge (guidelines) so the orchestrator binds a goal from NL.
+  assert.ok((registered.get("aipi_set_goal").promptGuidelines ?? []).length >= 1);
+
+  const callTool = (name, params) => registered.get(name).execute("id", params, null, null, { model: null });
+  const parseTool = (result) => JSON.parse(result.content[0].text);
+
+  const toolSet = parseTool(await callTool("aipi_set_goal", {
+    objective: "implementar cache de sessao no login de usuarios",
+    criteria: ["o login retorna 200 e cria a sessao", "logout invalida o token"],
+    done_when: "usuario loga e ve o dashboard",
+  }));
+  assert.equal(toolSet.accepted, true, JSON.stringify(toolSet));
+
+  const toolStatus = parseTool(await callTool("aipi_goal_status", {}));
+  assert.equal(toolStatus.status, "accepted");
+
+  const toolMet1 = parseTool(await callTool("aipi_criterion_met", { criterion_id: "c1", evidence: "verify.log mostra 200 no login" }));
+  assert.equal(toolMet1.met, 1);
+
+  const toolBlocked = parseTool(await callTool("aipi_achieve_goal", {}));
+  assert.equal(toolBlocked.achieved, false);
+  assert.equal(toolBlocked.unmet.length, 1);
+
+  await callTool("aipi_criterion_met", { criterion_id: "c2", evidence: "suite de auth cobre logout" });
+  const toolAchieved = parseTool(await callTool("aipi_achieve_goal", {}));
+  assert.equal(toolAchieved.achieved, true);
+
+  // A rejected goal comes back as accepted:false with reasons (never a thrown tool error).
+  const toolReject = parseTool(await callTool("aipi_set_goal", { objective: "fix", criteria: ["x"], done_when: "y" }));
+  assert.equal(toolReject.accepted, false);
+  assert.ok(toolReject.reasons.length >= 1);
 
   console.log("AIPI_GOAL_COMMAND_OK");
 } finally {

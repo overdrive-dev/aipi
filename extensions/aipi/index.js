@@ -21,6 +21,7 @@ import {
 } from "./runtime/plan-command.js";
 import {
   formatGoalCommandResult,
+  registerGoalTools,
   runGoalCommand,
 } from "./runtime/goal-command.js";
 import { buildModelMeasurabilityJudge } from "./runtime/goal-judge.js";
@@ -71,6 +72,9 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
   // the workflow executor and reconciliation layer decide when to call it.
   registerSubagentTools(pi, coordinator);
   registerAipiRuntimeTools(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx) });
+  // Model-callable goal tools: the orchestrator binds a measurable goal from natural language (no /aipi-goal
+  // typing required), through the same acceptance gate + live LLM judge as the slash command.
+  registerGoalTools(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx) });
   registerAipiLifecycleHooks(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx), coordinator });
   probeA.registerHooks();
 

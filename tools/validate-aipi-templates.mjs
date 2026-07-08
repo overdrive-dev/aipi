@@ -1788,6 +1788,9 @@ if (!packageJson.scripts?.test?.includes("npm run test:goal-judge")) {
 if (!extensionIndex.includes("./runtime/goal-judge.js")) {
   errors.push("extensions/aipi/index.js must load runtime/goal-judge.js (the live LLM measurability judge)");
 }
+if (!extensionIndex.includes("registerGoalTools(")) {
+  errors.push("extensions/aipi/index.js must call registerGoalTools so the goal is model-callable from natural language");
+}
 if (packageJson.scripts?.["test:model-class"] !== "node tools/test-model-class-fallback.mjs") {
   errors.push("package.json must include test:model-class for host-model fallback coverage");
 }
