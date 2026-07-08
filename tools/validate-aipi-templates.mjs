@@ -1144,6 +1144,12 @@ if (!extensionIndex.includes("./runtime/run-state.js")) {
 if (!extensionIndex.includes('pi.registerCommand("aipi-workflow"')) {
   errors.push("extensions/aipi/index.js must register /aipi-workflow");
 }
+if (!extensionIndex.includes('pi.registerCommand("aipi-goal"')) {
+  errors.push("extensions/aipi/index.js must register /aipi-goal");
+}
+if (!extensionIndex.includes("./runtime/goal-command.js")) {
+  errors.push("extensions/aipi/index.js must load runtime/goal-command.js");
+}
 if (!extensionIndex.includes('pi.registerCommand("aipi-memory"')) {
   errors.push("extensions/aipi/index.js must register /aipi-memory");
 }
@@ -1760,6 +1766,27 @@ if (packageJson.scripts?.["test:models-command"] !== "node tools/test-models-com
 }
 if (!packageJson.scripts?.test?.includes("npm run test:models-command")) {
   errors.push("package.json test script must run test:models-command");
+}
+if (packageJson.scripts?.["test:goal-state"] !== "node tools/test-goal-state.mjs") {
+  errors.push("package.json must include test:goal-state for the /aipi-goal acceptance gate");
+}
+if (!packageJson.scripts?.test?.includes("npm run test:goal-state")) {
+  errors.push("package.json test script must run test:goal-state");
+}
+if (packageJson.scripts?.["test:goal-command"] !== "node tools/test-goal-command.mjs") {
+  errors.push("package.json must include test:goal-command for the /aipi-goal command surface");
+}
+if (!packageJson.scripts?.test?.includes("npm run test:goal-command")) {
+  errors.push("package.json test script must run test:goal-command");
+}
+if (packageJson.scripts?.["test:goal-judge"] !== "node tools/test-goal-judge.mjs") {
+  errors.push("package.json must include test:goal-judge for the /aipi-goal live LLM measurability judge");
+}
+if (!packageJson.scripts?.test?.includes("npm run test:goal-judge")) {
+  errors.push("package.json test script must run test:goal-judge");
+}
+if (!extensionIndex.includes("./runtime/goal-judge.js")) {
+  errors.push("extensions/aipi/index.js must load runtime/goal-judge.js (the live LLM measurability judge)");
 }
 if (packageJson.scripts?.["test:model-class"] !== "node tools/test-model-class-fallback.mjs") {
   errors.push("package.json must include test:model-class for host-model fallback coverage");

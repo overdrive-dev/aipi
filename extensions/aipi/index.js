@@ -19,6 +19,11 @@ import {
   formatPlanCommandResult,
   runPlanCommand,
 } from "./runtime/plan-command.js";
+import {
+  formatGoalCommandResult,
+  runGoalCommand,
+} from "./runtime/goal-command.js";
+import { buildModelMeasurabilityJudge } from "./runtime/goal-judge.js";
 import { resolveStepModel } from "./runtime/model-router.js";
 import { registerAipiRuntimeTools } from "./runtime/aipi-tools.js";
 import {
@@ -57,7 +62,7 @@ import {
   formatEnvironmentReport,
 } from "./runtime/environment-doctor.js";
 
-export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowCommand, planCommandRunner = runPlanCommand } = {}) {
+export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowCommand, planCommandRunner = runPlanCommand, goalCommandRunner = runGoalCommand } = {}) {
   const coordinator = new SubagentCoordinator(pi);
   const probeA = new ProbeAController(pi);
 
@@ -163,6 +168,23 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
         ctx.ui.notify(formatPlanCommandResult(result), "info");
       } catch (error) {
         ctx.ui.notify(`AIPI plan failed: ${error.message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("aipi-goal", {
+    description: "Set and track a MEASURABLE top-level goal — accepted only with a clear objective + checkable criteria + done_when: set | status | criterion <id> met <evidence> | achieve | plan | show <id> | abandon.",
+    handler: async (args, ctx) => {
+      try {
+        const projectRoot = resolveProjectRoot(ctx);
+        // Live LLM vagueness judge: one bounded, tool-less forked worker on the current host model. It is
+        // fail-closed on a `vague` verdict; if no host model is available it is null (deterministic floor), and
+        // if the judge process fails it degrades to the deterministic floor rather than blocking creation.
+        const judge = buildModelMeasurabilityJudge({ root: projectRoot, model: ctx.model });
+        const result = await goalCommandRunner({ args: args ?? "", projectRoot, judge });
+        ctx.ui.notify(formatGoalCommandResult(result), "info");
+      } catch (error) {
+        ctx.ui.notify(`AIPI goal failed: ${error.message}`, "error");
       }
     },
   });
