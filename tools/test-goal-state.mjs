@@ -129,6 +129,21 @@ try {
   assert.equal(abandoned.goal.status, "abandoned");
   assert.equal(await readActiveGoal(tempRoot), null);
 
+  // --- STANDALONE: a goal needs NO /aipi-init. proposeGoal works in a bare directory (no .aipi scaffold),
+  //     creating only its own runtime/goals/ on demand — the guard removal Victor asked about. ---
+  const bareRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-goal-bare-"));
+  try {
+    const standalone = await proposeGoal({ projectRoot: bareRoot, ...CLEAR, now, randomBytes: fixedRandom });
+    assert.equal(standalone.accepted, true, "a goal is accepted without /aipi-init");
+    const active = await readActiveGoal(bareRoot);
+    assert.equal(active.goal.objective, CLEAR.objective, "the standalone goal persisted and is active");
+    // It created only its OWN storage — no full install (runtime-contract.json is absent).
+    await assert.rejects(fs.access(path.join(bareRoot, ".aipi", "runtime-contract.json")), "no full install was performed");
+    await fs.access(path.join(bareRoot, ".aipi", "runtime", "goals", standalone.goalId, "GOAL.json"));
+  } finally {
+    await fs.rm(bareRoot, { recursive: true, force: true });
+  }
+
   console.log("AIPI_GOAL_STATE_OK");
 } finally {
   await fs.rm(tempRoot, { recursive: true, force: true });

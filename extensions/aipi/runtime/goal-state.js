@@ -167,7 +167,10 @@ export async function proposeGoal({
 } = {}) {
   if (!projectRoot) throw new Error("projectRoot is required");
   const root = path.resolve(projectRoot);
-  await assertAipiInstalled(root);
+  // The goal is STANDALONE: it does not require /aipi-init. persistGoal creates its own
+  // .aipi/runtime/goals/ on demand (mkdir -p), and a goal (objective + criteria + done_when) depends on
+  // none of the project scaffold (memory, kanban, workflows) that the plan/workflow layers need. So there is
+  // deliberately no assertAipiInstalled gate here — you can set a measurable goal in any directory.
 
   const draft = buildGoalDraft({ objective, criteria, done_when });
 
@@ -394,18 +397,6 @@ function goalsDir(root) {
 
 function isTerminalGoalStatus(status) {
   return TERMINAL_GOAL_STATUSES.has(String(status ?? "").toLowerCase());
-}
-
-async function assertAipiInstalled(projectRoot) {
-  const contractPath = path.join(projectRoot, ".aipi", "runtime-contract.json");
-  try {
-    await fs.access(contractPath);
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      throw new Error("AIPI is not installed in this project; run /aipi-init first");
-    }
-    throw error;
-  }
 }
 
 function generateGoalId(now, randomBytes) {
