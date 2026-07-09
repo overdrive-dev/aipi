@@ -10,6 +10,7 @@ import {
   parsePlanArgs,
   parsePlanTasks,
   preflightPlan,
+  registerPlanTools,
   runPlanCommand,
 } from "../extensions/aipi/runtime/plan-command.js";
 
@@ -135,6 +136,55 @@ try {
   const realCreate = await runPlanCommand({ projectRoot: tempRoot, args: "investigar opções de cache na listagem", now });
   assert.equal(realCreate.plan.tasks[0].workflow, "research");
   assert.ok(buildDiscoveryReport(realCreate.plan).instruction.includes("Autonomy Law"));
+
+  // --- model-callable tools: natural-language binding (no /aipi-plan typing) ---
+  // Start clean: the realCreate plan above is still active — cancel it so aipi_start_plan drafts a fresh one.
+  await runPlanCommand({ projectRoot: tempRoot, args: "cancel", now });
+
+  const registered = new Map();
+  registerPlanTools({ registerTool: (def) => registered.set(def.name, def) }, { projectRootResolver: () => tempRoot });
+  for (const name of ["aipi_start_plan", "aipi_plan_status", "aipi_answer_plan_question", "aipi_settle_plan"]) {
+    assert.ok(registered.has(name), `tool ${name} must be registered`);
+  }
+  // aipi_start_plan carries the model nudge (guidelines) so the orchestrator routes NL to the plan layer.
+  assert.ok((registered.get("aipi_start_plan").promptGuidelines ?? []).length >= 1);
+
+  const callTool = (name, params) => registered.get(name).execute("id", params, null, null, { model: null });
+  const parseTool = (result) => JSON.parse(result.content[0].text);
+
+  const toolPlan = parseTool(await callTool("aipi_start_plan", {
+    tasks: ["corrigir o bug do save no perfil", "fazer deploy do faturamento"],
+  }));
+  assert.equal(toolPlan.ok, true, JSON.stringify(toolPlan));
+  assert.ok(toolPlan.plan_id, "aipi_start_plan returns the new plan id");
+  assert.equal(toolPlan.discovery.tasks.length, 2);
+
+  const toolStatus = parseTool(await callTool("aipi_plan_status", {}));
+  assert.equal(toolStatus.plan_id, toolPlan.plan_id);
+
+  // The model drives the discovery->settle gate: an open question blocks settle until answered.
+  await addPlanQuestions({
+    projectRoot: tempRoot,
+    questions: [{ task_id: "t1", question: "Persistir em perfis inativos?", options: ["Sim", "Não"] }],
+    now,
+  });
+  const withQuestion = parseTool(await callTool("aipi_plan_status", {}));
+  const openQuestionId = withQuestion.open_questions[0].question_id;
+
+  const toolBlocked = parseTool(await callTool("aipi_settle_plan", {}));
+  assert.equal(toolBlocked.settled, false);
+  assert.ok(toolBlocked.reasons.length >= 1);
+
+  const toolAnswer = parseTool(await callTool("aipi_answer_plan_question", { question_id: openQuestionId, answer: "Sim" }));
+  assert.equal(toolAnswer.ok, true);
+  assert.equal(toolAnswer.remaining, 0);
+
+  const toolSettled = parseTool(await callTool("aipi_settle_plan", {}));
+  assert.equal(toolSettled.settled, true, JSON.stringify(toolSettled));
+
+  // aipi_start_plan with no tasks comes back ok:false (never a thrown tool error).
+  const toolEmpty = parseTool(await callTool("aipi_start_plan", { tasks: [] }));
+  assert.equal(toolEmpty.ok, false);
 
   console.log("AIPI_PLAN_COMMAND_TEST_OK");
 } finally {

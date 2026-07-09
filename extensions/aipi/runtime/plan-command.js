@@ -225,6 +225,114 @@ export function formatPlanCommandResult(result) {
   return "AIPI plan: ok";
 }
 
+// ---- natural-language binding (model-callable tools) ----
+
+// Mirror of registerGoalTools: give the orchestrator model tools so a natural-language "monta um plano pra X"
+// routes to the plan layer WITHOUT the user typing /aipi-plan. aipi_start_plan drafts the plan through the
+// same pre-flight path (classify tasks + investigate business rules once) and returns the open discovery
+// questions; the answer/settle tools let the model drive the discovery->settle gate from NL. The gate is
+// unchanged: settlePlan still refuses to leave discovery until every question is answered.
+export function registerPlanTools(pi, { projectRootResolver = () => process.cwd() } = {}) {
+  pi.registerTool({
+    name: "aipi_start_plan",
+    description:
+      "Draft an AIPI execution plan from a natural-language request to plan work. Use this instead of asking the user to type /aipi-plan. It classifies each task, investigates the project's business rules once, and returns the plan plus the open clarifying questions that must be settled before autonomous execution.",
+    promptSnippet: "aipi_start_plan - draft an AIPI plan (tasks + discovery questions) from a natural-language planning request.",
+    promptGuidelines: [
+      "When the user asks you to build or draft a plan for some work (e.g. 'monta um plano pra X', 'planeje a migracao', 'faz um plano de refatoracao'), call aipi_start_plan with the concrete tasks instead of only outlining the plan in prose.",
+      "After aipi_start_plan returns open_questions, surface them to the user, record answers with aipi_answer_plan_question, then call aipi_settle_plan before execution — do not skip the discovery gate.",
+    ],
+    parameters: {
+      type: "object",
+      required: ["tasks"],
+      properties: {
+        tasks: {
+          type: "array",
+          items: { type: "string" },
+          description: "The tasks to plan — one concrete unit of work per item.",
+        },
+      },
+    },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      try {
+        const projectRoot = projectRootResolver(ctx);
+        const tasks = Array.isArray(params?.tasks)
+          ? params.tasks.map((task) => String(task ?? "").trim()).filter(Boolean)
+          : params?.tasks != null
+            ? [String(params.tasks).trim()].filter(Boolean)
+            : [];
+        if (!tasks.length) return toolJson({ ok: false, error: "aipi_start_plan needs at least one task" });
+        const result = await preflightPlan({ projectRoot, tasks, source: "tool" });
+        return toolJson({ ok: true, action: "create", plan_id: result.planId, discovery: result.discovery });
+      } catch (error) {
+        return toolJson({ ok: false, error: String(error?.message ?? error) });
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "aipi_plan_status",
+    description: "Show the active AIPI plan: id, status, tasks, business rules, and the still-open discovery questions.",
+    parameters: { type: "object", properties: {} },
+    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      try {
+        const active = await readActivePlan(projectRootResolver(ctx));
+        return toolJson(active ? buildDiscoveryReport(active.plan) : { active: null });
+      } catch (error) {
+        return toolJson({ ok: false, error: String(error?.message ?? error) });
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "aipi_answer_plan_question",
+    description:
+      "Record the user's answer to one open discovery question on the active AIPI plan. Every question must be answered before the plan can settle.",
+    parameters: {
+      type: "object",
+      required: ["question_id", "answer"],
+      properties: {
+        question_id: { type: "string", description: "The question id, e.g. q1." },
+        answer: { type: "string", description: "The user's answer to that question." },
+      },
+    },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      try {
+        const { plan, question } = await recordPlanAnswer({
+          projectRoot: projectRootResolver(ctx),
+          questionId: params?.question_id,
+          answer: params?.answer,
+        });
+        return toolJson({ ok: true, question, remaining: unsettledReasons(plan).length });
+      } catch (error) {
+        return toolJson({ ok: false, error: String(error?.message ?? error) });
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "aipi_settle_plan",
+    description:
+      "Settle the active AIPI plan, locking it for execution. Succeeds only when every discovery question is answered; otherwise returns the unsettled reasons so you can resolve them first.",
+    parameters: { type: "object", properties: {} },
+    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      try {
+        const { plan } = await settlePlan({ projectRoot: projectRootResolver(ctx) });
+        return toolJson({ ok: true, settled: true, plan_id: plan.plan_id });
+      } catch (error) {
+        if (error.reasons) return toolJson({ ok: true, settled: false, reasons: error.reasons });
+        return toolJson({ ok: false, error: String(error?.message ?? error) });
+      }
+    },
+  });
+}
+
+// ---- internals ----
+
+function toolJson(value) {
+  return { content: [{ type: "text", text: JSON.stringify(value, null, 2) }] };
+}
+
 function isAnswered(question) {
   return typeof question?.answer === "string" && question.answer.trim().length > 0;
 }

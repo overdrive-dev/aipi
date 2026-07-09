@@ -1791,6 +1791,9 @@ if (!extensionIndex.includes("./runtime/goal-judge.js")) {
 if (!extensionIndex.includes("registerGoalTools(")) {
   errors.push("extensions/aipi/index.js must call registerGoalTools so the goal is model-callable from natural language");
 }
+if (!extensionIndex.includes("registerPlanTools(")) {
+  errors.push("extensions/aipi/index.js must call registerPlanTools so the plan is model-callable from natural language");
+}
 if (packageJson.scripts?.["test:model-class"] !== "node tools/test-model-class-fallback.mjs") {
   errors.push("package.json must include test:model-class for host-model fallback coverage");
 }
