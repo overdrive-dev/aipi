@@ -6,6 +6,7 @@ import { PassThrough } from "node:stream";
 import {
   formatModelsCommandResult,
   parseModelsArgs,
+  registryModelSpecs,
   runModelsCommand,
 } from "../extensions/aipi/runtime/models-command.js";
 import { initProject } from "../extensions/aipi/runtime/project-init.js";
@@ -406,6 +407,68 @@ try {
   assert.equal(cliConfig.class_thinking["context-fast"], "low");
 } finally {
   await fs.rm(cliRoot, { recursive: true, force: true });
+}
+
+// === registryModelSpecs: a Pi ModelRegistry -> provider/model specs (getAvailable only) ===
+{
+  const specs = registryModelSpecs({
+    getAvailable: () => [
+      { provider: "anthropic", id: "claude-opus-4-8" },
+      { provider: "openai-codex", id: "gpt-5.6-sol" },
+      { provider: "xai-auth", model: "grok-4.5" }, // tolerate .model as well as .id
+      { provider: "", id: "" }, // incomplete -> dropped
+    ],
+  });
+  assert.deepEqual(specs, ["anthropic/claude-opus-4-8", "openai-codex/gpt-5.6-sol", "xai-auth/grok-4.5"]);
+  assert.deepEqual(registryModelSpecs(null), [], "no registry -> empty");
+  assert.deepEqual(registryModelSpecs({ getAvailable: () => { throw new Error("boom"); } }), [], "never throws");
+}
+
+// === wizard SELECTS from the real available models (native ctx.ui.select) instead of typing ===
+{
+  const selectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-effort-select-"));
+  try {
+    await initProject({ sourceRoot: path.resolve("templates/.aipi"), targetRoot: selectRoot });
+    // The host's auth'd models — includes a brand-new one (grok-4.5) to prove it is OFFERED for selection.
+    const available = [
+      "anthropic/claude-opus-4-8",
+      "openai-codex/gpt-5.5",
+      "anthropic/claude-haiku-4-5",
+      "xai-auth/grok-4.5",
+    ];
+    const offered = [];
+    const ui = {
+      async select(title, options) {
+        offered.push({ title, options });
+        if (/adversarial/i.test(title)) return "openai-codex/gpt-5.5"; // cross-provider from the anthropic doer
+        if (/mover/i.test(title)) return "anthropic/claude-haiku-4-5";
+        return "anthropic/claude-opus-4-8"; // planner + doer
+      },
+      async input() { return "high"; }, // thinking level per bucket
+    };
+    const report = await runModelsCommand({
+      projectRoot: selectRoot,
+      args: ["setup"],
+      availableModels: available,
+      ui,
+      now: () => new Date("2026-07-09T00:00:00.000Z"),
+    });
+    assert.equal(report.state, "ready");
+    // The picker was offered the REAL available models — the whole point (grok-4.5 was never configured).
+    assert.ok(offered.some((call) => call.options.includes("xai-auth/grok-4.5")), "available models offered in the selector");
+    // …with a manual-entry escape hatch for a model not yet in the list.
+    assert.ok(
+      offered.some((call) => call.options.some((opt) => /type a provider\/model manually/.test(opt))),
+      "manual-entry option present",
+    );
+    // The selection flowed through to the persisted topology.
+    const cfg = JSON.parse(await fs.readFile(path.join(selectRoot, ".aipi", "model-capabilities.json"), "utf8"));
+    assert.equal(cfg.classes["code-strong"], "anthropic/claude-opus-4-8"); // doer
+    assert.equal(cfg.classes["adversarial-heavy"], "openai-codex/gpt-5.5"); // adversarial (cross-provider)
+    assert.equal(cfg.classes["context-fast"], "anthropic/claude-haiku-4-5"); // mover
+  } finally {
+    await fs.rm(selectRoot, { recursive: true, force: true });
+  }
 }
 
 console.log("AIPI_MODELS_COMMAND_TEST_OK");

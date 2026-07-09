@@ -1833,6 +1833,9 @@ if (!extensionIndex.includes("./runtime/subagent-widget.js")) {
 if (!extensionIndex.includes("registerAskTool(")) {
   errors.push("extensions/aipi/index.js must call registerAskTool (the native interactive question tool)");
 }
+if (!extensionIndex.includes("registryModelSpecs(")) {
+  errors.push("extensions/aipi/index.js must feed registryModelSpecs(ctx.modelRegistry) into the effort wizard so it lists real available models");
+}
 if (!extensionIndex.includes("./runtime/ask-tool.js")) {
   errors.push("extensions/aipi/index.js must load runtime/ask-tool.js");
 }

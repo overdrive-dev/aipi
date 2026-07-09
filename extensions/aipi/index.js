@@ -38,6 +38,7 @@ import {
 } from "./runtime/memory-command.js";
 import {
   formatModelsCommandResult,
+  registryModelSpecs,
   runModelsCommand,
 } from "./runtime/models-command.js";
 import {
@@ -230,7 +231,9 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
   const effortCommandHandler = async (args, ctx) => {
     try {
       const projectRoot = resolveProjectRoot(ctx);
-      const result = await runModelsCommand({ args: args ?? "", projectRoot, ui: ctx?.ui });
+      // Offer the models the host actually has auth for, so the wizard lets the user PICK a real id.
+      const availableModels = registryModelSpecs(ctx?.modelRegistry);
+      const result = await runModelsCommand({ args: args ?? "", projectRoot, ui: ctx?.ui, availableModels });
       ctx.ui.notify(formatModelsCommandResult(result), result.state === "ready" ? "info" : "warning");
     } catch (error) {
       ctx.ui.notify(`AIPI effort failed: ${error.message}`, "error");

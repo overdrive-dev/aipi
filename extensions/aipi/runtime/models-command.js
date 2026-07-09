@@ -153,6 +153,9 @@ export async function runModelsCommand({
   projectRoot = null,
   cwd = process.cwd(),
   ui = null,
+  // The models the host actually has auth for (from ctx.modelRegistry.getAvailable()), as provider/model
+  // specs. The wizard offers these for selection so the user picks real, ready-to-use ids instead of typing.
+  availableModels = [],
   now = () => new Date(),
 } = {}) {
   const parsed = parseModelsArgs(args, { cwd: projectRoot ?? cwd });
@@ -170,7 +173,7 @@ export async function runModelsCommand({
 
   let setupWarnings = [];
   if (parsed.action === "setup") {
-    await fillInteractiveOptions(parsed, { root, ui });
+    await fillInteractiveOptions(parsed, { root, ui, availableModels });
     // Each bucket maps to ONE (model, thinking level) pair. Legacy --host/--adversarial/
     // --verifier feed the doer/adversarial buckets (and the verifier-fast override below)
     // so old invocations keep working without the new --planner/--mover flags.
@@ -373,12 +376,14 @@ function looksExpensiveFrontier(model) {
 // Interactive wizard: prompt the 4 provider-agnostic BUCKETS (model + thinking level each)
 // instead of looping the 8 capability classes. Each bucket's (model, level) fans out to
 // its classes in applyTopology. `--class <class>=<spec>` remains a power-user override.
-async function fillInteractiveOptions(options, { root, ui }) {
+async function fillInteractiveOptions(options, { root, ui, availableModels = [] }) {
   if (!options.interactive) return options;
   const promptUi = createPromptUi(ui);
   if (!promptUi) return options;
   try {
-    let candidates = await configuredModelCandidates(root);
+    // Available (auth'd) models FIRST so the picker leads with real, ready-to-use ids, then whatever was
+    // already configured in this project.
+    let candidates = mergeModelCandidates(availableModels, await configuredModelCandidates(root));
     options.buckets ??= {};
     for (const bucket of EFFORT_BUCKETS) {
       if (options.buckets[bucket]) {
@@ -445,30 +450,52 @@ function createPromptUi(ui) {
   };
 }
 
+const TYPE_MANUALLY_OPTION = "✎ type a provider/model manually…";
+
 async function promptModelSpec(ui, label, candidates = [], { defaultValue = null } = {}) {
   const uniqueCandidates = mergeModelCandidates(candidates, [defaultValue]);
+  const message = `${label} (provider/model)${defaultValue ? ` [${defaultValue}]` : ""}`;
+  const input = ui?.input ?? ui?.prompt;
+
+  // Prefer the native Pi selector so the user PICKS a real, system-known id instead of typing one blind.
+  // ctx.ui.select(title, options[]) returns the chosen option string. A manual-entry row is appended (only
+  // when a text prompt exists to receive it) so a brand-new model not yet in the list can still be entered.
   if (typeof ui?.select === "function" && uniqueCandidates.length) {
     try {
-      const selected = await ui.select({
-        title: label,
-        message: `${label} (provider/model)${defaultValue ? ` [${defaultValue}]` : ""}`,
-        options: uniqueCandidates.map((candidate) => ({ label: candidate, value: candidate })),
-        defaultValue,
-      });
-      const value = selected?.value ?? selected;
-      if (typeof value === "string" && value.trim()) return value.trim();
-      if (defaultValue) return defaultValue;
+      const options = typeof input === "function" ? [...uniqueCandidates, TYPE_MANUALLY_OPTION] : uniqueCandidates;
+      const selected = await ui.select(message, options);
+      const value = selected && typeof selected === "object" ? (selected.value ?? selected.label) : selected;
+      if (typeof value === "string" && value.trim() && value !== TYPE_MANUALLY_OPTION) return value.trim();
+      // Manual entry falls through to the text prompt; a dismissal with a default keeps the default.
+      if (value !== TYPE_MANUALLY_OPTION && defaultValue) return defaultValue;
     } catch {
       /* fall through to text input */
     }
   }
-  const input = ui?.input ?? ui?.prompt;
+
   if (typeof input === "function") {
-    const value = await input(`${label} (provider/model)${defaultValue ? ` [${defaultValue}]` : ""}`);
+    const value = await input(message);
     if (typeof value === "string" && value.trim()) return value.trim();
     if (defaultValue) return defaultValue;
   }
   return defaultValue ?? null;
+}
+
+// Map a Pi ModelRegistry into provider/model specs the wizard can offer. Uses getAvailable() — only models
+// with configured auth (login/API key), i.e. the ones the user can actually run. Never throws.
+export function registryModelSpecs(modelRegistry) {
+  try {
+    const models = typeof modelRegistry?.getAvailable === "function" ? modelRegistry.getAvailable() : [];
+    return [...new Set((Array.isArray(models) ? models : [])
+      .map((model) => {
+        const provider = model?.provider;
+        const id = model?.id ?? model?.model;
+        return provider && id ? `${provider}/${id}` : null;
+      })
+      .filter(Boolean))].sort();
+  } catch {
+    return [];
+  }
 }
 
 function mergeModelCandidates(...groups) {
