@@ -219,9 +219,30 @@ export async function proposeGoal({
     },
   };
 
+  // Safety net for the cwd pin: the AIPI session anchors the project on its working directory (resolveProjectRoot
+  // does NOT search upward). If .aipi/ does not exist yet, persisting will create a fresh one HERE — which is
+  // wrong if the session was opened from a parent/unintended folder. Flag it so the caller can warn.
+  const aipiExisted = await pathExists(path.join(root, ".aipi"));
   await persistGoal(root, goal);
   await fs.writeFile(path.join(goalsDir(root), "active"), `${goalId}\n`);
-  return { accepted: true, goalId, goal };
+  return {
+    accepted: true,
+    goalId,
+    goal,
+    ...(aipiExisted ? {} : {
+      created_aipi_root: root,
+      warning: `Created a new .aipi/ at ${root}. The AIPI session anchors on its working directory — confirm this is the intended project root, not a parent or wrong folder.`,
+    }),
+  };
+}
+
+async function pathExists(target) {
+  try {
+    await fs.access(target);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ---- read ----

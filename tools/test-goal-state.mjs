@@ -106,6 +106,8 @@ try {
   // --- achieve gate: verify == ship at the goal level ---
   const fresh = await proposeGoal({ projectRoot: tempRoot, ...CLEAR, now, randomBytes: fixedRandom });
   const goalId = fresh.goalId;
+  // An already-initialized project (.aipi/ present) does NOT trigger the fresh-.aipi warning.
+  assert.equal(fresh.created_aipi_root, undefined, "no fresh-.aipi warning when .aipi already exists");
   // Only the 2 REQUIRED criteria block achievement (the recommended one does not).
   assert.equal(unmetRequiredCriteria(fresh.goal).length, 2);
   await assert.rejects(achieveGoal({ projectRoot: tempRoot, goalId, now }), /not achievable/);
@@ -135,6 +137,9 @@ try {
   try {
     const standalone = await proposeGoal({ projectRoot: bareRoot, ...CLEAR, now, randomBytes: fixedRandom });
     assert.equal(standalone.accepted, true, "a goal is accepted without /aipi-init");
+    // cwd safety net: creating a fresh .aipi/ here is flagged so the caller can warn.
+    assert.equal(standalone.created_aipi_root, bareRoot, "a fresh .aipi/ creation is flagged");
+    assert.ok(String(standalone.warning ?? "").includes(".aipi/"), "carries a human-readable warning");
     const active = await readActiveGoal(bareRoot);
     assert.equal(active.goal.objective, CLEAR.objective, "the standalone goal persisted and is active");
     // It created only its OWN storage — no full install (runtime-contract.json is absent).

@@ -204,6 +204,9 @@ export function formatGoalCommandResult(result) {
       if (goal.acceptance?.measurability?.judge === "deterministic_fallback") {
         lines.push("(note: the LLM judge was unavailable — the deterministic vagueness floor decided.)");
       }
+      if (result.warning) {
+        lines.push(`⚠ ${result.warning}`);
+      }
       return lines.join("\n");
     }
     const lines = [
