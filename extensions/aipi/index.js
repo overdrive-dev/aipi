@@ -22,6 +22,7 @@ import {
 } from "./runtime/plan-command.js";
 import { refreshPlanWidget, registerPlanWidget } from "./runtime/plan-widget.js";
 import { registerBackgroundResearchTool } from "./runtime/background-research.js";
+import { registerSubagentWidget } from "./runtime/subagent-widget.js";
 import {
   formatGoalCommandResult,
   registerGoalTools,
@@ -86,6 +87,8 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
   // Background research fan-out: read-only workers that run async and wake the orchestrator with findings.
   // Non-ship by construction (artifacts-only, no shell) — the verify==ship gate stays on the foreground path.
   registerBackgroundResearchTool(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx) });
+  // Inline TUI widget: an always-visible live list of active subagent runs above the editor (grok-build style).
+  registerSubagentWidget(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx) });
   registerAipiLifecycleHooks(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx), coordinator });
   probeA.registerHooks();
 

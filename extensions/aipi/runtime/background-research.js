@@ -104,10 +104,10 @@ export function registerBackgroundResearchTool(pi, { projectRootResolver = () =>
         const runner = runnerFactory ? runnerFactory({ root }) : createAipiSubagentsRunner({ root });
         const accepted = tasks.slice(0, MAX_BACKGROUND_RESEARCH);
         const dropped = tasks.slice(MAX_BACKGROUND_RESEARCH);
-        const stamp = Date.now();
         const runs = accepted.map((task, index) => {
-          const runId = `research-${stamp}-${index + 1}`;
           const label = truncateLabel(task);
+          // A task-derived id so the /aipi-subagents widget shows readable labels (not an opaque timestamp).
+          const runId = `research-${slugify(task)}-${index + 1}`;
           // Fire-and-forget: the tool returns now; the job wakes the orchestrator on completion.
           void runBackgroundResearchJob({ pi, runner, root, task, runId, label, model });
           return { run_id: runId, task: label };
@@ -137,6 +137,14 @@ function normalizeTasks(tasks) {
 function truncateLabel(task) {
   const oneLine = String(task ?? "").replace(/\s+/g, " ").trim();
   return oneLine.length > 60 ? `${oneLine.slice(0, 57)}...` : oneLine;
+}
+
+function slugify(task) {
+  return String(task ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40) || "task";
 }
 
 function timeoutSignal(ms) {

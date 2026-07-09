@@ -1824,6 +1824,18 @@ if (!extensionIndex.includes("registerBackgroundResearchTool(")) {
 if (!extensionIndex.includes("./runtime/background-research.js")) {
   errors.push("extensions/aipi/index.js must load runtime/background-research.js");
 }
+if (!extensionIndex.includes("registerSubagentWidget(")) {
+  errors.push("extensions/aipi/index.js must call registerSubagentWidget (the inline live subagent list)");
+}
+if (!extensionIndex.includes("./runtime/subagent-widget.js")) {
+  errors.push("extensions/aipi/index.js must load runtime/subagent-widget.js");
+}
+if (packageJson.scripts?.["test:subagent-widget"] !== "node tools/test-subagent-widget.mjs") {
+  errors.push("package.json must include test:subagent-widget for the inline subagent list");
+}
+if (!packageJson.scripts?.test?.includes("npm run test:subagent-widget")) {
+  errors.push("package.json test script must run test:subagent-widget");
+}
 if (packageJson.scripts?.["test:background-research"] !== "node tools/test-background-research.mjs") {
   errors.push("package.json must include test:background-research for the background research fan-out");
 }
