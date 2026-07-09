@@ -49,6 +49,8 @@ import {
 } from "./runtime/diagnose.js";
 import {
   formatPiSubagentsLiveSpike,
+  loadSubagentView,
+  projectSubagentsRuntimePaths,
   runPiSubagentsLiveSpike,
 } from "./runtime/pi-subagents.js";
 import { makeProgressNotifier, registerAipiLifecycleHooks } from "./runtime/lifecycle-hooks.js";
@@ -255,6 +257,28 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
         ctx.ui.notify(formatPiSubagentsLiveSpike(result), result.go_no_go === "GO_CANDIDATE" ? "info" : "warning");
       } catch (error) {
         ctx.ui.notify(`AIPI pi-subagents spike failed: ${error.message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("aipi-subagents", {
+    description: "Open the AIPI subagent view: a live, navigable list of subagent runs (this session and durable history).",
+    handler: async (_args, ctx) => {
+      // Overlay is terminal-only; degrade to a text summary elsewhere (RPC/JSON/print/headless).
+      if (ctx.mode !== "tui" || typeof ctx.ui?.custom !== "function") {
+        ctx.ui.notify("The AIPI subagent view needs the interactive TUI.", "warning");
+        return;
+      }
+      try {
+        const paths = projectSubagentsRuntimePaths(resolveProjectRoot(ctx));
+        const { SubagentViewComponent, loadSubagentRuns } = loadSubagentView();
+        await ctx.ui.custom(
+          (tui, theme, _kb, done) =>
+            new SubagentViewComponent(tui, theme, () => loadSubagentRuns(paths.asyncDir, paths.resultsDir), done),
+          { overlay: true },
+        );
+      } catch (error) {
+        ctx.ui.notify(`AIPI subagent view failed: ${error.message}`, "error");
       }
     },
   });

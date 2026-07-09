@@ -1806,6 +1806,18 @@ if (packageJson.scripts?.["test:plan-widget"] !== "node tools/test-plan-widget.m
 if (!packageJson.scripts?.test?.includes("npm run test:plan-widget")) {
   errors.push("package.json test script must run test:plan-widget");
 }
+if (!extensionIndex.includes('registerCommand("aipi-subagents"')) {
+  errors.push("extensions/aipi/index.js must register the aipi-subagents command (the subagent view)");
+}
+if (!extensionIndex.includes("loadSubagentView(")) {
+  errors.push("extensions/aipi/index.js must open the subagent view via loadSubagentView (the vendored SubagentViewComponent)");
+}
+if (packageJson.scripts?.["test:subagent-runstore"] !== "node tools/test-subagent-runstore.mjs") {
+  errors.push("package.json must include test:subagent-runstore for the fork -> native run-store bridge");
+}
+if (!packageJson.scripts?.test?.includes("npm run test:subagent-runstore")) {
+  errors.push("package.json test script must run test:subagent-runstore");
+}
 if (packageJson.scripts?.["test:model-class"] !== "node tools/test-model-class-fallback.mjs") {
   errors.push("package.json must include test:model-class for host-model fallback coverage");
 }

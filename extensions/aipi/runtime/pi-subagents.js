@@ -22,6 +22,8 @@ const LIVE_SPIKE_TASK = "Reply with the single word OK.";
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
 const vendorRoot = path.join(currentDir, "vendor", "pi-subagents");
 const runSyncEntrypoint = path.join(vendorRoot, "src", "runs", "foreground", "execution.ts");
+const subagentViewEntrypoint = path.join(vendorRoot, "src", "tui", "subagent-view.ts");
+const historyStoreEntrypoint = path.join(vendorRoot, "src", "runs", "background", "history-store.ts");
 const guardedWriteExtensionPath = path.join(currentDir, "aipi-guarded-write-child.js");
 const guardedBashExtensionPath = path.join(currentDir, "aipi-guarded-bash-child.js");
 let cachedJiti = null;
@@ -278,6 +280,18 @@ export async function runAipiForkedSubagent({
 
   const ownedFiles = normalizeOwnedFiles(params.owned_files ?? job?.descriptor?.owned_files);
   const writeScope = params.write_scope ?? job?.descriptor?.write_scope ?? "artifacts";
+
+  // Bridge this foreground fork into the native subagent run-store so /aipi-subagents can see it live.
+  const startedAt = Date.now();
+  const runLabel = job?.descriptor?.label ?? params.id ?? AIPI_SUBAGENTS_AGENT_NAME;
+  await writeSubagentRunStatus(paths, runId, {
+    state: "running",
+    cwd: root,
+    startedAt,
+    lastUpdate: startedAt,
+    steps: [subagentRunStep({ agent: runLabel, status: "running", model: modelId })],
+  });
+
   const envRestore = applyScopedRuntimeEnv({
     AIPI_SUBAGENTS_AGENT_DIR: paths.agentDir,
     AIPI_SUBAGENTS_RUNTIME_DIR: paths.runtimeRoot,
@@ -330,6 +344,19 @@ export async function runAipiForkedSubagent({
     if (result.exitCode !== 0 || result.error) {
       throw new Error(result.error ?? `AIPI forked subagent exited ${result.exitCode}`);
     }
+    await writeSubagentRunStatus(paths, runId, {
+      state: "complete",
+      cwd: root,
+      startedAt,
+      lastUpdate: Date.now(),
+      endedAt: Date.now(),
+      steps: [subagentRunStep({
+        agent: runLabel,
+        status: "complete",
+        model: result.model ?? modelId,
+        toolCount: result.progressSummary?.toolCount ?? result.progress?.toolCount ?? 0,
+      })],
+    });
     return {
       content: [{ type: "text", text: output }],
       output,
@@ -348,19 +375,69 @@ export async function runAipiForkedSubagent({
       },
       model_resolved: result.model ?? modelId ?? null,
     };
+  } catch (error) {
+    await writeSubagentRunStatus(paths, runId, {
+      state: "failed",
+      cwd: root,
+      startedAt,
+      lastUpdate: Date.now(),
+      endedAt: Date.now(),
+      steps: [subagentRunStep({ agent: runLabel, status: "failed", model: modelId, error: String(error?.message ?? error) })],
+    });
+    throw error;
   } finally {
     envRestore();
   }
 }
 
-function loadForkedRunSync() {
+// One native run-store step (the shape summarizeAsyncRunDir reads). Only the agent + status are required;
+// model/toolCount/error are attached when known so the drilldown shows them.
+function subagentRunStep({ agent, status, model, toolCount, error }) {
+  return {
+    agent: agent ?? AIPI_SUBAGENTS_AGENT_NAME,
+    status,
+    ...(model ? { model } : {}),
+    ...(typeof toolCount === "number" ? { toolCount } : {}),
+    ...(error ? { error } : {}),
+  };
+}
+
+// Write a per-run status.json under asyncDir in the native format that loadSubagentRuns / summarizeAsyncRunDir
+// consume, so the foreground fork shows up in the /aipi-subagents view. Best-effort: a status-write failure
+// must NEVER break a real run, so all errors are swallowed.
+export async function writeSubagentRunStatus(paths, runId, patch) {
+  try {
+    const dir = path.join(paths.asyncDir, safePathSegment(runId));
+    await fs.mkdir(dir, { recursive: true });
+    const status = { runId, mode: "single", steps: [], ...patch };
+    await fs.writeFile(path.join(dir, "status.json"), JSON.stringify(status), "utf8");
+  } catch {
+    // Telemetry only; the run continues regardless.
+  }
+}
+
+function getJiti() {
   if (!cachedJiti) {
     cachedJiti = createJiti(import.meta.url, {
       interopDefault: true,
       moduleCache: false,
     });
   }
-  return cachedJiti(runSyncEntrypoint);
+  return cachedJiti;
+}
+
+function loadForkedRunSync() {
+  return getJiti()(runSyncEntrypoint);
+}
+
+// Load the vendored subagent view (a TS TUI component) + its data layer via jiti, so /aipi-subagents can
+// render our foreground runs. Named exports; the component is instantiated by the caller inside ctx.ui.custom.
+export function loadSubagentView() {
+  const jiti = getJiti();
+  return {
+    SubagentViewComponent: jiti(subagentViewEntrypoint).SubagentViewComponent,
+    loadSubagentRuns: jiti(historyStoreEntrypoint).loadSubagentRuns,
+  };
 }
 
 export function createAipiWorkerAgentConfig({ thinking = undefined, allowShell = true } = {}) {
