@@ -23,6 +23,7 @@ import {
 import { refreshPlanWidget, registerPlanWidget } from "./runtime/plan-widget.js";
 import { registerBackgroundResearchTool } from "./runtime/background-research.js";
 import { registerSubagentWidget } from "./runtime/subagent-widget.js";
+import { registerAskTool } from "./runtime/ask-tool.js";
 import {
   formatGoalCommandResult,
   registerGoalTools,
@@ -89,6 +90,8 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
   registerBackgroundResearchTool(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx) });
   // Inline TUI widget: an always-visible live list of active subagent runs above the editor (grok-build style).
   registerSubagentWidget(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx) });
+  // Interactive question tool: ask A/B/C questions via the native TUI selector instead of prose.
+  registerAskTool(pi);
   registerAipiLifecycleHooks(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx), coordinator });
   probeA.registerHooks();
 

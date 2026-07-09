@@ -1830,6 +1830,18 @@ if (!extensionIndex.includes("registerSubagentWidget(")) {
 if (!extensionIndex.includes("./runtime/subagent-widget.js")) {
   errors.push("extensions/aipi/index.js must load runtime/subagent-widget.js");
 }
+if (!extensionIndex.includes("registerAskTool(")) {
+  errors.push("extensions/aipi/index.js must call registerAskTool (the native interactive question tool)");
+}
+if (!extensionIndex.includes("./runtime/ask-tool.js")) {
+  errors.push("extensions/aipi/index.js must load runtime/ask-tool.js");
+}
+if (packageJson.scripts?.["test:ask-tool"] !== "node tools/test-ask-tool.mjs") {
+  errors.push("package.json must include test:ask-tool for the interactive question tool");
+}
+if (!packageJson.scripts?.test?.includes("npm run test:ask-tool")) {
+  errors.push("package.json test script must run test:ask-tool");
+}
 if (packageJson.scripts?.["test:subagent-widget"] !== "node tools/test-subagent-widget.mjs") {
   errors.push("package.json must include test:subagent-widget for the inline subagent list");
 }

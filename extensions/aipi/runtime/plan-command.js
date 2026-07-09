@@ -240,7 +240,7 @@ export function registerPlanTools(pi, { projectRootResolver = () => process.cwd(
     promptSnippet: "aipi_start_plan - draft an AIPI plan (tasks + discovery questions) from a natural-language planning request.",
     promptGuidelines: [
       "When the user asks you to build or draft a plan for some work (e.g. 'monta um plano pra X', 'planeje a migracao', 'faz um plano de refatoracao'), call aipi_start_plan with the concrete tasks instead of only outlining the plan in prose.",
-      "After aipi_start_plan returns open_questions, surface them to the user, record answers with aipi_answer_plan_question, then call aipi_settle_plan before execution — do not skip the discovery gate.",
+      "After aipi_start_plan returns open_questions, surface each to the user with aipi_ask (the native selector — do NOT list the options as prose), record answers with aipi_answer_plan_question, then call aipi_settle_plan before execution — do not skip the discovery gate.",
     ],
     parameters: {
       type: "object",
