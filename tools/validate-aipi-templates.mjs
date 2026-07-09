@@ -1818,6 +1818,18 @@ if (packageJson.scripts?.["test:subagent-runstore"] !== "node tools/test-subagen
 if (!packageJson.scripts?.test?.includes("npm run test:subagent-runstore")) {
   errors.push("package.json test script must run test:subagent-runstore");
 }
+if (!extensionIndex.includes("registerBackgroundResearchTool(")) {
+  errors.push("extensions/aipi/index.js must call registerBackgroundResearchTool (the non-ship background research fan-out)");
+}
+if (!extensionIndex.includes("./runtime/background-research.js")) {
+  errors.push("extensions/aipi/index.js must load runtime/background-research.js");
+}
+if (packageJson.scripts?.["test:background-research"] !== "node tools/test-background-research.mjs") {
+  errors.push("package.json must include test:background-research for the background research fan-out");
+}
+if (!packageJson.scripts?.test?.includes("npm run test:background-research")) {
+  errors.push("package.json test script must run test:background-research");
+}
 if (packageJson.scripts?.["test:model-class"] !== "node tools/test-model-class-fallback.mjs") {
   errors.push("package.json must include test:model-class for host-model fallback coverage");
 }

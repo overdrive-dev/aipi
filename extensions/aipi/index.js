@@ -21,6 +21,7 @@ import {
   runPlanCommand,
 } from "./runtime/plan-command.js";
 import { refreshPlanWidget, registerPlanWidget } from "./runtime/plan-widget.js";
+import { registerBackgroundResearchTool } from "./runtime/background-research.js";
 import {
   formatGoalCommandResult,
   registerGoalTools,
@@ -82,6 +83,9 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
   registerPlanTools(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx) });
   // Read-only TUI widget: keep the active plan visible above the editor (terminal-only; no-op headless).
   registerPlanWidget(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx) });
+  // Background research fan-out: read-only workers that run async and wake the orchestrator with findings.
+  // Non-ship by construction (artifacts-only, no shell) — the verify==ship gate stays on the foreground path.
+  registerBackgroundResearchTool(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx) });
   registerAipiLifecycleHooks(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx), coordinator });
   probeA.registerHooks();
 
