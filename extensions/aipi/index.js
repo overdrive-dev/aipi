@@ -20,6 +20,7 @@ import {
   registerPlanTools,
   runPlanCommand,
 } from "./runtime/plan-command.js";
+import { refreshPlanWidget, registerPlanWidget } from "./runtime/plan-widget.js";
 import {
   formatGoalCommandResult,
   registerGoalTools,
@@ -77,6 +78,8 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
   // typing required), through the same acceptance gate + live LLM judge as the slash command.
   registerGoalTools(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx) });
   registerPlanTools(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx) });
+  // Read-only TUI widget: keep the active plan visible above the editor (terminal-only; no-op headless).
+  registerPlanWidget(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx) });
   registerAipiLifecycleHooks(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx), coordinator });
   probeA.registerHooks();
 
@@ -172,6 +175,8 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
           notify: makeProgressNotifier(ctx),
         });
         ctx.ui.notify(formatPlanCommandResult(result), "info");
+        // Reflect the mutation in the plan widget immediately (a slash command emits no turn_end).
+        await refreshPlanWidget(ctx, projectRoot);
       } catch (error) {
         ctx.ui.notify(`AIPI plan failed: ${error.message}`, "error");
       }

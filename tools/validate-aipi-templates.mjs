@@ -1794,6 +1794,18 @@ if (!extensionIndex.includes("registerGoalTools(")) {
 if (!extensionIndex.includes("registerPlanTools(")) {
   errors.push("extensions/aipi/index.js must call registerPlanTools so the plan is model-callable from natural language");
 }
+if (!extensionIndex.includes("./runtime/plan-widget.js")) {
+  errors.push("extensions/aipi/index.js must load runtime/plan-widget.js (the active-plan TUI widget)");
+}
+if (!extensionIndex.includes("registerPlanWidget(")) {
+  errors.push("extensions/aipi/index.js must call registerPlanWidget so the active plan surfaces in the TUI");
+}
+if (packageJson.scripts?.["test:plan-widget"] !== "node tools/test-plan-widget.mjs") {
+  errors.push("package.json must include test:plan-widget for the active-plan TUI widget");
+}
+if (!packageJson.scripts?.test?.includes("npm run test:plan-widget")) {
+  errors.push("package.json test script must run test:plan-widget");
+}
 if (packageJson.scripts?.["test:model-class"] !== "node tools/test-model-class-fallback.mjs") {
   errors.push("package.json must include test:model-class for host-model fallback coverage");
 }
