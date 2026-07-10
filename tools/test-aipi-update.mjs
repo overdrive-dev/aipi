@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import path from "node:path";
 import {
+  aipiReinstallSpec,
   buildAipiUpdatePlan,
+  inspectAipiInstall,
   inspectAipiRepo,
   parseAipiUpdateArgs,
   runAipiUpdate,
@@ -196,5 +198,56 @@ assert.ok(/^npm\.cmd /.test(winDeps[0]), "command line must start with the bare 
 assert.ok(!winSpawns.some((call) => call[0] === "npm"), "must never spawn a bare `npm` on win32 (ENOENT)");
 const winGit = winSpawns.find((call) => call[0] === "git" && Array.isArray(call[1]) && call[1].includes("pull"));
 assert.ok(winGit, "windows git pull stays a direct git.exe spawn (no shell)");
+
+// === aipiReinstallSpec: derive an npm reinstall target from package.json (ref stripped -> latest) ===
+assert.equal(aipiReinstallSpec({ repository: { url: "git+https://github.com/overdrive-dev/aipi.git" } }), "github:overdrive-dev/aipi");
+assert.equal(aipiReinstallSpec({ _from: "@overdrive-dev/aipi@github:someforker/aipi" }), "github:someforker/aipi");
+assert.equal(aipiReinstallSpec({ _resolved: "git+https://github.com/overdrive-dev/aipi.git#abc123def" }), "github:overdrive-dev/aipi"); // sha dropped
+assert.equal(aipiReinstallSpec({ repository: "github:overdrive-dev/aipi" }), "github:overdrive-dev/aipi");
+assert.equal(aipiReinstallSpec({}), null);
+
+// === inspectAipiInstall: git checkout vs npm-global vs npm-local ===
+assert.equal(inspectAipiInstall({ packageRoot: path.join("C:", "repo", "aipi"), existsSync: () => true }).kind, "git-checkout");
+const globalInstall = inspectAipiInstall({
+  packageRoot: path.join("C:", "Users", "perse", "AppData", "Roaming", "npm", "node_modules", "@overdrive-dev", "aipi"),
+  existsSync: () => false, // no .git
+  readFile: () => JSON.stringify({ repository: { url: "git+https://github.com/overdrive-dev/aipi.git" } }),
+  platform: "win32",
+});
+assert.equal(globalInstall.kind, "npm-global");
+assert.equal(globalInstall.global, true);
+assert.equal(globalInstall.spec, "github:overdrive-dev/aipi");
+
+// === buildAipiUpdatePlan: an npm-global install REINSTALLS from source (no git-pull/npm-ci skip) ===
+const reinstallPlan = buildAipiUpdatePlan({
+  packageRoot: path.join("C:", "Users", "perse", "AppData", "Roaming", "npm", "node_modules", "@overdrive-dev", "aipi"),
+  existsSync: () => false,
+  install: { kind: "npm-global", global: true, spec: "github:overdrive-dev/aipi" },
+  platform: "win32",
+});
+assert.equal(reinstallPlan.length, 2);
+assert.equal(reinstallPlan[0].kind, "manual");
+assert.match(reinstallPlan[0].message, /pi is bundled with aipi/);
+assert.equal(reinstallPlan[1].kind, "exec");
+assert.equal(reinstallPlan[1].command, "npm.cmd");
+assert.deepEqual(reinstallPlan[1].args, ["install", "-g", "github:overdrive-dev/aipi"]);
+
+// A project-local npm install reinstalls without -g.
+const localReinstall = buildAipiUpdatePlan({
+  packageRoot: path.join("C:", "proj", "node_modules", "@overdrive-dev", "aipi"),
+  existsSync: () => false,
+  install: { kind: "npm-local", global: false, spec: "github:overdrive-dev/aipi" },
+  platform: "linux",
+});
+assert.deepEqual(localReinstall[1].args, ["install", "github:overdrive-dev/aipi"]);
+
+// No derivable source -> the improved skip message points at the reinstall command.
+const noSpecPlan = buildAipiUpdatePlan({
+  packageRoot: path.join("C:", "opt", "node_modules", "@overdrive-dev", "aipi"),
+  existsSync: () => false,
+  install: { kind: "npm-local", global: false, spec: null },
+});
+assert.equal(noSpecPlan[1].kind, "manual");
+assert.match(noSpecPlan[1].message, /npm install -g github:overdrive-dev\/aipi/);
 
 console.log("AIPI_UPDATE_TEST_OK");

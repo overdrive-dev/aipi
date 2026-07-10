@@ -260,12 +260,68 @@ function skippedStep(label, message) {
   return { label, kind: "manual", message };
 }
 
-function updatePlanSkipForRepo(packageRoot, repoInfo) {
+// Detect how AIPI was installed so `aipi update` can update it regardless of method. A git checkout is
+// handled by git pull; an npm install (global or project-local) is updated by reinstalling from the source
+// recorded in its package.json. Returns { kind, global, spec } where spec is an npm reinstall target
+// (e.g. "github:overdrive-dev/aipi") or null when it cannot be derived.
+export function inspectAipiInstall({
+  packageRoot = defaultPackageRoot,
+  existsSync = fs.existsSync,
+  readFile = (file) => fs.readFileSync(file, "utf8"),
+  spawnSyncFn = spawnSync,
+  env = process.env,
+  platform = process.platform,
+} = {}) {
+  if (existsSync(path.join(packageRoot, ".git"))) return { kind: "git-checkout", global: false, spec: null };
+  const normalized = `${packageRoot.replace(/\\/g, "/")}/`;
+  if (!/\/node_modules\//.test(normalized)) return { kind: "unknown", global: false, spec: null };
+  const global = isGlobalNpmRoot(normalized, { spawnSyncFn, env, platform });
+  let pkg = {};
+  try {
+    pkg = JSON.parse(readFile(path.join(packageRoot, "package.json")));
+  } catch {
+    pkg = {};
+  }
+  return { kind: global ? "npm-global" : "npm-local", global, spec: aipiReinstallSpec(pkg) };
+}
+
+function isGlobalNpmRoot(normalizedPathWithSlash, { spawnSyncFn, env, platform }) {
+  const lower = normalizedPathWithSlash.toLowerCase();
+  // %APPDATA%\npm\node_modules (Windows) or <prefix>/lib/node_modules (Unix global prefix).
+  if (platform === "win32" && /\/npm\/node_modules\//.test(lower)) return true;
+  if (/\/lib\/node_modules\//.test(lower)) return true;
+  try {
+    const npm = platform === "win32" ? "npm.cmd" : "npm";
+    const res = spawnSyncFn(npm, ["root", "-g"], { encoding: "utf8", env, shell: platform === "win32" });
+    const root = String(res?.stdout ?? "").trim().replace(/\\/g, "/").toLowerCase();
+    return Boolean(root) && lower.startsWith(root.endsWith("/") ? root : `${root}/`);
+  } catch {
+    return false;
+  }
+}
+
+// Derive the npm reinstall spec (owner/repo) from package.json. Prefers what npm recorded as installed
+// (_from/_requested — fork-aware), then the canonical repository. The commit ref is intentionally dropped so
+// a reinstall pulls the LATEST default branch (that is what "update" means), never re-pins the same sha.
+export function aipiReinstallSpec(pkg = {}) {
+  const candidates = [pkg._from, pkg?._requested?.raw, pkg?.repository?.url, pkg?.repository, pkg._resolved];
+  for (const raw of candidates) {
+    const value = typeof raw === "string" ? raw : raw?.url;
+    if (!value) continue;
+    const url = String(value).match(/github\.com[/:]([^/\s]+)\/([\w.-]+?)(?:\.git)?(?:#.*)?$/i);
+    if (url) return `github:${url[1]}/${url[2]}`;
+    const short = String(value).match(/github:([^/\s]+)\/([\w.-]+?)(?:#.*)?$/i);
+    if (short) return `github:${short[1]}/${short[2]}`;
+  }
+  return null;
+}
+
+function updatePlanSkipForRepo(packageRoot, repoInfo, install = null) {
   if (!repoInfo?.isGitCheckout) {
-    return skippedStep(
-      "aipi",
-      `AIPI at ${packageRoot} is not a git checkout; reinstall it with your install method (e.g. pi install npm:<aipi-source>).`,
-    );
+    const hint = install?.spec
+      ? `run: npm install ${install.global ? "-g " : ""}${install.spec}`
+      : "reinstall it from source, e.g. npm install -g github:overdrive-dev/aipi";
+    return skippedStep("aipi", `AIPI at ${packageRoot} is not a git checkout and its source could not be auto-detected; ${hint}.`);
   }
   if (repoInfo.hasHead === false) {
     return skippedStep("aipi", "git pull skipped because this checkout has no commits yet.");
@@ -644,42 +700,53 @@ export function formatAipiVersion({ aipiVersion, piVersion }) {
   return `aipi ${aipiVersion} (pi: not found)`;
 }
 
-// `aipi update` updates Pi and the AIPI checkout together.
+// `aipi update` updates Pi and AIPI together, however AIPI was installed: a git checkout is pulled; an npm
+// install (global or project-local) is reinstalled from its source so the command actually updates.
 export function buildAipiUpdatePlan({
   packageRoot = defaultPackageRoot,
   existsSync = fs.existsSync,
   repoInfo = null,
+  install = null,
   platform = process.platform,
   env = process.env,
 } = {}) {
   const steps = [];
-  // When Pi runs from the package-local node_modules (the pinned dependency),
-  // it is lockfile-managed: `npm ci` below updates it, and `pi update --self`
-  // would fight the pin (and abort the whole aipi self-update when Pi is
-  // missing). Only an env-override/global Pi still self-updates.
+  const npmCommand = platform === "win32" ? "npm.cmd" : "npm";
   const localPiCliJs = path.join(packageRoot, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js");
   const usesLocalPi = !env?.AIPI_PI_BIN && !env?.AIPI_PI_CLI_JS && existsSync(localPiCliJs);
+  const effectiveRepoInfo = repoInfo ?? { isGitCheckout: existsSync(path.join(packageRoot, ".git")) };
+
+  // NON-CHECKOUT npm install with a resolvable source: reinstall it. The reinstall replaces the whole package,
+  // so the pinned Pi comes with it — no separate pi step or npm ci is needed.
+  const inst = install
+    ?? (effectiveRepoInfo.isGitCheckout ? { kind: "git-checkout", global: false, spec: null } : inspectAipiInstall({ packageRoot, existsSync, env, platform }));
+  if (!effectiveRepoInfo.isGitCheckout && inst?.spec) {
+    steps.push({ label: "pi", kind: "manual", message: "pi is bundled with aipi; the reinstall below updates it" });
+    steps.push({
+      label: "aipi",
+      kind: "exec",
+      command: npmCommand,
+      args: inst.global ? ["install", "-g", inst.spec] : ["install", inst.spec],
+      note: `reinstall aipi from ${inst.spec}${inst.global ? " (global)" : ""}`,
+    });
+    return steps;
+  }
+
+  // When Pi runs from the package-local node_modules (the pinned dependency), it is lockfile-managed: `npm ci`
+  // below updates it, and `pi update --self` would fight the pin. Only an env-override/global Pi self-updates.
   if (usesLocalPi) {
     steps.push({ label: "pi", kind: "manual", message: "pi runs from the packaged dependency; npm ci below updates it with the lockfile" });
   } else {
     steps.push({ label: "pi", kind: "pi", args: ["update", "--self"], note: "update the Pi runtime" });
   }
 
-  const effectiveRepoInfo = repoInfo ?? {
-    isGitCheckout: existsSync(path.join(packageRoot, ".git")),
-  };
-  const skip = updatePlanSkipForRepo(packageRoot, effectiveRepoInfo);
+  const skip = updatePlanSkipForRepo(packageRoot, effectiveRepoInfo, inst);
   if (skip) {
     steps.push(skip);
   } else {
-    // npm on Windows is `npm.cmd` (a batch file); a bare `npm` spawn is ENOENT.
-    // git is `git.exe`, a real executable, so it stays as-is.
-    const npmCommand = platform === "win32" ? "npm.cmd" : "npm";
     steps.push({ label: "aipi", kind: "exec", command: "git", args: ["-C", packageRoot, "pull", "--ff-only"], note: "pull the latest AIPI" });
-    // `npm ci` (not `install`): a reproducible install straight from package-lock that NEVER mutates
-    // the lockfile. `npm install` can normalize lock fields (e.g. a transitive bin path), which would
-    // leave the runtime checkout dirty and make the NEXT `git pull --ff-only` get skipped — silently
-    // freezing the engine. ci keeps the checkout clean so consecutive updates keep working.
+    // `npm ci` (not `install`): a reproducible install straight from package-lock that NEVER mutates the
+    // lockfile — keeps the checkout clean so the NEXT `git pull --ff-only` is not skipped for a dirty tree.
     steps.push({ label: "aipi-deps", kind: "exec", command: npmCommand, args: ["ci", "--prefix", packageRoot], note: "reproducible install from package-lock; never mutates the lockfile" });
   }
 
