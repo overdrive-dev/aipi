@@ -4,16 +4,18 @@
 // (headless / print), the tool hands the question back so the model can ask in prose. Returns the picked option.
 
 const RECOMMENDED_MARK = "  ⭐ recomendado";
+const FREE_TEXT_OPTION = "✎ responder / discutir (texto livre)";
 
 export function registerAskTool(pi) {
   pi.registerTool({
     name: "aipi_ask",
     description:
-      "Ask the USER a multiple-choice question through the interactive TUI selector instead of writing the options as prose in the chat. Use it whenever the user must choose between options — a plan discovery question, an ambiguous requirement, or confirming a recommendation. Returns the option the user picked.",
-    promptSnippet: "aipi_ask - ask the user an A/B/C question via the native TUI selector; returns their pick.",
+      "Ask the USER a multiple-choice question through the interactive TUI selector instead of writing the options as prose in the chat. Use it whenever the user must choose between options — a plan discovery question, an ambiguous requirement, or confirming a recommendation. The selector ALSO includes a free-text option so the user can answer or discuss in their own words. Returns the picked option, or { free_text: true, answer } when the user typed a custom response.",
+    promptSnippet: "aipi_ask - ask the user an A/B/C question via the native TUI selector (with a free-text/discuss option); returns their pick or typed answer.",
     promptGuidelines: [
       "When you need the user to choose between options (a discovery question, an ambiguous decision, a recommendation to confirm), call aipi_ask with the question + options INSTEAD of writing an A/B/C list as prose. Put your recommended option in `recommended` so it is marked in the selector.",
-      "Only fall back to asking in prose when aipi_ask reports the UI is unavailable, or when the answer is genuinely free-form (then ask a plain open question instead).",
+      "The selector always offers a free-text option. If aipi_ask returns free_text:true, the user answered in their own words (a discussion, an edit, a different choice) — treat that answer as authoritative, do not force it back onto the listed options.",
+      "Only fall back to asking in prose when aipi_ask reports the UI is unavailable.",
     ],
     parameters: {
       type: "object",
@@ -60,9 +62,20 @@ export async function runAskTool(params, ctx) {
 
     const recommended = params?.recommended != null ? String(params.recommended).trim() : "";
     const display = options.map((opt) => (recommended && opt === recommended ? `${opt}${RECOMMENDED_MARK}` : opt));
-    const picked = await ctx.ui.select(question, display);
+    // Always offer a free-text escape hatch so the user can discuss / edit / answer in their own words instead
+    // of being forced to pick a listed option (requires a text-input dialog to receive it).
+    const canFreeText = typeof ctx?.ui?.input === "function";
+    const choices = canFreeText ? [...display, FREE_TEXT_OPTION] : display;
+    const picked = await ctx.ui.select(question, choices);
     if (picked === undefined || picked === null) {
       return toolJson({ ok: true, answered: false, note: "The user dismissed the selector without choosing." });
+    }
+    if (picked === FREE_TEXT_OPTION) {
+      const typed = await ctx.ui.input(question, "your answer or comment");
+      if (typeof typed === "string" && typed.trim()) {
+        return toolJson({ ok: true, answered: true, answer: typed.trim(), free_text: true });
+      }
+      return toolJson({ ok: true, answered: false, note: "The user chose free text but entered nothing." });
     }
     // Map the display label (which may carry the recommended mark) back to the original option.
     const index = display.indexOf(picked);

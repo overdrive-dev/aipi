@@ -68,7 +68,11 @@ export function registerPlanWidget(pi, { projectRootResolver = () => process.cwd
     await refreshPlanWidget(ctx, projectRootResolver(ctx));
   };
   pi.on("session_start", refresh);
+  pi.on("turn_start", refresh);
   pi.on("turn_end", refresh);
+  // Refresh on every tool boundary so the widget tracks task progress live during execution instead of only
+  // updating at turn_end (which made it look frozen at "0/N done" while a plan runs).
+  pi.on("tool_execution_end", refresh);
 }
 
 function isAnswered(question) {

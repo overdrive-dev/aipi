@@ -54,4 +54,43 @@ assert.deepEqual(headless.options, ["A", "B"]);
   assert.equal(res.interactive, false);
 }
 
+// --- free-text escape hatch: the selector always offers a free-text option when the UI has input ---
+{
+  const seen = [];
+  const ctx = {
+    hasUI: true,
+    ui: {
+      select: async (_q, opts) => { seen.push(opts); return opts[0]; },
+      input: async () => "",
+    },
+  };
+  await runAskTool({ question: "q", options: ["A", "B"] }, ctx);
+  assert.ok(seen[0].some((o) => /texto livre/.test(o)), "free-text option is offered when input is available");
+}
+
+// --- picking free text opens an input and returns the typed answer with free_text:true ---
+{
+  const inputs = [];
+  const ctx = {
+    hasUI: true,
+    ui: {
+      select: async (_q, opts) => opts.find((o) => o.includes("texto livre")),
+      input: async (question, placeholder) => { inputs.push({ question, placeholder }); return "prefiro uma abordagem híbrida"; },
+    },
+  };
+  const res = parse(await runAskTool({ question: "Qual estratégia?", options: ["A — X", "B — Y"] }, ctx));
+  assert.equal(res.answered, true);
+  assert.equal(res.free_text, true);
+  assert.equal(res.answer, "prefiro uma abordagem híbrida", "the typed answer is returned verbatim");
+  assert.equal(inputs.length, 1, "free text opened a text input");
+}
+
+// --- with NO input capability, no free-text option is appended (pick-only) ---
+{
+  const seen = [];
+  const ctx = { hasUI: true, ui: { select: async (_q, opts) => { seen.push(opts); return opts[0]; } } };
+  await runAskTool({ question: "q", options: ["A", "B"] }, ctx);
+  assert.ok(!seen[0].some((o) => /texto livre/.test(o)), "no free-text option without a text input");
+}
+
 console.log("AIPI_ASK_TOOL_TEST_OK");
