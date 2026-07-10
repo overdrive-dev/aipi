@@ -169,6 +169,7 @@ async function writePassingCapabilities(targetRoot) {
           "orchestrator-heavy": "anthropic/claude-frontier",
           "planner-heavy": "anthropic/claude-frontier",
           "adversarial-heavy": "anthropic/claude-frontier",
+          "planner-adversarial-heavy": "anthropic/claude-frontier",
           "research-heavy": "anthropic/claude-frontier",
           "code-strong": "anthropic/claude-frontier",
           "test-strong": "anthropic/claude-frontier",

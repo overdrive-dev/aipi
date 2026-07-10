@@ -150,18 +150,28 @@ from the console using the same run-state runtime as `/aipi-workflow`. `aipi mem
 the same Markdown memory query runtime as `aipi_memory_query`. `aipi effort setup`
 (aliased as `aipi models setup`) configures an **orchestrator** (`--orchestrator` /
 `--default` — the default session model, written to Pi's `settings.json` with its
-intelligence) plus 4 provider-agnostic buckets — `--planner`, `--adversarial`,
-`--doer`, `--mover` — each taking a `provider/model[:level]` spec. Each bucket fans its
-model out to its capability classes and its thinking level out to a persisted per-class
-`class_thinking` map that the router reads at resolve time. The interactive wizard (run
-with no flags) prompts the orchestrator first, then the buckets, and offers for each
-chosen model **only the thinking levels that model actually supports** (strongest
-first) — `off`/`minimal`/`low`/`medium`/`high`/`xhigh`, where `xhigh` is offered only
-for models that declare it. When no `--doer` is given it **defaults to the current
-authed model**, so a single-provider machine configures with zero flags. It keeps
-`--class <class>=<provider/model[:level]>` as a power-user override. Any provider is
-allowed per bucket; setting the adversarial bucket to the same family as the
-doer/planner bucket emits a cross-model-independence **warning** (not an error). `aipi --version`
+intelligence) plus 5 provider-agnostic buckets, each taking a `provider/model[:level]`
+spec:
+
+| Bucket | Role |
+|---|---|
+| `--planner` | authors the plan/requirements/BDD + research (orchestrator-heavy, planner-heavy, research-heavy) |
+| `--planner-adversarial` | independently reviews the **plan** — missing goals, contradictions, untested behavior (planner-adversarial-heavy) |
+| `--doer` | writes the implementation + tests (code-strong, test-strong) |
+| `--doer-adversarial` | independently reviews the **code** + final acceptance (adversarial-heavy, verifier-fast); `--adversarial` is a legacy alias |
+| `--mover` | cheap, high-parallel context: retrieval, mapping, packaging, summaries (context-fast) |
+
+Each bucket fans its model out to its capability classes and its thinking level out to a
+persisted per-class `class_thinking` map that the router reads at resolve time — so the
+plan gets reviewed by a **different model** than the one that reviews the code (both
+ideally cross-family from the work they review). The interactive wizard (run with no
+flags) prompts the orchestrator first, then each bucket (with a one-line explanation),
+offering for each chosen model **only the thinking levels that model actually supports**
+(strongest first). When no `--doer` is given it **defaults to the current authed model**,
+so a single-provider machine configures with zero flags. `--class <class>=<spec>` remains
+a power-user override. Any provider is allowed per bucket; an adversarial bucket that
+shares a family with the work it reviews emits a cross-model-independence **warning**
+(not an error). `aipi --version`
 reports both the AIPI package and wrapped Pi versions; use `aipi --pi-help` for
 the raw Pi flag reference. Point at a specific Pi with `AIPI_PI_CLI_JS` or
 `AIPI_PI_BIN`. See

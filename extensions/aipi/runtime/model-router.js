@@ -4,7 +4,7 @@ import path from "node:path";
 
 export const MODEL_CAPABILITIES_REL_PATH = ".aipi/model-capabilities.json";
 const BOOLEAN_CAPABILITY_FLOORS = new Set(["structured_outputs", "web", "citations", "evidence_audit"]);
-const CROSS_FAMILY_REVIEW_CLASSES = new Set(["adversarial-heavy", "verifier-fast"]);
+const CROSS_FAMILY_REVIEW_CLASSES = new Set(["adversarial-heavy", "planner-adversarial-heavy", "verifier-fast"]);
 
 export async function resolveStepModel({
   root,
@@ -870,6 +870,7 @@ export const BUILTIN_MODEL_CLASSES = Object.freeze([
   "orchestrator-heavy",
   "planner-heavy",
   "adversarial-heavy",
+  "planner-adversarial-heavy",
   "research-heavy",
   "code-strong",
   "test-strong",

@@ -4,6 +4,7 @@
     "orchestrator-heavy": "anthropic/claude-opus-4-8",
     "planner-heavy": "anthropic/claude-opus-4-8",
     "adversarial-heavy": "anthropic/claude-opus-4-8",
+    "planner-adversarial-heavy": "anthropic/claude-opus-4-8",
     "research-heavy": "anthropic/claude-opus-4-8",
     "code-strong": "anthropic/claude-opus-4-8",
     "test-strong": "anthropic/claude-opus-4-8",

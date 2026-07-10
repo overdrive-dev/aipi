@@ -32,7 +32,7 @@ classes:
     fallback_policy: Prefer accuracy and context retention over cost; fail if the BDD contract cannot be held.
 
   adversarial-heavy:
-    purpose: Contrarian review, hard code review, security/privacy challenges.
+    purpose: Contrarian review of CODE — hard code review, security/privacy challenges, regression risk.
     context_need: high
     effort: high
     max_parallel: 4
@@ -43,6 +43,19 @@ classes:
       structured_outputs: required
     preferred_families: [anthropic, openai]
     fallback_policy: Prefer a different model family than the implementation model when configured.
+
+  planner-adversarial-heavy:
+    purpose: Contrarian review of the PLAN — missing goals, contradictions, untested behavior, ambiguities, missing stakeholders.
+    context_need: high
+    effort: high
+    max_parallel: 4
+    capability_floor:
+      reasoning: high
+      context: high
+      tool_use: read_only
+      structured_outputs: required
+    preferred_families: [anthropic, openai]
+    fallback_policy: Prefer a different model family than the planner when configured.
 
   research-heavy:
     purpose: Domain and technical research with evidence and citations.

@@ -46,28 +46,34 @@ assert.deepEqual(
     verifierModel: null,
     orchestrator: null,
     models: [],
-    buckets: { adversarial: "anthropic/claude-opus-4-8" },
+    buckets: { "doer-adversarial": "anthropic/claude-opus-4-8" },
     classBindings: {},
     budgetNotes: {},
   },
 );
 
-// The 4 bucket flags each parse to options.buckets[bucket].
+// The bucket flags each parse to options.buckets[bucket]; --adversarial is the legacy alias for doer-adversarial.
 assert.deepEqual(
   parseModelsArgs([
     "setup",
     "--planner",
     "openai-codex/gpt-5.5:high",
+    "--planner-adversarial",
+    "anthropic/claude-sonnet-5:high",
     "--adversarial",
     "anthropic/claude-opus-4-8:high",
     "--doer",
     "openai-codex/gpt-5.5:medium",
+    "--doer-adversarial",
+    "xai-auth/grok-4.5:high",
     "--mover",
     "anthropic/claude-haiku-4-5:low",
   ], { cwd: path.join("C:", "repo") }).buckets,
   {
     planner: "openai-codex/gpt-5.5:high",
-    adversarial: "anthropic/claude-opus-4-8:high",
+    "planner-adversarial": "anthropic/claude-sonnet-5:high",
+    // --adversarial and --doer-adversarial both target doer-adversarial; the later flag wins.
+    "doer-adversarial": "xai-auth/grok-4.5:high",
     doer: "openai-codex/gpt-5.5:medium",
     mover: "anthropic/claude-haiku-4-5:low",
   },
@@ -150,18 +156,20 @@ try {
   try {
     await initProject({ sourceRoot: path.resolve("templates/.aipi"), targetRoot: interactiveRoot });
     const prompts = [];
-    // Cross-provider buckets: planner=openai-codex/gpt-5.5:high, adversarial=anthropic/
-    // claude-opus-4-8:high, doer=openai-codex/gpt-5.5:medium, mover=anthropic/claude-haiku-4-5:low.
+    // 5 buckets: planner=openai-codex/gpt-5.5:high, planner-adversarial=anthropic/opus:high,
+    // doer=openai-codex/gpt-5.5:medium, doer-adversarial=anthropic/opus:high, mover=anthropic/haiku:low.
     const bucketAnswers = {
       planner: { model: "openai-codex/gpt-5.5", level: "high" },
-      adversarial: { model: "anthropic/claude-opus-4-8", level: "high" },
+      "planner-adversarial": { model: "anthropic/claude-opus-4-8", level: "high" },
       doer: { model: "openai-codex/gpt-5.5", level: "medium" },
+      "doer-adversarial": { model: "anthropic/claude-opus-4-8", level: "high" },
       mover: { model: "anthropic/claude-haiku-4-5", level: "low" },
     };
     const answerFor = (question) => {
-      for (const [bucket, answer] of Object.entries(bucketAnswers)) {
-        const head = new RegExp(`^${bucket}`, "i");
-        if (head.test(question)) {
+      // Longest bucket name first so "planner-adversarial" matches before "planner".
+      for (const bucket of Object.keys(bucketAnswers).sort((a, b) => b.length - a.length)) {
+        if (new RegExp(`^${bucket}`, "i").test(question)) {
+          const answer = bucketAnswers[bucket];
           return /thinking level/i.test(question) ? answer.level : answer.model;
         }
       }
@@ -179,13 +187,13 @@ try {
       now: () => new Date("2026-06-22T01:00:00.000Z"),
     });
     assert.equal(interactiveReport.state, "ready");
-    // The wizard prompts all 4 BUCKETS (model + thinking level each), not the 8 classes.
-    assert.equal(prompts.some((prompt) => /^Planner.*model/i.test(prompt)), true);
-    assert.equal(prompts.some((prompt) => /^Planner.*thinking level/i.test(prompt)), true);
-    assert.equal(prompts.some((prompt) => /^Adversarial.*model/i.test(prompt)), true);
-    assert.equal(prompts.some((prompt) => /^Doer.*model/i.test(prompt)), true);
+    // The wizard prompts all 5 BUCKETS (model + thinking level each), not the classes.
+    assert.equal(prompts.some((prompt) => /^Planner \(.*model/i.test(prompt)), true);
+    assert.equal(prompts.some((prompt) => /^Planner \(.*thinking level/i.test(prompt)), true);
+    assert.equal(prompts.some((prompt) => /^Planner-adversarial.*model/i.test(prompt)), true);
+    assert.equal(prompts.some((prompt) => /^Doer \(.*model/i.test(prompt)), true);
+    assert.equal(prompts.some((prompt) => /^Doer-adversarial.*model/i.test(prompt)), true);
     assert.equal(prompts.some((prompt) => /^Mover.*model/i.test(prompt)), true);
-    assert.equal(prompts.some((prompt) => /^Model for code-strong/.test(prompt)), false);
 
     // class_thinking is persisted in model-capabilities.json per class.
     const interactiveConfig = JSON.parse(await fs.readFile(
@@ -196,25 +204,25 @@ try {
     assert.equal(interactiveConfig.classes["orchestrator-heavy"], "openai-codex/gpt-5.5"); // planner
     assert.equal(interactiveConfig.classes["planner-heavy"], "openai-codex/gpt-5.5");
     assert.equal(interactiveConfig.classes["research-heavy"], "openai-codex/gpt-5.5");
-    assert.equal(interactiveConfig.classes["adversarial-heavy"], "anthropic/claude-opus-4-8");
+    assert.equal(interactiveConfig.classes["planner-adversarial-heavy"], "anthropic/claude-opus-4-8"); // planner-adversarial
+    assert.equal(interactiveConfig.classes["adversarial-heavy"], "anthropic/claude-opus-4-8"); // doer-adversarial
     assert.equal(interactiveConfig.classes["verifier-fast"], "anthropic/claude-opus-4-8");
     assert.equal(interactiveConfig.classes["code-strong"], "openai-codex/gpt-5.5"); // doer
     assert.equal(interactiveConfig.classes["test-strong"], "openai-codex/gpt-5.5");
     assert.equal(interactiveConfig.classes["context-fast"], "anthropic/claude-haiku-4-5"); // mover
     // Bucket LEVEL fans out to config.class_thinking[<class>].
     assert.equal(interactiveConfig.class_thinking["orchestrator-heavy"], "high");
+    assert.equal(interactiveConfig.class_thinking["planner-adversarial-heavy"], "high");
     assert.equal(interactiveConfig.class_thinking["adversarial-heavy"], "high");
-    assert.equal(interactiveConfig.class_thinking["verifier-fast"], "high");
     assert.equal(interactiveConfig.class_thinking["code-strong"], "medium");
     assert.equal(interactiveConfig.class_thinking["context-fast"], "low");
 
-    // The whole point: assert via the REAL resolver that every class resolves to its
-    // bucket MODEL and that resolveModelClass(class).thinking_level === the bucket LEVEL.
-    // This proves the persisted level is READ by the router, not just written to JSON.
+    // Assert via the REAL resolver that every class resolves to its bucket LEVEL (proves the router reads it).
     const expectedByClass = {
       "orchestrator-heavy": { provider: "openai-codex", id: "gpt-5.5", level: "high" },
       "planner-heavy": { provider: "openai-codex", id: "gpt-5.5", level: "high" },
       "research-heavy": { provider: "openai-codex", id: "gpt-5.5", level: "high" },
+      "planner-adversarial-heavy": { provider: "anthropic", id: "claude-opus-4-8", level: "high" },
       "adversarial-heavy": { provider: "anthropic", id: "claude-opus-4-8", level: "high" },
       "verifier-fast": { provider: "anthropic", id: "claude-opus-4-8", level: "high" },
       "code-strong": { provider: "openai-codex", id: "gpt-5.5", level: "medium" },
@@ -223,14 +231,13 @@ try {
     };
     for (const [modelClass, expected] of Object.entries(expectedByClass)) {
       const route = await resolveModelClass({ root: interactiveRoot, modelClass });
-      // adversarial-heavy/verifier-fast may cross-family-select; assert the bucket level
-      // is read for every class, and the model for non-cross-family classes.
       assert.equal(
         route.thinking_level,
         expected.level,
         `${modelClass} thinking_level must be the persisted bucket level (read by router)`,
       );
-      if (!["adversarial-heavy", "verifier-fast"].includes(modelClass)) {
+      // The cross-family review classes may re-select a distinct family; only assert the model for the rest.
+      if (!["adversarial-heavy", "planner-adversarial-heavy", "verifier-fast"].includes(modelClass)) {
         assert.deepEqual(
           route.model,
           { provider: expected.provider, id: expected.id },
@@ -239,11 +246,12 @@ try {
       }
     }
 
-    // Cross-provider buckets resolve with no error (planner openai-codex, adversarial anthropic).
     const plannerRoute = await resolveModelClass({ root: interactiveRoot, modelClass: "planner-heavy" });
     assert.deepEqual(plannerRoute.model, { provider: "openai-codex", id: "gpt-5.5" });
     const advRoute = await resolveModelClass({ root: interactiveRoot, modelClass: "adversarial-heavy" });
     assert.equal(advRoute.model.provider, "anthropic");
+    const planAdvRoute = await resolveModelClass({ root: interactiveRoot, modelClass: "planner-adversarial-heavy" });
+    assert.equal(planAdvRoute.model.provider, "anthropic", "plan reviewer resolves to its configured family");
     assert.equal((await inspectAdversarialFamilyIsolation({ root: interactiveRoot })).state, "pass");
   } finally {
     await fs.rm(interactiveRoot, { recursive: true, force: true });
@@ -384,8 +392,9 @@ try {
   const cliOutput = new PassThrough();
   const cliAnswers = {
     planner: { model: "openai-codex/gpt-5.5", level: "high" },
-    adversarial: { model: "anthropic/claude-opus-4-8", level: "high" },
+    "planner-adversarial": { model: "anthropic/claude-opus-4-8", level: "high" },
     doer: { model: "openai-codex/gpt-5.5", level: "medium" },
+    "doer-adversarial": { model: "anthropic/claude-opus-4-8", level: "high" },
     mover: { model: "anthropic/claude-haiku-4-5", level: "low" },
   };
   // Respond to each wizard prompt as the REAL createCliPromptUi writes it to the output stream (the
@@ -396,8 +405,10 @@ try {
     if (!/model|thinking level/i.test(question)) return;
     cliPrompts.push(question);
     let answer = "";
-    for (const [bucket, value] of Object.entries(cliAnswers)) {
+    // Longest bucket name first so "doer-adversarial" matches before "doer".
+    for (const bucket of Object.keys(cliAnswers).sort((a, b) => b.length - a.length)) {
       if (new RegExp(`^${bucket}`, "i").test(question.trim())) {
+        const value = cliAnswers[bucket];
         answer = /thinking level/i.test(question) ? value.level : value.model;
         break;
       }

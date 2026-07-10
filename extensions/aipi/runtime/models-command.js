@@ -62,25 +62,28 @@ async function writeOrchestratorDefault(orchestrator, { agentDir = null, env = p
 // level) pair that fans out across its capability classes. Any provider is allowed per
 // bucket; nothing forces Anthropic. The bucket->class map below is the authoritative
 // mapping between the user-facing buckets and the internal capability classes.
-export const EFFORT_BUCKETS = Object.freeze(["planner", "adversarial", "doer", "mover"]);
+export const EFFORT_BUCKETS = Object.freeze(["planner", "planner-adversarial", "doer", "doer-adversarial", "mover"]);
 export const BUCKET_CLASS_MAP = Object.freeze({
   planner: ["orchestrator-heavy", "planner-heavy", "research-heavy"],
-  adversarial: ["adversarial-heavy", "verifier-fast"],
+  "planner-adversarial": ["planner-adversarial-heavy"],
   doer: ["code-strong", "test-strong"],
+  "doer-adversarial": ["adversarial-heavy", "verifier-fast"],
   mover: ["context-fast"],
 });
 const BUCKET_LABELS = Object.freeze({
   planner: "Planner (orchestration, planning, research)",
-  adversarial: "Adversarial (contrarian review, verification)",
+  "planner-adversarial": "Planner-adversarial (contrarian plan review)",
   doer: "Doer (implementation, tests)",
+  "doer-adversarial": "Doer-adversarial (contrarian code review, verification)",
   mover: "Mover (retrieval, context packaging)",
 });
 // One-line explanation of what each bucket DOES, shown in the wizard so the choice is informed. Names the
 // capability classes it fills so the user can trace bucket -> classes.
 const BUCKET_DESCRIPTIONS = Object.freeze({
   planner: "authors the plan/requirements/BDD and runs research; owns the long-horizon run (fills orchestrator-heavy, planner-heavy, research-heavy)",
-  adversarial: "contrarian review of the work + final acceptance verification, ideally a different model family than the doer (fills adversarial-heavy, verifier-fast)",
+  "planner-adversarial": "independently reviews the PLAN — missing goals, contradictions, untested behavior, ambiguities; ideally a different family than the planner (fills planner-adversarial-heavy)",
   doer: "writes the implementation and its tests (fills code-strong, test-strong)",
+  "doer-adversarial": "independently reviews the CODE — correctness, security, regression + final acceptance; ideally a different family than the doer (fills adversarial-heavy, verifier-fast)",
   mover: "cheap, high-parallel context work: retrieval, codebase mapping, context packaging, memory summaries — keeps grunt retrieval off the frontier models (fills context-fast)",
 });
 // Shown once before the orchestrator prompt.
@@ -134,7 +137,7 @@ export function parseModelsArgs(args = [], { cwd = process.cwd() } = {}) {
       options.target = resolveOptionPath(nextValue(tokens, ++index, token), cwd);
       continue;
     }
-    if (token === "--planner" || token === "--doer" || token === "--mover") {
+    if (["--planner", "--planner-adversarial", "--doer", "--doer-adversarial", "--mover"].includes(token)) {
       const bucket = token.slice(2);
       options.buckets[bucket] = nextValue(tokens, ++index, token);
       options.action = "setup";
@@ -147,10 +150,11 @@ export function parseModelsArgs(args = [], { cwd = process.cwd() } = {}) {
       continue;
     }
     if (token === "--adversarial" || token === "--reviewer") {
-      // Both the new "adversarial" bucket and the legacy adversarial topology slot.
+      // Legacy alias -> the CODE-review bucket (doer-adversarial). Plan review is the separate
+      // --planner-adversarial bucket.
       const value = nextValue(tokens, ++index, token);
       options.adversarialModel = value;
-      options.buckets.adversarial = value;
+      options.buckets["doer-adversarial"] = value;
       options.action = "setup";
       continue;
     }
@@ -254,18 +258,16 @@ export async function runModelsCommand({
     const doerFallback = explicitOrchestrator ?? safeParseSpec(hostSpec) ?? safeParseSpec(availableModels[0]);
 
     if (!buckets.doer && doerFallback) buckets.doer = doerFallback;
-    if (!buckets.adversarial && buckets.doer) {
-      // Prefer a DIFFERENT authed family for the adversarial (cross-model independence); else reuse the doer
-      // (same family — allowed, just warned).
-      const distinct = availableModels.map(safeParseSpec).find((m) => m && m.provider !== buckets.doer.provider);
-      buckets.adversarial = distinct ?? buckets.doer;
-    }
     if (!buckets.doer) {
       throw new Error("aipi effort setup found no --doer and no authed model to default to; pass --doer <provider/model[:level]> or log in to a provider first");
     }
-    if (!buckets.adversarial) throw new Error("aipi effort setup requires --adversarial <provider/model[:level]>");
     if (!buckets.planner) buckets.planner = buckets.doer;
     if (!buckets.mover) buckets.mover = buckets.doer;
+    // Each adversarial bucket defaults to a DIFFERENT authed family than the work it reviews (cross-model
+    // independence); if no distinct family is authed it reuses the author's model (same family — just warned).
+    const distinctFamily = (spec) => availableModels.map(safeParseSpec).find((m) => m && spec && m.provider !== spec.provider);
+    if (!buckets["doer-adversarial"]) buckets["doer-adversarial"] = distinctFamily(buckets.doer) ?? buckets.doer;
+    if (!buckets["planner-adversarial"]) buckets["planner-adversarial"] = distinctFamily(buckets.planner) ?? buckets.planner;
 
     // Persist the orchestrator (default session model) ONLY when the user EXPLICITLY chose one — never silently
     // change the session default just because it was borrowed as a doer fallback.
@@ -368,9 +370,8 @@ async function buildModelsReport(root, { action = "status", now = () => new Date
   };
 }
 
-// Resolve the 4 buckets into parsed { provider, model, thinking_level } specs. Legacy
-// flags (--host -> doer, --adversarial -> adversarial, --verifier folds into adversarial)
-// are honored so existing invocations and the wizard fallbacks keep working.
+// Resolve the buckets into parsed { provider, model, thinking_level } specs. Legacy flags (--host -> doer,
+// --adversarial -> doer-adversarial) are honored so existing invocations and the wizard fallbacks keep working.
 function resolveBucketSpecs(parsed) {
   const out = {};
   for (const bucket of EFFORT_BUCKETS) {
@@ -378,27 +379,31 @@ function resolveBucketSpecs(parsed) {
     if (spec) out[bucket] = parseProviderModelSpec(spec, `--${bucket}`);
   }
   if (!out.doer && parsed.hostModel) out.doer = parseProviderModelSpec(parsed.hostModel, "--host");
-  if (!out.adversarial && parsed.adversarialModel) {
-    out.adversarial = parseProviderModelSpec(parsed.adversarialModel, "--adversarial");
+  if (!out["doer-adversarial"] && parsed.adversarialModel) {
+    out["doer-adversarial"] = parseProviderModelSpec(parsed.adversarialModel, "--adversarial");
   }
   return out;
 }
 
-// Soft WARNING (not a hard error): if the adversarial bucket shares a provider/family with
-// the doer or planner bucket, cross-model independence is degraded.
+// Soft WARNING (not a hard error): each adversarial bucket that shares a provider/family with the work it
+// reviews (planner-adversarial↔planner, doer-adversarial↔doer) loses cross-model independence.
+const ADVERSARIAL_BUCKET_PAIRS = Object.freeze([
+  ["planner-adversarial", "planner"],
+  ["doer-adversarial", "doer"],
+]);
 function bucketSetupWarnings(buckets) {
   const warnings = [];
-  const advProvider = buckets.adversarial?.provider;
-  for (const peer of ["doer", "planner"]) {
-    if (advProvider && buckets[peer]?.provider === advProvider) {
+  for (const [adv, author] of ADVERSARIAL_BUCKET_PAIRS) {
+    const advProvider = buckets[adv]?.provider;
+    if (advProvider && buckets[author]?.provider === advProvider) {
       warnings.push({
         code: "AIPI_EFFORT_ADVERSARIAL_SHARES_FAMILY",
         severity: "warning",
-        bucket: "adversarial",
-        peer_bucket: peer,
+        bucket: adv,
+        peer_bucket: author,
         provider: advProvider,
         message:
-          `adversarial bucket provider/family "${advProvider}" equals the ${peer} bucket; ` +
+          `adversarial bucket "${adv}" provider/family "${advProvider}" equals the "${author}" bucket; ` +
           `this loses cross-model adversarial independence (correlated blind spots).`,
       });
     }
@@ -506,8 +511,11 @@ async function fillInteractiveOptions(options, { root, ui, availableModels = [],
       const label = BUCKET_LABELS[bucket] ?? bucket;
       const description = BUCKET_DESCRIPTIONS[bucket];
       const promptLabel = description ? `${label} — ${description}` : label;
-      const filtered = bucket === "adversarial"
-        ? candidates.filter((candidate) => providerOfSpec(candidate) !== providerOfSpec(options.buckets.doer))
+      // For an adversarial bucket, lead the picker with families OTHER than the work it reviews (the author is
+      // already chosen since it is prompted earlier). Manual entry can still pick the same family.
+      const authorBucket = bucket === "planner-adversarial" ? "planner" : bucket === "doer-adversarial" ? "doer" : null;
+      const filtered = authorBucket
+        ? candidates.filter((candidate) => providerOfSpec(candidate) !== providerOfSpec(options.buckets[authorBucket]))
         : candidates;
       const modelSpec = await promptModelSpec(promptUi, `${promptLabel} model`, filtered);
       if (!modelSpec) continue;

@@ -183,7 +183,7 @@ agents:
 
   - id: plan-checker
     source_reference: plan-checker
-    class: adversarial-heavy
+    class: planner-adversarial-heavy
     runtime: skill
     role: reviewer
     tools: [read, grep, find, ls, bash, aipi_memory_query]
@@ -194,7 +194,7 @@ agents:
 
   - id: plan-calibrator
     source_reference: plan-calibrator
-    class: adversarial-heavy
+    class: planner-adversarial-heavy
     runtime: skill
     role: planner
     tools: [read, grep, find, ls, bash, aipi_rule_gap]
@@ -205,7 +205,7 @@ agents:
 
   - id: contrarian
     source_reference: contrarian
-    class: adversarial-heavy
+    class: planner-adversarial-heavy
     runtime: skill
     role: reviewer
     tools: [read, grep, find, ls]
