@@ -13,6 +13,7 @@ import {
   formatAipiVersion,
   pathCommandCandidates,
   piCliJsCandidates,
+  pinnedPiSpawnEnv,
   parseAipiMemoryArgs,
   parseAipiModelsArgs,
   parseAipiOnboardArgs,
@@ -657,5 +658,22 @@ await runAipiDiagnose({
   },
 });
 assert.deepEqual(diagnoseHelpOutput, ["Usage: aipi diagnose"]);
+
+// === pinnedPiSpawnEnv: default Pi's version-check OFF (pinned bundle), overridable, childEnv wins ===
+{
+  // No user setting -> aipi defaults PI_SKIP_VERSION_CHECK on so the "run pi update" banner is suppressed.
+  const defaulted = pinnedPiSpawnEnv({ PATH: "/x" }, { AIPI_PI_CLI_JS: "/pi/cli.js" });
+  assert.equal(defaulted.PI_SKIP_VERSION_CHECK, "1", "banner suppressed by default on a pinned bundle");
+  assert.equal(defaulted.AIPI_PI_CLI_JS, "/pi/cli.js", "childEnv (pinned Pi) still applied");
+  assert.equal(defaulted.PATH, "/x", "base env preserved");
+
+  // A user who explicitly set PI_SKIP_VERSION_CHECK keeps control (their value wins, even to re-enable it).
+  assert.equal(pinnedPiSpawnEnv({ PI_SKIP_VERSION_CHECK: "" }).PI_SKIP_VERSION_CHECK, "", "user override respected (re-enables the banner)");
+  assert.equal(pinnedPiSpawnEnv({ PI_SKIP_VERSION_CHECK: "1" }).PI_SKIP_VERSION_CHECK, "1", "user's explicit skip respected");
+  // PI_OFFLINE already disables the check, so aipi does not also inject PI_SKIP_VERSION_CHECK.
+  assert.equal(pinnedPiSpawnEnv({ PI_OFFLINE: "1" }).PI_SKIP_VERSION_CHECK, undefined, "PI_OFFLINE left as the sole switch");
+  // childEnv overrides everything (the pin must always hold).
+  assert.equal(pinnedPiSpawnEnv({ AIPI_PI_CLI_JS: "/old" }, { AIPI_PI_CLI_JS: "/new" }).AIPI_PI_CLI_JS, "/new");
+}
 
 console.log("AIPI_BIN_TEST_OK");

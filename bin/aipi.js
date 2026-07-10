@@ -441,6 +441,18 @@ export function createRawPiSpawnSpec({
   return createCommandSpawnSpec(command, userArgs, platform);
 }
 
+// aipi ships a PINNED Pi, so Pi's interactive "New version X — Run pi update" banner points at the wrong
+// updater: `pi update` replaces a GLOBAL pi, not aipi's pinned copy, and would desync the bundle. Default the
+// version check OFF for every aipi-launched Pi (Pi honors PI_SKIP_VERSION_CHECK). A user who explicitly set
+// PI_SKIP_VERSION_CHECK or PI_OFFLINE themselves keeps control — their value wins. childEnv (e.g. the pinned
+// AIPI_PI_CLI_JS) is applied last so it always holds. New Pi releases still surface through `aipi update`.
+export function pinnedPiSpawnEnv(baseEnv = process.env, childEnv = {}) {
+  const versionCheckDefault = baseEnv.PI_SKIP_VERSION_CHECK == null && baseEnv.PI_OFFLINE == null
+    ? { PI_SKIP_VERSION_CHECK: "1" }
+    : {};
+  return { ...versionCheckDefault, ...baseEnv, ...childEnv };
+}
+
 function createCommandSpawnSpec(command, args, platform) {
   if (platform === "win32" && /\.(cmd|bat)$/i.test(command)) {
     return {
@@ -1085,7 +1097,8 @@ export async function main() {
     // childEnv pins AIPI_PI_CLI_JS to the Pi this wrapper resolved, so worker
     // runtimes inside the session (vendored pi-subagents) spawn the SAME Pi
     // instead of re-resolving a possibly different global/PATH copy.
-    env: { ...process.env, ...(spec.childEnv ?? {}) },
+    // pinnedPiSpawnEnv also defaults Pi's version-check OFF (the pinned bundle must not nag "run pi update").
+    env: pinnedPiSpawnEnv(process.env, spec.childEnv ?? {}),
   });
 
   child.on("error", (error) => {
