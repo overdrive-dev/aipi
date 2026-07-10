@@ -19,6 +19,11 @@ import {
 } from "../extensions/aipi/runtime/model-router.js";
 import { runAipiModels } from "../bin/aipi.js";
 
+// SAFETY: the setup wizard can write the orchestrator (default model) into Pi's settings.json. Point the Pi
+// agent dir at a throwaway temp dir for the whole test so no run ever touches the developer's real
+// ~/.pi/agent/settings.json. (writeOrchestratorDefault honors PI_CODING_AGENT_DIR.)
+process.env.PI_CODING_AGENT_DIR = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-models-agent-"));
+
 assert.deepEqual(
   parseModelsArgs([
     "--target",
@@ -39,6 +44,7 @@ assert.deepEqual(
     hostModel: "openai-codex/gpt-5.5",
     adversarialModel: "anthropic/claude-opus-4-8",
     verifierModel: null,
+    orchestrator: null,
     models: [],
     buckets: { adversarial: "anthropic/claude-opus-4-8" },
     classBindings: {},
@@ -567,6 +573,68 @@ try {
     assert.equal(cfg.classes["context-fast"], "anthropic/claude-haiku-4-5"); // mover
   } finally {
     await fs.rm(selectRoot, { recursive: true, force: true });
+  }
+}
+
+// === orchestrator (default model) written to Pi settings.json (merge) + seeds the doer ===
+{
+  const orchRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-orch-"));
+  const orchAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-orch-agent-"));
+  try {
+    await initProject({ sourceRoot: path.resolve("templates/.aipi"), targetRoot: orchRoot });
+    // Existing settings.json to prove the write MERGES (other keys preserved).
+    await fs.writeFile(path.join(orchAgentDir, "settings.json"), JSON.stringify({ theme: "dark", enabledModels: ["a/b"] }));
+
+    const orchReport = await runModelsCommand({
+      projectRoot: orchRoot,
+      args: ["setup", "--orchestrator", "anthropic/claude-opus-4-8:high", "--adversarial", "openai-codex/gpt-5.6-sol:high"],
+      agentDir: orchAgentDir,
+      now: () => new Date("2026-06-22T03:00:00.000Z"),
+    });
+    assert.ok(orchReport.orchestrator, "report surfaces the orchestrator");
+    assert.equal(orchReport.orchestrator.model, "anthropic/claude-opus-4-8");
+    assert.equal(orchReport.orchestrator.thinking_level, "high");
+
+    const settings = JSON.parse(await fs.readFile(path.join(orchAgentDir, "settings.json"), "utf8"));
+    assert.equal(settings.defaultProvider, "anthropic");
+    assert.equal(settings.defaultModel, "claude-opus-4-8");
+    assert.equal(settings.defaultThinkingLevel, "high");
+    assert.equal(settings.theme, "dark", "merge preserves existing settings");
+    assert.deepEqual(settings.enabledModels, ["a/b"], "merge preserves existing settings");
+
+    // No --doer given -> the doer defaulted to the orchestrator.
+    const orchConfig = JSON.parse(await fs.readFile(path.join(orchRoot, ".aipi", "model-capabilities.json"), "utf8"));
+    assert.equal(orchConfig.classes["code-strong"], "anthropic/claude-opus-4-8", "doer defaults to the orchestrator");
+  } finally {
+    await fs.rm(orchRoot, { recursive: true, force: true });
+    await fs.rm(orchAgentDir, { recursive: true, force: true });
+  }
+}
+
+// === zero-flag: doer falls back to the authed host model; NO settings write without an explicit orchestrator ===
+{
+  const hostRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-hostdoer-"));
+  const hostAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-hostdoer-agent-"));
+  try {
+    await initProject({ sourceRoot: path.resolve("templates/.aipi"), targetRoot: hostRoot });
+    const report = await runModelsCommand({
+      projectRoot: hostRoot,
+      args: ["setup"], // no flags, no ui -> wizard skipped
+      hostModel: { provider: "anthropic", id: "claude-opus-4-8" },
+      availableModels: ["anthropic/claude-opus-4-8", "openai-codex/gpt-5.6-sol"],
+      agentDir: hostAgentDir,
+      now: () => new Date("2026-06-22T04:00:00.000Z"),
+    });
+    const cfg = JSON.parse(await fs.readFile(path.join(hostRoot, ".aipi", "model-capabilities.json"), "utf8"));
+    assert.equal(cfg.classes["code-strong"], "anthropic/claude-opus-4-8", "doer defaults to the authed host model");
+    assert.equal(cfg.classes["adversarial-heavy"], "openai-codex/gpt-5.6-sol", "adversarial prefers a distinct authed family");
+    assert.equal(report.orchestrator, null, "no orchestrator write without an explicit choice");
+    let wrote = true;
+    try { await fs.access(path.join(hostAgentDir, "settings.json")); } catch { wrote = false; }
+    assert.equal(wrote, false, "settings.json untouched when the orchestrator is not explicitly set");
+  } finally {
+    await fs.rm(hostRoot, { recursive: true, force: true });
+    await fs.rm(hostAgentDir, { recursive: true, force: true });
   }
 }
 

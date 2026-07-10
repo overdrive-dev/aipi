@@ -241,7 +241,8 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
       // per-model supported thinking levels so it offers only the intelligence each model can actually run.
       const availableModels = registryModelSpecs(ctx?.modelRegistry);
       const thinkingLevels = registryThinkingLevels(ctx?.modelRegistry);
-      const result = await runModelsCommand({ args: args ?? "", projectRoot, ui: ctx?.ui, availableModels, thinkingLevels });
+      // ctx.model is the current authed session model — the doer defaults to it when no builder is specified.
+      const result = await runModelsCommand({ args: args ?? "", projectRoot, ui: ctx?.ui, availableModels, thinkingLevels, hostModel: ctx?.model });
       ctx.ui.notify(formatModelsCommandResult(result), result.state === "ready" ? "info" : "warning");
     } catch (error) {
       ctx.ui.notify(`AIPI effort failed: ${error.message}`, "error");

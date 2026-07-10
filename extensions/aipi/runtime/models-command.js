@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
@@ -19,6 +20,43 @@ const MODEL_CLASSES_REL_PATH = ".aipi/model-classes.yaml";
 const PROVIDER_BUDGET_REL_PATH = ".aipi/provider-budget.json";
 const VERIFIER_CLASS_ID = "verifier-fast";
 const HIGH_FREQUENCY_CLASSES = new Set(["context-fast", "verifier-fast"]);
+
+// The Pi agent dir that holds settings.json (the global default model). Honors the same env overrides Pi uses.
+// Inlined so models-command stays self-contained.
+function piAgentDir(env = process.env, homeDir = os.homedir()) {
+  const override = env.PI_CODING_AGENT_DIR?.trim() || env.PI_AGENT_DIR?.trim();
+  return override ? path.resolve(override.replace(/^~(?=$|[/\\])/, homeDir)) : path.join(homeDir, ".pi", "agent");
+}
+
+// Tolerant parse of a "provider/model[:level]" spec into a bucket object; null on anything unparseable.
+function safeParseSpec(spec) {
+  try {
+    return spec ? parseProviderModelSpec(spec, "model") : null;
+  } catch {
+    return null;
+  }
+}
+
+// Write the ORCHESTRATOR (= Pi's default session model) into ~/.pi/agent/settings.json, MERGING so every other
+// setting is preserved. This is Pi's own default-model mechanism, so `aipi effort` setting the orchestrator ==
+// setting Pi's defaultProvider / defaultModel / defaultThinkingLevel. Best-effort: never fails the setup.
+async function writeOrchestratorDefault(orchestrator, { agentDir = null, env = process.env, homeDir = os.homedir() } = {}) {
+  const dir = agentDir ?? piAgentDir(env, homeDir);
+  const file = path.join(dir, "settings.json");
+  let settings = {};
+  try {
+    const parsed = JSON.parse(await fs.readFile(file, "utf8"));
+    if (parsed && typeof parsed === "object") settings = parsed;
+  } catch {
+    settings = {}; // fresh install / unreadable -> create clean
+  }
+  settings.defaultProvider = orchestrator.provider;
+  settings.defaultModel = orchestrator.model;
+  if (orchestrator.thinking_level) settings.defaultThinkingLevel = orchestrator.thinking_level;
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(file, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  return { path: file, provider: orchestrator.provider, model: orchestrator.model, thinking_level: orchestrator.thinking_level ?? null };
+}
 
 // Provider-agnostic 4-bucket model topology. Each bucket binds ONE (model, thinking
 // level) pair that fans out across its capability classes. Any provider is allowed per
@@ -51,6 +89,7 @@ export function parseModelsArgs(args = [], { cwd = process.cwd() } = {}) {
     hostModel: null,
     adversarialModel: null,
     verifierModel: null,
+    orchestrator: null,
     models: [],
     buckets: {},
     classBindings: {},
@@ -110,6 +149,13 @@ export function parseModelsArgs(args = [], { cwd = process.cwd() } = {}) {
       options.action = "setup";
       continue;
     }
+    if (token === "--orchestrator" || token === "--default") {
+      // The orchestrator = the DEFAULT session model (Pi's settings.json defaultModel). Setting it here writes
+      // that default and also seeds the doer fallback.
+      options.orchestrator = nextValue(tokens, ++index, token);
+      options.action = "setup";
+      continue;
+    }
     if (token === "--model") {
       options.models.push(nextValue(tokens, ++index, token));
       options.action = "setup";
@@ -159,6 +205,13 @@ export async function runModelsCommand({
   // { "provider/id": ThinkingLevel[] } from ctx.modelRegistry, so the wizard offers each model only the
   // intelligence levels it actually supports instead of a fixed low|medium|high|xhigh prompt.
   thinkingLevels = {},
+  // The current session model (ctx.model — object or "provider/model" string). Used as the doer fallback so a
+  // single authed provider configures with zero flags.
+  hostModel = null,
+  // Where Pi's settings.json lives (default ~/.pi/agent). Injectable for tests.
+  agentDir = null,
+  env = process.env,
+  homeDir = os.homedir(),
   now = () => new Date(),
 } = {}) {
   const parsed = parseModelsArgs(args, { cwd: projectRoot ?? cwd });
@@ -175,16 +228,44 @@ export async function runModelsCommand({
   }
 
   let setupWarnings = [];
+  let orchestrator = null;
   if (parsed.action === "setup") {
     await fillInteractiveOptions(parsed, { root, ui, availableModels, thinkingLevels });
     // Each bucket maps to ONE (model, thinking level) pair. Legacy --host/--adversarial/
     // --verifier feed the doer/adversarial buckets (and the verifier-fast override below)
     // so old invocations keep working without the new --planner/--mover flags.
     const buckets = resolveBucketSpecs(parsed);
-    if (!buckets.doer) throw new Error("aipi effort setup requires --doer <provider/model[:level]> (or legacy --host)");
+
+    // Orchestrator = the DEFAULT session model. Explicit when the user passed --orchestrator/--default or picked
+    // it in the wizard — that is what gets written to Pi's settings.json. For the DOER fallback we also accept
+    // the current authed/host model, so a single-provider machine configures with zero flags.
+    const hostSpec = typeof hostModel === "string" ? hostModel : describeModel(hostModel);
+    const explicitOrchestrator = safeParseSpec(parsed.orchestrator);
+    const doerFallback = explicitOrchestrator ?? safeParseSpec(hostSpec) ?? safeParseSpec(availableModels[0]);
+
+    if (!buckets.doer && doerFallback) buckets.doer = doerFallback;
+    if (!buckets.adversarial && buckets.doer) {
+      // Prefer a DIFFERENT authed family for the adversarial (cross-model independence); else reuse the doer
+      // (same family — allowed, just warned).
+      const distinct = availableModels.map(safeParseSpec).find((m) => m && m.provider !== buckets.doer.provider);
+      buckets.adversarial = distinct ?? buckets.doer;
+    }
+    if (!buckets.doer) {
+      throw new Error("aipi effort setup found no --doer and no authed model to default to; pass --doer <provider/model[:level]> or log in to a provider first");
+    }
     if (!buckets.adversarial) throw new Error("aipi effort setup requires --adversarial <provider/model[:level]>");
     if (!buckets.planner) buckets.planner = buckets.doer;
     if (!buckets.mover) buckets.mover = buckets.doer;
+
+    // Persist the orchestrator (default session model) ONLY when the user EXPLICITLY chose one — never silently
+    // change the session default just because it was borrowed as a doer fallback.
+    if (explicitOrchestrator) {
+      try {
+        orchestrator = await writeOrchestratorDefault(explicitOrchestrator, { agentDir, env, homeDir });
+      } catch {
+        /* the default-model settings write is best-effort; the class topology still applies */
+      }
+    }
 
     // Cross-model independence is a RECOMMENDATION, not a hard requirement. If the adversarial bucket shares a
     // family with the doer/planner, bucketSetupWarnings emits a warning (below) but the user's choice stands —
@@ -206,7 +287,7 @@ export async function runModelsCommand({
     await writeBudgetNotes(root, parsed.budgetNotes, { now });
   }
 
-  return buildModelsReport(root, { action: parsed.action, now, extraWarnings: setupWarnings });
+  return buildModelsReport(root, { action: parsed.action, now, extraWarnings: setupWarnings, orchestrator });
 }
 
 export function formatModelsCommandResult(report) {
@@ -217,9 +298,13 @@ export function formatModelsCommandResult(report) {
   const warningLines = report.warnings.length
     ? ["", "Warnings:", ...report.warnings.map((warning) => `- ${warning.message}`)]
     : [];
+  const orchestratorLine = report.orchestrator
+    ? [`Orchestrator (default model): ${report.orchestrator.model}${report.orchestrator.thinking_level ? ` · ${report.orchestrator.thinking_level}` : ""}`]
+    : [];
   return [
     `${title}: ${report.state}`,
     `Config: ${MODEL_CAPABILITIES_REL_PATH}`,
+    ...orchestratorLine,
     `Adversarial isolation: ${report.adversarial_family_isolation.state}`,
     "Class bindings:",
     ...classLines,
@@ -227,7 +312,7 @@ export function formatModelsCommandResult(report) {
   ].join("\n");
 }
 
-async function buildModelsReport(root, { action = "status", now = () => new Date(), extraWarnings = [] } = {}) {
+async function buildModelsReport(root, { action = "status", now = () => new Date(), extraWarnings = [], orchestrator = null } = {}) {
   const [classIds, capabilityFloors, familyIsolation] = await Promise.all([
     readModelClassIds(root),
     inspectModelCapabilityFloors({ root }),
@@ -261,6 +346,10 @@ async function buildModelsReport(root, { action = "status", now = () => new Date
     model_classes_path: MODEL_CLASSES_REL_PATH,
     classes,
     host_model: describeModel(hostRoute.model),
+    // The orchestrator (default session model) written this run, if the user set one. null when unchanged.
+    orchestrator: orchestrator
+      ? { provider: orchestrator.provider, model: `${orchestrator.provider}/${orchestrator.model}`, thinking_level: orchestrator.thinking_level ?? null }
+      : null,
     adversarial_reviewer_model: describeModel(reviewerRoute?.model),
     adversarial_reviewer_distinct: Boolean(reviewerRoute?.cross_model_adversarial?.distinct_provider),
     capability_floors: capabilityFloors,
@@ -387,6 +476,18 @@ async function fillInteractiveOptions(options, { root, ui, availableModels = [],
     // already configured in this project.
     let candidates = mergeModelCandidates(availableModels, await configuredModelCandidates(root));
     options.buckets ??= {};
+
+    // Orchestrator = the DEFAULT session model, prompted FIRST (with conditional intelligence). Dismissing it
+    // keeps the current default unchanged; choosing one both sets Pi's defaultModel and seeds the doer.
+    if (!options.orchestrator) {
+      const orchestratorSpec = await promptModelSpec(promptUi, "Orchestrator (default session model)", candidates);
+      if (orchestratorSpec) {
+        const level = await promptThinkingLevel(promptUi, "Orchestrator thinking level", orchestratorSpec, thinkingLevels);
+        options.orchestrator = applyThinkingLevel(orchestratorSpec, level);
+        candidates = mergeModelCandidates(candidates, [stripThinkingLevel(options.orchestrator)]);
+      }
+    }
+
     for (const bucket of EFFORT_BUCKETS) {
       if (options.buckets[bucket]) {
         candidates = mergeModelCandidates(candidates, [options.buckets[bucket]]);

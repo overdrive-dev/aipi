@@ -148,17 +148,20 @@ starting a Pi session. `aipi workflow
 from the console using the same run-state runtime as `/aipi-workflow`. `aipi memory
 [--target <dir>] [--json] ...` exposes read-only memory status/refs/query using
 the same Markdown memory query runtime as `aipi_memory_query`. `aipi effort setup`
-(aliased as `aipi models setup`) configures 4 provider-agnostic buckets —
-`--planner`, `--adversarial`, `--doer`, `--mover` — each taking a
-`provider/model[:level]` spec. Each bucket fans its model out to its capability
-classes and its thinking level out to a persisted per-class `class_thinking` map that
-the router reads at resolve time. The interactive wizard (run with no flags) offers,
-for each chosen model, **only the thinking levels that model actually supports**
-(strongest first) — `off`/`minimal`/`low`/`medium`/`high`/`xhigh`, where `xhigh` is
-offered only for models that declare it. It keeps
-`--class <class>=<provider/model[:level]>` as a power-user override. Any
-provider is allowed per bucket; setting the adversarial bucket to the same family as
-the doer/planner bucket emits a cross-model-independence warning. `aipi --version`
+(aliased as `aipi models setup`) configures an **orchestrator** (`--orchestrator` /
+`--default` — the default session model, written to Pi's `settings.json` with its
+intelligence) plus 4 provider-agnostic buckets — `--planner`, `--adversarial`,
+`--doer`, `--mover` — each taking a `provider/model[:level]` spec. Each bucket fans its
+model out to its capability classes and its thinking level out to a persisted per-class
+`class_thinking` map that the router reads at resolve time. The interactive wizard (run
+with no flags) prompts the orchestrator first, then the buckets, and offers for each
+chosen model **only the thinking levels that model actually supports** (strongest
+first) — `off`/`minimal`/`low`/`medium`/`high`/`xhigh`, where `xhigh` is offered only
+for models that declare it. When no `--doer` is given it **defaults to the current
+authed model**, so a single-provider machine configures with zero flags. It keeps
+`--class <class>=<provider/model[:level]>` as a power-user override. Any provider is
+allowed per bucket; setting the adversarial bucket to the same family as the
+doer/planner bucket emits a cross-model-independence **warning** (not an error). `aipi --version`
 reports both the AIPI package and wrapped Pi versions; use `aipi --pi-help` for
 the raw Pi flag reference. Point at a specific Pi with `AIPI_PI_CLI_JS` or
 `AIPI_PI_BIN`. See
