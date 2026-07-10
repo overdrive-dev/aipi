@@ -8,7 +8,9 @@ import {
   formatAipiReadiness,
   formatAipiStatus,
   formatAnthropicAuthStatus,
+  formatXaiOauthStatus,
   inspectAnthropicAuth,
+  inspectXaiOauth,
   resolveAnthropicAuthPath,
 } from "../extensions/aipi/runtime/provider-auth.js";
 import {
@@ -379,6 +381,35 @@ try {
   });
   assert.equal(invalid.ready, false);
   assert.equal(invalid.sidecar.validJson, false);
+
+  // === xAI (Grok) OAuth detection: optional, user-installed provider (never gates readiness) ===
+  const xaiEnv = { PI_CODING_AGENT_DIR: agentDir };
+  const xaiExtDir = path.join(agentDir, "extensions", "pi-xai-oauth");
+
+  // not installed: no xai extension present -> not_installed (regardless of auth.json state)
+  const xaiNone = await inspectXaiOauth({ env: xaiEnv, homeDir: tempRoot });
+  assert.equal(xaiNone.state, "not_installed");
+  assert.match(formatXaiOauthStatus(xaiNone), /not installed/);
+
+  // installed but not logged in: extension present, no xai credential
+  await fs.mkdir(xaiExtDir, { recursive: true });
+  await fs.writeFile(authFile, JSON.stringify({ anthropic: { type: "oauth", access: "a" } }));
+  const xaiInstalled = await inspectXaiOauth({ env: xaiEnv, homeDir: tempRoot });
+  assert.equal(xaiInstalled.installed, true);
+  assert.equal(xaiInstalled.authed, false);
+  assert.equal(xaiInstalled.state, "installed");
+  assert.match(formatXaiOauthStatus(xaiInstalled), /login xai-auth/);
+
+  // ready: extension + xai-auth credential
+  await fs.writeFile(authFile, JSON.stringify({ "xai-auth": { type: "oauth", access: "tok", refresh: "r" } }));
+  const xaiReady = await inspectXaiOauth({ env: xaiEnv, homeDir: tempRoot });
+  assert.equal(xaiReady.state, "ready");
+  assert.match(formatXaiOauthStatus(xaiReady), /ready/);
+
+  // the status report surfaces it and prints the line
+  const xaiStatus = await buildAipiStatusReport({ projectRoot, env: xaiEnv, homeDir: tempRoot });
+  assert.equal(xaiStatus.xaiOauth.state, "ready");
+  assert.match(formatAipiStatus(xaiStatus), /xAI OAuth \(Grok\)/);
 
   console.log("AIPI_PROVIDER_AUTH_TEST_OK");
 } finally {

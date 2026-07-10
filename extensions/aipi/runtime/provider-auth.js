@@ -29,11 +29,63 @@ export function resolveAnthropicAuthPath({
   env = process.env,
   homeDir = os.homedir(),
 } = {}) {
-  const agentDirOverride = env.PI_CODING_AGENT_DIR?.trim() || env.PI_AGENT_DIR?.trim();
-  const agentDir = agentDirOverride
-    ? expandHome(agentDirOverride, homeDir)
-    : path.join(homeDir, ".pi", "agent");
-  return path.join(agentDir, ANTHROPIC_AUTH_FILE_NAME);
+  return path.join(resolveAgentDir({ env, homeDir }), ANTHROPIC_AUTH_FILE_NAME);
+}
+
+// The Pi agent dir (honors PI_CODING_AGENT_DIR / PI_AGENT_DIR overrides, else ~/.pi/agent). Both auth.json
+// and the auto-discovered extensions dir live here.
+export function resolveAgentDir({ env = process.env, homeDir = os.homedir() } = {}) {
+  const override = env.PI_CODING_AGENT_DIR?.trim() || env.PI_AGENT_DIR?.trim();
+  return override ? expandHome(override, homeDir) : path.join(homeDir, ".pi", "agent");
+}
+
+// Optional, user-installed xAI (Grok) OAuth provider. aipi does NOT bundle it: pi-xai-oauth self-installs
+// into the Pi agent's auto-discovered extensions dir, and aipi's pinned Pi loads it from there. We only
+// DETECT + REPORT its state so `aipi status` gives visibility — it never gates readiness (Grok is optional).
+export async function inspectXaiOauth({ env = process.env, homeDir = os.homedir() } = {}) {
+  const agentDir = resolveAgentDir({ env, homeDir });
+  const extensionsDir = path.join(agentDir, "extensions");
+  const authPath = path.join(agentDir, ANTHROPIC_AUTH_FILE_NAME);
+  const [installed, authed] = await Promise.all([
+    xaiExtensionInstalled(extensionsDir),
+    xaiAuthPresent(authPath),
+  ]);
+  return {
+    schema: "aipi.xai-oauth-status.v1",
+    provider: "xai-auth",
+    extensionsDir,
+    authPath,
+    installed,
+    authed,
+    state: !installed ? "not_installed" : authed ? "ready" : "installed",
+  };
+}
+
+async function xaiExtensionInstalled(extensionsDir) {
+  try {
+    const entries = await fs.readdir(extensionsDir);
+    return entries.some((name) => /pi-xai-oauth|(^|[-_.])xai([-_.]|$)/i.test(name));
+  } catch {
+    return false;
+  }
+}
+
+async function xaiAuthPresent(authPath) {
+  const parsed = await readJson(authPath);
+  if (!parsed.ok || !parsed.data) return false;
+  const cred = parsed.data["xai-auth"] ?? parsed.data.xai;
+  if (!cred || typeof cred !== "object") return false;
+  return Boolean(cred.access || cred.refresh || cred.key);
+}
+
+export function formatXaiOauthStatus(xai) {
+  if (!xai) return "xAI OAuth (Grok): not detected";
+  const detail = {
+    ready: "ready (extension + login)",
+    installed: "installed, not logged in — run /login xai-auth in a session",
+    not_installed: "not installed (optional) — `npx pi-xai-oauth` to add Grok via subscription",
+  }[xai.state] ?? xai.state;
+  return `xAI OAuth (Grok): ${detail}`;
 }
 
 export async function inspectAnthropicAuth({
@@ -169,10 +221,11 @@ export async function buildAipiStatusReport({
   homeDir = os.homedir(),
 } = {}) {
   if (!projectRoot) throw new Error("projectRoot is required");
-  const [project, anthropic, contract] = await Promise.all([
+  const [project, anthropic, contract, xaiOauth] = await Promise.all([
     inspectProjectInstall(projectRoot),
     inspectAnthropicAuth({ root, env, homeDir }),
     readJson(path.join(root, "templates", ".aipi", "runtime-contract.json")),
+    inspectXaiOauth({ env, homeDir }),
   ]);
   const backend = contract.data?.subagentBackendOptions ?? {};
   const capabilityReport = buildRuntimeCapabilityReport({ contract: contract.data ?? {} });
@@ -209,6 +262,7 @@ export async function buildAipiStatusReport({
   return {
     project,
     anthropic,
+    xaiOauth,
     capabilities: capabilityReport,
     modelCapabilityFloors,
     adversarialFamilyIsolation,
@@ -234,6 +288,7 @@ export function formatAipiStatus(report) {
   return [
     `AIPI project: ${projectStatus}`,
     formatAnthropicAuthStatus(report.anthropic),
+    formatXaiOauthStatus(report.xaiOauth),
     formatCapabilityReport(report.capabilities),
     formatAipiReadiness(report.readiness),
     `Subagents: ${report.subagents.preferredBackend} registered; ${subagentStatus}. ${report.subagents.criterionZero}`,
