@@ -75,6 +75,16 @@ const BUCKET_LABELS = Object.freeze({
   doer: "Doer (implementation, tests)",
   mover: "Mover (retrieval, context packaging)",
 });
+// One-line explanation of what each bucket DOES, shown in the wizard so the choice is informed. Names the
+// capability classes it fills so the user can trace bucket -> classes.
+const BUCKET_DESCRIPTIONS = Object.freeze({
+  planner: "authors the plan/requirements/BDD and runs research; owns the long-horizon run (fills orchestrator-heavy, planner-heavy, research-heavy)",
+  adversarial: "contrarian review of the work + final acceptance verification, ideally a different model family than the doer (fills adversarial-heavy, verifier-fast)",
+  doer: "writes the implementation and its tests (fills code-strong, test-strong)",
+  mover: "cheap, high-parallel context work: retrieval, codebase mapping, context packaging, memory summaries — keeps grunt retrieval off the frontier models (fills context-fast)",
+});
+// Shown once before the orchestrator prompt.
+const ORCHESTRATOR_DESCRIPTION = "the DEFAULT session model that drives the interactive run (written to Pi's settings.json)";
 
 export function parseModelsArgs(args = [], { cwd = process.cwd() } = {}) {
   const tokens = Array.isArray(args)
@@ -480,7 +490,7 @@ async function fillInteractiveOptions(options, { root, ui, availableModels = [],
     // Orchestrator = the DEFAULT session model, prompted FIRST (with conditional intelligence). Dismissing it
     // keeps the current default unchanged; choosing one both sets Pi's defaultModel and seeds the doer.
     if (!options.orchestrator) {
-      const orchestratorSpec = await promptModelSpec(promptUi, "Orchestrator (default session model)", candidates);
+      const orchestratorSpec = await promptModelSpec(promptUi, `Orchestrator — ${ORCHESTRATOR_DESCRIPTION}`, candidates);
       if (orchestratorSpec) {
         const level = await promptThinkingLevel(promptUi, "Orchestrator thinking level", orchestratorSpec, thinkingLevels);
         options.orchestrator = applyThinkingLevel(orchestratorSpec, level);
@@ -494,10 +504,12 @@ async function fillInteractiveOptions(options, { root, ui, availableModels = [],
         continue;
       }
       const label = BUCKET_LABELS[bucket] ?? bucket;
+      const description = BUCKET_DESCRIPTIONS[bucket];
+      const promptLabel = description ? `${label} — ${description}` : label;
       const filtered = bucket === "adversarial"
         ? candidates.filter((candidate) => providerOfSpec(candidate) !== providerOfSpec(options.buckets.doer))
         : candidates;
-      const modelSpec = await promptModelSpec(promptUi, `${label} model`, filtered);
+      const modelSpec = await promptModelSpec(promptUi, `${promptLabel} model`, filtered);
       if (!modelSpec) continue;
       const level = await promptThinkingLevel(promptUi, `${label} thinking level`, modelSpec, thinkingLevels);
       const combined = applyThinkingLevel(modelSpec, level);
