@@ -41,9 +41,12 @@ export function renderSubagentWidgetLines(runs) {
 }
 
 function runLabel(run) {
-  const model = run.steps?.[0]?.model;
-  const suffix = model ? ` · ${String(model).split("/").pop()}` : "";
-  return `${run.id}${suffix}`;
+  const step = run.steps?.[0];
+  // Show the model + its set intelligence (thinking level) of whatever is running, e.g. "grok-4.5 · high".
+  const model = step?.model ? String(step.model).split("/").pop() : null;
+  const thinking = step?.thinking ? String(step.thinking) : null;
+  const suffix = [model, thinking].filter(Boolean).join(" · ");
+  return suffix ? `${run.id} · ${suffix}` : run.id;
 }
 
 function shorten(text, max) {

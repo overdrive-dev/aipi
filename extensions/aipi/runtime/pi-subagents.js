@@ -284,12 +284,13 @@ export async function runAipiForkedSubagent({
   // Bridge this foreground fork into the native subagent run-store so /aipi-subagents can see it live.
   const startedAt = Date.now();
   const runLabel = job?.descriptor?.label ?? params.id ?? AIPI_SUBAGENTS_AGENT_NAME;
+  const thinkingLevel = params.thinking_level ?? job?.descriptor?.thinking_level ?? null;
   await writeSubagentRunStatus(paths, runId, {
     state: "running",
     cwd: root,
     startedAt,
     lastUpdate: startedAt,
-    steps: [subagentRunStep({ agent: runLabel, status: "running", model: modelId })],
+    steps: [subagentRunStep({ agent: runLabel, status: "running", model: modelId, thinking: thinkingLevel })],
   });
 
   const envRestore = applyScopedRuntimeEnv({
@@ -354,6 +355,7 @@ export async function runAipiForkedSubagent({
         agent: runLabel,
         status: "complete",
         model: result.model ?? modelId,
+        thinking: thinkingLevel,
         toolCount: result.progressSummary?.toolCount ?? result.progress?.toolCount ?? 0,
       })],
     });
@@ -382,7 +384,7 @@ export async function runAipiForkedSubagent({
       startedAt,
       lastUpdate: Date.now(),
       endedAt: Date.now(),
-      steps: [subagentRunStep({ agent: runLabel, status: "failed", model: modelId, error: String(error?.message ?? error) })],
+      steps: [subagentRunStep({ agent: runLabel, status: "failed", model: modelId, thinking: thinkingLevel, error: String(error?.message ?? error) })],
     });
     throw error;
   } finally {
@@ -392,11 +394,12 @@ export async function runAipiForkedSubagent({
 
 // One native run-store step (the shape summarizeAsyncRunDir reads). Only the agent + status are required;
 // model/toolCount/error are attached when known so the drilldown shows them.
-function subagentRunStep({ agent, status, model, toolCount, error }) {
+function subagentRunStep({ agent, status, model, thinking, toolCount, error }) {
   return {
     agent: agent ?? AIPI_SUBAGENTS_AGENT_NAME,
     status,
     ...(model ? { model } : {}),
+    ...(thinking ? { thinking } : {}),
     ...(typeof toolCount === "number" ? { toolCount } : {}),
     ...(error ? { error } : {}),
   };

@@ -12,12 +12,15 @@ assert.deepEqual(renderSubagentWidgetLines([{ id: "r", state: "complete" }]), []
 
 // --- pure render: only ACTIVE runs are listed, with the model suffix ---
 const lines = renderSubagentWidgetLines([
-  { id: "research-explore-auth-1", state: "running", steps: [{ agent: "aipi-worker", status: "running", model: "anthropic/claude-opus-4-8" }] },
+  { id: "research-explore-auth-1", state: "running", steps: [{ agent: "aipi-worker", status: "running", model: "anthropic/claude-opus-4-8", thinking: "high" }] },
   { id: "research-find-callers-2", state: "queued", steps: [{ agent: "aipi-worker", status: "queued" }] },
   { id: "research-done-3", state: "complete", steps: [{ agent: "aipi-worker", status: "complete" }] },
 ]);
 assert.ok(lines[0].includes("2 running"), lines[0]);
-assert.ok(lines.some((l) => l.includes("research-explore-auth-1") && l.includes("claude-opus-4-8")), "running run + model shown");
+assert.ok(
+  lines.some((l) => l.includes("research-explore-auth-1") && l.includes("claude-opus-4-8") && l.includes("high")),
+  "running run shows model + set intelligence (thinking level)",
+);
 assert.ok(lines.some((l) => l.includes("research-find-callers-2")), "queued run shown");
 assert.ok(!lines.some((l) => l.includes("research-done-3")), "completed run is NOT shown");
 
