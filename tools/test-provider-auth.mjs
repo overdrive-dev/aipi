@@ -382,25 +382,18 @@ try {
   assert.equal(invalid.ready, false);
   assert.equal(invalid.sidecar.validJson, false);
 
-  // === xAI (Grok) OAuth detection: optional, user-installed provider (never gates readiness) ===
+  // === xAI (Grok) OAuth: BUNDLED (provider-only) — always installed; only the login varies, never gates readiness ===
   const xaiEnv = { PI_CODING_AGENT_DIR: agentDir };
-  const xaiExtDir = path.join(agentDir, "extensions", "pi-xai-oauth");
 
-  // not installed: no xai extension present -> not_installed (regardless of auth.json state)
-  const xaiNone = await inspectXaiOauth({ env: xaiEnv, homeDir: tempRoot });
-  assert.equal(xaiNone.state, "not_installed");
-  assert.match(formatXaiOauthStatus(xaiNone), /not installed/);
-
-  // installed but not logged in: extension present, no xai credential
-  await fs.mkdir(xaiExtDir, { recursive: true });
+  // bundled + no credential -> installed, not logged in
   await fs.writeFile(authFile, JSON.stringify({ anthropic: { type: "oauth", access: "a" } }));
-  const xaiInstalled = await inspectXaiOauth({ env: xaiEnv, homeDir: tempRoot });
-  assert.equal(xaiInstalled.installed, true);
-  assert.equal(xaiInstalled.authed, false);
-  assert.equal(xaiInstalled.state, "installed");
-  assert.match(formatXaiOauthStatus(xaiInstalled), /login xai-auth/);
+  const xaiNotLoggedIn = await inspectXaiOauth({ env: xaiEnv, homeDir: tempRoot });
+  assert.equal(xaiNotLoggedIn.installed, true, "xAI is bundled -> always installed");
+  assert.equal(xaiNotLoggedIn.authed, false);
+  assert.equal(xaiNotLoggedIn.state, "installed");
+  assert.match(formatXaiOauthStatus(xaiNotLoggedIn), /not logged in/);
 
-  // ready: extension + xai-auth credential
+  // with a xai-auth credential -> ready
   await fs.writeFile(authFile, JSON.stringify({ "xai-auth": { type: "oauth", access: "tok", refresh: "r" } }));
   const xaiReady = await inspectXaiOauth({ env: xaiEnv, homeDir: tempRoot });
   assert.equal(xaiReady.state, "ready");

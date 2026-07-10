@@ -43,31 +43,20 @@ export function resolveAgentDir({ env = process.env, homeDir = os.homedir() } = 
 // into the Pi agent's auto-discovered extensions dir, and aipi's pinned Pi loads it from there. We only
 // DETECT + REPORT its state so `aipi status` gives visibility — it never gates readiness (Grok is optional).
 export async function inspectXaiOauth({ env = process.env, homeDir = os.homedir() } = {}) {
-  const agentDir = resolveAgentDir({ env, homeDir });
-  const extensionsDir = path.join(agentDir, "extensions");
-  const authPath = path.join(agentDir, ANTHROPIC_AUTH_FILE_NAME);
-  const [installed, authed] = await Promise.all([
-    xaiExtensionInstalled(extensionsDir),
-    xaiAuthPresent(authPath),
-  ]);
+  // xAI (Grok) OAuth is BUNDLED with AIPI (pi-xai-oauth, loaded provider-only through the AIPI wrapper), so
+  // it is always installed. Only the login (auth material in auth.json) varies, and its absence never gates
+  // readiness — Grok is optional.
+  const authPath = path.join(resolveAgentDir({ env, homeDir }), ANTHROPIC_AUTH_FILE_NAME);
+  const authed = await xaiAuthPresent(authPath);
   return {
     schema: "aipi.xai-oauth-status.v1",
     provider: "xai-auth",
-    extensionsDir,
+    bundled: true,
     authPath,
-    installed,
+    installed: true,
     authed,
-    state: !installed ? "not_installed" : authed ? "ready" : "installed",
+    state: authed ? "ready" : "installed",
   };
-}
-
-async function xaiExtensionInstalled(extensionsDir) {
-  try {
-    const entries = await fs.readdir(extensionsDir);
-    return entries.some((name) => /pi-xai-oauth|(^|[-_.])xai([-_.]|$)/i.test(name));
-  } catch {
-    return false;
-  }
 }
 
 async function xaiAuthPresent(authPath) {
@@ -81,9 +70,8 @@ async function xaiAuthPresent(authPath) {
 export function formatXaiOauthStatus(xai) {
   if (!xai) return "xAI OAuth (Grok): not detected";
   const detail = {
-    ready: "ready (extension + login)",
-    installed: "installed, not logged in — run /login xai-auth in a session",
-    not_installed: "not installed (optional) — `npx pi-xai-oauth` to add Grok via subscription",
+    ready: "ready (bundled + logged in)",
+    installed: "bundled, not logged in — run /login xai-auth in a session",
   }[xai.state] ?? xai.state;
   return `xAI OAuth (Grok): ${detail}`;
 }

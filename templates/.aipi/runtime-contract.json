@@ -394,6 +394,23 @@
         "reviewRule": "Before package bumps, review src/claude-oauth-adapter.ts for identity-block, billing-header, docs-context, before_provider_request, and provider hook changes; docs/anthropic-auth-integration.md must disclose these transitive request mutations."
       },
       "rule": "AIPI keeps @ersintarhan/pi-toolkit pinned as the upstream source of the Anthropic OAuth adapter, but does not autoload the package's broad index.ts by default. The default provider extension is an AIPI-owned wrapper that imports only src/claude-oauth-adapter.ts. The wrapper intentionally inherits the adapter's disclosed Claude Code identity-block handling, x-anthropic-billing-header injection/preservation, Pi docs context handling, and provider hook mutations. AIPI still owns model-class routing, workflow gates, memory, and policy."
+    },
+    "xai": {
+      "providerId": "xai-auth",
+      "package": "pi-xai-oauth",
+      "version": "1.3.1",
+      "extensionPath": "./extensions/aipi/provider/xai-oauth.ts",
+      "adapterImport": "./node_modules/pi-xai-oauth/extensions/xai/oauth.ts",
+      "loginCommand": "/login xai-auth",
+      "sidecarPath": "~/.pi/agent/auth.json",
+      "sidecarEnvOverride": "PI_CODING_AGENT_DIR",
+      "optional": true,
+      "adapterTransitiveBehavior": {
+        "provider": "Registers the xai-auth OAuth provider (SuperGrok / X Premium+ subscription) with Grok models via api xai-responses and PKCE OAuth against auth.x.ai.",
+        "toolsExcluded": "The AIPI wrapper registers ONLY the provider. It deliberately skips pi-xai-oauth's registerXaiTools (Cursor/Grok-CLI Read/Write/StrReplace/Edit/Delete/LS/Grep/Glob/Shell shims) because those add a raw bash + raw write/delete surface that bypasses AIPI's guarded write and aipi_shell watchdog.",
+        "reviewRule": "Before pi-xai-oauth bumps, review extensions/xai-oauth.ts and extensions/xai/* for provider/oauth/model changes AND confirm the AIPI wrapper still avoids registerXaiTools."
+      },
+      "rule": "xAI (Grok) OAuth is bundled as a provider-only dependency (pi-xai-oauth), loaded through an AIPI-owned wrapper that registers ONLY the provider — never the Cursor tool shims. It is optional: absence of a login never gates readiness. AIPI still owns tool policy, model-class routing, workflow gates, and memory."
     }
   },
   "piRuntime": {

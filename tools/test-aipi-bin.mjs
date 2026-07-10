@@ -59,7 +59,20 @@ assert.equal(hasAipiMcpConfig({
   cwd: path.join("C:", "repo", "project"),
   existsSync: (candidate) => candidate.endsWith(path.join(".aipi", "mcp.json")),
 }), true);
+// Fallback (contract unreadable at a fake packageRoot): only the critical Anthropic default loads.
 assert.deepEqual(aipiProviderExtensionPaths({ packageRoot }), ["./extensions/aipi/provider/anthropic-oauth-only.ts"]);
+
+// The shipped contract carries BOTH providers: Anthropic first, then the optional xAI (Grok) wrapper.
+const anthropicXaiContract = () => JSON.stringify({
+  providerAuth: {
+    anthropic: { extensionPath: "./extensions/aipi/provider/anthropic-oauth-only.ts" },
+    xai: { extensionPath: "./extensions/aipi/provider/xai-oauth.ts" },
+  },
+});
+assert.deepEqual(aipiProviderExtensionPaths({ packageRoot, readFileSync: anthropicXaiContract }), [
+  "./extensions/aipi/provider/anthropic-oauth-only.ts",
+  "./extensions/aipi/provider/xai-oauth.ts",
+]);
 
 const customProviderContract = () => JSON.stringify({
   providerAuth: {

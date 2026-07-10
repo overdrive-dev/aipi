@@ -19,6 +19,7 @@ try {
   assert.equal(await exists(path.join(installedRoot, "extensions", "aipi", "index.js")), true);
   assert.equal(await exists(path.join(installedRoot, "extensions", "aipi", ["pi", "subagents", "embedded"].join("-") + ".js")), false);
   assert.equal(await exists(path.join(installedRoot, "extensions", "aipi", "provider", "anthropic-oauth-only.ts")), true);
+  assert.equal(await exists(path.join(installedRoot, "extensions", "aipi", "provider", "xai-oauth.ts")), true);
   assert.equal(await exists(path.join(installedRoot, "templates", ".aipi", "runtime-contract.json")), true);
   assert.equal(await exists(path.join(installedRoot, "NOTICE.md")), true);
 
@@ -28,6 +29,7 @@ try {
     bin.aipiExtensionPaths({ packageRoot: installedRoot }).map((entry) => path.relative(installedRoot, entry).replaceAll("\\", "/")),
     [
       "extensions/aipi/provider/anthropic-oauth-only.ts",
+      "extensions/aipi/provider/xai-oauth.ts",
       "extensions/aipi/index.js",
     ],
   );
