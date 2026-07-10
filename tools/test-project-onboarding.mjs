@@ -132,6 +132,30 @@ try {
   assert.equal(typescriptCount >= 12, true);
   assert.equal(pythonCount >= 10, true);
 
+  // has_code robustness: an operational repo in a language beyond the original 11 extensions, or one detected
+  // only via its dependency manifest, must NOT be falsely flagged empty (the false-"empty repository" bug).
+  const goRoot = path.join(tempRoot, "go-service");
+  await fs.mkdir(path.join(goRoot, "cmd"), { recursive: true });
+  await fs.writeFile(path.join(goRoot, "go.mod"), "module example.com/svc\n\ngo 1.22\n");
+  await fs.writeFile(path.join(goRoot, "cmd", "main.go"), "package main\nfunc main() {}\n");
+  assert.equal((await inventoryRepository(goRoot)).has_code, true, "a Go service is not empty");
+
+  const kotlinRoot = path.join(tempRoot, "kotlin-app");
+  await fs.mkdir(kotlinRoot, { recursive: true });
+  await fs.writeFile(path.join(kotlinRoot, "App.kt"), "fun main() {}\n");
+  assert.equal((await inventoryRepository(kotlinRoot)).has_code, true, "a Kotlin file counts as code");
+
+  const manifestOnlyRoot = path.join(tempRoot, "manifest-only");
+  await fs.mkdir(manifestOnlyRoot, { recursive: true });
+  await fs.writeFile(path.join(manifestOnlyRoot, "Cargo.toml"), "[package]\nname = \"x\"\n");
+  await fs.writeFile(path.join(manifestOnlyRoot, "notes.txt"), "hello\n");
+  assert.equal((await inventoryRepository(manifestOnlyRoot)).has_code, true, "a project manifest means not-empty");
+
+  const emptyDocsRoot = path.join(tempRoot, "empty-docs");
+  await fs.mkdir(emptyDocsRoot, { recursive: true });
+  await fs.writeFile(path.join(emptyDocsRoot, "README.md"), "# hi\n");
+  assert.equal((await inventoryRepository(emptyDocsRoot)).has_code, false, "a docs-only repo is still empty");
+
   const freeTextRoot = path.join(tempRoot, "free-text-repo");
   await writeFixtureRepo(freeTextRoot);
   await initProject({ sourceRoot, targetRoot: freeTextRoot });

@@ -186,11 +186,10 @@ export async function runModelsCommand({
     if (!buckets.planner) buckets.planner = buckets.doer;
     if (!buckets.mover) buckets.mover = buckets.doer;
 
-    // Hard error preserved: the doer/implementation family must differ from the adversarial
-    // bucket so cross-model review stays independent.
-    if (buckets.doer.provider === buckets.adversarial.provider) {
-      throw new Error("aipi effort setup requires adversarial provider/family to differ from the host provider/family");
-    }
+    // Cross-model independence is a RECOMMENDATION, not a hard requirement. If the adversarial bucket shares a
+    // family with the doer/planner, bucketSetupWarnings emits a warning (below) but the user's choice stands —
+    // on a machine with a single authed provider you must still be able to configure effort. (Previously this
+    // threw and blocked setup entirely; the README always described it as a warning.)
     setupWarnings = bucketSetupWarnings(buckets);
 
     // Legacy --verifier binds verifier-fast independently of the adversarial bucket.

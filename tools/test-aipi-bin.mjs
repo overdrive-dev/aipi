@@ -248,14 +248,14 @@ const readme = fs.readFileSync("README.md", "utf8");
 const installationDoc = fs.readFileSync(path.join("docs", "installation.md"), "utf8");
 const wrapperDoc = fs.readFileSync(path.join("docs", "aipi-cli-wrapper.md"), "utf8");
 assert.match(readme, /docs\/installation\.md`\]\(docs\/installation\.md\)/);
-assert.match(readme, /aipi\s+# starts an interactive Pi session with AIPI preloaded/);
+assert.match(readme, /aipi\s+# interactive Pi session with AIPI preloaded/);
 // Standalone story: Pi ships as a pinned dependency; the docs must NOT tell
 // users to globally install Pi as a prerequisite anymore.
 assert.doesNotMatch(installationDoc, /npm install -g @earendil-works\/pi-coding-agent/);
-assert.match(installationDoc, /No separate global Pi install is required/);
+assert.match(installationDoc, /no global Pi is required/);
 assert.match(installationDoc, /npm link/);
 assert.match(installationDoc, /npm install -g \./);
-assert.match(installationDoc, /Bare `aipi` is the primary entry point/);
+assert.match(installationDoc, /starts an interactive Pi session with the AIPI extensions preloaded/);
 assert.match(wrapperDoc, /`aipi` with no arguments starts an interactive Pi session/);
 
 const piVersion = readPiVersion({

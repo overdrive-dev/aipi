@@ -49,6 +49,22 @@ const LOW_PRIORITY_INVENTORY_DIRS = new Set([
   "documentation",
 ]);
 
+// Source extensions the onboarding treats as "real code" for the has_code / investigation decision. Broad on
+// purpose: a project in ANY of these is not an empty repo. (Previously only 11 web/backend extensions, so an
+// operational repo in Kotlin, Swift, C/C++, Elixir, Scala, Dart, Vue, SQL, etc. was falsely detected empty.)
+const INVESTIGABLE_CODE_EXTENSIONS = new Set([
+  ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".py", ".go", ".rs", ".rb", ".php", ".java",
+  ".kt", ".kts", ".cs", ".fs", ".swift", ".scala", ".c", ".cc", ".cpp", ".cxx", ".h", ".hh",
+  ".hpp", ".m", ".mm", ".ex", ".exs", ".clj", ".cljs", ".cljc", ".dart", ".vue", ".svelte", ".sql",
+]);
+// Strong dependency manifests: their presence means a REAL project even when the code is in a language the
+// extension set above does not cover — so has_code is true and onboarding takes the existing-code path.
+const PROJECT_MANIFEST_RE =
+  /(^|\/)(package\.json|pyproject\.toml|requirements[^/]*\.txt|Pipfile|setup\.py|go\.mod|Cargo\.toml|pom\.xml|build\.gradle(\.kts)?|Gemfile|composer\.json|mix\.exs|pubspec\.yaml|Package\.swift|[^/]+\.csproj|[^/]+\.fsproj)$/i;
+function hasProjectManifest(files) {
+  return (Array.isArray(files) ? files : []).some((file) => PROJECT_MANIFEST_RE.test(file));
+}
+
 const LANGUAGE_EXTENSIONS = new Map([
   [".js", "JavaScript"],
   [".jsx", "React JSX"],
@@ -337,7 +353,10 @@ export async function inventoryRepository(projectRoot) {
     files_sample: representativeFileSample({ files, manifestPaths, limit: 80 }),
     file_count: files.length,
     inference_file_count: inferenceFiles.length,
-    has_code: codeFiles.length > 0,
+    // A repo is "empty" only when it has neither recognized source files NOR a project manifest — so an
+    // operational codebase in an uncommon language (or one investigated only via its manifest) is never
+    // falsely routed to the new-project scaffold path.
+    has_code: codeFiles.length > 0 || hasProjectManifest(files),
     code_files: codeFiles,
     config_files: configFiles,
     languages,
@@ -931,7 +950,7 @@ function isLowPriorityInventoryFile(file) {
 
 function isInvestigableCodeFile(file) {
   const ext = path.extname(file).toLowerCase();
-  if (![".js", ".jsx", ".ts", ".tsx", ".py", ".go", ".rs", ".rb", ".php", ".java", ".cs"].includes(ext)) return false;
+  if (!INVESTIGABLE_CODE_EXTENSIONS.has(ext)) return false;
   return !/(^|\/)(node_modules|dist|build|coverage|\.aipi)\//.test(file);
 }
 

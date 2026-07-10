@@ -117,13 +117,22 @@ try {
   assert.equal(reviewer.cross_model_adversarial.distinct_provider, true);
   assert.equal((await inspectAdversarialFamilyIsolation({ root })).state, "pass");
 
-  await assert.rejects(
-    () => runModelsCommand({
-      projectRoot: root,
+  // Cross-model independence is a RECOMMENDATION, not a hard requirement: a same-family doer/adversarial now
+  // WARNS instead of throwing (you must be able to configure effort with a single authed provider).
+  const sameProviderRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-effort-sameprov-"));
+  try {
+    await initProject({ sourceRoot: path.resolve("templates/.aipi"), targetRoot: sameProviderRoot });
+    const sameProviderReport = await runModelsCommand({
+      projectRoot: sameProviderRoot,
       args: ["setup", "--host", "openai-codex/gpt-5.5", "--adversarial", "openai-codex/gpt-5.1"],
-    }),
-    /adversarial provider\/family to differ/,
-  );
+    });
+    assert.ok(
+      (sameProviderReport.warnings ?? []).some((w) => w.code === "AIPI_EFFORT_ADVERSARIAL_SHARES_FAMILY"),
+      "same-family adversarial warns instead of throwing",
+    );
+  } finally {
+    await fs.rm(sameProviderRoot, { recursive: true, force: true });
+  }
 
   // ===================================================================
   // REAL-PATH 4-bucket wizard test. Drive runModelsCommand with a stubbed readline/ui
@@ -310,9 +319,8 @@ try {
   }
 
   // ===================================================================
-  // adversarial-shares-family WARNING (soft, not a hard error). The host!=adversarial hard
-  // error covers doer==adversarial, so the warning meaningfully fires when the PLANNER
-  // bucket shares the adversarial family while the doer differs (so the hard error passes).
+  // adversarial-shares-family WARNING (soft — there is NO hard error). Fires for whichever peer bucket
+  // (doer and/or planner) shares the adversarial family. The user's choice always stands.
   // ===================================================================
   const sameFamilyRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-effort-samefamily-"));
   try {
@@ -339,13 +347,17 @@ try {
     assert.equal(sameFamilyWarning.severity, "warning");
     assert.match(sameFamilyWarning.message, /cross-model adversarial independence/);
 
-    // The host!=adversarial HARD error still fires when doer and adversarial share a family.
-    await assert.rejects(
-      () => runModelsCommand({
-        projectRoot: sameFamilyRoot,
-        args: ["setup", "--doer", "anthropic/claude-sonnet-4-5", "--adversarial", "anthropic/claude-haiku-4-5"],
-      }),
-      /adversarial provider\/family to differ/,
+    // Same-family doer==adversarial now WARNS too (was a hard error) — the user's choice stands.
+    const doerSameReport = await runModelsCommand({
+      projectRoot: sameFamilyRoot,
+      args: ["setup", "--doer", "anthropic/claude-sonnet-4-5", "--adversarial", "anthropic/claude-haiku-4-5"],
+      now: () => new Date("2026-06-22T02:00:00.000Z"),
+    });
+    assert.ok(
+      doerSameReport.warnings.some(
+        (w) => w.code === "AIPI_EFFORT_ADVERSARIAL_SHARES_FAMILY" && w.peer_bucket === "doer",
+      ),
+      "doer==adversarial family now warns (doer peer) instead of throwing",
     );
   } finally {
     await fs.rm(sameFamilyRoot, { recursive: true, force: true });
