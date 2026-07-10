@@ -21,9 +21,16 @@ const TASK_GLYPH = Object.freeze({
 
 // Pure render: the active-plan object ({ plan, planId } | null) -> the widget's string[] lines. Returns []
 // when there is no active plan, which clears the widget. Kept pure so it is unit-testable without a TUI.
+// Only surface a plan while it is LIVE/actionable: discovery (answer the open questions) or in-flight
+// (executing / blocked). A SETTLED-but-idle plan is PARKED — keeping it pinned clutters the TUI and reads as
+// "stuck / won't go away", so hide it until it starts executing (it reappears with live progress) or it is
+// cancelled. Terminal plans are already excluded upstream (readActivePlan returns null for them).
+const LIVE_PLAN_STATUSES = new Set(["discovery", "executing", "blocked"]);
+
 export function renderPlanWidgetLines(active) {
   const plan = active?.plan;
   if (!plan) return [];
+  if (!LIVE_PLAN_STATUSES.has(plan.status)) return [];
   const tasks = plan.tasks ?? [];
   const openQuestions = (plan.questions ?? []).filter((question) => !isAnswered(question));
   const done = tasks.filter((task) => task.status === "passed" || task.status === "skipped").length;
@@ -37,8 +44,6 @@ export function renderPlanWidgetLines(active) {
   }
   if (openQuestions.length) {
     lines.push(`  ? ${openQuestions.length} open question(s) — answer to settle`);
-  } else if (plan.status === "settled") {
-    lines.push("  ✓ settled — ready to execute");
   }
   return lines;
 }

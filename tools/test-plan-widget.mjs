@@ -29,7 +29,7 @@ assert.ok(discovery.some((l) => l.includes("t1") && l.includes("corrigir o save"
 assert.ok(discovery.some((l) => l.includes("✓") && l.includes("t2")), "passed task shows the done glyph");
 assert.ok(discovery.some((l) => l.includes("open question")), "open question surfaced");
 
-// --- pure render: a settled plan (all answered) shows the ready line, not the question line ---
+// --- pure render: a SETTLED-but-idle plan is HIDDEN (parked) so it does not linger as "stuck" ---
 const settled = renderPlanWidgetLines({
   plan: {
     plan_id: "plan-2",
@@ -39,8 +39,23 @@ const settled = renderPlanWidgetLines({
     questions: [{ question_id: "q1", answer: "sim" }],
   },
 });
-assert.ok(settled.some((l) => l.includes("settled") && l.includes("ready")));
-assert.ok(!settled.some((l) => l.includes("open question")));
+assert.deepEqual(settled, [], "a settled-but-idle plan is hidden (not pinned forever)");
+
+// --- pure render: an EXECUTING plan IS shown, with live progress ---
+const executing = renderPlanWidgetLines({
+  plan: {
+    plan_id: "plan-3",
+    status: "executing",
+    execution_cadence: "autonomous_to_pr",
+    tasks: [
+      { task_id: "t1", workflow: "feature", text: "primeiro", status: "passed" },
+      { task_id: "t2", workflow: "feature", text: "segundo", status: "running" },
+    ],
+    questions: [],
+  },
+});
+assert.ok(executing[0].includes("executing") && executing[0].includes("1/2 done"), executing[0]);
+assert.ok(executing.some((l) => l.includes("▸") && l.includes("t2")), "the running task shows the active glyph");
 
 // --- refreshPlanWidget: PULLS the active plan and pushes it; the mode guard blocks non-TUI ---
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-plan-widget-"));
