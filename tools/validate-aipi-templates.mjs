@@ -359,7 +359,7 @@ if (!backendOptions) {
     !backendOptions.piSubagentsPhaseOneRule?.includes("aipi-guarded-write-child.js") ||
     !backendOptions.piSubagentsPhaseOneRule?.includes("jiti@2.7.0") ||
     !backendOptions.piSubagentsPhaseOneRule?.includes("typebox@1.2.16") ||
-    !backendOptions.piSubagentsPhaseOneRule?.includes("@earendil-works/pi-tui is not a direct AIPI dependency") ||
+    !backendOptions.piSubagentsPhaseOneRule?.includes("@earendil-works/pi-tui is a pinned direct AIPI dependency") ||
     !backendOptions.piSubagentsPhaseOneRule?.includes("/aipi-pi-subagents-spike") ||
     !backendOptions.piSubagentsPhaseOneRule?.includes("provider_event_observed=true") ||
     !backendOptions.piSubagentsPhaseOneRule?.includes("no provider/model other than the selected worker model")) {
@@ -2016,10 +2016,8 @@ for (const [dep, version] of [
     errors.push(`package.json must pin ${dep}@${version} for the forked pi-subagents runtime`);
   }
 }
-if (packageJson.dependencies?.["@earendil-works/pi-tui"] ||
-  packageJson.optionalDependencies?.["@earendil-works/pi-tui"] ||
-  packageJson.devDependencies?.["@earendil-works/pi-tui"]) {
-  errors.push("package.json must not keep @earendil-works/pi-tui as a direct AIPI dependency; the separate pi-subagents extension is not loaded");
+if (packageJson.dependencies?.["@earendil-works/pi-tui"] !== "0.79.8") {
+  errors.push("package.json must pin @earendil-works/pi-tui to 0.79.8 (the vendored subagent view + TUI widgets load it via jiti and need it hoisted to top-level)");
 }
 // pi-coding-agent is deliberately excluded here: it is now the pinned direct
 // dependency (see the piRuntime lockstep check above). The remaining Pi peers
@@ -2510,11 +2508,11 @@ if (!anthropicAuth) {
   if (anthropicAuth.blockedAutoloadPath && packageJson.pi?.extensions?.includes(anthropicAuth.blockedAutoloadPath)) {
     errors.push("package.json pi.extensions must not autoload the broad pi-toolkit index.ts by default");
   }
-  if (anthropicAuth.adapterImport !== "../../../node_modules/@ersintarhan/pi-toolkit/src/claude-oauth-adapter.ts") {
-    errors.push("runtime-contract providerAuth.anthropic.adapterImport must point at the narrow Claude OAuth adapter");
+  if (anthropicAuth.adapterImport !== "../../runtime/vendor/pi-toolkit/claude-oauth-adapter.ts") {
+    errors.push("runtime-contract providerAuth.anthropic.adapterImport must point at the vendored Claude OAuth adapter");
   }
-  if (!runtimeContractText.includes("does not autoload the package's broad index.ts by default")) {
-    errors.push("runtime-contract providerAuth.anthropic.rule must document the pi-toolkit trust-surface decision");
+  if (!runtimeContractText.includes("vendor/pi-toolkit")) {
+    errors.push("runtime-contract providerAuth.anthropic.rule must document the vendored pi-toolkit adapter (vendor/pi-toolkit)");
   }
   for (const requiredText of [
     "Claude Code identity",
@@ -2525,7 +2523,7 @@ if (!anthropicAuth) {
       errors.push(`Anthropic provider contract and docs must disclose adapter transitive behavior: ${requiredText}`);
     }
   }
-  const adapterSourcePath = "node_modules/@ersintarhan/pi-toolkit/src/claude-oauth-adapter.ts";
+  const adapterSourcePath = "extensions/aipi/runtime/vendor/pi-toolkit/claude-oauth-adapter.ts";
   if (fs.existsSync(path.join(root, adapterSourcePath))) {
     const adapterSource = read(adapterSourcePath);
     for (const [adapterNeedle, disclosureNeedle] of [
@@ -2548,7 +2546,16 @@ for (const [providerName, provider] of providerAuthEntries) {
       errors.push(`runtime-contract providerAuth.${providerName}.${field} is required`);
     }
   }
-  if (provider?.package && provider?.version && packageJson.dependencies?.[provider.package] !== provider.version) {
+  if (provider?.vendored) {
+    // Vendored provider: source is forked into the repo (not an npm dep). Require the vendored source to exist
+    // and require the upstream package to be ABSENT from dependencies.
+    if (!provider.vendorSource || !fs.existsSync(path.join(root, provider.vendorSource))) {
+      errors.push(`runtime-contract providerAuth.${providerName} is vendored but vendorSource is missing: ${provider.vendorSource}`);
+    }
+    if (packageJson.dependencies?.[provider.package]) {
+      errors.push(`providerAuth.${providerName} is vendored — remove ${provider.package} from package.json dependencies`);
+    }
+  } else if (provider?.package && provider?.version && packageJson.dependencies?.[provider.package] !== provider.version) {
     errors.push(`package.json must pin ${provider.package} to providerAuth.${providerName}.version ${provider.version}`);
   }
   if (provider?.extensionPath && !packageJson.pi?.extensions?.includes(provider.extensionPath)) {

@@ -111,21 +111,28 @@ export async function inspectAnthropicAuth({
 
   const contract = contractState.contract;
   const packageJson = await readJson(path.join(root, "package.json"));
-  const installedPackageJson = await readJson(
-    path.join(root, "node_modules", "@ersintarhan", "pi-toolkit", "package.json"),
-  );
   const extensionAbsPath = path.resolve(root, contract.extensionPath);
+  const extensionExists = await pathExists(extensionAbsPath);
 
+  // A vendored adapter lives in the repo (no npm dep / node_modules install to pin). "Pinned" == the vendored
+  // source is present; there is no dependency version to match.
+  const vendored = contract.vendored === true;
+  const vendorAbsPath = contract.vendorSource ? path.resolve(root, contract.vendorSource) : null;
+  const vendorPresent = vendored && vendorAbsPath ? await pathExists(vendorAbsPath) : false;
+  const installedPackageJson = vendored
+    ? { data: null }
+    : await readJson(path.join(root, "node_modules", "@ersintarhan", "pi-toolkit", "package.json"));
   const dependencyVersion = packageJson.data?.dependencies?.[contract.package] ?? null;
   const installedVersion = installedPackageJson.data?.version ?? null;
-  const extensionExists = await pathExists(extensionAbsPath);
-  const dependencyPinned = dependencyVersion === contract.version;
-  const installedMatches = installedVersion === contract.version;
+  const dependencyPinned = vendored ? true : dependencyVersion === contract.version;
+  const installedMatches = vendored ? vendorPresent : installedVersion === contract.version;
 
   return {
     providerId: contract.providerId,
     package: contract.package,
     expectedVersion: contract.version,
+    vendored,
+    vendorPresent,
     dependencyVersion,
     installedVersion,
     dependencyPinned,

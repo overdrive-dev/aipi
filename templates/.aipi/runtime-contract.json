@@ -264,7 +264,7 @@
     "lifecycleTraceRule": "Workers emit queued, started, aipi_forked_subagent_start, worker_prompt_start, worker_prompt_end, aipi_forked_subagent_end, done/failed/cancelled, and worker_cleanup events with elapsed_ms, prompt_elapsed_ms, budget, model provenance, runtime_root, and tool-call counters where available.",
     "workerProviderRule": "Forked workers run through the host Pi runtime with the AIPI provider extension loaded by the wrapper. The coordinator passes the captured or configured provider/model into the forked runtime, strips fallbackModels, and limits availableModels to the selected worker model when it is provider-qualified. Child sessions receive read/grep/find/ls as built-ins and AIPI's guarded write extension, not the unguarded builtin write.",
     "hostModelFallbackRule": "When a spawn descriptor has an unresolved or unknown model_class and fallback is allowed, AIPI prefers the model captured in SubagentCoordinator.getHostModel from lifecycle model_select/session_start/before_agent_start, then falls back to tool-call ctx.model fields. aipi_agent_status and step_result strict provenance show model_requested, model_resolved as the real host model id actually passed to the worker, model_fallback=true, and a warning such as running on host model <id> (class <name> unbound). allow_fallback:false rejects the spawn before owned-file allocation. Worker fallback remains provider-agnostic for provider-qualified models such as Anthropic, OpenAI, Codex/OpenAI-Codex, or another configured provider. The interactive host/orchestrator turn is narrower: unsupported non-Anthropic host providers must be reported gracefully instead of crashing.",
-    "piSubagentsPhaseOneRule": "pi-subagents source is forked from pi-subagents@0.28.0 under extensions/aipi/runtime/vendor/pi-subagents with LICENSE and VENDOR.md. The npm package pi-subagents is not a dependency or optionalDependency, there is no separately-loaded pi-subagents extension, and no backend-selection environment flag exists. AIPI owns runtime/pi-subagents.js, calls the vendored runSync entrypoint through jiti, writes agent/sessions/artifacts/results under .aipi/runtime/subagents, disables fallbackModels, passes AIPI_SUBAGENTS_PROJECT_ROOT/AIPI_SUBAGENTS_AGENT_ID/AIPI_SUBAGENTS_OWNED_FILES into the child, loads extensions/aipi/runtime/aipi-guarded-write-child.js as the worker write tool, and exposes the stable aipi_* tool surface by default. Non-auth utility deps kept are jiti@2.7.0 for loading the vendored TS runSync path and typebox@1.2.16 for the vendored structured-output validator; @earendil-works/pi-tui is not a direct AIPI dependency because the TUI extension surface is no longer loaded. Live provider-inheritance proof is manual: start a real AIPI/Pi session via `aipi` with provider auth/model selected, then run `/aipi-pi-subagents-spike`. GO requires assistant_text_ok=true for the child worker's OK reply, provider_event_observed=true from .aipi/runtime/provider-events.jsonl, project-scoped .aipi/runtime/subagents writes, and no provider/model other than the selected worker model is attempted.",
+    "piSubagentsPhaseOneRule": "pi-subagents source is forked from pi-subagents@0.28.0 under extensions/aipi/runtime/vendor/pi-subagents with LICENSE and VENDOR.md. The npm package pi-subagents is not a dependency or optionalDependency, there is no separately-loaded pi-subagents extension, and no backend-selection environment flag exists. AIPI owns runtime/pi-subagents.js, calls the vendored runSync entrypoint through jiti, writes agent/sessions/artifacts/results under .aipi/runtime/subagents, disables fallbackModels, passes AIPI_SUBAGENTS_PROJECT_ROOT/AIPI_SUBAGENTS_AGENT_ID/AIPI_SUBAGENTS_OWNED_FILES into the child, loads extensions/aipi/runtime/aipi-guarded-write-child.js as the worker write tool, and exposes the stable aipi_* tool surface by default. Non-auth utility deps kept are jiti@2.7.0 for loading the vendored TS runSync path and typebox@1.2.16 for the vendored structured-output validator; @earendil-works/pi-tui is a pinned direct AIPI dependency because the vendored subagent view (tui/subagent-view.ts, opened by /aipi-subagents) and the plan/subagent TUI widgets load it. Live provider-inheritance proof is manual: start a real AIPI/Pi session via `aipi` with provider auth/model selected, then run `/aipi-pi-subagents-spike`. GO requires assistant_text_ok=true for the child worker's OK reply, provider_event_observed=true from .aipi/runtime/provider-events.jsonl, project-scoped .aipi/runtime/subagents writes, and no provider/model other than the selected worker model is attempted.",
     "cleanupRule": "aipi_cleanup_agents applies retention cleanup only to terminal workers, releases owned-file allocations, emits a cleanup trace, returns aipi.subagents.cleanup.v1, and never deletes durable project/user memory.",
     "steeringRule": "aipi_steer_agent is registered but returns accepted=false with an explicit reason until worker prompt/response boundaries are resumable.",
     "redispatchRule": "Workflow adapters call coordinator.dispatch(descriptor). If a restored interrupted worker matches step_id, catalog agent id, and owned_files, the coordinator marks the old worker redispatched, releases its owned-file allocation, and spawns a fresh worker from the current descriptor/context.",
@@ -380,37 +380,40 @@
       "providerId": "anthropic",
       "package": "@ersintarhan/pi-toolkit",
       "version": "0.5.12",
+      "vendored": true,
+      "vendorSource": "extensions/aipi/runtime/vendor/pi-toolkit/claude-oauth-adapter.ts",
       "extensionPath": "./extensions/aipi/provider/anthropic-oauth-only.ts",
-      "adapterImport": "../../../node_modules/@ersintarhan/pi-toolkit/src/claude-oauth-adapter.ts",
+      "adapterImport": "../../runtime/vendor/pi-toolkit/claude-oauth-adapter.ts",
       "loginCommand": "/login anthropic",
       "sidecarPath": "~/.pi/agent/auth.json",
       "sidecarEnvOverride": "PI_CODING_AGENT_DIR",
       "autoloadScope": "anthropic-oauth-only",
-      "blockedAutoloadPath": "./node_modules/@ersintarhan/pi-toolkit/index.ts",
       "adapterTransitiveBehavior": {
-        "identityBlock": "The upstream adapter removes any system block equal to the Claude Code identity text before Anthropic OAuth requests.",
-        "billingHeader": "The upstream adapter preserves an existing x-anthropic-billing-header system text block or injects a synthetic one when absent.",
-        "docsContext": "The upstream adapter can strip and re-inject Pi docs context around Anthropic OAuth provider requests.",
-        "reviewRule": "Before package bumps, review src/claude-oauth-adapter.ts for identity-block, billing-header, docs-context, before_provider_request, and provider hook changes; docs/anthropic-auth-integration.md must disclose these transitive request mutations."
+        "identityBlock": "The vendored adapter removes any system block equal to the Claude Code identity text before Anthropic OAuth requests.",
+        "billingHeader": "The vendored adapter preserves an existing x-anthropic-billing-header system text block or injects a synthetic one when absent.",
+        "docsContext": "The vendored adapter can strip and re-inject Pi docs context around Anthropic OAuth provider requests.",
+        "reviewRule": "Before re-vendoring, review vendor/pi-toolkit/claude-oauth-adapter.ts for identity-block, billing-header, docs-context, before_provider_request, and provider hook changes; docs/anthropic-auth-integration.md must disclose these transitive request mutations."
       },
-      "rule": "AIPI keeps @ersintarhan/pi-toolkit pinned as the upstream source of the Anthropic OAuth adapter, but does not autoload the package's broad index.ts by default. The default provider extension is an AIPI-owned wrapper that imports only src/claude-oauth-adapter.ts. The wrapper intentionally inherits the adapter's disclosed Claude Code identity-block handling, x-anthropic-billing-header injection/preservation, Pi docs context handling, and provider hook mutations. AIPI still owns model-class routing, workflow gates, memory, and policy."
+      "rule": "AIPI VENDORS only src/claude-oauth-adapter.ts from @ersintarhan/pi-toolkit@0.5.12 under extensions/aipi/runtime/vendor/pi-toolkit — NOT the npm package. The AIPI-owned wrapper imports only that vendored adapter, never the package's broad index.ts. The wrapper intentionally inherits the adapter's disclosed Claude Code identity-block handling, x-anthropic-billing-header injection/preservation, Pi docs context handling, and provider hook mutations. AIPI still owns model-class routing, workflow gates, memory, and policy."
     },
     "xai": {
       "providerId": "xai-auth",
       "package": "pi-xai-oauth",
       "version": "1.3.1",
+      "vendored": true,
+      "vendorSource": "extensions/aipi/runtime/vendor/pi-xai-oauth/oauth.ts",
       "extensionPath": "./extensions/aipi/provider/xai-oauth.ts",
-      "adapterImport": "./node_modules/pi-xai-oauth/extensions/xai/oauth.ts",
+      "adapterImport": "../../runtime/vendor/pi-xai-oauth/oauth.ts",
       "loginCommand": "/login xai-auth",
       "sidecarPath": "~/.pi/agent/auth.json",
       "sidecarEnvOverride": "PI_CODING_AGENT_DIR",
       "optional": true,
       "adapterTransitiveBehavior": {
         "provider": "Registers the xai-auth OAuth provider (SuperGrok / X Premium+ subscription) with Grok models via api xai-responses and PKCE OAuth against auth.x.ai.",
-        "toolsExcluded": "The AIPI wrapper registers ONLY the provider. It deliberately skips pi-xai-oauth's registerXaiTools (Cursor/Grok-CLI Read/Write/StrReplace/Edit/Delete/LS/Grep/Glob/Shell shims) because those add a raw bash + raw write/delete surface that bypasses AIPI's guarded write and aipi_shell watchdog.",
-        "reviewRule": "Before pi-xai-oauth bumps, review extensions/xai-oauth.ts and extensions/xai/* for provider/oauth/model changes AND confirm the AIPI wrapper still avoids registerXaiTools."
+        "toolsExcluded": "Only the provider subgraph (auth/oauth/constants/models/responses/payload/text/images) was vendored. pi-xai-oauth's registerXaiTools (Cursor/Grok-CLI Read/Write/StrReplace/Edit/Delete/LS/Grep/Glob/Shell shims — a raw bash + raw write/delete surface) was NOT vendored, so AIPI's guarded write and aipi_shell watchdog stay authoritative.",
+        "reviewRule": "Before re-vendoring pi-xai-oauth, review vendor/pi-xai-oauth/*.ts for provider/oauth/model/streaming changes AND confirm the tool shims (cursor-shims/custom-tools) were not vendored."
       },
-      "rule": "xAI (Grok) OAuth is bundled as a provider-only dependency (pi-xai-oauth), loaded through an AIPI-owned wrapper that registers ONLY the provider — never the Cursor tool shims. It is optional: absence of a login never gates readiness. AIPI still owns tool policy, model-class routing, workflow gates, and memory."
+      "rule": "xAI (Grok) OAuth is VENDORED provider-only from pi-xai-oauth@1.3.1 under extensions/aipi/runtime/vendor/pi-xai-oauth — NOT an npm dependency. Loaded through an AIPI-owned wrapper that registers ONLY the provider; the Cursor tool shims were not vendored. Optional: absence of a login never gates readiness. AIPI owns tool policy, model-class routing, workflow gates, and memory."
     }
   },
   "piRuntime": {
