@@ -42,11 +42,13 @@ export function renderSubagentWidgetLines(runs) {
 
 function runLabel(run) {
   const step = run.steps?.[0];
-  // Show the model + its set intelligence (thinking level) of whatever is running, e.g. "grok-4.5 · high".
+  // LEAD with the model + its set intelligence (thinking level), e.g. "grok-4.5 · high", so it always shows:
+  // the run.id (a long task slug) used to eat the whole width and the model got truncated to "claud…". The id
+  // is the differentiator, so it takes the remaining width and truncates instead of the model.
   const model = step?.model ? String(step.model).split("/").pop() : null;
   const thinking = step?.thinking ? String(step.thinking) : null;
-  const suffix = [model, thinking].filter(Boolean).join(" · ");
-  return suffix ? `${run.id} · ${suffix}` : run.id;
+  const tag = [model, thinking].filter(Boolean).join(" · ");
+  return tag ? `${tag} · ${run.id}` : run.id;
 }
 
 function shorten(text, max) {

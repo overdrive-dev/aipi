@@ -23,6 +23,7 @@ import {
 import { refreshPlanWidget, registerPlanWidget } from "./runtime/plan-widget.js";
 import { registerBackgroundResearchTool } from "./runtime/background-research.js";
 import { registerSubagentWidget } from "./runtime/subagent-widget.js";
+import { registerModelIndicator } from "./runtime/model-indicator.js";
 import { registerAskTool } from "./runtime/ask-tool.js";
 import {
   formatGoalCommandResult,
@@ -91,6 +92,10 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
   registerBackgroundResearchTool(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx) });
   // Inline TUI widget: an always-visible live list of active subagent runs above the editor (grok-build style).
   registerSubagentWidget(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx) });
+  // Foreground model indicator: show the current session model + thinking on the footer chip and the streaming
+  // "Working…" row, so write/edit/read actions in the main stream name their model (Pi core renders those
+  // boxes; extensions cannot decorate them, so this is the visible surface for it).
+  registerModelIndicator(pi);
   // Interactive question tool: ask A/B/C questions via the native TUI selector instead of prose.
   registerAskTool(pi);
   registerAipiLifecycleHooks(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx), coordinator });
