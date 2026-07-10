@@ -9,7 +9,13 @@ import {
   recordCriterionMet,
   unmetRequiredCriteria,
 } from "./goal-state.js";
-import { buildModelMeasurabilityJudge } from "./goal-judge.js";
+import { buildModelMeasurabilityJudge, GOAL_JUDGE_TOTAL_BUDGET_MS } from "./goal-judge.js";
+
+// proposeGoal's outer guard against a judge that HANGS forever. It must sit ABOVE the judge's own internal
+// budget so the judge's graceful { unavailable } wins the race — the old default (2000ms) preempted the model
+// judge entirely (a forked worker never spawns in 2s), so the model judge could never run and every set_goal
+// fail-closed on a fake "goal_judge_timeout".
+export const GOAL_PROPOSE_TIMEOUT_MS = GOAL_JUDGE_TOTAL_BUDGET_MS + 15_000;
 
 // Command surface for /aipi-goal — the top-level, measurable objective. The whole point is the acceptance
 // gate: `set` only ACCEPTS a goal that carries a clear objective + checkable criteria + a measurable
@@ -110,7 +116,9 @@ export async function runGoalCommand({
   now = () => new Date(),
   randomBytes = undefined,
   judge = null,
-  timeoutMs = undefined,
+  // Default to the realistic judge budget (not proposeGoal's tiny 2000ms) so the /aipi-goal slash path, which
+  // builds a model judge but does not pass a timeout, gives the judge room to run instead of preempting it.
+  timeoutMs = GOAL_PROPOSE_TIMEOUT_MS,
 } = {}) {
   if (!projectRoot) throw new Error("projectRoot is required");
   const command = parseGoalArgs(args);
@@ -292,6 +300,7 @@ export function registerGoalTools(pi, { projectRootResolver = () => process.cwd(
           done_when: params?.done_when,
           source: "tool",
           judge,
+          timeoutMs: GOAL_PROPOSE_TIMEOUT_MS,
         });
         return toolJson(result);
       } catch (error) {

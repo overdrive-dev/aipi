@@ -16,39 +16,59 @@ import { createAipiSubagentsRunner, extractToolText, modelToPiModelId } from "./
 //   `measurable` rejects the goal (the vagueness gate the user asked for).
 
 const JUDGE_RUN_ID = "goal-measurability-judge";
-const DEFAULT_TIMEOUT_MS = 45_000;
+// Per-attempt spawn budget. A forked Pi worker takes seconds to spawn + run, so this must be generous — the
+// old outer 2s cap in proposeGoal preempted this entirely and the model judge never got to run.
+export const GOAL_JUDGE_ATTEMPT_TIMEOUT_MS = 30_000;
+// Retry once: a cold-loaded local model (e.g. Ollama) that times out on the first call is usually warm for the
+// next, so a second attempt frequently succeeds — this is the "warm-up" without a provider-specific ping.
+export const GOAL_JUDGE_ATTEMPTS = 2;
+const GOAL_JUDGE_RETRY_BACKOFF_MS = 1_500;
+// The TOTAL time the judge may take. proposeGoal's outer guard must sit ABOVE this so the judge's own graceful
+// { unavailable } wins the race instead of the outer timeout throwing and fail-closing.
+export const GOAL_JUDGE_TOTAL_BUDGET_MS = GOAL_JUDGE_ATTEMPT_TIMEOUT_MS * GOAL_JUDGE_ATTEMPTS + GOAL_JUDGE_RETRY_BACKOFF_MS;
 
-export function buildModelMeasurabilityJudge({ root = process.cwd(), model = null, runner = null, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+export function buildModelMeasurabilityJudge({
+  root = process.cwd(),
+  model = null,
+  runner = null,
+  attemptTimeoutMs = GOAL_JUDGE_ATTEMPT_TIMEOUT_MS,
+  attempts = GOAL_JUDGE_ATTEMPTS,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+} = {}) {
   const modelId = modelToPiModelId(model);
   if (!modelId) return null; // no concrete host model -> caller uses the deterministic floor
   const spawnRunner = runner ?? createAipiSubagentsRunner({ root });
+  const maxAttempts = Math.max(1, attempts);
 
   return async function modelMeasurabilityJudge({ objective = "", criteria = [] } = {}) {
     const targets = (Array.isArray(criteria) ? criteria : []).filter((t) => t && t.target);
     if (!targets.length) return { unavailable: true, error: "no targets to judge" };
+    const task = buildJudgePrompt({ objective, targets });
 
-    let raw;
-    try {
-      raw = await spawnRunner.spawn(
-        {
-          agent: "aipi-worker",
-          task: buildJudgePrompt({ objective, targets }),
-          async: false,
-          context: "fresh",
-          model: modelId,
-          allow_shell: false,
-          max_tool_calls: 1,
-          id: JUDGE_RUN_ID,
-        },
-        { signal: timeoutSignal(timeoutMs) },
-      );
-    } catch (error) {
-      return { unavailable: true, error: String(error?.message ?? error) };
+    let lastError = "measurability judge produced no verdict";
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      let raw;
+      try {
+        raw = await spawnRunner.spawn(
+          { agent: "aipi-worker", task, async: false, context: "fresh", model: modelId, allow_shell: false, max_tool_calls: 1, id: JUDGE_RUN_ID },
+          { signal: timeoutSignal(attemptTimeoutMs) },
+        );
+      } catch (error) {
+        lastError = String(error?.message ?? error);
+        if (attempt < maxAttempts) {
+          await sleep(GOAL_JUDGE_RETRY_BACKOFF_MS); // let a cold model finish loading before the retry
+          continue;
+        }
+        break;
+      }
+      const parsed = parseJudgeJson(extractToolText(raw));
+      if (parsed) return parsed;
+      lastError = "measurability judge returned no parseable JSON verdict";
+      if (attempt < maxAttempts) await sleep(GOAL_JUDGE_RETRY_BACKOFF_MS);
     }
-
-    const parsed = parseJudgeJson(extractToolText(raw));
-    if (!parsed) return { unavailable: true, error: "measurability judge returned no parseable JSON verdict" };
-    return parsed;
+    // Infra failure (timeout / spawn error / unparseable across all attempts): degrade, do NOT reject. Marked
+    // retryable so the caller can distinguish "judge was down" from a real "vague" verdict.
+    return { unavailable: true, retryable: true, error: lastError };
   };
 }
 

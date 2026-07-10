@@ -61,11 +61,21 @@ try {
   const judgeFenced = buildModelMeasurabilityJudge({ root: ".", model: MODEL, runner: runnerReturning("```json\n" + affirmJson + "\n```") });
   assert.ok((await judgeFenced({ criteria: [{ target: "criterion:c1", text: "t" }] })).findings);
 
-  // --- infra failures => { unavailable } (never throws) ---
-  const judgeThrows = buildModelMeasurabilityJudge({ root: ".", model: MODEL, runner: throwingRunner });
-  assert.equal((await judgeThrows({ criteria: [{ target: "criterion:c1", text: "t" }] })).unavailable, true);
-  const judgeGarbage = buildModelMeasurabilityJudge({ root: ".", model: MODEL, runner: runnerReturning("totally not json") });
+  // --- infra failures => { unavailable, retryable } (never throws; a no-op sleep skips the retry backoff) ---
+  const noSleep = async () => {};
+  const judgeThrows = buildModelMeasurabilityJudge({ root: ".", model: MODEL, runner: throwingRunner, sleep: noSleep });
+  const throwsResult = await judgeThrows({ criteria: [{ target: "criterion:c1", text: "t" }] });
+  assert.equal(throwsResult.unavailable, true);
+  assert.equal(throwsResult.retryable, true, "an infra failure is retryable");
+  const judgeGarbage = buildModelMeasurabilityJudge({ root: ".", model: MODEL, runner: runnerReturning("totally not json"), sleep: noSleep });
   assert.equal((await judgeGarbage({ criteria: [{ target: "criterion:c1", text: "t" }] })).unavailable, true);
+
+  // --- the judge RETRIES on a cold-load timeout: a runner that throws once then succeeds is affirmed ---
+  let calls = 0;
+  const flakyRunner = { spawn: async () => { calls += 1; if (calls === 1) throw new Error("model cold-loading"); return { output: affirmJson }; } };
+  const judgeFlaky = buildModelMeasurabilityJudge({ root: ".", model: MODEL, runner: flakyRunner, sleep: noSleep });
+  assert.ok((await judgeFlaky({ criteria: [{ target: "criterion:c1", text: "t" }] })).findings, "retry recovers a cold-loaded model");
+  assert.equal(calls, 2, "one retry after the first-call timeout");
 
   // --- judgeGoalMeasurability wiring: model affirm => ok+model ---
   const rModel = await judgeGoalMeasurability({
@@ -97,6 +107,31 @@ try {
   assert.equal(rFallbackVague.judge, "deterministic_fallback");
   assert.equal(rFallbackVague.ok, false);
 
+  // --- THE INCIDENT: a THROWN judge error / a hung judge (outer guard fires) must degrade to the floor, NOT
+  //     fail-closed. An infra timeout is not "criterion not measurable". ---
+  const rThrown = await judgeGoalMeasurability({
+    objective: "x",
+    criteria: [{ criterion_id: "c1", text: "retorna 200 no login" }],
+    done_when: "ve o dashboard",
+    judge: () => Promise.reject(new Error("goal_judge_timeout")),
+    timeoutMs: 50,
+  });
+  assert.equal(rThrown.judge, "deterministic_fallback", "a thrown judge error degrades, NOT fail-closed");
+  assert.equal(rThrown.retryable, true);
+  assert.equal(rThrown.ok, true, "a well-formed goal still passes the floor when the judge throws");
+  assert.ok(!rThrown.findings.some((f) => f.verdict === "error"), "no fake 'error' verdicts");
+  assert.match(String(rThrown.judge_unavailable_reason), /goal_judge_timeout/);
+
+  const rHung = await judgeGoalMeasurability({
+    objective: "x",
+    criteria: [{ criterion_id: "c1", text: "retorna 200 no login" }],
+    done_when: "ve o dashboard",
+    judge: () => new Promise(() => {}), // never resolves -> the outer withTimeout fires
+    timeoutMs: 50,
+  });
+  assert.equal(rHung.judge, "deterministic_fallback", "an outer-timeout (hung judge) degrades, NOT fail-closed");
+  assert.equal(rHung.ok, true);
+
   // --- proposeGoal end-to-end with the live-style judge ---
   const modelAccept = await proposeGoal({ projectRoot: tempRoot, ...CLEAR, now, randomBytes: fixedRandom, judge: buildModelMeasurabilityJudge({ root: tempRoot, model: MODEL, runner: runnerReturning(affirmJson) }) });
   assert.equal(modelAccept.accepted, true);
@@ -110,6 +145,32 @@ try {
   const fallbackAccept = await proposeGoal({ projectRoot: tempRoot, ...CLEAR, now, randomBytes: fixedRandom, judge: judgeThrows });
   assert.equal(fallbackAccept.accepted, true);
   assert.equal(fallbackAccept.goal.acceptance.measurability.judge, "deterministic_fallback");
+
+  // THE INCIDENT end-to-end: a well-formed goal + a judge that TIMES OUT is now ACCEPTED via the floor (was
+  // rejected with fake per-target "error" verdicts). The acceptance records the infra caveat transparently.
+  const timeoutAccept = await proposeGoal({
+    projectRoot: tempRoot, ...CLEAR, now, randomBytes: fixedRandom,
+    judge: () => Promise.reject(new Error("goal_judge_timeout")),
+    timeoutMs: 50,
+  });
+  assert.equal(timeoutAccept.accepted, true, "the incident goal is now accepted, not fail-closed");
+  assert.equal(timeoutAccept.goal.acceptance.measurability.judge, "deterministic_fallback");
+  assert.match(String(timeoutAccept.goal.acceptance.measurability.judge_unavailable_reason), /goal_judge_timeout/);
+
+  // A genuinely vague goal + a down judge rejects with phase "judge_unavailable" + retryable (infra caveat,
+  // not a confident semantic verdict).
+  const timeoutReject = await proposeGoal({
+    projectRoot: tempRoot,
+    objective: "deixar o app melhor",
+    criteria: ["deixar mais limpo"],
+    done_when: "ficar bom",
+    now, randomBytes: fixedRandom,
+    judge: () => Promise.reject(new Error("goal_judge_timeout")),
+    timeoutMs: 50,
+  });
+  assert.equal(timeoutReject.accepted, false);
+  assert.equal(timeoutReject.phase, "judge_unavailable", "a down judge yields judge_unavailable, not measurability");
+  assert.equal(timeoutReject.retryable, true);
 
   console.log("AIPI_GOAL_JUDGE_OK");
 } finally {

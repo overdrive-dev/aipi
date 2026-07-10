@@ -115,19 +115,15 @@ export async function judgeGoalMeasurability({
     // Infra degrade: the model judge could not run (spawn error / timeout / unparseable). Do NOT block goal
     // creation on infra noise — fall back to the deterministic floor. (A real `vague` VERDICT still rejects.)
     if (raw && raw.unavailable) {
-      const findings = targets.map(({ target, text }) => defaultGoalMeasurabilityJudge({ target, text }));
-      return {
-        ok: findings.every((f) => f.verdict === "measurable"),
-        judge: "deterministic_fallback",
-        judge_unavailable_reason: String(raw.error ?? "judge unavailable"),
-        findings,
-      };
+      return deterministicMeasurabilityFallback(targets, raw.error ?? "judge unavailable");
     }
     verdicts = normalizeJudgeVerdicts(raw);
   } catch (error) {
-    // Fail-closed: a model error/timeout rejects EVERY target (we cannot affirm measurability).
-    const findings = targets.map(({ target }) => ({ target, verdict: "error", reason: String(error?.message ?? error) }));
-    return { ok: false, judge: "model", findings };
+    // A THROWN error/timeout is INFRA, not a semantic verdict — an unreachable judge does not make a criterion
+    // "not measurable". Degrade to the deterministic floor exactly like the { unavailable } path above, rather
+    // than fail-closed rejecting every target (which masked judge outages as immeasurability). A genuine
+    // `vague` VERDICT from a reachable judge still rejects; only infra failures degrade.
+    return deterministicMeasurabilityFallback(targets, error?.message ?? error);
   }
 
   const findings = targets.map(({ target }) => {
@@ -141,6 +137,21 @@ export async function judgeGoalMeasurability({
     };
   });
   return { ok: findings.every((f) => f.verdict === "measurable"), judge: "model", findings };
+}
+
+// Infra degrade path shared by the { unavailable } signal and a THROWN judge error/timeout: the model judge
+// could not produce a verdict, so decide on the deterministic floor (a well-formed goal — verifiable verbs +
+// a binary done_when — passes) and mark the result retryable so the caller can surface "judge was down" rather
+// than a false immeasurability. Never fail-closed on infra noise.
+function deterministicMeasurabilityFallback(targets, reason) {
+  const findings = targets.map(({ target, text }) => defaultGoalMeasurabilityJudge({ target, text }));
+  return {
+    ok: findings.every((f) => f.verdict === "measurable"),
+    judge: "deterministic_fallback",
+    judge_unavailable_reason: String(reason ?? "judge unavailable"),
+    retryable: true,
+    findings,
+  };
 }
 
 export function measurabilityRejectReasons(measurability) {
@@ -187,12 +198,16 @@ export async function proposeGoal({
     timeoutMs,
   });
   if (!measurability.ok) {
+    // When the model judge was DOWN, the rejection came from the deterministic floor — surface that so the
+    // caller sees an infra caveat (retryable), not a confident semantic verdict.
+    const judgeDown = Boolean(measurability.judge_unavailable_reason);
     return {
       accepted: false,
-      phase: "measurability",
+      phase: judgeDown ? "judge_unavailable" : "measurability",
       reasons: measurabilityRejectReasons(measurability),
       findings: measurability.findings,
       judge: measurability.judge,
+      ...(judgeDown ? { judge_unavailable_reason: measurability.judge_unavailable_reason, retryable: true } : {}),
     };
   }
 
@@ -215,7 +230,13 @@ export async function proposeGoal({
     acceptance: {
       accepted_at: createdAt,
       structural: { ok: true, reasons: [] },
-      measurability: { ok: true, judge: measurability.judge, findings: measurability.findings },
+      measurability: {
+        ok: true,
+        judge: measurability.judge,
+        findings: measurability.findings,
+        // Transparency: a soft-accept via the deterministic floor when the model judge was unreachable.
+        ...(measurability.judge_unavailable_reason ? { judge_unavailable_reason: measurability.judge_unavailable_reason } : {}),
+      },
     },
   };
 

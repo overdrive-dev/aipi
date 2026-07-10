@@ -95,13 +95,17 @@ try {
   assert.equal(modelReject.accepted, false);
   assert.equal(modelReject.phase, "measurability");
 
-  // --- injected MODEL judge: FAIL-CLOSED on error/timeout ---
+  // --- injected MODEL judge: a THROWN error/timeout is INFRA, so it DEGRADES to the deterministic floor
+  //     (not fail-closed). A well-formed goal is accepted via the floor, never rejected with fake "error"
+  //     verdicts — this is the goal_judge_timeout incident fix. ---
   const modelThrows = () => { throw new Error("model down"); };
   const modelErr = await proposeGoal({ projectRoot: tempRoot, ...CLEAR, now, randomBytes: fixedRandom, judge: modelThrows });
-  assert.equal(modelErr.accepted, false);
-  const errJudge = await judgeGoalMeasurability({ criteria: [{ criterion_id: "c1", text: "x" }], done_when: "y", judge: modelThrows });
-  assert.equal(errJudge.ok, false);
-  assert.ok(errJudge.findings.every((f) => f.verdict === "error"));
+  assert.equal(modelErr.accepted, true, "a well-formed goal is accepted via the floor when the judge throws");
+  assert.equal(modelErr.goal.acceptance.measurability.judge, "deterministic_fallback");
+  const errJudge = await judgeGoalMeasurability({ criteria: [{ criterion_id: "c1", text: "retorna 200 no login" }], done_when: "ve o dashboard", judge: modelThrows });
+  assert.equal(errJudge.judge, "deterministic_fallback");
+  assert.equal(errJudge.retryable, true);
+  assert.ok(!errJudge.findings.some((f) => f.verdict === "error"), "no fake 'error' verdicts on infra failure");
 
   // --- achieve gate: verify == ship at the goal level ---
   const fresh = await proposeGoal({ projectRoot: tempRoot, ...CLEAR, now, randomBytes: fixedRandom });
