@@ -7,7 +7,9 @@ import {
   formatModelsCommandResult,
   parseModelsArgs,
   registryModelSpecs,
+  registryThinkingLevels,
   runModelsCommand,
+  supportedThinkingLevels,
 } from "../extensions/aipi/runtime/models-command.js";
 import { initProject } from "../extensions/aipi/runtime/project-init.js";
 import {
@@ -422,6 +424,91 @@ try {
   assert.deepEqual(specs, ["anthropic/claude-opus-4-8", "openai-codex/gpt-5.6-sol", "xai-auth/grok-4.5"]);
   assert.deepEqual(registryModelSpecs(null), [], "no registry -> empty");
   assert.deepEqual(registryModelSpecs({ getAvailable: () => { throw new Error("boom"); } }), [], "never throws");
+}
+
+// === supportedThinkingLevels: derive per-model levels exactly like Pi's getSupportedThinkingLevels ===
+{
+  // Reasoning model, no thinkingLevelMap -> up to high; xhigh needs an explicit declaration.
+  assert.deepEqual(
+    supportedThinkingLevels({ reasoning: true }),
+    ["off", "minimal", "low", "medium", "high"],
+    "custom reasoning model (no map) tops out at high, not xhigh",
+  );
+  // Explicit xhigh declaration -> xhigh becomes available.
+  assert.deepEqual(
+    supportedThinkingLevels({ reasoning: true, thinkingLevelMap: { xhigh: "x" } }),
+    ["off", "minimal", "low", "medium", "high", "xhigh"],
+    "explicit xhigh is offered",
+  );
+  // A level pinned to null is dropped.
+  assert.ok(
+    !supportedThinkingLevels({ reasoning: true, thinkingLevelMap: { minimal: null } }).includes("minimal"),
+    "a null-mapped level is unsupported",
+  );
+  assert.deepEqual(supportedThinkingLevels({ reasoning: false }), ["off"], "non-reasoning model -> off only");
+  assert.equal(supportedThinkingLevels(null), null, "unknown model -> null (caller falls back to free-text)");
+}
+
+// === registryThinkingLevels: ModelRegistry -> { provider/id: levels[] } (getAvailable only) ===
+{
+  const map = registryThinkingLevels({
+    getAvailable: () => [
+      { provider: "anthropic", id: "claude-sonnet-5", reasoning: true }, // custom: max high
+      { provider: "xai-auth", model: "grok-4.5", reasoning: true, thinkingLevelMap: { xhigh: "x" } }, // supports xhigh
+      { provider: "", id: "" }, // incomplete -> dropped
+    ],
+  });
+  assert.deepEqual(map["anthropic/claude-sonnet-5"], ["off", "minimal", "low", "medium", "high"]);
+  assert.deepEqual(map["xai-auth/grok-4.5"], ["off", "minimal", "low", "medium", "high", "xhigh"]);
+  assert.equal(Object.keys(map).length, 2, "incomplete entries dropped");
+  assert.deepEqual(registryThinkingLevels(null), {}, "no registry -> empty map");
+  assert.deepEqual(registryThinkingLevels({ getAvailable: () => { throw new Error("boom"); } }), {}, "never throws");
+}
+
+// === wizard thinking prompt is CONDITIONAL on the chosen model's supported levels ===
+{
+  const condRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-effort-thinking-"));
+  try {
+    await initProject({ sourceRoot: path.resolve("templates/.aipi"), targetRoot: condRoot });
+    const available = ["anthropic/claude-opus-4-8", "openai-codex/gpt-5.6-sol"];
+    const thinkingLevels = {
+      "anthropic/claude-opus-4-8": ["off", "minimal", "low", "medium", "high", "xhigh"], // supports xhigh
+      "openai-codex/gpt-5.6-sol": ["off", "minimal", "low", "medium", "high"], // max high
+    };
+    const thinkingSelects = [];
+    const ui = {
+      async select(title, options) {
+        if (/thinking level/i.test(title)) {
+          thinkingSelects.push({ title, options });
+          return options[0]; // pick the strongest ("<max> (max for ...)")
+        }
+        if (/adversarial/i.test(title)) return "openai-codex/gpt-5.6-sol"; // cross-provider from the anthropic doer
+        return "anthropic/claude-opus-4-8";
+      },
+      async input() { throw new Error("thinking must use the conditional SELECT, not free-text"); },
+    };
+    const report = await runModelsCommand({
+      projectRoot: condRoot,
+      args: ["setup"],
+      ui,
+      availableModels: available,
+      thinkingLevels,
+    });
+    assert.ok(report, "wizard completed via conditional selects");
+    // The opus buckets offered xhigh (opus supports it); the GPT adversarial bucket did NOT (max high).
+    const opusPrompt = thinkingSelects.find((s) => /claude-opus-4-8 supports/.test(s.title));
+    const gptPrompt = thinkingSelects.find((s) => /gpt-5\.6-sol supports/.test(s.title));
+    assert.ok(opusPrompt && opusPrompt.options.some((o) => /^xhigh/.test(o)), "opus offers xhigh");
+    assert.ok(gptPrompt && !gptPrompt.options.some((o) => /^xhigh/.test(o)), "gpt-5.6-sol does NOT offer xhigh");
+    assert.ok(/^high /.test(gptPrompt.options[0]), "strongest-first: gpt leads with high (its max)");
+
+    // The chosen strongest levels were written into class_thinking.
+    const written = JSON.parse(await fs.readFile(path.join(condRoot, ".aipi/model-capabilities.json"), "utf8"));
+    assert.equal(written.class_thinking["code-strong"], "xhigh", "doer=opus wrote its max (xhigh)");
+    assert.equal(written.class_thinking["adversarial-heavy"], "high", "adversarial=gpt wrote its max (high)");
+  } finally {
+    await fs.rm(condRoot, { recursive: true, force: true });
+  }
 }
 
 // === wizard SELECTS from the real available models (native ctx.ui.select) instead of typing ===

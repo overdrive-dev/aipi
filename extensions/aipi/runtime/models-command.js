@@ -156,6 +156,9 @@ export async function runModelsCommand({
   // The models the host actually has auth for (from ctx.modelRegistry.getAvailable()), as provider/model
   // specs. The wizard offers these for selection so the user picks real, ready-to-use ids instead of typing.
   availableModels = [],
+  // { "provider/id": ThinkingLevel[] } from ctx.modelRegistry, so the wizard offers each model only the
+  // intelligence levels it actually supports instead of a fixed low|medium|high|xhigh prompt.
+  thinkingLevels = {},
   now = () => new Date(),
 } = {}) {
   const parsed = parseModelsArgs(args, { cwd: projectRoot ?? cwd });
@@ -173,7 +176,7 @@ export async function runModelsCommand({
 
   let setupWarnings = [];
   if (parsed.action === "setup") {
-    await fillInteractiveOptions(parsed, { root, ui, availableModels });
+    await fillInteractiveOptions(parsed, { root, ui, availableModels, thinkingLevels });
     // Each bucket maps to ONE (model, thinking level) pair. Legacy --host/--adversarial/
     // --verifier feed the doer/adversarial buckets (and the verifier-fast override below)
     // so old invocations keep working without the new --planner/--mover flags.
@@ -376,7 +379,7 @@ function looksExpensiveFrontier(model) {
 // Interactive wizard: prompt the 4 provider-agnostic BUCKETS (model + thinking level each)
 // instead of looping the 8 capability classes. Each bucket's (model, level) fans out to
 // its classes in applyTopology. `--class <class>=<spec>` remains a power-user override.
-async function fillInteractiveOptions(options, { root, ui, availableModels = [] }) {
+async function fillInteractiveOptions(options, { root, ui, availableModels = [], thinkingLevels = {} }) {
   if (!options.interactive) return options;
   const promptUi = createPromptUi(ui);
   if (!promptUi) return options;
@@ -396,7 +399,7 @@ async function fillInteractiveOptions(options, { root, ui, availableModels = [] 
         : candidates;
       const modelSpec = await promptModelSpec(promptUi, `${label} model`, filtered);
       if (!modelSpec) continue;
-      const level = await promptThinkingLevel(promptUi, `${label} thinking level`, modelSpec);
+      const level = await promptThinkingLevel(promptUi, `${label} thinking level`, modelSpec, thinkingLevels);
       const combined = applyThinkingLevel(modelSpec, level);
       options.buckets[bucket] = combined;
       candidates = mergeModelCandidates(candidates, [stripThinkingLevel(combined)]);
@@ -407,13 +410,91 @@ async function fillInteractiveOptions(options, { root, ui, availableModels = [] 
   return options;
 }
 
-async function promptThinkingLevel(ui, label, modelSpec) {
+// Canonical thinking-level order (mirrors @earendil-works/pi-ai). "xhigh" is supported only when a model
+// EXPLICITLY declares it; every other level is available to any reasoning model unless declared null.
+const EXTENDED_THINKING_LEVELS = Object.freeze(["off", "minimal", "low", "medium", "high", "xhigh"]);
+
+// The thinking levels a model supports, derived from its capabilities exactly as Pi does
+// (getSupportedThinkingLevels): a non-reasoning model supports only "off"; a reasoning model supports every
+// level whose thinkingLevelMap entry is not null, and "xhigh" only when explicitly present. Returns null for
+// an unknown model so callers fall back to free-text instead of guessing.
+export function supportedThinkingLevels(model) {
+  if (!model) return null;
+  if (!model.reasoning) return ["off"];
+  return EXTENDED_THINKING_LEVELS.filter((level) => {
+    const mapped = model.thinkingLevelMap?.[level];
+    if (mapped === null) return false;
+    if (level === "xhigh") return mapped !== undefined;
+    return true;
+  });
+}
+
+// Map a Pi ModelRegistry -> { "provider/id": ThinkingLevel[] } for the auth'd (getAvailable) models, so the
+// wizard can offer each model ONLY the intelligence levels it actually supports. Never throws.
+export function registryThinkingLevels(modelRegistry) {
+  const out = {};
+  try {
+    const models = typeof modelRegistry?.getAvailable === "function" ? modelRegistry.getAvailable() : [];
+    for (const model of Array.isArray(models) ? models : []) {
+      const provider = model?.provider;
+      const id = model?.id ?? model?.model;
+      if (!provider || !id) continue;
+      const levels = supportedThinkingLevels(model);
+      if (levels) out[`${provider}/${id}`] = levels;
+    }
+  } catch {
+    /* best-effort: an unavailable registry just means free-text thinking prompts */
+  }
+  return out;
+}
+
+// Clamp a requested level to the nearest one the model supports (Pi's clampThinkingLevel: prefer the next
+// higher supported level, else the next lower). Unknown support -> leave the level as-is.
+function clampThinkingLevelTo(level, supported) {
+  if (!level) return level ?? null;
+  if (!Array.isArray(supported) || !supported.length || supported.includes(level)) return level;
+  const idx = EXTENDED_THINKING_LEVELS.indexOf(level);
+  if (idx === -1) return supported[0];
+  for (let i = idx; i < EXTENDED_THINKING_LEVELS.length; i += 1) {
+    if (supported.includes(EXTENDED_THINKING_LEVELS[i])) return EXTENDED_THINKING_LEVELS[i];
+  }
+  for (let i = idx - 1; i >= 0; i -= 1) {
+    if (supported.includes(EXTENDED_THINKING_LEVELS[i])) return EXTENDED_THINKING_LEVELS[i];
+  }
+  return supported[0];
+}
+
+// Prompt the thinking level CONDITIONAL on the chosen model's capabilities: offer a native select of only the
+// levels that model supports (strongest first, so max intelligence leads) when known. Falls back to a
+// free-text prompt (clamped to supported) when the model's levels are unknown or no select UI exists.
+async function promptThinkingLevel(ui, label, modelSpec, thinkingLevels = {}) {
   const embedded = parseProviderModelSpec(modelSpec, label).thinking_level;
+  const base = stripThinkingLevel(modelSpec);
+  const supported = thinkingLevels?.[base] ?? null;
+
+  // A model that supports exactly one level (e.g. a non-reasoning model -> "off") needs no prompt.
+  if (Array.isArray(supported) && supported.length === 1) return supported[0];
+
+  if (Array.isArray(supported) && supported.length > 1 && typeof ui?.select === "function") {
+    const ordered = [...supported].sort(
+      (a, b) => EXTENDED_THINKING_LEVELS.indexOf(b) - EXTENDED_THINKING_LEVELS.indexOf(a),
+    );
+    const options = ordered.map((lvl, i) => (i === 0 ? `${lvl} (max for ${base})` : lvl));
+    try {
+      const picked = await ui.select(`${label} — ${base} supports: ${ordered.join(", ")}`, options);
+      const value = picked && typeof picked === "object" ? (picked.value ?? picked.label) : picked;
+      if (typeof value === "string" && value.trim()) return value.trim().split(/\s+/)[0].toLowerCase();
+    } catch {
+      /* fall through to free-text */
+    }
+  }
+
   const input = ui?.input ?? ui?.prompt;
-  if (typeof input !== "function") return embedded ?? null;
-  const value = await input(`${label} (low|medium|high|xhigh)${embedded ? ` [${embedded}]` : ""}`);
-  if (typeof value === "string" && value.trim()) return value.trim().toLowerCase();
-  return embedded ?? null;
+  if (typeof input !== "function") return clampThinkingLevelTo(embedded, supported) ?? embedded ?? null;
+  const hint = Array.isArray(supported) && supported.length ? supported.join("|") : "off|minimal|low|medium|high|xhigh";
+  const value = await input(`${label} (${hint})${embedded ? ` [${embedded}]` : ""}`);
+  const chosen = typeof value === "string" && value.trim() ? value.trim().toLowerCase() : embedded;
+  return clampThinkingLevelTo(chosen, supported) ?? chosen ?? null;
 }
 
 function applyThinkingLevel(modelSpec, level) {

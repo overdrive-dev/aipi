@@ -40,6 +40,7 @@ import {
 import {
   formatModelsCommandResult,
   registryModelSpecs,
+  registryThinkingLevels,
   runModelsCommand,
 } from "./runtime/models-command.js";
 import {
@@ -236,9 +237,11 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
   const effortCommandHandler = async (args, ctx) => {
     try {
       const projectRoot = resolveProjectRoot(ctx);
-      // Offer the models the host actually has auth for, so the wizard lets the user PICK a real id.
+      // Offer the models the host actually has auth for, so the wizard lets the user PICK a real id, and the
+      // per-model supported thinking levels so it offers only the intelligence each model can actually run.
       const availableModels = registryModelSpecs(ctx?.modelRegistry);
-      const result = await runModelsCommand({ args: args ?? "", projectRoot, ui: ctx?.ui, availableModels });
+      const thinkingLevels = registryThinkingLevels(ctx?.modelRegistry);
+      const result = await runModelsCommand({ args: args ?? "", projectRoot, ui: ctx?.ui, availableModels, thinkingLevels });
       ctx.ui.notify(formatModelsCommandResult(result), result.state === "ready" ? "info" : "warning");
     } catch (error) {
       ctx.ui.notify(`AIPI effort failed: ${error.message}`, "error");
