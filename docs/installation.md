@@ -1,108 +1,140 @@
 # Installation
 
-This guide installs the AIPI wrapper so the `aipi` command is available in a
-terminal. `aipi` does not replace Pi; it launches Pi with the AIPI provider and
-runtime extensions preloaded.
+`aipi` is a wrapper that launches [Pi](https://pi.dev) with the AIPI provider and
+runtime extensions preloaded. It does **not** replace Pi and it does **not** require
+you to install Pi first.
 
-AIPI is standalone: `npm install` in the checkout brings the **pinned** Pi
-runtime (`@earendil-works/pi-coding-agent`, exact version from `package.json`)
-into the package's own `node_modules`, and the wrapper resolves that copy
-first. **No separate global Pi install is required.**
+AIPI is standalone: the Pi runtime (`@earendil-works/pi-coding-agent`, the exact
+pinned version in `package.json`) is a **normal dependency**, so installing aipi
+pulls Pi into the package's own `node_modules`, and the wrapper resolves that copy
+first. **There is no separate "install Pi" step and no global Pi is required.**
+
+## TL;DR
+
+```bash
+npm install -g github:overdrive-dev/aipi   # installs aipi AND the pinned Pi together
+aipi setup                                 # check the workstation can run projects
+aipi                                       # start an interactive session
+```
 
 ## Prerequisites
 
-1. Install Node.js and npm. Pi requires Node `>= 22.19.0` (enforced via
-   `engines`); this checkout is smoke-checked with Node 24.
-2. Install Git so you can clone and update the repository.
+- **Node.js ≥ 22.19.0** and npm (enforced via `engines`; the pinned Pi requires it).
+  Smoke-checked with Node 24.
+- **Git** — to install/update from the repo. On Windows make sure Git is on `PATH`
+  (e.g. `C:\Program Files\Git\cmd`); `aipi setup` flags it if it is missing.
+- Optional, checked (and fixable) by `aipi setup`: **Docker**, **Playwright**,
+  **Ollama** with the `bge-m3` embedding model (used by the code-graph semantic index;
+  it degrades loudly to lexical search when absent).
 
-### Optional: using your own Pi instead of the packaged one
+Pi itself is **not** a prerequisite — it is installed as a dependency of aipi (below).
 
-The wrapper resolves Pi in this order: `AIPI_PI_BIN` (executable/shim),
-`AIPI_PI_CLI_JS` (a `dist/cli.js` path), the **package-local pinned Pi**,
-npm's global prefix, then a `pi` executable on `PATH`. Set one of the env
-overrides to point AIPI at a development Pi. Note: extensions are tested
-against the pinned version — a different Pi may silently change hook behavior.
+## Install
 
-## Install From A Clone
+Releases are published to **GitHub only** (there is no npm publish), so install from
+the repository.
 
-1. Clone the repository and enter it:
+### Option A — global install from GitHub (end users)
 
-   ```bash
-   git clone <this-repo-url>
-   cd aipi
-   ```
+```bash
+npm install -g github:overdrive-dev/aipi
+```
 
-2. Install the AIPI package dependencies:
+`npm install` fetches the pinned Pi as a normal dependency, so this single command
+brings both aipi and its Pi runtime. No separate Pi download.
 
-   ```bash
-   npm install
-   ```
+### Option B — from a clone (contributors)
 
-3. Expose the `aipi` command with one of these install modes:
+```bash
+git clone https://github.com/overdrive-dev/aipi.git
+cd aipi
+npm install          # materializes the pinned Pi into ./node_modules
+npm link             # dev install: exposes the `aipi` CLI on PATH (points at this checkout)
+#   or
+npm install -g .     # a normal global install from the checkout
+```
 
-   ```bash
-   npm link
-   ```
+### Smoke-check the wrapper
 
-   Use `npm link` while developing this checkout. It points the global `aipi`
-   command at the current directory.
+```bash
+aipi --version   # prints the AIPI package version AND the wrapped Pi version
+aipi --help
+```
 
-   ```bash
-   npm install -g .
-   ```
+`aipi --version` reports both versions; if Pi is not discoverable it prints
+`pi: not found` and exits non-zero, so a missing prerequisite is visible immediately.
 
-   Use `npm install -g .` when you want a normal global install from the current
-   checkout.
+## Prepare the workstation
 
-4. Smoke-check the wrapper:
+```bash
+aipi setup           # environment doctor: Node, Git, Pi (always); Docker, Playwright, Ollama (optional)
+aipi setup --fix     # auto-fixes what it can: `npx playwright install`, `ollama pull bge-m3` (~1.2GB first pull)
+```
 
-   ```bash
-   aipi --help
-   aipi --version
-   ```
+`aipi setup` (also `/aipi-setup` inside a session) verifies the workstation can run
+projects the way AIPI drives them, per `.aipi/environment.json`.
 
-   `aipi --help` is handled by the wrapper. `aipi --version` prints the AIPI
-   package version and the wrapped Pi version; if Pi is not discoverable yet, it
-   reports `pi: not found` and exits non-zero so the missing prerequisite is
-   visible.
+## Set up a project
 
-5. Start Pi through AIPI:
+```bash
+cd <your-project>
+aipi                 # starts an interactive Pi session with the AIPI extensions preloaded
+```
 
-   ```bash
-   aipi
-   ```
+Inside the session:
 
-   Bare `aipi` is the primary entry point. With no arguments, it starts an
-   interactive Pi session with the packaged AIPI extensions preloaded.
+```text
+/aipi-init           # scaffold the .aipi/ overlay into this repo
+/login anthropic     # Claude subscription via OAuth (vendored AIPI provider)
+/login xai-auth      # Grok via OAuth (vendored AIPI provider; SuperGrok / X Premium+)
+/aipi-status         # readiness report, no credentials printed
+```
 
-6. Initialize a project repository from inside the interactive session:
+Provider logins use Pi's normal auth storage (`~/.pi/agent/auth.json`), never the repo.
+The Anthropic (Claude OAuth) and xAI (Grok OAuth) providers ship **vendored inside aipi**
+and are preloaded — no extra install. For GPT models, log in to `openai-codex`.
 
-   ```text
-   /aipi-init
-   /login anthropic
-   /aipi-status
-   ```
+### Models and per-role model classes
 
-   `/aipi-init` scaffolds `.aipi/` into the current project. `/login anthropic`
-   uses Pi's normal auth storage, and `/aipi-status` checks project readiness
-   without printing credentials.
+- New model ids (e.g. `claude-sonnet-5`, `gpt-5.6-sol`) are added through Pi's
+  `~/.pi/agent/models.json`; the vendored xAI provider lists Grok ids itself.
+- Bind capability classes (researcher, adversarial reviewer, builder, …) to concrete
+  models with the wizard `aipi effort` (aliased `aipi models`) or by editing
+  `.aipi/model-capabilities.json`. The wizard offers only the thinking levels each
+  chosen model actually supports.
 
-## Common Commands
+## Optional: point AIPI at your own Pi
+
+The wrapper resolves Pi in this order:
+
+1. `AIPI_PI_BIN` — an executable/shim,
+2. `AIPI_PI_CLI_JS` — a `dist/cli.js` path,
+3. **the package-local pinned Pi** (resolves here on a clean install),
+4. npm's global prefix,
+5. a `pi` executable on `PATH`.
+
+Set one of the env overrides to run against a development Pi. Extensions are tested
+against the pinned version, so a different Pi may silently change hook behavior.
+
+## Common commands
 
 ```bash
 aipi                  # interactive Pi session with AIPI preloaded
+aipi setup [--fix]    # environment doctor
 aipi "/aipi-init"     # run a Pi slash command through the wrapper
 aipi status           # readiness report without opening a Pi session
 aipi workflow list    # inspect installed AIPI workflows
 aipi memory status    # inspect AIPI memory state
-aipi --pi-help        # show raw Pi CLI help
+aipi effort status    # show the configured per-role model topology
+aipi update --dry-run # print the Pi/AIPI update plan without changing anything
+aipi --pi-help        # raw Pi CLI help
 ```
 
-## Evidence Anchors
+## Evidence anchors
 
 - `npm run test:bin` covers wrapper argument classification, extension prepending,
-  help/version formatting, and local command routing.
-- `node bin/aipi.js --help` exercises the wrapper help path without requiring a
-  global link.
-- `node bin/aipi.js --version` exercises AIPI version reporting; it also verifies
-  whether the Pi prerequisite is discoverable in the current shell.
+  Pi resolution (including the package-local pinned Pi), help/version formatting, and
+  local command routing.
+- `node bin/aipi.js --help` exercises the wrapper help path without a global link.
+- `node bin/aipi.js --version` exercises version reporting and whether the Pi
+  prerequisite is discoverable in the current shell.

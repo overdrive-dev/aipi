@@ -16,9 +16,9 @@ Alpha. What exists today:
 - The `.aipi` template system (workflows, agents, disciplines, protocols,
   memory, model classes) and a machine-readable `runtime-contract.json`, all
   enforced by a structured validator + CI.
-- A Pi extension with working commands: `/aipi-init`, `/aipi-status`,
-  `/aipi-workflow`, `/aipi-memory`, `/aipi-effort` (alias `/aipi-models`), `/aipi-mcp`, `/aipi-probe-a`,
-  `/aipi-probe-a-prime`.
+- A Pi extension with working commands: `/aipi-init`, `/aipi-status`, `/aipi-goal`,
+  `/aipi-plan`, `/aipi-workflow`, `/aipi-memory`, `/aipi-effort` (alias `/aipi-models`),
+  `/aipi-mcp`, `/aipi-setup`, `/aipi-probe-a`, `/aipi-probe-a-prime`.
 - An optional MCP bridge extension. When a project has `.aipi/mcp.json`, the
   `aipi` wrapper starts configured stdio MCP servers and exposes their tools to
   Pi as `mcp__<server>__<tool>`. Linear is supported through `mcp-remote`.
@@ -53,8 +53,8 @@ Alpha. What exists today:
 - The owned-file enforcement primitive (`wrapWriteToolWithOwnership`), proven
   in-process against the real Pi SDK (see Probe A′ below).
 
-Current regression coverage re-checks the worker-session toolset against Pi
-0.79.5 with `npm run test:subagents-real-sdk`.
+Current regression coverage re-checks the worker-session toolset against the pinned
+Pi (`0.79.8`) with `npm run test:subagents-real-sdk`.
 
 Claim evidence anchors for the live runtime surfaces are
 `npm run test:workflow-executor`, `npm run test:fake-provider-workflows`,
@@ -72,32 +72,43 @@ unless a reviewed JSON command adapter is configured.
 ## Installation
 
 `aipi` keeps Pi as the runtime and starts it with the AIPI extensions preloaded.
-The Pi runtime is a **pinned dependency**: `npm install` materializes the exact
-tested `@earendil-works/pi-coding-agent` version inside the package, and the
-wrapper resolves that copy first — no separate global Pi install is needed.
-For the full numbered walkthrough see
+The Pi runtime is a **pinned dependency**: installing aipi pulls the exact tested
+`@earendil-works/pi-coding-agent` version into the package, and the wrapper resolves
+that copy first — **there is no separate "install Pi" step and no global Pi is
+needed.** Releases are GitHub-only (no npm publish). For the full walkthrough see
 [`docs/installation.md`](docs/installation.md).
 
 ```bash
-git clone <this-repo-url>
-cd aipi
-npm install
-npm link          # dev install: exposes the `aipi` CLI on PATH
-aipi --version
-aipi --help
-aipi              # starts an interactive Pi session with AIPI preloaded
-aipi "/aipi-init" # scaffold .aipi/ into the current repo
-aipi "/login anthropic"
+# Install aipi + its pinned Pi in one command (end users)
+npm install -g github:overdrive-dev/aipi
+#   or from a clone (contributors): git clone … && cd aipi && npm install && npm link
+
+aipi --version        # prints AIPI + wrapped Pi versions
+aipi setup            # environment doctor (Node/Git/Pi always; Docker/Playwright/Ollama optional; --fix to auto-fix)
+aipi                  # interactive Pi session with AIPI preloaded
+```
+
+Inside the session, scaffold a project and log in to the providers you use (the
+Anthropic Claude-OAuth and xAI Grok-OAuth providers ship vendored and preloaded):
+
+```text
+/aipi-init            # scaffold .aipi/ into the current repo
+/login anthropic      # Claude subscription via OAuth
+/login xai-auth       # Grok via OAuth   (+ log in to openai-codex for GPT models)
+/aipi-status
+```
+
+Everything is also runnable from the console without opening a session:
+
+```bash
 aipi status
 aipi workflow list
-aipi workflow status
-aipi memory status
 aipi memory query business rules
 aipi effort status
-aipi effort setup --planner openai-codex/gpt-5.5:high --adversarial anthropic/claude-opus-4-8:high --doer openai-codex/gpt-5.5:medium --mover anthropic/claude-haiku-4-5:low
-aipi models status   # alias of aipi effort
-aipi "/aipi-status"
-aipi "/aipi-mcp"
+# Configure the per-role model topology (any provider per bucket; adversarial should differ in family):
+aipi effort setup --planner anthropic/claude-opus-4-8:high --adversarial openai-codex/gpt-5.6-sol:high \
+                  --doer xai-auth/grok-4.5:high --mover anthropic/claude-opus-4-8:low
+aipi models status    # alias of aipi effort
 ```
 
 `aipi` with no arguments is the primary interactive entry point: it starts `pi`
@@ -111,11 +122,13 @@ from the console using the same run-state runtime as `/aipi-workflow`. `aipi mem
 the same Markdown memory query runtime as `aipi_memory_query`. `aipi effort setup`
 (aliased as `aipi models setup`) configures 4 provider-agnostic buckets —
 `--planner`, `--adversarial`, `--doer`, `--mover` — each taking a
-`provider/model[:level]` spec (level = low|medium|high|xhigh). Each bucket fans its
-model out to its capability classes and its thinking level out to a persisted
-per-class `class_thinking` map that the router reads at resolve time. It runs an
-interactive terminal fallback (prompting the 4 buckets) when no flags are provided,
-and keeps `--class <class>=<provider/model[:level]>` as a power-user override. Any
+`provider/model[:level]` spec. Each bucket fans its model out to its capability
+classes and its thinking level out to a persisted per-class `class_thinking` map that
+the router reads at resolve time. The interactive wizard (run with no flags) offers,
+for each chosen model, **only the thinking levels that model actually supports**
+(strongest first) — `off`/`minimal`/`low`/`medium`/`high`/`xhigh`, where `xhigh` is
+offered only for models that declare it. It keeps
+`--class <class>=<provider/model[:level]>` as a power-user override. Any
 provider is allowed per bucket; setting the adversarial bucket to the same family as
 the doer/planner bucket emits a cross-model-independence warning. `aipi --version`
 reports both the AIPI package and wrapped Pi versions; use `aipi --pi-help` for
@@ -129,6 +142,8 @@ the raw Pi flag reference. Point at a specific Pi with `AIPI_PI_CLI_JS` or
 |---|---|
 | `/aipi-init [--dry-run] [--force] [--reset-memory] [--target <dir>]` | Scaffold the `.aipi/` overlay into a repo. Preserves existing files by default; `--force` still protects `.aipi/memory/project/**` unless `--reset-memory` is also present. |
 | `/aipi-status` | Report project install, Anthropic auth/sidecar, capability states, readiness blockers/evidence gaps, and the subagent backend (no credentials printed). |
+| `/aipi-goal` | Set/inspect the top-level measurable goal (objective + checkable criteria + a binary `done_when`). Passes an acceptance gate; a model measurability judge refines the deterministic floor and degrades to it if the judge is unavailable. Also bound from natural language via `aipi_set_goal`. |
+| `/aipi-plan` | Draw/inspect the task plan that a request is worked from; shown live in the TUI plan widget. Natural-language "monta um plano pra X" routes here automatically. |
 | `/aipi-setup` | In-session environment doctor: Node, Git, Pi, Docker, Playwright, and the Ollama embedding model, per `.aipi/environment.json`. Fixes run from the console: `aipi setup --fix`. |
 | `/aipi-workflow [list \| status \| start <name> \| run <name> \| execute]` | List, inspect, start, execute the active run, or run any installed workflow through the current executor. |
 | `/aipi-memory [status \| refs \| query <terms>]` | Inspect Markdown memory and generated code graph state without writing durable memory. |
@@ -183,15 +198,24 @@ guarded AIPI `write` extension, not Pi's unguarded `write` builtin.
 
 ### Provider auth
 
-The package depends on pinned `@ersintarhan/pi-toolkit`, which includes a Claude
-OAuth adapter for Pi's `anthropic` provider while keeping `/login anthropic`.
-The default AIPI provider extension is an OAuth-only wrapper that imports
-`src/claude-oauth-adapter.ts`; it does not autoload the toolkit's broad
-`index.ts` provider/search surface. AIPI pins and validates that decision, and
-the security tradeoff is tracked in
-[`docs/anthropic-auth-integration.md`](docs/anthropic-auth-integration.md).
-Credentials live in Pi's normal auth file (`~/.pi/agent/auth.json`), never in the
-repo.
+AIPI ships two provider adapters **vendored** (copied into the tree, not npm
+dependencies), preloaded via `package.json` `pi.extensions`:
+
+- **Anthropic (Claude OAuth)** — `extensions/aipi/provider/anthropic-oauth-only.ts`
+  imports the vendored `runtime/vendor/pi-toolkit/claude-oauth-adapter.ts`, keeping
+  `/login anthropic` on Pi's `anthropic` provider. It is an OAuth-only wrapper: it
+  does **not** autoload the upstream toolkit's broad provider/search surface. The
+  security tradeoff is tracked in
+  [`docs/anthropic-auth-integration.md`](docs/anthropic-auth-integration.md).
+- **xAI (Grok OAuth)** — `extensions/aipi/provider/xai-oauth.ts` registers the
+  `xai-auth` provider from `runtime/vendor/pi-xai-oauth/` (SuperGrok / X Premium+),
+  logged in with `/login xai-auth`. Only the provider is registered; the upstream
+  package's raw shell/file tool shims are deliberately not.
+
+Both were internalized so the pinned bundle carries them (no `@ersintarhan/pi-toolkit`
+or `pi-xai-oauth` npm dependency); re-vendoring rules are governed by the runtime
+contract. Credentials live in Pi's normal auth file (`~/.pi/agent/auth.json`), never
+in the repo. For GPT models, log in to `openai-codex`.
 
 ## Project layout
 
