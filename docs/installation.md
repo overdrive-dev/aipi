@@ -98,10 +98,22 @@ and are preloaded — no extra install. For GPT models, log in to `openai-codex`
 
 - New model ids (e.g. `claude-sonnet-5`, `gpt-5.6-sol`) are added through Pi's
   `~/.pi/agent/models.json`; the vendored xAI provider lists Grok ids itself.
-- Bind capability classes (researcher, adversarial reviewer, builder, …) to concrete
-  models with the wizard `aipi effort` (aliased `aipi models`) or by editing
-  `.aipi/model-capabilities.json`. The wizard offers only the thinking levels each
-  chosen model actually supports.
+- Configure the model topology with `aipi effort` (aliased `aipi models`):
+
+  ```bash
+  aipi effort setup     # zero flags: the doer defaults to the current authed model,
+                        # so a single-provider machine configures out of the box
+  # or set it explicitly, including the orchestrator (default session model):
+  aipi effort setup --orchestrator anthropic/claude-opus-4-8:high \
+                    --doer anthropic/claude-opus-4-8:high \
+                    --adversarial anthropic/claude-opus-4-8:high
+  ```
+
+  The interactive wizard prompts the **orchestrator** (the default session model, written
+  to Pi's `settings.json`) first, then the 4 buckets (planner / adversarial / doer /
+  mover), offering each chosen model **only the thinking levels it actually supports**.
+  You can also bind capability classes directly by editing `.aipi/model-capabilities.json`.
+  Same-family adversarial is allowed (it just warns); a distinct family is recommended.
 
 ## Optional: point AIPI at your own Pi
 
