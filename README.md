@@ -19,6 +19,34 @@ Alpha. What exists today:
 - A Pi extension with working commands: `/aipi-init`, `/aipi-status`, `/aipi-goal`,
   `/aipi-plan`, `/aipi-workflow`, `/aipi-memory`, `/aipi-effort` (alias `/aipi-models`),
   `/aipi-mcp`, `/aipi-setup`, `/aipi-probe-a`, `/aipi-probe-a-prime`.
+- A top-level measurable **goal** (`/aipi-goal`, or bound from natural language via
+  `aipi_set_goal`): objective + checkable criteria + a binary `done_when`, gated by a
+  structural then measurability acceptance check. A model measurability judge refines a
+  deterministic floor and **degrades to that floor** (never fail-closed) when the judge
+  is slow or unreachable, so an infra timeout can't masquerade as "not measurable".
+- A **plan** layer (`/aipi-plan`; "monta um plano pra X" natural-language routing)
+  rendered live in a read-only TUI plan widget that tracks task progress and hides once
+  the plan is settled/idle.
+- **Reviewed background research** (`aipi_background_research`): read-only workers on the
+  `research-heavy` model class run in the background, and each is cross-checked by an
+  **adversarial reviewer** (`adversarial-heavy`, chosen cross-family from the researcher)
+  before findings reach the orchestrator — findings arrive as reviewed claims, not
+  trusted truth.
+- **Per-role model topology**: capability classes (research, adversarial, builder,
+  verifier, planner, …) bound to concrete provider/models + per-class thinking in
+  `.aipi/model-capabilities.json`. `aipi effort` (alias `aipi models`) offers each chosen
+  model only the thinking levels it actually supports; adversarial review prefers a model
+  family different from the implementer.
+- **Vendored native providers**, preloaded: Anthropic Claude-OAuth and xAI Grok-OAuth
+  (no npm provider dependency); `/login anthropic`, `/login xai-auth`, plus `openai-codex`
+  for GPT models.
+- **Terminal UX**: an inline live subagent list (model + set thinking per run), the plan
+  widget, a foreground model indicator (footer chip + streaming "Working" row) that names
+  the model driving write/edit/read, and A/B/C questions via the native selector
+  (`aipi_ask`) with a free-text "discuss" option.
+- Pinned-bundle hygiene: the wrapper **suppresses Pi's "run pi update" banner** by default
+  (it targets the global Pi, not the pinned copy; overridable); new Pi versions come
+  through `aipi update`.
 - An optional MCP bridge extension. When a project has `.aipi/mcp.json`, the
   `aipi` wrapper starts configured stdio MCP servers and exposes their tools to
   Pi as `mcp__<server>__<tool>`. Linear is supported through `mcp-remote`.
@@ -195,6 +223,33 @@ project cwd, write runtime state under `.aipi/runtime/subagents/`, inherit the
 selected host/configured provider model, and keep worker fallback scoped to that
 selected model. Child sessions receive `read`, `grep`, `find`, `ls`, and the
 guarded AIPI `write` extension, not Pi's unguarded `write` builtin.
+
+### Per-role models and reviewed background research
+
+Agents bind to capability *classes*, and each class resolves to a concrete
+provider/model (+ thinking level) from `.aipi/model-capabilities.json` — so who plans,
+who builds, who reviews, and at what intelligence are **configuration, not code**.
+`aipi effort` sets a 4-bucket topology (planner / adversarial / doer / mover) and, in the
+interactive wizard, offers each chosen model only the thinking levels it actually
+supports. Adversarial classes (`adversarial-heavy`, `verifier-fast`) prefer a model
+family different from the implementer to avoid correlated blind spots.
+
+`aipi_background_research` fans read-only investigation out to `research-heavy` workers
+that run in the background and wake the orchestrator with their findings — the model
+running as orchestrator is not the one doing the research. Before a finding is trusted, an
+`adversarial-heavy` reviewer (cross-family when a distinct family is configured) verifies
+its claims against the code, so findings arrive as **reviewed claims**, never ground
+truth. The orchestrator's own ship-gate still sits between any finding and a merge.
+
+### The interactive surface
+
+Terminal-only widgets keep the run legible without leaving the editor: a live plan widget
+above the editor (visible only while a plan is actionable), an inline list of active
+subagent runs (each labelled with its model and set thinking), and a foreground model
+indicator on the footer + the streaming "Working" row so a write/edit/read names the model
+driving it. Recommendation/choice prompts use Pi's native selector (`aipi_ask`) with a
+free-text "discuss" escape hatch instead of prose A/B/C. These are no-ops in headless /
+RPC / print modes.
 
 ### Provider auth
 
