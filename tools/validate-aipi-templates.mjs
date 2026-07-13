@@ -2102,8 +2102,8 @@ for (const requiredText of [
   "AIPI_SUBAGENTS_PROJECT_ROOT",
   "AIPI_SUBAGENTS_AGENT_ID",
   "AIPI_SUBAGENTS_OWNED_FILES",
-  // Experimental hashline worker editing must ship OFF by default (flipped only after live validation).
-  "HASHLINE_WORKER_EDIT_ENABLED = false",
+  // Hashline worker editing is ON by default (unconditional; opt out per-spawn with hashlineEdit:false).
+  "HASHLINE_WORKER_EDIT_ENABLED = true",
   "projectSubagentsRuntimePaths",
   "assertAipiHostScopedModel",
   "createAipiSubagentsRunner",

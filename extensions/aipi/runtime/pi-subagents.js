@@ -31,11 +31,11 @@ const askOrchestratorExtensionPath = path.join(currentDir, "aipi-ask-orchestrato
 const hashlineEditExtensionPath = path.join(currentDir, "aipi-hashline-edit-child.js");
 let cachedJiti = null;
 
-// EXPERIMENTAL: give workers content-hash-anchored editing (aipi_read_hashline + aipi_edit) alongside the
-// guarded write. OFF by default — a package-level flag (not an env knob) flipped once we've confirmed the
-// worker models reliably emit the `[PATH#TAG]` hashline format. When true, createAipiWorkerAgentConfig adds
-// the two tools and extends the worker prompt with the hashline edit format. See aipi-hashline-edit-child.js.
-export const HASHLINE_WORKER_EDIT_ENABLED = false;
+// Give workers content-hash-anchored editing (aipi_read_hashline + aipi_edit) alongside the guarded write.
+// ON by default (Victor's call — unconditional, no opt-out param needed): createAipiWorkerAgentConfig adds the
+// two tools and extends the worker prompt with the hashline edit format for every worker. Pass
+// `hashlineEdit: false` to a specific spawn to opt a worker out. See aipi-hashline-edit-child.js.
+export const HASHLINE_WORKER_EDIT_ENABLED = true;
 
 export function normalizePiSubagentsBackend(value) {
   const normalized = String(value ?? "").trim().toLowerCase().replaceAll("-", "_");

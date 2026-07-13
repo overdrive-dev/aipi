@@ -23,36 +23,36 @@ function collectTools(register) {
 }
 const text = (result) => (result?.content ?? []).map((part) => part.text).join("\n");
 
-// --- default flag is OFF: existing worker behavior is unchanged ---
+// --- default is ON: every worker gets hashline editing with no param ---
 {
-  assert.equal(HASHLINE_WORKER_EDIT_ENABLED, false, "hashline worker editing must ship OFF by default");
-  const off = createAipiWorkerAgentConfig({});
-  assert.ok(!off.tools.includes("aipi_edit"), "flag OFF: no aipi_edit tool");
-  assert.ok(!off.tools.includes("aipi_read_hashline"), "flag OFF: no aipi_read_hashline tool");
-  assert.ok(
-    !off.tools.some((tool) => String(tool).includes("aipi-hashline-edit-child")),
-    "flag OFF: hashline extension not loaded",
-  );
-  assert.ok(!/hashline flow/.test(off.systemPrompt), "flag OFF: no hashline prompt block");
-  // The guarded write is still present regardless.
-  assert.ok(off.tools.includes("write"), "guarded write always present");
-}
-
-// --- flag ON: both tools + extension + prompt are wired ---
-{
-  const on = createAipiWorkerAgentConfig({ hashlineEdit: true });
-  assert.ok(on.tools.includes("aipi_read_hashline"), "flag ON: aipi_read_hashline listed");
-  assert.ok(on.tools.includes("aipi_edit"), "flag ON: aipi_edit listed");
+  assert.equal(HASHLINE_WORKER_EDIT_ENABLED, true, "hashline worker editing ships ON by default");
+  const on = createAipiWorkerAgentConfig({});
+  assert.ok(on.tools.includes("aipi_read_hashline"), "default: aipi_read_hashline listed");
+  assert.ok(on.tools.includes("aipi_edit"), "default: aipi_edit listed");
   assert.ok(
     on.tools.some((tool) => String(tool).includes("aipi-hashline-edit-child")),
-    "flag ON: hashline extension path loaded",
+    "default: hashline extension path loaded",
   );
-  assert.match(on.systemPrompt, /hashline flow/, "flag ON: prompt teaches the hashline flow");
-  assert.match(on.systemPrompt, /\[PATH#TAG\]/, "flag ON: prompt embeds the hashline format");
+  assert.match(on.systemPrompt, /hashline flow/, "default: prompt teaches the hashline flow");
+  assert.match(on.systemPrompt, /\[PATH#TAG\]/, "default: prompt embeds the hashline format");
+  assert.ok(on.tools.includes("write"), "guarded write always present");
   // Fanout (shell-less) workers also get it — aipi_edit self-guards owned scope.
-  const fanout = createAipiWorkerAgentConfig({ allowShell: false, hashlineEdit: true });
-  assert.ok(fanout.tools.includes("aipi_edit"), "flag ON: fanout worker also gets aipi_edit");
+  const fanout = createAipiWorkerAgentConfig({ allowShell: false });
+  assert.ok(fanout.tools.includes("aipi_edit"), "default: fanout worker also gets aipi_edit");
   assert.ok(!fanout.tools.includes("aipi_shell"), "fanout worker still has no shell");
+}
+
+// --- explicit opt-out (hashlineEdit:false) still strips the tools + prompt for a specific spawn ---
+{
+  const off = createAipiWorkerAgentConfig({ hashlineEdit: false });
+  assert.ok(!off.tools.includes("aipi_edit"), "opt-out: no aipi_edit tool");
+  assert.ok(!off.tools.includes("aipi_read_hashline"), "opt-out: no aipi_read_hashline tool");
+  assert.ok(
+    !off.tools.some((tool) => String(tool).includes("aipi-hashline-edit-child")),
+    "opt-out: hashline extension not loaded",
+  );
+  assert.ok(!/hashline flow/.test(off.systemPrompt), "opt-out: no hashline prompt block");
+  assert.ok(off.tools.includes("write"), "guarded write still present");
 }
 
 // --- the child tools, exercised against a real temp project with env scope ---
