@@ -1106,12 +1106,12 @@ export function classifyAipiInputRoute(text, { activeRun = null, codePipeline = 
     return buildReadOnlyCheckRoute(pipeline);
   }
 
-  // Regex/heuristic auto-dispatch is ON by default (the runtime resolver aipiAutoDispatchEnabled() passes
-  // autoDispatchEnabled=true unless AIPI_AUTO_DISPATCH=0): a substantive task routes to a forked workflow
-  // run so the per-role model topology is actually exercised. With auto-dispatch off it falls through to
-  // `null` and the full-tool main agent handles it inline (AIPI guidance injected via before_agent_start).
-  // NB: this function's own `autoDispatchEnabled` param still defaults to false — callers that want the
-  // runtime default must pass aipiAutoDispatchEnabled(); bare unit calls test the off branch.
+  // Regex/heuristic auto-dispatch is UNCONDITIONALLY ON at runtime (aipiAutoDispatchEnabled() always
+  // returns true, no opt-out): a substantive task routes to a forked workflow run so the per-role model
+  // topology is actually exercised. When auto-dispatch is off it falls through to `null` and the full-tool
+  // main agent handles it inline. NB: this function's own `autoDispatchEnabled` param still defaults to
+  // false — callers that want the runtime behavior must pass aipiAutoDispatchEnabled(); bare unit calls
+  // test the off branch.
   const autoWorkflow = autoDispatchEnabled ? autoDispatchWorkflowForPipeline(pipeline) : null;
   if (autoWorkflow) {
     return {
@@ -1978,13 +1978,13 @@ async function hasActivePlan(projectRoot) {
 const AIPI_WORKFLOW_WORKER_COLLECT_TIMEOUT_MS = 20 * 60_000; // 20 minutes
 
 // Flexible-agent default: AIPI does NOT auto-launch a forked, hard-gated workflow from keyword/regex
-// intent. Auto-dispatch is ON by default: the orchestrator hands substantive code/bug/deploy/research
-// work to the per-role worker topology (this is what actually exercises the configured models — sonnet-5
-// for code, grok-4.5 for adversarial, etc.), while trivial edits and read-only questions still fall
-// through to the inline main agent. Opt out (old flexible-agent behavior, everything inline) with
-// AIPI_AUTO_DISPATCH=0. Read at call time so it can be toggled at runtime.
+// intent. Auto-dispatch is UNCONDITIONAL (project decision — no opt-out): the orchestrator always hands
+// substantive code/bug/deploy/research work to the per-role worker topology (this is what actually
+// exercises the configured models — sonnet-5 for code, grok-4.5 for adversarial, etc.). Trivial edits
+// (typo/rename/format), read-only questions, and continuations still resolve inline inside
+// classifyAipiInputRoute regardless. The AIPI_AUTO_DISPATCH env var is intentionally no longer consulted.
 function aipiAutoDispatchEnabled() {
-  return process.env.AIPI_AUTO_DISPATCH !== "0";
+  return true;
 }
 
 function buildExecutableWorkflowAdapter({ coordinator = null, ctx = {} } = {}) {
