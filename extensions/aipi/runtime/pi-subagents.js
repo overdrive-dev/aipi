@@ -423,7 +423,11 @@ export async function writeSubagentRunStatus(paths, runId, patch) {
   try {
     const dir = path.join(paths.asyncDir, safePathSegment(runId));
     await fs.mkdir(dir, { recursive: true });
-    const status = { runId, mode: "single", steps: [], ...patch };
+    // Stamp the owning process pid so the vendored stale-run reconciler (loadSubagentRuns -> reconcileAsyncRun)
+    // can detect an orphan: AIPI forked runs execute IN THIS process, so after an AIPI restart the recorded pid
+    // is dead (ESRCH) and the reconciler reaps the run to `failed` instead of leaving it a zombie `running` in
+    // the /aipi-subagents view and the widget. A live in-process run keeps process.pid (alive) and is untouched.
+    const status = { runId, mode: "single", steps: [], pid: process.pid, ...patch };
     await fs.writeFile(path.join(dir, "status.json"), JSON.stringify(status), "utf8");
   } catch {
     // Telemetry only; the run continues regardless.

@@ -25,6 +25,7 @@ import { registerBackgroundResearchTool } from "./runtime/background-research.js
 import { registerSubagentWidget } from "./runtime/subagent-widget.js";
 import { registerWorkerActivityRenderer } from "./runtime/aipi-worker-activity-renderer.js";
 import { registerInflightResearchNotice } from "./runtime/inflight-research-notice.js";
+import { registerOrphanRunReaper } from "./runtime/aipi-orphan-run-reaper.js";
 import { registerModelIndicator } from "./runtime/model-indicator.js";
 import { registerAskTool } from "./runtime/ask-tool.js";
 import {
@@ -93,6 +94,9 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
   // Background research fan-out: read-only workers that run async and wake the orchestrator with findings.
   // Non-ship by construction (artifacts-only, no shell) — the verify==ship gate stays on the foreground path.
   registerBackgroundResearchTool(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx) });
+  // Reap pid-less zombie runs (older builds wrote status without a pid, so the vendored stale-run reconciler
+  // can't detect them) at session_start, BEFORE the widget mounts, so a restart doesn't show dead "running" runs.
+  registerOrphanRunReaper(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx) });
   // Inline TUI widget: an always-visible live list of active subagent runs above the editor (grok-build style).
   registerSubagentWidget(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx) });
   // Titled-card renderer for worker-activity messages: header = agent · model, action below — replaces Pi's

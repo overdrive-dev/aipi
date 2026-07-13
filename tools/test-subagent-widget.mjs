@@ -35,11 +35,15 @@ const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-subagent-widget-"
 try {
   const paths = projectSubagentsRuntimePaths(tempRoot, "research-explore-auth-1");
   await fs.mkdir(paths.asyncDir, { recursive: true });
+  // writeSubagentRunStatus stamps pid: process.pid — this test process is alive, so the vendored reconciler
+  // keeps the run as long as its lastUpdate is recent (a real run updates within the 10-min timeout, far under
+  // the 24h stale-alive-pid window). Use a current timestamp so the live run is not stale-reaped.
+  const nowMs = Date.now();
   await writeSubagentRunStatus(paths, "research-explore-auth-1", {
     state: "running",
     cwd: tempRoot,
-    startedAt: 1000,
-    lastUpdate: 1000,
+    startedAt: nowMs,
+    lastUpdate: nowMs,
     steps: [{ agent: "aipi-worker", status: "running", model: "anthropic/claude-opus-4-8" }],
   });
 
@@ -48,15 +52,15 @@ try {
   assert.equal(calls.length, 1, "TUI mode pushes the widget");
   assert.equal(calls[0].key, "aipi-subagents");
   assert.ok(Array.isArray(calls[0].content) && calls[0].content[0].includes("1 running"));
-  assert.ok(calls[0].content.some((l) => l.includes("research-explore-auth-1")), "a running (no-pid) run survives reconcile and shows");
+  assert.ok(calls[0].content.some((l) => l.includes("research-explore-auth-1")), "a live (fresh-pid) run survives reconcile and shows");
 
   // completing the run clears the widget (no active runs -> undefined).
   await writeSubagentRunStatus(paths, "research-explore-auth-1", {
     state: "complete",
     cwd: tempRoot,
-    startedAt: 1000,
-    lastUpdate: 2000,
-    endedAt: 2000,
+    startedAt: nowMs,
+    lastUpdate: nowMs + 1000,
+    endedAt: nowMs + 1000,
     steps: [{ agent: "aipi-worker", status: "complete" }],
   });
   const cleared = [];
