@@ -2,22 +2,25 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-// Curated context-window / max-output definitions for the custom (non-Pi-builtin) models AIPI's
-// cross-family topology commonly references. Pi's model registry defaults ANY custom model that
-// lacks a declared contextWindow to 128000 (node_modules/@earendil-works/pi-coding-agent/dist/core/
-// model-registry.js) — so gpt-5.6-sol, grok-4.5, and claude-sonnet-5 all silently cap at 128k unless
-// ~/.pi/agent/models.json declares the real window. Seeding these lets a fresh AIPI workstation
-// resolve the correct context window without hand-editing models.json.
+// Curated context-window / max-output definitions for the custom models users add to
+// ~/.pi/agent/models.json under a BUILT-IN provider (anthropic, openai-codex). Pi's model registry
+// defaults ANY custom model that lacks a declared contextWindow to 128000 (node_modules/
+// @earendil-works/pi-coding-agent/dist/core/model-registry.js) — so gpt-5.6-sol and claude-sonnet-5
+// silently cap at 128k unless models.json declares the real window. Seeding fills those windows.
+//
+// NOT included: grok-4.5. It is served by the vendored xai-oauth PROVIDER EXTENSION (provider
+// xai-auth), not by a models.json custom-model entry. Defining an xai-auth custom model in models.json
+// requires a provider-level "baseUrl" and makes Pi reject the whole file — see mergePiModels, which
+// also refuses to create any provider bucket that isn't already present. If grok-4.5 ever needs a
+// context-window fix, it belongs in the xai-oauth extension's MODELS registration, not here.
 //
 // Values (verified 2026-07-12):
 //   openai-codex/gpt-5.6-sol, gpt-5.6 — 1.05M full API, but the openai-codex (Codex OAuth) backend is
 //     catalog-capped at ~353,400 effective input (openai/codex#31860); use 353000 / 128000 output.
-//   xai-auth/grok-4.5 — 500K context / 30K output.
 //   anthropic/claude-sonnet-5 — 1M context / 128K output (launched 2026-06-30).
 export const AIPI_SEEDED_PI_MODELS = [
   { provider: "openai-codex", id: "gpt-5.6-sol", contextWindow: 353000, maxTokens: 128000, reasoning: true },
   { provider: "openai-codex", id: "gpt-5.6", contextWindow: 353000, maxTokens: 128000, reasoning: true },
-  { provider: "xai-auth", id: "grok-4.5", contextWindow: 500000, maxTokens: 30000, reasoning: true },
   { provider: "anthropic", id: "claude-sonnet-5", contextWindow: 1000000, maxTokens: 128000, reasoning: true },
 ];
 
@@ -32,9 +35,13 @@ export function piModelsAgentDir(env = process.env, homeDir = os.homedir()) {
 }
 
 // Pure merge: fold the curated defs into an existing Pi models.json object WITHOUT clobbering user choices.
-// - Missing provider bucket / model entry -> add the full curated def.
+// - Provider bucket ABSENT -> SKIP the model (never create a provider bucket: a provider not already
+//   declared may require provider-level config we can't supply, e.g. the xai-auth OAuth provider needs a
+//   baseUrl, and a bare bucket makes Pi reject the whole models.json).
+// - Provider present, model entry missing -> add the full curated def to that existing bucket.
 // - Existing model entry -> only FILL a missing contextWindow/maxTokens (never overwrite a user-set value).
-// Returns { models, changes: [{ provider, id, action, fields }] } where action is "added" | "filled" | "unchanged".
+// Returns { models, changes: [{ provider, id, action, fields }] } with action
+// "added" | "filled" | "unchanged" | "skipped_absent_provider".
 export function mergePiModels(existing, seed = AIPI_SEEDED_PI_MODELS) {
   const models = existing && typeof existing === "object" ? structuredClone(existing) : {};
   if (!models.providers || typeof models.providers !== "object") models.providers = {};
@@ -42,10 +49,10 @@ export function mergePiModels(existing, seed = AIPI_SEEDED_PI_MODELS) {
   for (const def of seed) {
     const { provider, id, ...fields } = def;
     if (!provider || !id) continue;
-    let bucket = models.providers[provider];
+    const bucket = models.providers[provider];
     if (!bucket || typeof bucket !== "object") {
-      bucket = { models: [] };
-      models.providers[provider] = bucket;
+      changes.push({ provider, id, action: "skipped_absent_provider", fields: [] });
+      continue;
     }
     if (!Array.isArray(bucket.models)) bucket.models = [];
     const entry = bucket.models.find((model) => model && model.id === id);
@@ -94,7 +101,7 @@ export async function seedPiModels({
     existed = false;
   }
   const { models, changes } = mergePiModels(existing, seed);
-  const pending = changes.some((change) => change.action !== "unchanged");
+  const pending = changes.some((change) => change.action === "added" || change.action === "filled");
   const wrote = pending && !dryRun;
   if (wrote) {
     await mkdir(dir);
