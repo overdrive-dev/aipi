@@ -15,6 +15,7 @@ import {
   buildWorkerTools,
   latestSubagentStateFromEntries,
   parseWorkerStepResult,
+  resolveInteractiveSpawnModel,
 } from "../extensions/aipi/runtime/subagents.js";
 import {
   AIPI_SUBAGENTS_AGENT_NAME,
@@ -1272,3 +1273,55 @@ function assertUnder(root, candidate) {
   const rel = path.relative(path.resolve(root), path.resolve(candidate));
   assert.equal(rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel)), true);
 }
+
+// --- interactive aipi_spawn_agent resolves model_class -> configured model (not host fallback) ---
+{
+  const modelRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-spawn-model-"));
+  await fs.mkdir(path.join(modelRoot, ".aipi"), { recursive: true });
+  // A real aipi project always carries both files; resolveModelClass reads the class catalog too.
+  await fs.copyFile(
+    path.join(process.cwd(), "templates", ".aipi", "model-classes.yaml"),
+    path.join(modelRoot, ".aipi", "model-classes.yaml"),
+  );
+  await fs.writeFile(
+    path.join(modelRoot, ".aipi", "model-capabilities.json"),
+    JSON.stringify({
+      schema: "aipi.model-capabilities.v1",
+      classes: { "code-strong": "anthropic/claude-sonnet-5" },
+      models: { "anthropic:claude-sonnet-5": { capabilities: { coding: "high", context: "very_high" } } },
+    }),
+    "utf8",
+  );
+
+  // A class bound in model-capabilities.json resolves to that concrete model, even though the
+  // session (host) model is different — this is the gap the fix closes.
+  const resolved = await resolveInteractiveSpawnModel(
+    { agent_id: "coder", model_class: "code-strong" },
+    { root: modelRoot, env: {}, ctx: { model: "openai-codex/gpt-5.6-sol" } },
+  );
+  assert.deepEqual(resolved.model, { provider: "anthropic", id: "claude-sonnet-5" });
+  assert.equal(resolved.model_resolution_source, "model-capabilities");
+
+  // An already-concrete model on the spawn params is left untouched.
+  const preset = await resolveInteractiveSpawnModel(
+    { model_class: "code-strong", model: { provider: "x", id: "y" } },
+    { root: modelRoot, env: {} },
+  );
+  assert.deepEqual(preset.model, { provider: "x", id: "y" });
+
+  // An unbound/unknown class does NOT get a model bound -> the coordinator keeps host-fallback semantics.
+  const unbound = await resolveInteractiveSpawnModel(
+    { model_class: "totally-unknown" },
+    { root: modelRoot, env: {}, ctx: { model: "openai-codex/gpt-5.6-sol" } },
+  );
+  assert.equal("model" in unbound, false, "unbound class stays on host fallback");
+
+  // A spawn with no model_class at all is a pass-through.
+  const classless = await resolveInteractiveSpawnModel(
+    { agent_id: "coder" },
+    { root: modelRoot, env: {}, ctx: { model: "openai-codex/gpt-5.6-sol" } },
+  );
+  assert.equal("model" in classless, false);
+}
+
+console.log("subagents interactive-spawn model resolution: ok");

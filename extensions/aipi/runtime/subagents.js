@@ -20,6 +20,7 @@ import {
   BUILTIN_MODEL_CLASSES,
   HOST_DEFAULT_MODEL,
   loadKnownModelClassesSync,
+  resolveModelClass,
   resolveSpawnModelDecision,
 } from "./model-router.js";
 import {
@@ -118,6 +119,14 @@ export class SubagentCoordinator {
 
   getHostModel() {
     return this.#hostModel;
+  }
+
+  getRoot() {
+    return this.#root;
+  }
+
+  getEnv() {
+    return this.#env;
   }
 
   dispatch(descriptor) {
@@ -1498,6 +1507,28 @@ function currentHostModelFromContext(ctx = {}) {
     null;
 }
 
+// Interactive aipi_spawn_agent passes model_class but no concrete model, so the coordinator's
+// resolveSpawnModelDecision would fall back to the host (session) model — an interactive
+// `code-strong` worker would run on the orchestrator's model instead of the configured class model
+// (e.g. claude-sonnet-5). Resolve the class -> configured model here, where the async tool path can
+// await (#spawnNew stays synchronous), mirroring how the workflow executor sets descriptor.model via
+// resolveStepModel. Only bind when the class resolves to a CONFIGURED model (env or
+// model-capabilities); "current-session"/"class-only" fall through so the existing host-fallback and
+// allow_fallback semantics are unchanged. Best-effort: a resolution error leaves params untouched.
+export async function resolveInteractiveSpawnModel(params = {}, { root = process.cwd(), ctx = null, env = process.env } = {}) {
+  const modelClass = params?.model_class ?? null;
+  if (!modelClass || params.model) return params;
+  let route = null;
+  try {
+    route = await resolveModelClass({ root, modelClass, ctx, env });
+  } catch {
+    return params;
+  }
+  const configured = route?.model && (route.source === "env" || route.source === "model-capabilities");
+  if (!configured) return params;
+  return { ...params, model: route.model, model_resolution_source: route.source };
+}
+
 export async function createWorkerProviderOptions(sdk, { cwd = process.cwd() } = {}) {
   const authStorage = createWorkerAuthStorage(sdk);
   const modelRegistry = createWorkerModelRegistry(sdk, authStorage);
@@ -1579,7 +1610,12 @@ export function registerSubagentTools(pi, coordinator) {
       },
     },
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      return jsonResult(coordinator.spawn(withHostModel(params, currentHostModelFromContext(ctx))));
+      const resolved = await resolveInteractiveSpawnModel(params, {
+        root: coordinator.getRoot(),
+        ctx,
+        env: coordinator.getEnv(),
+      });
+      return jsonResult(coordinator.spawn(withHostModel(resolved, currentHostModelFromContext(ctx))));
     },
   });
 

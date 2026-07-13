@@ -652,10 +652,25 @@ export async function runAipiSetup({
     }
   }
 
+  // Seed correct context-windows for AIPI's custom models into ~/.pi/agent/models.json so a fresh
+  // workstation doesn't inherit Pi's 128k default for gpt-5.6-sol/grok-4.5/claude-sonnet-5. Plain
+  // `aipi setup` reports what it would do (dry run); `aipi setup --fix` applies it. Best-effort.
+  const seedModule = await import(
+    pathToFileURL(path.join(packageRoot, "extensions", "aipi", "runtime", "pi-models-seed.js")).href
+  );
+  let seedResult;
+  try {
+    seedResult = await seedModule.seedPiModels({ env, homeDir, dryRun: !options.fix });
+  } catch (error) {
+    seedResult = { ok: false, error: String(error?.message ?? error) };
+  }
+
   if (options.json) {
+    report.model_context_windows = seedResult;
     log(JSON.stringify(report, null, 2));
   } else {
     log(doctor.formatEnvironmentReport(report));
+    log(seedModule.formatPiModelsSeedResult(seedResult));
     if (report.fixes_applied?.length) {
       log(`fixes applied: ${report.fixes_applied.map((fix) => `${fix.id}=${fix.ok ? "ok" : "failed"}`).join(", ")}`);
     }
