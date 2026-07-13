@@ -22,6 +22,7 @@ import {
 } from "./workflow-executor.js";
 import { describeModel, resolveModelClass, resolveStepModel } from "./model-router.js";
 import { aipiHostModelReadiness, modelProvider } from "./pi-subagents.js";
+import { buildBlockedRunSupervisor } from "./workflow-supervisor.js";
 import { normalizeExecutionCadence, readActivePlan } from "./plan-state.js";
 import { redactSecrets } from "./redact.js";
 import { appendRotatedJsonlLine } from "./runtime-log.js";
@@ -902,6 +903,12 @@ export async function handleInput({
         adapter,
         workflowCommandRunner,
         userInputRecorder,
+        // The orchestrator gets first crack at resolving the block from the run context (on the session
+        // model); the human picker is the fallback. Null model -> supervisor null -> straight to the picker.
+        supervisor: buildBlockedRunSupervisor({
+          root: projectRoot,
+          model: ctx?.model ?? ctx?.current_model ?? ctx?.currentModel ?? null,
+        }),
       });
       if (pickerResult?.action === "handled") return pickerResult;
     }
@@ -945,6 +952,7 @@ export async function handleBlockedRunPicker({
   adapter,
   workflowCommandRunner = runWorkflowCommand,
   userInputRecorder = recordWorkflowUserInput,
+  supervisor = null,
   maxLoops = 5,
 } = {}) {
   if (!isAwaitingUserInput(active)) return { action: "continue" };
@@ -968,7 +976,32 @@ export async function handleBlockedRunPicker({
     const options = normalizeBlockerOptions(awaiting.options);
     const question = String(awaiting.question || awaiting.reason || "AIPI precisa de uma decisão do usuário para continuar.");
     const choices = [...options, BLOCKER_FREE_TEXT_OPTION];
-    const selected = await ctx.ui.select(question, choices);
+    // Orchestrator-first: before asking the human, let the orchestrator supervisor try to resolve the block
+    // from the run context. It only ever returns an offered option (or escalates), so this can never invent
+    // an action; anything but a confident, offered choice falls through to the user picker (fail-safe).
+    let selected;
+    const supervised = supervisor
+      ? await Promise.resolve(
+          supervisor({
+            workflow: current.state?.workflow ?? null,
+            step: awaiting.step_id ?? current.state?.current_step ?? null,
+            question,
+            reason: awaiting.reason ?? question,
+            options,
+            context: (current.state?.steps ?? []).map((s) => `${s.id}=${s.status}`).join(" · "),
+          }),
+        ).catch(() => ({ unavailable: true }))
+      : null;
+    if (supervised?.resolved && options.includes(supervised.choice)) {
+      selected = supervised.choice;
+      safeNotify(
+        ctx,
+        `🤖 orquestrador resolveu o bloqueio em ${current.state?.current_step ?? "step"}: "${supervised.choice}"${supervised.reason ? ` — ${supervised.reason}` : ""}`,
+        "info",
+      );
+    } else {
+      selected = await ctx.ui.select(question, choices);
+    }
 
     if (selected == null || selected === "") {
       safeAppendEntry(pi, "aipi.input.route", {

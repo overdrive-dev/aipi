@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { BLOCKER_FREE_TEXT_OPTION } from "../extensions/aipi/runtime/blocker-input.js";
 import { createAipiLifecycleHandlers, handleBlockedRunPicker } from "../extensions/aipi/runtime/lifecycle-hooks.js";
+import { buildBlockedRunSupervisor } from "../extensions/aipi/runtime/workflow-supervisor.js";
 import { initProject } from "../extensions/aipi/runtime/project-init.js";
 import { readActiveRun, startWorkflowRun } from "../extensions/aipi/runtime/run-state.js";
 
@@ -132,6 +133,59 @@ try {
   assert.equal(cancelledState.status, "cancelled");
   assert.equal(cancelledState.awaiting_user_input, null);
   assert.equal(cancelledState.current_step, null);
+
+  // --- Supervisor-first: the orchestrator resolves the block WITHOUT asking the human ---
+  await writeBlockedState(tempRoot, started.runId);
+  const selectBeforeSup = selectCalls.length;
+  const supResolved = await handleBlockedRunPicker({
+    event: { type: "input", text: "x", source: "interactive" },
+    ctx, pi, projectRoot: tempRoot, active: await readActiveRun(tempRoot), workflowCommandRunner,
+    supervisor: async () => ({ resolved: true, choice: "B", reason: "contexto indica B" }),
+  });
+  assert.equal(supResolved.action, "handled");
+  assert.equal(selectCalls.length, selectBeforeSup, "supervisor resolving must NOT ask the human (no select)");
+  assert.equal(runnerCalls.at(-1).args, "execute", "the supervisor's decision continues the run");
+  assert.equal((await readUserInputRecords(tempRoot, started.runId)).at(-1).text, "B", "supervisor's choice is recorded as the answer");
+  assert.ok(notifications.some((n) => /orquestrador resolveu/.test(n.message)), "notifies that the orchestrator resolved the block");
+
+  // --- Escalate / unavailable / error -> falls back to the human picker (fail-safe) ---
+  selectedValue = "A";
+  for (const sup of [
+    async () => ({ resolved: false, reason: "precisa de humano" }),
+    async () => ({ unavailable: true }),
+    async () => { throw new Error("judge down"); },
+  ]) {
+    await writeBlockedState(tempRoot, started.runId);
+    const before = selectCalls.length;
+    await handleBlockedRunPicker({
+      event: { type: "input", text: "x", source: "interactive" },
+      ctx, pi, projectRoot: tempRoot, active: await readActiveRun(tempRoot), workflowCommandRunner,
+      supervisor: sup,
+    });
+    assert.equal(selectCalls.length, before + 1, "a non-resolving supervisor falls safe to the human picker");
+  }
+
+  // --- buildBlockedRunSupervisor: model verdict -> matched option / escalate / non-matching / unavailable ---
+  {
+    const model = { provider: "anthropic", id: "claude-opus-4-8" };
+    const fakeRunner = (verdict) => ({
+      spawn: async () => {
+        const text = JSON.stringify(verdict);
+        return { output: text, assistant_text: text, content: [{ type: "text", text }] };
+      },
+    });
+    const ok = buildBlockedRunSupervisor({ root: tempRoot, model, runner: fakeRunner({ choice: "Tentar novamente", confident: true, reason: "recuperável" }) });
+    assert.deepEqual(await ok({ options: ["Tentar novamente", "Cancelar"], reason: "x" }), { resolved: true, choice: "Tentar novamente", reason: "recuperável" });
+    const esc = buildBlockedRunSupervisor({ root: tempRoot, model, runner: fakeRunner({ choice: "ESCALATE", confident: true }) });
+    assert.equal((await esc({ options: ["A"], reason: "x" })).resolved, false, "ESCALATE -> not resolved");
+    const unsure = buildBlockedRunSupervisor({ root: tempRoot, model, runner: fakeRunner({ choice: "A", confident: false }) });
+    assert.equal((await unsure({ options: ["A"], reason: "x" })).resolved, false, "confident:false -> not resolved");
+    const invented = buildBlockedRunSupervisor({ root: tempRoot, model, runner: fakeRunner({ choice: "algo inventado", confident: true }) });
+    assert.equal((await invented({ options: ["A"], reason: "x" })).resolved, false, "a choice not among the options is never honored");
+    const down = buildBlockedRunSupervisor({ root: tempRoot, model, runner: { spawn: async () => { throw new Error("down"); } } });
+    assert.equal((await down({ options: ["A"], reason: "x" })).unavailable, true, "spawn error -> unavailable");
+    assert.equal(buildBlockedRunSupervisor({ root: tempRoot, model: null }), null, "no host model -> null (caller uses the picker)");
+  }
 
   await writeBlockedState(tempRoot, started.runId);
   const selectCountBeforeHeadless = selectCalls.length;
