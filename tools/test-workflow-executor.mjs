@@ -928,6 +928,8 @@ try {
   richSink.supportsWidgets = true;
   richSink.setActivity = (payload) => richWidget.push(payload);
   richSink.updateActivity = () => {};
+  const richActivityLog = [];
+  richSink.logActivity = (line) => richActivityLog.push(line);
   const richAdapter = createSubagentWorkflowAdapter(richCoordinator, {
     pollIntervalMs: 1,
     collectTimeoutMs: 2_000,
@@ -941,6 +943,11 @@ try {
   assert.ok(richSnapshot.items.some((it) => it.kind === "think" && /Applying the fix/.test(it.detail)), "activity payload includes thinking (kind=think)");
   assert.ok(richSnapshot.items.some((it) => it.kind === "tool" && /read index\.tsx/.test(it.detail)), "activity payload includes file reads");
   assert.equal(richSnapshot.tools, 2, "activity payload carries the jsonl-derived tool count (2)");
+  // Persistent per-action HISTORY in the conversation: every worker action is also logged once via
+  // logActivity (deduped by the feed's byte cursor) so it lands in the scrollback, not just the widget.
+  assert.ok(richActivityLog.some((line) => /write .*gestores-tipo\.ts/.test(line)), `logActivity must record the worker's write; got: ${JSON.stringify(richActivityLog)}`);
+  assert.ok(richActivityLog.some((line) => /read .*index\.tsx/.test(line)), "logActivity records the worker's reads");
+  assert.ok(richActivityLog.some((line) => /Applying the fix/.test(line)), "logActivity records the worker's thinking notes");
   // The live panel is cleared (setActivity(undefined)) when the worker finishes so it doesn't linger.
   assert.equal(richWidget.at(-1), undefined, "activity widget cleared when the worker ends");
 

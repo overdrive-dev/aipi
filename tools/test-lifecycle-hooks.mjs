@@ -17,6 +17,7 @@ import {
   getStallHeartbeat,
   handleBeforeAgentStart,
   looksLikeAipiProject,
+  makeProgressNotifier,
   renderRecentRunSummary,
   StallHeartbeat,
   updateStallHeartbeat,
@@ -1922,3 +1923,24 @@ async function forceFastSemanticFallback(projectRoot) {
     `${JSON.stringify({ ...config, ollama_host: "http://127.0.0.1:9" }, null, 2)}\n`,
   );
 }
+
+// --- makeProgressNotifier.logActivity: persistent worker-activity line in the conversation ---
+{
+  const sent = [];
+  const fakePi = { sendMessage: (message, opts) => sent.push({ message, opts }) };
+  const fakeCtx = { ui: { notify: () => {} } };
+  const sink = makeProgressNotifier(fakeCtx, fakePi);
+  sink.logActivity("intake 🔧 write INTAKE.md");
+  assert.equal(sent.length, 1, "logActivity emits one message");
+  assert.equal(sent[0].message.customType, "aipi-worker-activity");
+  assert.equal(sent[0].message.content, "intake 🔧 write INTAKE.md");
+  assert.equal(sent[0].message.display, true, "display:true so it renders in the conversation");
+  assert.equal(sent[0].opts.triggerTurn, false, "triggerTurn:false so it does not kick off a turn");
+  // Empty/whitespace is not emitted.
+  sink.logActivity("   ");
+  assert.equal(sent.length, 1, "blank activity is not logged");
+  // No pi (or no sendMessage) -> logActivity is a safe no-op (degrades to the widget/notify surfaces).
+  const noPiSink = makeProgressNotifier(fakeCtx);
+  assert.doesNotThrow(() => noPiSink.logActivity("x"), "logActivity is a no-op without a sendMessage host");
+}
+console.log("lifecycle makeProgressNotifier.logActivity: ok");

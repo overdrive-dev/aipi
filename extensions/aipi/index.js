@@ -167,7 +167,7 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
           // CR-59-3 / ADV-58-3: surface per-step progress on the explicit /aipi-workflow surface
           // (not only the auto-dispatch path) so a long `run`/`execute` is never a silent "hung vs
           // processing" black box. Reuses the same notifier the lifecycle auto-dispatch path uses.
-          notify: makeProgressNotifier(ctx),
+          notify: makeProgressNotifier(ctx, pi),
         });
         ctx.ui.notify(formatWorkflowCommandResult(result), "info");
       } catch (error) {
@@ -191,7 +191,7 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
           args: args ?? "",
           projectRoot,
           adapter,
-          notify: makeProgressNotifier(ctx),
+          notify: makeProgressNotifier(ctx, pi),
         });
         ctx.ui.notify(formatPlanCommandResult(result), "info");
         // Reflect the mutation in the plan widget immediately (a slash command emits no turn_end).

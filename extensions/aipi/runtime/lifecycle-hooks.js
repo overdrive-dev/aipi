@@ -853,7 +853,7 @@ export async function handleInput({
       projectRoot,
       adapter,
       parentInteractiveToolCallHook: "registered_parent_interactive_tool_call_hook",
-      notify: makeProgressNotifier(ctx),
+      notify: makeProgressNotifier(ctx, pi),
       params: buildWorkflowParams(route, event),
     });
     const blockedAfterCommand = activeRunFromWorkflowCommandResult(result);
@@ -1033,7 +1033,7 @@ export async function handleBlockedRunPicker({
       projectRoot,
       adapter,
       parentInteractiveToolCallHook: "registered_parent_interactive_tool_call_hook",
-      notify: makeProgressNotifier(ctx),
+      notify: makeProgressNotifier(ctx, pi),
     });
     safeAppendEntry(pi, "aipi.input.route", {
       schema: "aipi.input-route.v1",
@@ -4670,9 +4670,15 @@ const PROGRESS_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦"
 // instead of a single frozen "running…" line. Every host capability is feature-detected; when only
 // ctx.ui.notify exists (or it's the CLI), the extra surfaces degrade to no-ops and the notify lines
 // remain exactly as before.
-export function makeProgressNotifier(ctx) {
+export function makeProgressNotifier(ctx, pi = null) {
   if (typeof ctx?.ui?.notify !== "function") return null;
   const ui = ctx.ui;
+  // sendMessage lives on the extension (pi); fall back to ctx.sendMessage if a host exposes it there.
+  const sendMessage = typeof pi?.sendMessage === "function"
+    ? pi.sendMessage.bind(pi)
+    : typeof ctx?.sendMessage === "function"
+      ? ctx.sendMessage.bind(ctx)
+      : null;
   const PLAN_KEY = "aipi.workflow.plan";
   const STATUS_KEY = "aipi.workflow.status";
   const ACTIVITY_KEY = "aipi.workflow.activity";
@@ -4745,6 +4751,22 @@ export function makeProgressNotifier(ctx) {
   // Updated in place by the executor's worker poll loop; rendered by the spinner tick (no extra line spam).
   sink.updateActivity = (text) => {
     spinnerActivity = String(text ?? "").trim();
+  };
+  // Persistent per-action history in the CONVERSATION (distinct from the transient notify line and the live
+  // widget): each worker action is appended as a display message with triggerTurn:false, so it lands in the
+  // scrollback without kicking off a turn. Best-effort + feature-detected — degrades to a no-op (the widget /
+  // notify line still surfaces the activity) when the host exposes no sendMessage.
+  sink.logActivity = (line) => {
+    const text = String(line ?? "").replace(/\s+/g, " ").trim();
+    if (!text || !sendMessage) return;
+    try {
+      sendMessage(
+        { customType: "aipi-worker-activity", content: text, display: true },
+        { triggerTurn: false },
+      );
+    } catch {
+      /* best-effort — the live widget / notify line still surfaces the activity */
+    }
   };
   sink.stopSpinner = () => {
     if (spinnerTimer) {

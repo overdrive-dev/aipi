@@ -949,6 +949,13 @@ async function collectSubagentResult(coordinator, agentId, {
           const glyph = event.kind === "think" ? "💭 " : event.kind === "text" ? "💬 " : "";
           notify(`  ↳ ${tag} ${glyph}${event.detail}`, "info");
         }
+        // Persistent per-action HISTORY in the conversation (the transient notify above / the live widget
+        // vanish; this stays in the scrollback). The feed's byte cursor already yields each action once, so
+        // no extra dedupe is needed. Best-effort — a no-op on hosts without sendMessage.
+        if (typeof notify.logActivity === "function") {
+          const glyph = event.kind === "think" ? "💭" : event.kind === "text" ? "💬" : "🔧";
+          notify.logActivity(`${tag} ${glyph} ${event.detail}`);
+        }
       }
       if (richUI && recent.length) {
         const elapsed = Math.round((Date.now() - startedAt) / 1000);
