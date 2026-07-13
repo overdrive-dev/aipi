@@ -256,7 +256,8 @@
       "aipi_collect_agent",
       "aipi_cancel_agent",
       "aipi_cleanup_agents",
-      "aipi_steer_agent"
+      "aipi_steer_agent",
+      "aipi_answer_agent"
     ],
     "eventEntry": "aipi.subagents.event",
     "budgetRule": "Worker descriptors may set budget.timeout_ms, timeoutMs, max_runtime_ms, maxRuntimeMs, max_tool_calls, or maxToolCalls. The coordinator aborts the forked runtime on timeout with abort_reason=budget_timeout and fails a completed worker whose reported tool_call_count exceeds max_tool_calls with abort_reason=budget_max_tool_calls. State, counters, and aipi.subagents.event traces are persisted.",
@@ -267,6 +268,7 @@
     "piSubagentsPhaseOneRule": "pi-subagents source is forked from pi-subagents@0.28.0 under extensions/aipi/runtime/vendor/pi-subagents with LICENSE and VENDOR.md. The npm package pi-subagents is not a dependency or optionalDependency, there is no separately-loaded pi-subagents extension, and no backend-selection environment flag exists. AIPI owns runtime/pi-subagents.js, calls the vendored runSync entrypoint through jiti, writes agent/sessions/artifacts/results under .aipi/runtime/subagents, disables fallbackModels, passes AIPI_SUBAGENTS_PROJECT_ROOT/AIPI_SUBAGENTS_AGENT_ID/AIPI_SUBAGENTS_OWNED_FILES into the child, loads extensions/aipi/runtime/aipi-guarded-write-child.js as the worker write tool, and exposes the stable aipi_* tool surface by default. Non-auth utility deps kept are jiti@2.7.0 for loading the vendored TS runSync path and typebox@1.2.16 for the vendored structured-output validator; @earendil-works/pi-tui is a pinned direct AIPI dependency because the vendored subagent view (tui/subagent-view.ts, opened by /aipi-subagents) and the plan/subagent TUI widgets load it. Live provider-inheritance proof is manual: start a real AIPI/Pi session via `aipi` with provider auth/model selected, then run `/aipi-pi-subagents-spike`. GO requires assistant_text_ok=true for the child worker's OK reply, provider_event_observed=true from .aipi/runtime/provider-events.jsonl, project-scoped .aipi/runtime/subagents writes, and no provider/model other than the selected worker model is attempted.",
     "cleanupRule": "aipi_cleanup_agents applies retention cleanup only to terminal workers, releases owned-file allocations, emits a cleanup trace, returns aipi.subagents.cleanup.v1, and never deletes durable project/user memory.",
     "steeringRule": "aipi_steer_agent is registered but returns accepted=false with an explicit reason until worker prompt/response boundaries are resumable.",
+    "askAnswerRule": "Live worker->orchestrator dialogue. A running worker's aipi_ask_orchestrator tool (registered in the forked child via aipi-ask-orchestrator-child.js) routes its question through the in-process globalThis.__AIPI_ASK_BRIDGE__ to the owning coordinator's workerAsk, which BLOCKS the worker's tool call and surfaces pending_question/awaiting_answer on aipi_agent_status. The orchestrator replies with aipi_answer_agent, resolving the blocked call so the worker resumes with full context. Cancel and budget_timeout reject the pending question so the worker never hangs; the child tool degrades gracefully (best-judgment) if no bridge is present. The user only interacts with the orchestrator; workers converse with the orchestrator through this channel.",
     "redispatchRule": "Workflow adapters call coordinator.dispatch(descriptor). If a restored interrupted worker matches step_id, catalog agent id, and owned_files, the coordinator marks the old worker redispatched, releases its owned-file allocation, and spawns a fresh worker from the current descriptor/context.",
     "criterionZero": "Probe A's host tool_call hooks observed zero worker calls, but live Round 29 evidence proved the forked pi-subagents runtime can spawn real workers through the host Pi/Anthropic OAuth path. AIPI now wraps that single runtime with owned-file allocation, a guarded-shell worker policy, timeout/tool-count budgets, model provenance, and project-scoped runtime directories. The worker toolset is read/grep/find/ls/write plus aipi_guarded_bash (the watchdog-wrapped, project-root-scoped shell that lets a worker actually run tests/typecheck/build to VERIFY); raw bash/user_bash/exec/edit are absent. Probe A tested host tool_call attribution, a mechanism the design no longer relies on."
   },
@@ -279,6 +281,7 @@
       "aipi_cancel_agent",
       "aipi_cleanup_agents",
       "aipi_steer_agent",
+      "aipi_answer_agent",
       "aipi_memory_query",
       "aipi_rule_lookup",
       "aipi_rule_gap",

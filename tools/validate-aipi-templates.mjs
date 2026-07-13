@@ -2125,6 +2125,8 @@ for (const requiredToolToken of [
   "guardedWriteExtensionPath",
   "\"aipi_shell\"",
   "guardedBashExtensionPath",
+  "\"aipi_ask_orchestrator\"",
+  "askOrchestratorExtensionPath",
 ]) {
   if (!piSubagentsRuntime.includes(requiredToolToken)) {
     errors.push(`runtime/pi-subagents.js worker tools must include ${requiredToolToken} (read-only builtins + the guarded write AND guarded shell extensions)`);

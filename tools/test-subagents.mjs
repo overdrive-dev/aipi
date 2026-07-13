@@ -11,6 +11,7 @@ import {
   SUBAGENT_EVENT_ENTRY,
   SUBAGENT_STATE_ENTRY,
   SubagentCoordinator,
+  aipiAskBridge,
   buildWorkerPrompt,
   buildWorkerTools,
   latestSubagentStateFromEntries,
@@ -198,10 +199,11 @@ try {
   const spawnedArgs = realRuntimeCalls[0].args;
   assert.equal(spawnedArgs.includes("--model"), true);
   assert.equal(spawnedArgs[spawnedArgs.indexOf("--model") + 1], "anthropic/claude-opus-4-8");
-  // The production --tools allowlist MUST include "write" (guarded-write extension) AND "aipi_shell"
-  // (guarded-shell extension) so both registered tools survive the child's allowlist filter. Raw bash/shell/
-  // exec stay ABSENT — the worker's only shell is the watchdog-wrapped aipi_shell.
-  assert.deepEqual(spawnedTools(spawnedArgs), ["read", "grep", "find", "ls", "write", "aipi_shell"]);
+  // The production --tools allowlist MUST include "write" (guarded-write extension), "aipi_shell"
+  // (guarded-shell extension), and "aipi_ask_orchestrator" (live orchestrator back-channel) so all three
+  // registered tools survive the child's allowlist filter. Raw bash/shell/exec stay ABSENT — the worker's
+  // only shell is the watchdog-wrapped aipi_shell.
+  assert.deepEqual(spawnedTools(spawnedArgs), ["read", "grep", "find", "ls", "write", "aipi_shell", "aipi_ask_orchestrator"]);
   assert.equal(spawnedTools(spawnedArgs).some((tool) => /^(bash|shell|exec|user_bash)$/i.test(tool)), false);
   assert.equal(spawnedArgs.includes("--no-extensions"), true);
   assert.equal(
@@ -1325,3 +1327,93 @@ function assertUnder(root, candidate) {
 }
 
 console.log("subagents interactive-spawn model resolution: ok");
+
+// --- live worker<->orchestrator ask/answer channel ---
+{
+  const askEntries = [];
+  const askCoordinator = new SubagentCoordinator(
+    { appendEntry(name, value) { askEntries.push({ name, value }); } },
+    {
+      root: process.cwd(),
+      maxConcurrent: 1,
+      hostModel: { provider: "anthropic", id: "claude-opus-4-8" },
+      piSubagentsRunner: {
+        // A worker that hits ambiguity, asks the orchestrator via the in-process bridge (exactly what the
+        // aipi_ask_orchestrator child tool does), blocks on the answer, then finishes.
+        async spawn(params) {
+          const agentId = params.task.match(/AIPI worker id: ([^\n]+)/)?.[1] ?? params.id ?? "ask";
+          const answer = await aipiAskBridge().ask(agentId, "which price wins on renewal?");
+          return {
+            content: [{ type: "text", text: JSON.stringify({ ...stepResult, agent_ids: [agentId], notes: answer }) }],
+            tool_call_count: 0,
+          };
+        },
+      },
+    },
+  );
+  const { agent_id: askAgentId } = askCoordinator.spawn({
+    agent_id: "ask",
+    step_id: "review_swarm",
+    context_packet: "BDD: ask path.",
+    owned_files: ["src/ask.js"],
+  });
+  // Worker starts, asks, and blocks -> status surfaces the pending question.
+  await waitFor(() => askCoordinator.status(askAgentId).awaiting_answer === true);
+  const pending = askCoordinator.status(askAgentId);
+  assert.equal(pending.pending_question, "which price wins on renewal?");
+  assert.equal(pending.awaiting_answer, true);
+  assert.equal(pending.state, "running", "worker stays running while blocked on the orchestrator");
+  // Orchestrator answers -> worker unblocks and completes with the answer threaded in.
+  const ans = askCoordinator.answer(askAgentId, "keep the current price");
+  assert.equal(ans.accepted, true);
+  assert.equal(ans.answered_question, "which price wins on renewal?");
+  await waitFor(() => askCoordinator.status(askAgentId).state === "done");
+  assert.equal(askCoordinator.status(askAgentId).awaiting_answer, false);
+  assert.equal(askCoordinator.status(askAgentId).pending_question, null);
+  // Both sides traced.
+  assert.equal(askEntries.some((entry) => entry.value?.event === "worker_ask"), true);
+  assert.equal(askEntries.some((entry) => entry.value?.event === "worker_answer"), true);
+  // Answering with nothing pending is a rejected no-op, not a throw.
+  const late = askCoordinator.answer(askAgentId, "too late");
+  assert.equal(late.accepted, false);
+}
+
+// --- ask/answer edge cases: unknown agent, cancel rejects the pending question ---
+{
+  await assert.rejects(aipiAskBridge().ask("nonexistent:agent", "hi?"), /no live AIPI coordinator/);
+
+  const cancelEntries = [];
+  const cancelCoordinator = new SubagentCoordinator(
+    { appendEntry(name, value) { cancelEntries.push({ name, value }); } },
+    {
+      root: process.cwd(),
+      maxConcurrent: 1,
+      hostModel: { provider: "anthropic", id: "claude-opus-4-8" },
+      piSubagentsRunner: {
+        async spawn(params) {
+          const agentId = params.task.match(/AIPI worker id: ([^\n]+)/)?.[1] ?? params.id ?? "cancelask";
+          // Blocks forever on the orchestrator; cancel must reject the pending question so this rejects.
+          try {
+            await aipiAskBridge().ask(agentId, "blocking question");
+            return { content: [{ type: "text", text: JSON.stringify({ ...stepResult, agent_ids: [agentId] }) }], tool_call_count: 0 };
+          } catch (error) {
+            throw new Error(`ask rejected: ${error.message}`);
+          }
+        },
+      },
+    },
+  );
+  const { agent_id: cancelAgentId } = cancelCoordinator.spawn({
+    agent_id: "cancelask",
+    step_id: "review_swarm",
+    context_packet: "BDD: cancel path.",
+    owned_files: ["src/cancelask.js"],
+  });
+  await waitFor(() => cancelCoordinator.status(cancelAgentId).awaiting_answer === true);
+  cancelCoordinator.cancel(cancelAgentId);
+  // Cancel cleared the pending question immediately.
+  assert.equal(cancelCoordinator.status(cancelAgentId).awaiting_answer, false);
+  assert.equal(cancelCoordinator.status(cancelAgentId).pending_question, null);
+}
+
+console.log("subagents ask/answer channel: ok");

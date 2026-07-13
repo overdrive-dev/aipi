@@ -9,7 +9,7 @@ export const PI_SUBAGENTS_ISOLATION = "pi_subagents";
 export const PI_SUBAGENTS_LIVE_SPIKE_SCHEMA = "aipi.pi-subagents-spike.v1";
 export const AIPI_SUBAGENTS_RUNTIME_ROOT = ".aipi/runtime/subagents";
 export const AIPI_SUBAGENTS_AGENT_NAME = "aipi-worker";
-export const AIPI_SUBAGENTS_ALLOWED_TOOLS = ["read", "grep", "find", "ls", "write", "aipi_shell"];
+export const AIPI_SUBAGENTS_ALLOWED_TOOLS = ["read", "grep", "find", "ls", "write", "aipi_shell", "aipi_ask_orchestrator"];
 export const AIPI_SUBAGENTS_READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
 export const AIPI_SUBAGENTS_GUARDED_WRITE_EXTENSION = "extensions/aipi/runtime/aipi-guarded-write-child.js";
 export const AIPI_SUBAGENTS_GUARDED_BASH_EXTENSION = "extensions/aipi/runtime/aipi-guarded-bash-child.js";
@@ -26,6 +26,7 @@ const subagentViewEntrypoint = path.join(vendorRoot, "src", "tui", "subagent-vie
 const historyStoreEntrypoint = path.join(vendorRoot, "src", "runs", "background", "history-store.ts");
 const guardedWriteExtensionPath = path.join(currentDir, "aipi-guarded-write-child.js");
 const guardedBashExtensionPath = path.join(currentDir, "aipi-guarded-bash-child.js");
+const askOrchestratorExtensionPath = path.join(currentDir, "aipi-ask-orchestrator-child.js");
 let cachedJiti = null;
 
 export function normalizePiSubagentsBackend(value) {
@@ -467,6 +468,10 @@ export function createAipiWorkerAgentConfig({ thinking = undefined, allowShell =
       "write",
       guardedWriteExtensionPath,
       ...shellTools,
+      // Live back-channel to the orchestrator — every worker (lead or parallel reviewer) may ask; it
+      // only pauses for an answer, it never bypasses the owned-file/controller write guards.
+      "aipi_ask_orchestrator",
+      askOrchestratorExtensionPath,
     ],
     extensions: [],
     fallbackModels: [],
@@ -483,6 +488,7 @@ export function createAipiWorkerAgentConfig({ thinking = undefined, allowShell =
         ? "For shell (tests, typecheck, build, git, lint) use aipi_shell — your only shell; do not use raw bash/exec. Prefer running the real verification (e.g. the project's test command) over claiming a result."
         : "You have NO shell in this parallel review step; review by reading the code and the verify step's test evidence, and do not claim a result you did not see verified.",
       "Do not use a provider/model other than the selected worker model.",
+      "If you hit an ambiguity you cannot resolve from your task or context — a missing or contradictory decision, an underspecified requirement, a 'which option' choice, or missing access/info — call aipi_ask_orchestrator with ONE focused question instead of guessing; you will get an answer and continue. Do not ask about things you can determine yourself from the code, the context packet, or aipi_retrieve.",
       "Follow the task exactly and return the requested output format.",
     ].join("\n"),
   };

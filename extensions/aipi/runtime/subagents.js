@@ -63,6 +63,29 @@ const JobState = {
   REDISPATCHED: "redispatched",
 };
 
+// In-process bridge so forked workers (foreground runSync runs in this same process/realm) can reach
+// the live coordinator's ask registry WITHOUT IPC — the worker's aipi_ask_orchestrator tool, loaded
+// fresh inside the worker's pi run, has no direct handle to the coordinator object, but globalThis is
+// shared across the realm. It routes by agent_id across registered coordinators (normally one per
+// session; tests may create several), so only the coordinator that owns the asking worker answers.
+export function aipiAskBridge() {
+  let bridge = globalThis.__AIPI_ASK_BRIDGE__;
+  if (!bridge) {
+    const coordinators = new Set();
+    bridge = {
+      coordinators,
+      ask(agentId, question) {
+        for (const coordinator of coordinators) {
+          if (coordinator.hasAgent?.(agentId)) return coordinator.workerAsk(agentId, question);
+        }
+        return Promise.reject(new Error(`no live AIPI coordinator owns agent ${agentId}`));
+      },
+    };
+    globalThis.__AIPI_ASK_BRIDGE__ = bridge;
+  }
+  return bridge;
+}
+
 export class SubagentCoordinator {
   #pi;
   #maxConcurrent;
@@ -76,6 +99,7 @@ export class SubagentCoordinator {
   #hostModel;
   #env;
   #defaultIsolation;
+  #pendingQuestions = new Map(); // agent_id -> { question, askedAt, resolve, reject, promise }
 
   constructor(
     pi,
@@ -102,6 +126,13 @@ export class SubagentCoordinator {
     // Per-project isolation default from .aipi/runtime-contract.json isolationModel.workerIsolation
     // (pi_subagents unless the project opts into per_worker_worktree). Never an environment flag.
     this.#defaultIsolation = loadConfiguredWorkerIsolation(this.#root);
+    // Expose this coordinator to the in-process ask bridge so a running worker's aipi_ask_orchestrator
+    // tool can route its question back here (see aipiAskBridge above).
+    aipiAskBridge().coordinators.add(this);
+  }
+
+  hasAgent(agentId) {
+    return this.#jobs.has(agentId);
   }
 
   get registry() {
@@ -214,6 +245,8 @@ export class SubagentCoordinator {
       controller: new AbortController(),
       lastSummary: null,
       harnessHandle: null,
+      pendingQuestion: null,
+      awaitingAnswer: false,
       ownedFileBaseline: snapshotOwnedFiles(this.#root, descriptor.owned_files),
     });
     const job = this.#jobs.get(agentId);
@@ -233,6 +266,8 @@ export class SubagentCoordinator {
       state: job.state,
       elapsed_ms: job.startedAt ? (job.finishedAt ?? Date.now()) - job.startedAt : 0,
       last_summary: job.lastSummary,
+      pending_question: job.pendingQuestion ?? null,
+      awaiting_answer: Boolean(job.awaitingAnswer),
       error: job.error,
       model_requested: model?.requested ?? null,
       model_resolved: model?.resolved ?? null,
@@ -275,6 +310,7 @@ export class SubagentCoordinator {
   cancel(agentId) {
     const job = this.#requireJob(agentId);
     if (job.state === JobState.RUNNING || job.state === JobState.QUEUED) {
+      this.#rejectPendingQuestion(agentId, "agent cancelled");
       job.controller.abort();
       job.state = JobState.CANCELLED;
       job.finishedAt = Date.now();
@@ -295,6 +331,67 @@ export class SubagentCoordinator {
     const result = this.#steerWorkerSession(job, message);
     this.#trace("steer", job, { accepted: result.accepted, reason: result.reason });
     return { agent_id: agentId, ...result };
+  }
+
+  // Live worker->orchestrator question. Called (via the in-process bridge) by a running worker's
+  // aipi_ask_orchestrator tool; returns a Promise that BLOCKS the worker's tool call until the
+  // orchestrator answers (answer()) or the job is cancelled/times out (#rejectPendingQuestion). The
+  // worker keeps its full context and resumes exactly where it paused. One outstanding question per
+  // worker: a second ask before an answer returns the same pending promise.
+  workerAsk(agentId, question) {
+    const job = this.#jobs.get(agentId);
+    if (!job) return Promise.reject(new Error(`unknown agent ${agentId}`));
+    if (job.state !== JobState.RUNNING) {
+      return Promise.reject(new Error(`agent ${agentId} is not running (state ${job.state})`));
+    }
+    const text = String(question ?? "").trim();
+    if (!text) return Promise.resolve("");
+    const existing = this.#pendingQuestions.get(agentId);
+    if (existing) return existing.promise;
+    let resolveFn;
+    let rejectFn;
+    const promise = new Promise((resolve, reject) => {
+      resolveFn = resolve;
+      rejectFn = reject;
+    });
+    this.#pendingQuestions.set(agentId, { question: text, askedAt: Date.now(), resolve: resolveFn, reject: rejectFn, promise });
+    job.pendingQuestion = text;
+    job.awaitingAnswer = true;
+    this.#trace("worker_ask", job, { question: truncateText(text, 200) });
+    this.#persist();
+    return promise;
+  }
+
+  // aipi_answer_agent — the orchestrator's reply to a worker's pending question. Resolves the blocked
+  // aipi_ask_orchestrator tool call so the worker resumes.
+  answer(agentId, answerText) {
+    const pending = this.#pendingQuestions.get(agentId);
+    if (!pending) return { agent_id: agentId, accepted: false, reason: "no pending question" };
+    this.#pendingQuestions.delete(agentId);
+    const job = this.#jobs.get(agentId);
+    if (job) {
+      job.pendingQuestion = null;
+      job.awaitingAnswer = false;
+    }
+    const text = String(answerText ?? "").trim();
+    pending.resolve(text);
+    if (job) this.#trace("worker_answer", job, { answer: truncateText(text, 200) });
+    this.#persist();
+    return { agent_id: agentId, accepted: true, answered_question: pending.question };
+  }
+
+  // Fail an outstanding question (cancel / budget timeout / terminal) so the worker's ask tool unblocks
+  // and can degrade gracefully instead of hanging forever.
+  #rejectPendingQuestion(agentId, reason) {
+    const pending = this.#pendingQuestions.get(agentId);
+    if (!pending) return;
+    this.#pendingQuestions.delete(agentId);
+    const job = this.#jobs.get(agentId);
+    if (job) {
+      job.pendingQuestion = null;
+      job.awaitingAnswer = false;
+    }
+    pending.reject(new Error(reason));
   }
 
   // Retention only; never deletes durable memory.
@@ -872,6 +969,7 @@ export class SubagentCoordinator {
       job.abortReason = "budget_timeout";
       job.error = `budget timeout after ${job.budgetTimeoutMs}ms`;
       this.#trace("budget_timeout", job, { timeout_ms: job.budgetTimeoutMs });
+      this.#rejectPendingQuestion(job.agentId, "budget timeout");
       job.controller.abort();
     }, job.budgetTimeoutMs);
     timer.unref?.();
@@ -1587,7 +1685,9 @@ export function registerSubagentTools(pi, coordinator) {
   pi.registerTool({
     name: "aipi_spawn_agent",
     description:
-      "Spawn an AIPI session worker with a context packet, model class, shared project root, and owned-file scope. Returns an agent_id.",
+      "Spawn an AIPI session worker with a context packet, model class, shared project root, and owned-file scope. Returns an agent_id. " +
+      "While a worker runs, poll aipi_agent_status: a worker can call aipi_ask_orchestrator when it is stuck, which sets " +
+      "awaiting_answer/pending_question on its status and BLOCKS the worker until you reply with aipi_answer_agent. Answer promptly so it can resume.",
     parameters: {
       type: "object",
       required: ["agent_id"],
@@ -1621,10 +1721,32 @@ export function registerSubagentTools(pi, coordinator) {
 
   pi.registerTool({
     name: "aipi_agent_status",
-    description: "Return live state, elapsed time, and last summary for a spawned agent.",
+    description:
+      "Return live state, elapsed time, and last summary for a spawned agent. When the worker is blocked " +
+      "waiting on you, awaiting_answer is true and pending_question holds its question — reply with " +
+      "aipi_answer_agent to unblock it. Poll this while workers run.",
     parameters: idOnly,
     async execute(_id, params) {
       return jsonResult(coordinator.status(params.agent_id));
+    },
+  });
+
+  pi.registerTool({
+    name: "aipi_answer_agent",
+    description:
+      "Answer a running worker's pending question (from aipi_agent_status.pending_question). This resolves " +
+      "the worker's blocked aipi_ask_orchestrator call so it resumes with your answer. The worker keeps its " +
+      "context — give a direct, decisive answer.",
+    parameters: {
+      type: "object",
+      required: ["agent_id", "answer"],
+      properties: {
+        agent_id: { type: "string" },
+        answer: { type: "string", description: "Your answer to the worker's pending question." },
+      },
+    },
+    async execute(_id, params) {
+      return jsonResult(coordinator.answer(params.agent_id, params.answer));
     },
   });
 
