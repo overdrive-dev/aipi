@@ -773,10 +773,12 @@ export async function runAipiUpdate({
   existsSync = fs.existsSync,
   spawnSyncFn = spawnSync,
   env = process.env,
+  homeDir = os.homedir(),
   userArgs = [],
   log = console.log,
   errorLog = console.error,
   platform = process.platform,
+  seedFns = null,
 } = {}) {
   let options;
   try {
@@ -804,6 +806,21 @@ export async function runAipiUpdate({
     });
     if (!ok) {
       return;
+    }
+  }
+  // After a real update, seed correct context-windows for AIPI's custom models so `aipi update` alone
+  // leaves a working state — otherwise gpt-5.6-sol/grok-4.5/claude-sonnet-5 inherit Pi's 128k default
+  // until the user separately runs `aipi setup --fix`. Loaded fresh from the just-updated package on
+  // disk; best-effort; skipped on --dry-run. (Takes effect on updates FROM the version that ships this.)
+  if (!options.dryRun) {
+    try {
+      const seedModule = seedFns ?? await import(
+        pathToFileURL(path.join(packageRoot, "extensions", "aipi", "runtime", "pi-models-seed.js")).href
+      );
+      const seedResult = await seedModule.seedPiModels({ env, homeDir });
+      log(seedModule.formatPiModelsSeedResult(seedResult));
+    } catch (error) {
+      log(`aipi update: model context-window seed skipped (${String(error?.message ?? error)})`);
     }
   }
   log(options.dryRun ? "aipi update dry-run complete." : "aipi update complete.");

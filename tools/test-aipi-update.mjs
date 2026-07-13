@@ -174,6 +174,7 @@ assert.ok(logs.includes("aipi update dry-run complete."));
 // single command string, NOT a bare `npm` (ENOENT) and NOT fragile cmd.exe per-arg
 // quoting. git stays a direct git.exe spawn.
 const winSpawns = [];
+let updateSeedCalled = false;
 await runAipiUpdate({
   packageRoot,
   userArgs: [],
@@ -182,6 +183,11 @@ await runAipiUpdate({
   existsSync: (candidate) => candidate.endsWith(".git"),
   log: () => {},
   errorLog: () => {},
+  // Stub the model-context-window seed so the test never touches the real ~/.pi/agent/models.json.
+  seedFns: {
+    seedPiModels: async () => { updateSeedCalled = true; return { ok: true, wrote: false, pending: false, added: [], filled: [] }; },
+    formatPiModelsSeedResult: () => "model context-windows: already correct",
+  },
   spawnSyncFn: (command, second) => {
     const probe = gitOnlyRepoProbe(command, second);
     if (probe) return probe;
@@ -189,6 +195,7 @@ await runAipiUpdate({
     return { status: 0, stdout: "", stderr: "" };
   },
 });
+assert.ok(updateSeedCalled, "a real (non-dry-run) aipi update seeds model context-windows");
 const winDeps = winSpawns.find(
   (call) => typeof call[0] === "string" && /\bnpm\.cmd\b/.test(call[0]) && /--prefix/.test(call[0]),
 );
