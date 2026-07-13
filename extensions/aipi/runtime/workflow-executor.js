@@ -596,7 +596,39 @@ export function createSubagentWorkflowAdapter(coordinator, {
       if (workerRestrict && !workerSteps.has(args.step.id)) return fallback.executeStep(args);
       return runWorker(args);
     },
+    // Resolve a concrete model on a DIFFERENT authed provider than the step's configured model, for a
+    // rate-limit retry (see executeStepWithTransientRetries). Returns { model, fromProvider, toProvider } or
+    // null when no distinct authed provider is available. Best-effort — never throws.
+    async resolveRateLimitFallback(args) {
+      if (typeof coordinator.pickFallbackModel !== "function") return null;
+      let resolution = null;
+      try {
+        resolution = await modelResolver({
+          root: args.root,
+          workflow: args.workflow,
+          step: args.step,
+          context: args.context,
+          contract: args.contract,
+        });
+      } catch {
+        return null;
+      }
+      const fromProvider = providerOfModelRef(resolution?.model);
+      const model = coordinator.pickFallbackModel({ excludeProvider: fromProvider });
+      if (!model) return null;
+      return { model, fromProvider, toProvider: providerOfModelRef(model) };
+    },
   };
+}
+
+// Provider name of a model ref ({provider,id} or "provider/id" string), lowercased, or null.
+function providerOfModelRef(model) {
+  if (!model) return null;
+  if (typeof model === "string") {
+    const sep = model.indexOf("/");
+    return sep > 0 ? model.slice(0, sep).trim().toLowerCase() : null;
+  }
+  return String(model.provider ?? model.family ?? "").trim().toLowerCase() || null;
 }
 
 async function executeFanoutSubagentStep({
@@ -611,6 +643,7 @@ async function executeFanoutSubagentStep({
   collectTimeoutMs,
   modelResolver,
   notify = null,
+  modelOverride = null,
 }) {
   const artifacts = step.produces.map((template) => renderTemplate(template, state, step));
   const assignments = assignArtifactsToAgents(step.agents, artifacts);
@@ -625,12 +658,14 @@ async function executeFanoutSubagentStep({
       context,
       contract,
     });
+    // A rate-limit fallback forces every fanout worker onto a concrete model on a different authed provider.
+    const workerModel = modelOverride ?? modelResolution.model ?? undefined;
     const descriptor = {
       agent_id: agent,
       step_id: step.id,
       model_class: modelResolution.model_class,
-      model_resolution_source: modelResolution.source,
-      model: modelResolution.model ?? undefined,
+      model_resolution_source: modelOverride ? "rate-limit-fallback" : modelResolution.source,
+      model: workerModel,
       thinking_level: modelResolution.thinking_level,
       result_schema: "aipi.step-result.v1",
       artifact_target: path.join(runRelDir(state), "steps", step.id).replaceAll("\\", "/"),
@@ -659,7 +694,7 @@ async function executeFanoutSubagentStep({
       ),
     };
     const dispatched = dispatchSubagent(coordinator, descriptor);
-    spawned.push({ catalogAgentId: agent, model: modelResolution.model ?? null, ...dispatched });
+    spawned.push({ catalogAgentId: agent, model: workerModel ?? null, ...dispatched });
     // Log the unique dispatched id (base:uuid), not the catalog base name, so a routing record can be
     // correlated back to its worker session jsonl.
     await recordWorkerRoute({ root, state, step, agentId: dispatched.agent_id ?? agent, descriptor, modelResolution, coordinator });
@@ -748,6 +783,7 @@ async function executeSubagentStep({
   collectTimeoutMs,
   modelResolver,
   notify = null,
+  modelOverride = null,
 }) {
   const artifacts = step.produces.map((template) => renderTemplate(template, state, step));
   // controller_updates are run-root single-writer surfaces owned by the controller — a worker cannot write
@@ -758,12 +794,15 @@ async function executeSubagentStep({
   const controllerStaging = controllerUpdateStagingPlan(state, step);
   const expectedArtifacts = [...artifacts, ...controllerStaging.map((entry) => entry.staging)];
   const modelResolution = await modelResolver({ root, workflow, step, context, contract });
+  // A rate-limit fallback (see executeStepWithTransientRetries) forces a concrete model on a different authed
+  // provider for this retry; it wins over the class-resolved model.
+  const workerModel = modelOverride ?? modelResolution.model ?? undefined;
   const descriptor = {
     agent_id: step.agents[0] ?? "aipi-worker",
     step_id: step.id,
     model_class: modelResolution.model_class,
-    model_resolution_source: modelResolution.source,
-    model: modelResolution.model ?? undefined,
+    model_resolution_source: modelOverride ? "rate-limit-fallback" : modelResolution.source,
+    model: workerModel,
     thinking_level: modelResolution.thinking_level,
     result_schema: "aipi.step-result.v1",
     artifact_target: path.join(runRelDir(state), "steps", step.id).replaceAll("\\", "/"),
@@ -800,7 +839,7 @@ async function executeSubagentStep({
     notify,
     root,
     stepId: step.id,
-    model: modelResolution.model ?? null,
+    model: workerModel ?? null,
   });
   if (!collect.ready) {
     return workerOutcomeOrThrow({ step, agentId, collect });
@@ -1684,25 +1723,58 @@ async function missingRequiredArtifacts({ root, state, step, result }) {
   return missing;
 }
 
-async function executeStepWithTransientRetries({ adapter, args, retry } = {}) {
+export async function executeStepWithTransientRetries({ adapter, args, retry } = {}) {
   const maxAttempts = retry.maxAttempts;
   const events = [];
+  const stampRetries = (result, attempt) => {
+    if (events.length && result && typeof result === "object") {
+      result.transient_provider_retries = {
+        schema: "aipi.transient-provider-retries.v1",
+        recovered: true,
+        attempts: attempt,
+        events,
+      };
+    }
+    return result;
+  };
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      const result = await adapter.executeStep(args);
-      if (events.length && result && typeof result === "object") {
-        result.transient_provider_retries = {
-          schema: "aipi.transient-provider-retries.v1",
-          recovered: true,
-          attempts: attempt,
-          events,
-        };
-      }
-      return result;
+      return stampRetries(await adapter.executeStep(args), attempt);
     } catch (error) {
       if (!isTransientProviderError(error)) throw error;
       const summary = transientProviderErrorSummary(error);
       if (attempt >= maxAttempts) {
+        // Retries on the configured provider are exhausted (e.g. a sustained 429 account rate limit). Instead
+        // of hard-blocking the whole workflow, fall back ONCE to a concrete model on a DIFFERENT authed
+        // provider — and announce it, so a rate-limited step keeps the run moving on another family.
+        const fallback = typeof adapter.resolveRateLimitFallback === "function"
+          ? await adapter.resolveRateLimitFallback(args).catch(() => null)
+          : null;
+        if (fallback?.model) {
+          announceRateLimitFallback(args?.notify, { step: args.step, fallback });
+          events.push({
+            attempt,
+            error: summary,
+            fallback: { from: fallback.fromProvider ?? null, to: fallback.toProvider ?? null, model: describeModel(fallback.model) },
+          });
+          try {
+            const result = await adapter.executeStep({ ...args, modelOverride: fallback.model });
+            if (result && typeof result === "object") {
+              result.rate_limit_fallback = {
+                schema: "aipi.rate-limit-fallback.v1",
+                from_provider: fallback.fromProvider ?? null,
+                to_provider: fallback.toProvider ?? null,
+                model: describeModel(fallback.model),
+                after_attempts: attempt,
+              };
+            }
+            return stampRetries(result, attempt + 1);
+          } catch (fallbackError) {
+            if (!isTransientProviderError(fallbackError)) throw fallbackError;
+            // The fallback provider is ALSO transient-failing — block with the fallback error.
+            return transientProviderBlockedResult({ step: args.step, error: fallbackError, attempts: attempt + 1, events });
+          }
+        }
         return transientProviderBlockedResult({ step: args.step, error, attempts: attempt, events });
       }
       const delayMs = transientProviderRetryDelayMs({ retry, attempt });
@@ -1715,6 +1787,20 @@ async function executeStepWithTransientRetries({ adapter, args, retry } = {}) {
     }
   }
   return transientProviderBlockedResult({ step: args.step, error: new Error("transient provider retry exhausted"), attempts: maxAttempts, events });
+}
+
+// Announce a rate-limit fallback so the user sees the workflow rerouting to another family instead of just
+// stalling. Best-effort + feature-detected across the progress-sink surfaces.
+function announceRateLimitFallback(notify, { step, fallback }) {
+  const message =
+    `⚠ Rate-limited on ${fallback.fromProvider ?? "the provider"} — retrying step "${step?.id ?? "?"}" on ` +
+    `${describeModel(fallback.model)} (${fallback.toProvider ?? "?"}) instead of blocking.`;
+  try {
+    if (typeof notify === "function") notify(message, "warn");
+    if (typeof notify?.logActivity === "function") notify.logActivity(message);
+  } catch {
+    /* best-effort */
+  }
 }
 
 function transientProviderRetryConfig(contract = {}) {

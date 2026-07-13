@@ -116,6 +116,9 @@ export class SubagentCoordinator {
   // Lowercased providers the host is actually authed for (from ctx.modelRegistry.getAvailable()). null =
   // unknown (no live registry) → never override a resolved model. Set via setAvailableModels().
   #availableProviders = null;
+  // The authed models as { provider, id } refs (same source), so a rate-limited step can fall back to a
+  // concrete model on a DIFFERENT provider. null = unknown.
+  #availableModelSpecs = null;
 
   constructor(
     pi,
@@ -183,15 +186,31 @@ export class SubagentCoordinator {
   // of blocking the workflow. Empty/no specs → null (unknown) → the fallback stays disabled.
   setAvailableModels(specs) {
     const providers = new Set();
+    const models = [];
     for (const spec of Array.isArray(specs) ? specs : []) {
-      const provider = modelProvider(describeModel(spec) ?? spec);
-      if (provider) providers.add(provider);
+      const id = describeModel(spec) ?? (typeof spec === "string" ? spec : null);
+      const provider = modelProvider(id);
+      if (!provider) continue;
+      providers.add(provider);
+      const sep = String(id).indexOf("/");
+      if (sep > 0) models.push({ provider, id: String(id).slice(sep + 1) });
     }
     this.#availableProviders = providers.size ? providers : null;
+    this.#availableModelSpecs = models.length ? models : null;
   }
 
   getAvailableProviders() {
     return this.#availableProviders ? new Set(this.#availableProviders) : null;
+  }
+
+  // Pick a concrete authed model on a DIFFERENT provider than `excludeProvider` — for a rate-limit fallback
+  // (retry a step on another family instead of blocking). Returns { provider, id } or null when the only
+  // authed provider is the excluded one (or availability is unknown).
+  pickFallbackModel({ excludeProvider = null } = {}) {
+    if (!this.#availableModelSpecs) return null;
+    const exclude = String(excludeProvider ?? "").trim().toLowerCase();
+    const candidate = this.#availableModelSpecs.find((model) => model.provider && model.provider !== exclude);
+    return candidate ? { provider: candidate.provider, id: candidate.id } : null;
   }
 
   getRoot() {
