@@ -296,7 +296,18 @@ export class SubagentCoordinator {
       // own LLM calls) so the executor can classify it as a transient provider error and RETRY with
       // backoff instead of blocking the whole run on a "did not finish: failed" with no actionable
       // reason. Additive — existing { ready, state } consumers are unaffected.
-      return { agent_id: agentId, ready: false, state: job.state, error: job.error ?? null, abort_reason: job.abortReason ?? null };
+      // Also surface a pending question here so the orchestrator's natural "is it done yet?" collect
+      // loop catches a blocked worker without a separate aipi_agent_status poll — it can answer inline
+      // (aipi_answer_agent) and keep going, no interruption to its own flow.
+      return {
+        agent_id: agentId,
+        ready: false,
+        state: job.state,
+        pending_question: job.pendingQuestion ?? null,
+        awaiting_answer: Boolean(job.awaitingAnswer),
+        error: job.error ?? null,
+        abort_reason: job.abortReason ?? null,
+      };
     }
     return {
       agent_id: agentId,
@@ -1753,7 +1764,9 @@ export function registerSubagentTools(pi, coordinator) {
   pi.registerTool({
     name: "aipi_collect_agent",
     description:
-      "Collect a finished worker's aipi.step-result.v1 and artifact pointers. Does not write durable memory.",
+      "Collect a finished worker's aipi.step-result.v1 and artifact pointers. Does not write durable memory. " +
+      "If the worker is not ready yet, the result carries pending_question/awaiting_answer when it is blocked " +
+      "waiting on you — answer inline with aipi_answer_agent and keep collecting, no separate status poll needed.",
     parameters: idOnly,
     async execute(_id, params) {
       return jsonResult(coordinator.collect(params.agent_id));

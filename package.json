@@ -1,6 +1,6 @@
 {
   "name": "@overdrive-dev/aipi",
-  "version": "0.6.17",
+  "version": "0.6.18",
   "description": "BDD-contract agent harness for the Pi coding agent: staged workflow gates, specialist worker swarm, Markdown memory, and a standalone pinned Pi runtime.",
   "license": "MIT",
   "repository": {

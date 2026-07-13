@@ -1363,6 +1363,12 @@ console.log("subagents interactive-spawn model resolution: ok");
   assert.equal(pending.pending_question, "which price wins on renewal?");
   assert.equal(pending.awaiting_answer, true);
   assert.equal(pending.state, "running", "worker stays running while blocked on the orchestrator");
+  // collect() surfaces the pending question too, so the orchestrator's natural "is it done?" loop catches
+  // it without a separate status poll.
+  const blockedCollect = askCoordinator.collect(askAgentId);
+  assert.equal(blockedCollect.ready, false);
+  assert.equal(blockedCollect.pending_question, "which price wins on renewal?");
+  assert.equal(blockedCollect.awaiting_answer, true);
   // Orchestrator answers -> worker unblocks and completes with the answer threaded in.
   const ans = askCoordinator.answer(askAgentId, "keep the current price");
   assert.equal(ans.accepted, true);
