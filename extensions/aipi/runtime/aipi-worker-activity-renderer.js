@@ -19,26 +19,25 @@ export function registerWorkerActivityRenderer(pi, { components = piTui } = {}) 
   return true;
 }
 
-// Build the titled card component:
-//   ┌ <agent> · <model>
-//   │ <glyph> <action>
-//   └──────────────────
-// Header: agent in `accent`, model in `dim`. Body: the action in `customMessageText`. The card's box uses
-// the host `customMessageBg` so it stays visually consistent with Pi's other custom messages.
-export function buildWorkerActivityCard(message, theme, { Box, Text }) {
+// Build a clean, minimal "grok-build" activity line — matching the /aipi-subagents widget's look — INSTEAD of
+// Pi's heavy purple `[aipi-worker-activity]` custom-message box:
+//
+//   ▸ <agent> · <model>   <glyph> <action>
+//
+// A dim leading marker, the agent in `accent` with a dim `· model` suffix, then the action glyph + the detail
+// in `muted`. No background box: the purple `customMessageBg` is exactly what made the default look heavy, so
+// the renderer returns a plain indented Text and lets the terminal breathe.
+export function buildWorkerActivityCard(message, theme, { Text }) {
   const details = message?.details ?? {};
   const agent = String(details.agent ?? "worker").trim() || "worker";
   const model = details.model ? String(details.model).trim() : null;
   const glyph = details.glyph ? `${details.glyph} ` : "";
   const detail = String(details.detail ?? textOf(message?.content)).trim();
-  const header = model
+  const head = model
     ? `${theme.fg("accent", agent)}${theme.fg("dim", ` · ${model}`)}`
     : theme.fg("accent", agent);
-  const body = `${glyph}${theme.fg("customMessageText", detail)}`;
-  const box = new Box(1, 0, (t) => theme.bg("customMessageBg", t));
-  box.addChild(new Text(header, 0, 0));
-  box.addChild(new Text(body, 0, 0));
-  return box;
+  const body = detail ? `   ${glyph}${theme.fg("muted", detail)}` : "";
+  return new Text(`${theme.fg("dim", "▸")} ${head}${body}`, 1, 0);
 }
 
 function textOf(content) {
