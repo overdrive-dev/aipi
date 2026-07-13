@@ -902,8 +902,9 @@ try {
   );
   assert.ok(!teleActivity.some((a) => /99 tools/.test(a)), "host tool_call_count must be ignored for forked workers");
 
-  // Rich-UI host: because notify() is transient, the live worker stream is rendered as a persistent
-  // activity WIDGET (setActivity -> setWidget) showing the worker's recent thinking + file/graph ops.
+  // Rich-UI host: the live worker stream is rendered as persistent per-action HISTORY CARDS in the
+  // conversation (logActivity), each labeled with the worker AND its model. The old below-editor live
+  // activity WIDGET (setActivity) is intentionally NOT fed — it duplicated the cards under the plan.
   const richAgentId = "implementer:rich01";
   const richSessionDir = path.join(tempRoot, ".aipi", "runtime", "subagents", "sessions", richAgentId.replaceAll(":", "-"));
   await fs.mkdir(richSessionDir, { recursive: true });
@@ -936,20 +937,16 @@ try {
     modelResolver: async () => ({ model_class: "code-strong", model: { provider: "anthropic", id: "x" }, thinking_level: "medium", source: "t" }),
   });
   await richAdapter.executeStep({ root: tempRoot, state: bugParamRun.state, workflow: bugParamWorkflow, step: triageStep, context: {}, contract: {}, notify: richSink });
-  // The rich path passes a STRUCTURED payload {tag,tools,elapsed_s,items:[{kind,detail}]}; the host theme
-  // styles it (italic thinking / muted tools) — see test-aipi-workflow-command for the native rendering.
-  const richSnapshot = richWidget.find((p) => p && Array.isArray(p.items) && p.items.some((it) => /write gestores-tipo\.ts/.test(it.detail)));
-  assert.ok(richSnapshot, `live activity payload must include the worker's file ops; got: ${JSON.stringify(richWidget)}`);
-  assert.ok(richSnapshot.items.some((it) => it.kind === "think" && /Applying the fix/.test(it.detail)), "activity payload includes thinking (kind=think)");
-  assert.ok(richSnapshot.items.some((it) => it.kind === "tool" && /read index\.tsx/.test(it.detail)), "activity payload includes file reads");
-  assert.equal(richSnapshot.tools, 2, "activity payload carries the jsonl-derived tool count (2)");
-  // Persistent per-action HISTORY in the conversation: every worker action is also logged once via
-  // logActivity (deduped by the feed's byte cursor) so it lands in the scrollback, not just the widget.
+  // Persistent per-action HISTORY in the conversation: every worker action is logged once via logActivity
+  // (deduped by the feed's byte cursor) so it lands in the scrollback. Each line is labeled with the worker
+  // AND its model, so it is clear which model produced the action.
   assert.ok(richActivityLog.some((line) => /write .*gestores-tipo\.ts/.test(line)), `logActivity must record the worker's write; got: ${JSON.stringify(richActivityLog)}`);
   assert.ok(richActivityLog.some((line) => /read .*index\.tsx/.test(line)), "logActivity records the worker's reads");
   assert.ok(richActivityLog.some((line) => /Applying the fix/.test(line)), "logActivity records the worker's thinking notes");
-  // The live panel is cleared (setActivity(undefined)) when the worker finishes so it doesn't linger.
-  assert.equal(richWidget.at(-1), undefined, "activity widget cleared when the worker ends");
+  assert.ok(richActivityLog.every((line) => /anthropic\/x/.test(line)), `every activity card names the worker's model; got: ${JSON.stringify(richActivityLog)}`);
+  // The below-editor live activity WIDGET is disabled (de-duped against the cards): setActivity is never
+  // fed a real payload — only cleared (undefined) on exit — so the plan widget is the sole surface below.
+  assert.ok(richWidget.every((p) => p === undefined), `live activity widget must not be fed (planning-only below); got: ${JSON.stringify(richWidget)}`);
 
   // ADV review: the activity widget must be cleared even if coordinator.collect() THROWS mid-poll
   // (e.g. "unknown agent" if the job was pruned) — otherwise a stale panel lingers until the run unwinds.
@@ -981,8 +978,10 @@ try {
     () => wtAdapter.executeStep({ root: tempRoot, state: bugParamRun.state, workflow: bugParamWorkflow, step: triageStep, context: {}, contract: {}, notify: wtSink }),
     /unknown agent/,
   );
-  assert.ok(wtWidget.length >= 2, "activity widget was rendered then cleared");
-  assert.equal(wtWidget.at(-1), undefined, "activity widget cleared even when collect() throws mid-poll");
+  // The live activity widget is disabled (de-duped against the cards), but the clear guard must still run on
+  // EVERY exit — including a thrown collect() mid-poll — so a stale panel from any prior version never lingers.
+  assert.ok(wtWidget.every((p) => p === undefined), "live activity widget is not fed a payload");
+  assert.equal(wtWidget.at(-1), undefined, "activity panel cleared even when collect() throws mid-poll");
 
   // ADV review: the worker's spoken text/narration is surfaced too — including a string-content message —
   // so a tools-free, text-only turn isn't a blank panel; non-assistant (toolResult) text is NOT echoed.

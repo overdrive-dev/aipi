@@ -2520,6 +2520,15 @@ export async function captureCoordinatorHostModel({
   source = "unknown",
 } = {}) {
   if (typeof coordinator?.setHostModel !== "function") return null;
+  // Feed the coordinator the providers the host is actually authed for, so a step whose configured model
+  // (e.g. an xai-auth reviewer) is unavailable falls back to the host model instead of blocking the run.
+  if (typeof coordinator.setAvailableModels === "function") {
+    try {
+      coordinator.setAvailableModels(availableModelSpecsFromCtx(ctx, event));
+    } catch {
+      /* best-effort: no registry just means the availability fallback stays disabled */
+    }
+  }
   const model = await resolveHostModelCandidate({ event, ctx, routing });
   if (!model) return null;
   coordinator.setHostModel(model);
@@ -4391,6 +4400,25 @@ async function safeSetThinkingLevel(pi, thinkingLevel) {
   }
 }
 
+// Provider/model specs the host is authed for, as "provider/id" strings, for the coordinator's
+// availability fallback. Uses the registry's getAvailable() (auth-gated) when present; returns [] when
+// unknown so the fallback stays disabled rather than guessing.
+function availableModelSpecsFromCtx(ctx, event = null) {
+  const registry = event?.modelRegistry ?? ctx?.modelRegistry ?? null;
+  try {
+    const models = typeof registry?.getAvailable === "function" ? registry.getAvailable() : [];
+    return [...new Set((Array.isArray(models) ? models : [])
+      .map((model) => {
+        const provider = model?.provider ?? model?.family ?? null;
+        const id = model?.id ?? model?.model ?? model?.name ?? null;
+        return provider && id ? `${provider}/${id}` : null;
+      })
+      .filter(Boolean))];
+  } catch {
+    return [];
+  }
+}
+
 function modelRegistryFromEvent(event, ctx) {
   const direct = event?.modelRegistry ?? ctx?.modelRegistry ?? null;
   if (typeof direct?.find === "function") return direct;
@@ -4789,12 +4817,14 @@ export function makeProgressNotifier(ctx, pi = null) {
   // widget): each worker action is appended as a display message with triggerTurn:false, so it lands in the
   // scrollback without kicking off a turn. Best-effort + feature-detected — degrades to a no-op (the widget /
   // notify line still surfaces the activity) when the host exposes no sendMessage.
-  sink.logActivity = (line) => {
+  sink.logActivity = (line, details = null) => {
     const text = String(line ?? "").replace(/\s+/g, " ").trim();
     if (!text || !sendMessage) return;
     try {
       sendMessage(
-        { customType: "aipi-worker-activity", content: text, display: true },
+        // `details` (agent/model/glyph/detail) drives the titled-card renderer (aipi-worker-activity-renderer);
+        // `content` is the plain-text fallback for hosts without the renderer.
+        { customType: "aipi-worker-activity", content: text, display: true, ...(details ? { details } : {}) },
         { triggerTurn: false },
       );
     } catch {

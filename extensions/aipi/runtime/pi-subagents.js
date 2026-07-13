@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
+import { readHashlinePrompt } from "./hashline.js";
 
 export const PI_SUBAGENTS_PACKAGE = "pi-subagents@0.28.0";
 export const PI_SUBAGENTS_VENDOR_ROOT = "extensions/aipi/runtime/vendor/pi-subagents";
@@ -27,7 +28,14 @@ const historyStoreEntrypoint = path.join(vendorRoot, "src", "runs", "background"
 const guardedWriteExtensionPath = path.join(currentDir, "aipi-guarded-write-child.js");
 const guardedBashExtensionPath = path.join(currentDir, "aipi-guarded-bash-child.js");
 const askOrchestratorExtensionPath = path.join(currentDir, "aipi-ask-orchestrator-child.js");
+const hashlineEditExtensionPath = path.join(currentDir, "aipi-hashline-edit-child.js");
 let cachedJiti = null;
+
+// EXPERIMENTAL: give workers content-hash-anchored editing (aipi_read_hashline + aipi_edit) alongside the
+// guarded write. OFF by default — a package-level flag (not an env knob) flipped once we've confirmed the
+// worker models reliably emit the `[PATH#TAG]` hashline format. When true, createAipiWorkerAgentConfig adds
+// the two tools and extends the worker prompt with the hashline edit format. See aipi-hashline-edit-child.js.
+export const HASHLINE_WORKER_EDIT_ENABLED = false;
 
 export function normalizePiSubagentsBackend(value) {
   const normalized = String(value ?? "").trim().toLowerCase().replaceAll("-", "_");
@@ -446,7 +454,12 @@ export function loadSubagentView() {
   };
 }
 
-export function createAipiWorkerAgentConfig({ thinking = undefined, allowShell = true, maxToolCalls = null } = {}) {
+export function createAipiWorkerAgentConfig({
+  thinking = undefined,
+  allowShell = true,
+  maxToolCalls = null,
+  hashlineEdit = HASHLINE_WORKER_EDIT_ENABLED,
+} = {}) {
   // Shell (aipi_shell, formerly aipi_guarded_bash) is granted ONLY to single-lead, sequential workers —
   // NOT to parallel fanout (review_swarm) workers. A shell bypasses the owned-file/controller-path write
   // guards (it can write outside its owned files, touch .git or .aipi/memory), so giving it to PARALLEL
@@ -455,6 +468,11 @@ export function createAipiWorkerAgentConfig({ thinking = undefined, allowShell =
   // read the verify step's evidence instead. (Validator/tests still see both names in source — they are
   // conditionally included.)
   const shellTools = allowShell ? ["aipi_shell", guardedBashExtensionPath] : [];
+  // Additive, flag-gated hashline editing. Both worker classes (lead + parallel reviewer) may receive it:
+  // aipi_edit self-enforces the SAME owned-file scope as the guarded write, so it is safe for fanout too.
+  const hashlineTools = hashlineEdit
+    ? ["aipi_read_hashline", "aipi_edit", hashlineEditExtensionPath]
+    : [];
   return {
     name: AIPI_SUBAGENTS_AGENT_NAME,
     package: "aipi",
@@ -474,6 +492,7 @@ export function createAipiWorkerAgentConfig({ thinking = undefined, allowShell =
       // only pauses for an answer, it never bypasses the owned-file/controller write guards.
       "aipi_ask_orchestrator",
       askOrchestratorExtensionPath,
+      ...hashlineTools,
     ],
     extensions: [],
     fallbackModels: [],
@@ -494,6 +513,12 @@ export function createAipiWorkerAgentConfig({ thinking = undefined, allowShell =
       maxToolCalls
         ? `You have a LIMITED tool-call budget (about ${maxToolCalls} calls). Exceeding it interrupts you and DISCARDS your work — nothing is delivered. So pace yourself: don't spend the whole budget exploring; write your complete result/findings (and any owned-file artifacts) well BEFORE you run low. A delivered partial result beats being cut off with nothing.`
         : "You have a LIMITED tool-call budget; exceeding it interrupts you and DISCARDS your work. Pace yourself and write your complete result well before you run low — a delivered partial beats being cut off with nothing.",
+      ...(hashlineEdit
+        ? [
+            "To EDIT an existing file, prefer the hashline flow: call aipi_read_hashline to get the file's `[PATH#TAG]` header and `LINE:TEXT` numbered rows, then aipi_edit with a patch anchored on that TAG. aipi_edit REJECTS a stale TAG instead of corrupting the file — if that happens, re-read with aipi_read_hashline and retry. Use the write tool only to CREATE a new file. The hashline edit format:",
+            readHashlinePrompt(),
+          ]
+        : []),
       "Follow the task exactly and return the requested output format.",
     ].join("\n"),
   };

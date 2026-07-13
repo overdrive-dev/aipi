@@ -659,7 +659,7 @@ async function executeFanoutSubagentStep({
       ),
     };
     const dispatched = dispatchSubagent(coordinator, descriptor);
-    spawned.push({ catalogAgentId: agent, ...dispatched });
+    spawned.push({ catalogAgentId: agent, model: modelResolution.model ?? null, ...dispatched });
     // Log the unique dispatched id (base:uuid), not the catalog base name, so a routing record can be
     // correlated back to its worker session jsonl.
     await recordWorkerRoute({ root, state, step, agentId: dispatched.agent_id ?? agent, descriptor, modelResolution, coordinator });
@@ -673,6 +673,7 @@ async function executeFanoutSubagentStep({
       notify,
       root,
       stepId: step.id,
+      model: worker.model,
     });
     if (!collect.ready) {
       return workerOutcomeOrThrow({ step, agentId: worker.agent_id, collect });
@@ -799,6 +800,7 @@ async function executeSubagentStep({
     notify,
     root,
     stepId: step.id,
+    model: modelResolution.model ?? null,
   });
   if (!collect.ready) {
     return workerOutcomeOrThrow({ step, agentId, collect });
@@ -922,44 +924,46 @@ async function collectSubagentResult(coordinator, agentId, {
   notify = null,
   root = null,
   stepId = null,
+  model = null,
 }) {
   const startedAt = Date.now();
   let lastActivityAt = 0;
   // Live worker telemetry: a forked worker runs for minutes; surface what it is actually DOING so the
   // terminal isn't a silent spinner. The worker streams its real session to a jsonl; we tail NEW events
-  // and show each thinking note + file/graph/tool action live. The host's notify() is a TRANSIENT
-  // notification (only the latest shows), so on a rich host we render a persistent, scrolling activity
-  // WIDGET (setWidget — the same reliable surface as the planner). On a plain/CLI host (no widgets) we
-  // fall back to one notify line per event. The feed keeps a byte cursor so each event is seen once.
+  // and show each thinking note + file/graph/tool action live. Two surfaces, no duplication (per Victor):
+  //   - the persistent per-action HISTORY CARDS in the conversation (logActivity) — the "events on top";
+  //   - the animated spinner status line (updateActivity) with the live tool count + latest action.
+  // The below-editor space is left to the PLAN widget only (setPlan); the old live activity WIDGET
+  // (setActivity) is intentionally NOT fed here — it duplicated the cards under the plan. On a plain/CLI
+  // host with no cards channel, we fall back to one transient notify line per event. Each activity line is
+  // labeled with the worker agent AND its model, so it's clear which model produced the action.
   const canStream = typeof notify === "function" && Boolean(root);
   const feed = canStream ? createWorkerActivityFeed(root, agentId) : null;
   const tag = String(agentId).split(":")[0] || stepId || "worker";
-  const richUI = canStream && notify.supportsWidgets === true && typeof notify.setActivity === "function";
-  const recent = []; // rolling window of {kind, detail} the live widget renders natively
-  const RECENT_CAP = 14;
+  const modelLabel = describeModel(model);
+  const label = modelLabel ? `${tag} · ${modelLabel}` : tag;
+  const widgetHost = canStream && notify.supportsWidgets === true;
   const pump = async () => {
     if (!feed) return;
     try {
       const { events, toolCount, latestAction } = await feed.poll();
       for (const event of events) {
-        if (richUI) {
-          recent.push(event); // {kind, detail} — styled (italic thinking, muted tools) by the host theme
-          if (recent.length > RECENT_CAP) recent.shift();
-        } else {
-          const glyph = event.kind === "think" ? "💭 " : event.kind === "text" ? "💬 " : "";
-          notify(`  ↳ ${tag} ${glyph}${event.detail}`, "info");
-        }
-        // Persistent per-action HISTORY in the conversation (the transient notify above / the live widget
-        // vanish; this stays in the scrollback). The feed's byte cursor already yields each action once, so
-        // no extra dedupe is needed. Best-effort — a no-op on hosts without sendMessage.
+        const glyph = event.kind === "think" ? "💭" : event.kind === "text" ? "💬" : "🔧";
+        // Plain/CLI host (no widgets/cards): stream each action as a transient notify line — its only
+        // per-event surface. On a widget host the persistent cards below cover it, so skip the line.
+        if (!widgetHost) notify(`  ↳ ${label} ${glyph} ${event.detail}`, "info");
+        // Persistent per-action HISTORY card in the conversation (the transient notify above vanishes;
+        // this stays in the scrollback). The feed's byte cursor already yields each action once. `details`
+        // drive the titled-card renderer (header = agent · model); `content` is the plain-text fallback.
         if (typeof notify.logActivity === "function") {
-          const glyph = event.kind === "think" ? "💭" : event.kind === "text" ? "💬" : "🔧";
-          notify.logActivity(`${tag} ${glyph} ${event.detail}`);
+          notify.logActivity(`${label} ${glyph} ${event.detail}`, {
+            agent: tag,
+            model: modelLabel ?? null,
+            glyph,
+            detail: event.detail,
+            kind: event.kind,
+          });
         }
-      }
-      if (richUI && recent.length) {
-        const elapsed = Math.round((Date.now() - startedAt) / 1000);
-        notify.setActivity({ tag, tools: toolCount, elapsed_s: elapsed, items: recent.slice() });
       }
       if (typeof notify.updateActivity === "function") {
         const parts = [`${toolCount} tool${toolCount === 1 ? "" : "s"}`];
@@ -970,6 +974,7 @@ async function collectSubagentResult(coordinator, agentId, {
       /* telemetry is best-effort and must never break the run */
     }
   };
+  // The live activity widget is no longer fed; clear any stale panel a prior version may have left.
   const clearLivePanel = () => {
     try { notify?.setActivity?.(undefined); } catch { /* best-effort */ }
   };

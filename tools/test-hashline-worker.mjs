@@ -1,0 +1,135 @@
+// Verifies the flag-gated hashline worker tools: config gating in
+// createAipiWorkerAgentConfig, and the aipi_read_hashline / aipi_edit child
+// tools enforcing owned-file scope + content-hash-anchored (stale-rejecting)
+// edits against a real temp project.
+
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import registerAipiHashlineEditChild from "../extensions/aipi/runtime/aipi-hashline-edit-child.js";
+import { loadHashline } from "../extensions/aipi/runtime/hashline.js";
+import {
+  createAipiWorkerAgentConfig,
+  HASHLINE_WORKER_EDIT_ENABLED,
+} from "../extensions/aipi/runtime/pi-subagents.js";
+
+const hl = loadHashline();
+
+function collectTools(register) {
+  const tools = {};
+  register({ registerTool: (def) => { tools[def.name] = def; } });
+  return tools;
+}
+const text = (result) => (result?.content ?? []).map((part) => part.text).join("\n");
+
+// --- default flag is OFF: existing worker behavior is unchanged ---
+{
+  assert.equal(HASHLINE_WORKER_EDIT_ENABLED, false, "hashline worker editing must ship OFF by default");
+  const off = createAipiWorkerAgentConfig({});
+  assert.ok(!off.tools.includes("aipi_edit"), "flag OFF: no aipi_edit tool");
+  assert.ok(!off.tools.includes("aipi_read_hashline"), "flag OFF: no aipi_read_hashline tool");
+  assert.ok(
+    !off.tools.some((tool) => String(tool).includes("aipi-hashline-edit-child")),
+    "flag OFF: hashline extension not loaded",
+  );
+  assert.ok(!/hashline flow/.test(off.systemPrompt), "flag OFF: no hashline prompt block");
+  // The guarded write is still present regardless.
+  assert.ok(off.tools.includes("write"), "guarded write always present");
+}
+
+// --- flag ON: both tools + extension + prompt are wired ---
+{
+  const on = createAipiWorkerAgentConfig({ hashlineEdit: true });
+  assert.ok(on.tools.includes("aipi_read_hashline"), "flag ON: aipi_read_hashline listed");
+  assert.ok(on.tools.includes("aipi_edit"), "flag ON: aipi_edit listed");
+  assert.ok(
+    on.tools.some((tool) => String(tool).includes("aipi-hashline-edit-child")),
+    "flag ON: hashline extension path loaded",
+  );
+  assert.match(on.systemPrompt, /hashline flow/, "flag ON: prompt teaches the hashline flow");
+  assert.match(on.systemPrompt, /\[PATH#TAG\]/, "flag ON: prompt embeds the hashline format");
+  // Fanout (shell-less) workers also get it — aipi_edit self-guards owned scope.
+  const fanout = createAipiWorkerAgentConfig({ allowShell: false, hashlineEdit: true });
+  assert.ok(fanout.tools.includes("aipi_edit"), "flag ON: fanout worker also gets aipi_edit");
+  assert.ok(!fanout.tools.includes("aipi_shell"), "fanout worker still has no shell");
+}
+
+// --- the child tools, exercised against a real temp project with env scope ---
+{
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-hl-worker-"));
+  const saved = {
+    root: process.env.AIPI_SUBAGENTS_PROJECT_ROOT,
+    owned: process.env.AIPI_SUBAGENTS_OWNED_FILES,
+    id: process.env.AIPI_SUBAGENTS_AGENT_ID,
+    scope: process.env.AIPI_SUBAGENTS_WRITE_SCOPE,
+  };
+  try {
+    await fs.mkdir(path.join(root, "src"), { recursive: true });
+    const fooBody = "alpha\nbeta\ngamma\n";
+    await fs.writeFile(path.join(root, "src", "foo.txt"), fooBody);
+    await fs.writeFile(path.join(root, "src", "stale.txt"), "x\ny\nz\n");
+    await fs.writeFile(path.join(root, "src", "other.txt"), "not\nowned\n"); // exists, NOT owned
+
+    process.env.AIPI_SUBAGENTS_PROJECT_ROOT = root;
+    process.env.AIPI_SUBAGENTS_OWNED_FILES = JSON.stringify(["src/foo.txt", "src/stale.txt", "src/new.txt"]);
+    process.env.AIPI_SUBAGENTS_AGENT_ID = "worker-x";
+    process.env.AIPI_SUBAGENTS_WRITE_SCOPE = "artifacts";
+
+    const tools = collectTools(registerAipiHashlineEditChild);
+    assert.ok(tools.aipi_read_hashline && tools.aipi_edit, "child registers both tools");
+
+    // read renders [PATH#TAG] + numbered rows, and the TAG matches the content hash.
+    const readRes = await tools.aipi_read_hashline.execute("r1", { path: "src/foo.txt" });
+    assert.ok(!readRes.isError, "read succeeds for an in-root file");
+    const readOut = text(readRes);
+    const tag = hl.computeFileHash(fooBody);
+    assert.ok(readOut.startsWith(`[src/foo.txt#${tag}]`), "read header carries the content-hash tag");
+    assert.match(readOut, /\n2:beta/, "read shows numbered lines");
+
+    // a valid, correctly-anchored edit lands on disk and reports a fresh tag.
+    const editRes = await tools.aipi_edit.execute("e1", {
+      patch: `[src/foo.txt#${tag}]\nSWAP 2.=2:\n+BETA`,
+    });
+    assert.ok(!editRes.isError, `valid edit should apply: ${text(editRes)}`);
+    assert.equal(await fs.readFile(path.join(root, "src", "foo.txt"), "utf8"), "alpha\nBETA\ngamma\n");
+    assert.match(text(editRes), /update src\/foo\.txt -> \[src\/foo\.txt#[0-9A-F]{4}\]/, "reports the new anchor");
+
+    // an edit to a file OUTSIDE the owned scope is refused, and the file is untouched.
+    const scopeRes = await tools.aipi_edit.execute("e2", {
+      patch: `[src/other.txt#0000]\nSWAP 1.=1:\n+hacked`,
+    });
+    assert.ok(scopeRes.isError, "out-of-scope edit must be refused");
+    assert.match(text(scopeRes), /owned-file scope/, "refusal cites owned-file scope");
+    assert.equal(await fs.readFile(path.join(root, "src", "other.txt"), "utf8"), "not\nowned\n", "unowned file untouched");
+
+    // a stale anchor (tag != live content) is rejected instead of corrupting the file.
+    const staleBody = "x\ny\nz\n";
+    const staleTag = hl.computeFileHash(staleBody) === "0000" ? "1111" : "0000";
+    const staleRes = await tools.aipi_edit.execute("e3", {
+      patch: `[src/stale.txt#${staleTag}]\nSWAP 2.=2:\n+Y`,
+    });
+    assert.ok(staleRes.isError, "stale-anchored edit must be rejected");
+    assert.equal(await fs.readFile(path.join(root, "src", "stale.txt"), "utf8"), staleBody, "stale target untouched");
+
+    // hashline edits existing files only: an owned-but-missing file is refused with write guidance.
+    const createRes = await tools.aipi_edit.execute("e4", {
+      patch: `[src/new.txt#0000]\nINS.HEAD:\n+hello`,
+    });
+    assert.ok(createRes.isError, "editing a non-existent file is refused");
+    assert.match(text(createRes), /not found|write/i, "refusal points to the write tool");
+  } finally {
+    for (const [key, value] of Object.entries({
+      AIPI_SUBAGENTS_PROJECT_ROOT: saved.root,
+      AIPI_SUBAGENTS_OWNED_FILES: saved.owned,
+      AIPI_SUBAGENTS_AGENT_ID: saved.id,
+      AIPI_SUBAGENTS_WRITE_SCOPE: saved.scope,
+    })) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+console.log("hashline-worker: ok");

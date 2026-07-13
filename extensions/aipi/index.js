@@ -23,6 +23,7 @@ import {
 import { refreshPlanWidget, registerPlanWidget } from "./runtime/plan-widget.js";
 import { registerBackgroundResearchTool } from "./runtime/background-research.js";
 import { registerSubagentWidget } from "./runtime/subagent-widget.js";
+import { registerWorkerActivityRenderer } from "./runtime/aipi-worker-activity-renderer.js";
 import { registerModelIndicator } from "./runtime/model-indicator.js";
 import { registerAskTool } from "./runtime/ask-tool.js";
 import {
@@ -93,6 +94,9 @@ export default function aipiExtension(pi, { workflowCommandRunner = runWorkflowC
   registerBackgroundResearchTool(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx) });
   // Inline TUI widget: an always-visible live list of active subagent runs above the editor (grok-build style).
   registerSubagentWidget(pi, { projectRootResolver: (ctx) => resolveProjectRoot(ctx) });
+  // Titled-card renderer for worker-activity messages: header = agent · model, action below — replaces Pi's
+  // default "[aipi-worker-activity]" label box. Feature-detected; a no-op on hosts without the renderer API.
+  registerWorkerActivityRenderer(pi);
   // Foreground model indicator: show the current session model + thinking on the footer chip and the streaming
   // "Working…" row, so write/edit/read actions in the main stream name their model (Pi core renders those
   // boxes; extensions cannot decorate them, so this is the visible surface for it).

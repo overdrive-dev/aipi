@@ -658,6 +658,84 @@ assert.throws(() => coordinator.status(agentId), /unknown agent/);
 assert.equal(piEntries.some((entry) => entry.name === SUBAGENT_EVENT_ENTRY && entry.value.event === "cleanup"), true);
 await fs.rm(coordinatorRoot, { recursive: true, force: true });
 
+// Model availability fallback: a worker whose resolved model's provider is NOT authed on the host falls
+// back to the (authed) host model — so the workflow completes on the default model instead of blocking on an
+// unavailable provider (e.g. a configured xai-auth/grok reviewer with the xAI extension not installed) — and
+// the fallback is ANNOUNCED. maxConcurrent:0 keeps each job QUEUED so we read the resolution without running.
+{
+  const fallbackMessages = [];
+  const fallbackRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-model-fallback-"));
+  const fallbackCoordinator = new SubagentCoordinator(
+    { appendEntry() {}, log() {}, sendMessage(message) { fallbackMessages.push(message); } },
+    {
+      root: fallbackRoot,
+      maxConcurrent: 0, // never dispatch; we only assert the spawn-time model resolution
+      env: {},
+      hostModel: { provider: "anthropic", id: "claude-opus-4-8" },
+      knownModelClasses: ["adversarial-heavy", "code-strong"],
+      piSubagentsRunner: { spawn() {} },
+    },
+  );
+  fallbackCoordinator.setAvailableModels(["anthropic/claude-opus-4-8", "anthropic/claude-sonnet-5"]);
+
+  // (1) an unavailable xai-auth reviewer model falls back to the host model + warns + announces.
+  const { agent_id: unavail } = fallbackCoordinator.spawn({
+    agent_id: "reviewer",
+    model_class: "adversarial-heavy",
+    model: { provider: "xai-auth", id: "grok-4.5" },
+    step_id: "verify",
+  });
+  const unavailStatus = fallbackCoordinator.status(unavail);
+  assert.equal(unavailStatus.model_resolved, "anthropic/claude-opus-4-8", "unavailable provider falls back to the host model");
+  assert.equal(unavailStatus.model_warning?.code, "AIPI_MODEL_UNAVAILABLE_FALLBACK", "the fallback is recorded as a model warning");
+  assert.match(unavailStatus.model_warning.message, /grok-4\.5/, "warning names the unavailable model");
+  assert.ok(
+    fallbackMessages.some((m) => m.customType === "aipi-model-fallback" && /grok-4\.5/.test(m.content) && /claude-opus-4-8/.test(m.content)),
+    `a visible fallback announcement is sent; got: ${JSON.stringify(fallbackMessages)}`,
+  );
+
+  // (2) an authed provider model is used as configured (no fallback, no announcement).
+  fallbackMessages.length = 0;
+  const { agent_id: avail } = fallbackCoordinator.spawn({
+    agent_id: "coder",
+    model_class: "code-strong",
+    model: { provider: "anthropic", id: "claude-sonnet-5" },
+    step_id: "implement",
+  });
+  const availStatus = fallbackCoordinator.status(avail);
+  assert.equal(availStatus.model_resolved, "anthropic/claude-sonnet-5", "an authed model runs as configured");
+  assert.equal(availStatus.model_warning, null, "no warning for an available model");
+  assert.equal(fallbackMessages.length, 0, "no fallback announcement for an available model");
+  await fs.rm(fallbackRoot, { recursive: true, force: true });
+}
+
+// Unknown availability (no live registry): the fallback stays DISABLED — a configured model is never
+// overridden when we cannot prove its provider is unavailable (setAvailableModels was not called).
+{
+  const noRegRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-model-noreg-"));
+  const noRegCoordinator = new SubagentCoordinator(
+    { appendEntry() {}, log() {}, sendMessage() {} },
+    {
+      root: noRegRoot,
+      maxConcurrent: 0,
+      env: {},
+      hostModel: { provider: "anthropic", id: "claude-opus-4-8" },
+      knownModelClasses: ["adversarial-heavy"],
+      piSubagentsRunner: { spawn() {} },
+    },
+  );
+  const { agent_id: keep } = noRegCoordinator.spawn({
+    agent_id: "reviewer",
+    model_class: "adversarial-heavy",
+    model: { provider: "xai-auth", id: "grok-4.5" },
+    step_id: "verify",
+  });
+  const keepStatus = noRegCoordinator.status(keep);
+  assert.equal(keepStatus.model_resolved, "xai-auth/grok-4.5", "unknown availability never overrides a configured model");
+  assert.equal(keepStatus.model_warning, null, "no fallback warning when availability is unknown");
+  await fs.rm(noRegRoot, { recursive: true, force: true });
+}
+
 // Owned-file conflict regression — the live nora-app `fix (4/7)` block:
 // "owned-file conflict for implementer:...: .../steps/fix/FIXES.md, IMPLEMENTATION.md".
 const conflictRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-owned-conflict-"));

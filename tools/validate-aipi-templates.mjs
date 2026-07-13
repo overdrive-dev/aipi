@@ -2102,6 +2102,8 @@ for (const requiredText of [
   "AIPI_SUBAGENTS_PROJECT_ROOT",
   "AIPI_SUBAGENTS_AGENT_ID",
   "AIPI_SUBAGENTS_OWNED_FILES",
+  // Experimental hashline worker editing must ship OFF by default (flipped only after live validation).
+  "HASHLINE_WORKER_EDIT_ENABLED = false",
   "projectSubagentsRuntimePaths",
   "assertAipiHostScopedModel",
   "createAipiSubagentsRunner",
@@ -2138,15 +2140,32 @@ if (!piSubagentsRuntime.includes("extensions: []")) {
 const guardedWriteChild = read("extensions/aipi/runtime/aipi-guarded-write-child.js");
 for (const requiredText of [
   "name: \"write\"",
+  // The owned-file scope enforcement is single-sourced in aipi-worker-path-guard.js (shared with the
+  // hashline aipi_edit tool); the guarded write MUST use it.
+  "aipi-worker-path-guard",
+  "assertWorkerWritable",
+  "assertInside",
+]) {
+  if (!guardedWriteChild.includes(requiredText)) {
+    errors.push(`runtime/aipi-guarded-write-child.js must include ${requiredText}`);
+  }
+}
+// Security-critical owned-file scope enforcement, single-sourced here for both the guarded write and the
+// flag-gated hashline aipi_edit tool. Keep the enforcement literals asserted at their canonical location.
+const workerPathGuard = read("extensions/aipi/runtime/aipi-worker-path-guard.js");
+for (const requiredText of [
   "AIPI_SUBAGENTS_PROJECT_ROOT",
   "AIPI_SUBAGENTS_OWNED_FILES",
   "AIPI_SUBAGENTS_AGENT_ID",
+  "AIPI_SUBAGENTS_WRITE_SCOPE",
+  "isControllerOwnedPath",
+  "assertWorkerWritable",
   "outside its owned-file scope",
   ".aipi/memory",
   "write path escapes project root",
 ]) {
-  if (!guardedWriteChild.includes(requiredText)) {
-    errors.push(`runtime/aipi-guarded-write-child.js must include ${requiredText}`);
+  if (!workerPathGuard.includes(requiredText)) {
+    errors.push(`runtime/aipi-worker-path-guard.js must include ${requiredText}`);
   }
 }
 const guardedBashChild = read("extensions/aipi/runtime/aipi-guarded-bash-child.js");

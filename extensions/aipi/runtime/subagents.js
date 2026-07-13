@@ -19,6 +19,7 @@ import { aipiRetrieve } from "./aipi-tools.js";
 import {
   BUILTIN_MODEL_CLASSES,
   HOST_DEFAULT_MODEL,
+  describeModel,
   loadKnownModelClassesSync,
   resolveModelClass,
   resolveSpawnModelDecision,
@@ -112,6 +113,9 @@ export class SubagentCoordinator {
   #defaultIsolation;
   #pendingQuestions = new Map(); // agent_id -> { question, askedAt, resolve, reject, promise, timer }
   #workerAskTimeoutMs;
+  // Lowercased providers the host is actually authed for (from ctx.modelRegistry.getAvailable()). null =
+  // unknown (no live registry) → never override a resolved model. Set via setAvailableModels().
+  #availableProviders = null;
 
   constructor(
     pi,
@@ -172,6 +176,24 @@ export class SubagentCoordinator {
     return this.#hostModel;
   }
 
+  // Record the providers the host is authed for, as "provider/id" specs (from
+  // ctx.modelRegistry.getAvailable() via registryModelSpecs). Enables the spawn-time availability
+  // fallback: a step whose resolved model belongs to an un-authed provider (e.g. a configured
+  // xai-auth/grok reviewer with the xAI extension not installed) falls back to the host model instead
+  // of blocking the workflow. Empty/no specs → null (unknown) → the fallback stays disabled.
+  setAvailableModels(specs) {
+    const providers = new Set();
+    for (const spec of Array.isArray(specs) ? specs : []) {
+      const provider = modelProvider(describeModel(spec) ?? spec);
+      if (provider) providers.add(provider);
+    }
+    this.#availableProviders = providers.size ? providers : null;
+  }
+
+  getAvailableProviders() {
+    return this.#availableProviders ? new Set(this.#availableProviders) : null;
+  }
+
   getRoot() {
     return this.#root;
   }
@@ -213,10 +235,26 @@ export class SubagentCoordinator {
     // Hybrid model-class policy: validate BEFORE any side effects so a strict-rejected
     // spawn (unknown class without allow_fallback) leaves no orphaned allocation.
     const descriptorWithHostModel = withHostModel(descriptor, this.#hostModel);
+    // Availability fallback: if the resolved worker model's provider is not authed on this host, strip the
+    // concrete model so resolveSpawnModelDecision falls back to the (authed) host model — the workflow
+    // completes on the default model instead of blocking on an unavailable provider. Announced below.
+    const availabilityFallback = this.#stripUnavailableWorkerModel(descriptorWithHostModel);
     const modelResolution = resolveSpawnModelDecision({
       knownClasses: this.#knownModelClasses,
       descriptor: descriptorWithHostModel,
     });
+    if (availabilityFallback) {
+      modelResolution.model_availability_fallback = availabilityFallback;
+      modelResolution.warning = {
+        code: "AIPI_MODEL_UNAVAILABLE_FALLBACK",
+        severity: "warn",
+        message:
+          `model "${availabilityFallback.requested}" (provider "${availabilityFallback.provider}") is not ` +
+          `authed/available on this host; running this worker on the host model "${availabilityFallback.hostModel}" instead.`,
+        model_requested: availabilityFallback.requested,
+        model_resolved: availabilityFallback.hostModel,
+      };
+    }
     if (modelResolution.resolved === HOST_DEFAULT_MODEL) {
       const err = new Error("AIPI worker spawn requires a concrete host model; current session model was unavailable.");
       err.code = "AIPI_HOST_MODEL_UNAVAILABLE";
@@ -243,6 +281,7 @@ export class SubagentCoordinator {
       this.#registry.grantProjectScope(agentId);
     }
     if (modelResolution.warning) this.#emitModelWarning(agentId, modelResolution.warning);
+    if (availabilityFallback) this.#announceModelAvailabilityFallback(modelResolution.warning);
     this.#emitModelDivergence(agentId, modelResolution);
     const budget = normalizeBudget(descriptor.budget);
     this.#jobs.set(agentId, {
@@ -713,6 +752,41 @@ export class SubagentCoordinator {
     }
     job.lastSummary = stepResult?.verdict ?? null;
     return { stepResult, artifacts: raw?.artifacts ?? stepResult?.artifacts ?? [] };
+  }
+
+  // Strip descriptor.model when its provider is not authed on this host, so the spawn falls back to the
+  // host model. Returns { requested, provider, hostModel } when a fallback was applied, else null. Fully
+  // conservative: acts ONLY when the available-provider set is known, the worker model's provider is known
+  // and absent from it, AND a usable (authed) host model exists to fall back to — otherwise leaves the
+  // descriptor untouched (preserving the prior fail-loud behavior when no host model is available).
+  #stripUnavailableWorkerModel(descriptor) {
+    if (!this.#availableProviders || this.#availableProviders.size === 0) return null;
+    const requested = describeModel(descriptor.model);
+    if (!requested) return null;
+    const provider = modelProvider(requested);
+    if (!provider) return null;
+    if (this.#availableProviders.has(provider)) return null;
+    const hostModelRef = descriptor.host_model ?? descriptor.hostModel ?? null;
+    const hostModel = describeModel(hostModelRef);
+    if (!hostModel) return null;
+    const hostProvider = modelProvider(hostModel);
+    if (hostProvider && !this.#availableProviders.has(hostProvider)) return null; // host itself unusable → don't swap
+    descriptor.model = undefined;
+    return { requested, provider, hostModel };
+  }
+
+  // Surface the availability fallback to the USER live (not just pi.log), so a step silently running on the
+  // host model instead of its configured reviewer/verifier model is visible. Best-effort + feature-detected.
+  #announceModelAvailabilityFallback(warning) {
+    if (!warning) return;
+    try {
+      this.#pi?.sendMessage?.(
+        { customType: "aipi-model-fallback", content: `⚠ AIPI model fallback — ${warning.message}`, display: true },
+        { triggerTurn: false },
+      );
+    } catch {
+      /* best-effort — the durable signal still lives in step_result.model_warning + pi.log */
+    }
   }
 
   #emitModelWarning(agentId, warning) {

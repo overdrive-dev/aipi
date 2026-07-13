@@ -34,3 +34,13 @@ structure, or implementation details.
 - AIPI usage: vendored and modified worker runtime under
   `extensions/aipi/runtime/vendor/pi-subagents/`, executed only through AIPI's
   project-scoped forked subagent wrapper.
+
+## hashline
+
+- Source: https://github.com/can1357/oh-my-pi (package `@oh-my-pi/hashline`)
+- License: MIT, copyright Can Boluk
+- AIPI usage: vendored content-hash-anchored patch engine under
+  `extensions/aipi/runtime/vendor/hashline/`, executed only through AIPI's
+  `extensions/aipi/runtime/hashline.js` loader. Patched from the Bun runtime to
+  Node in two places (`format.ts` hash, `fs.ts` disk filesystem); see that
+  directory's `VENDOR.md`.

@@ -26,6 +26,12 @@ const READ_ONLY_TOOLS = new Set([
   // OPAQUE-denied below. aipi_guarded_bash is the deprecated alias of aipi_shell.
   "aipi_shell",
   "aipi_guarded_bash",
+  // hashline-aware read: pure read producer (renders [PATH#TAG] + numbered lines).
+  "aipi_read_hashline",
+  // hashline edit (flag-gated). Self-guards owned-file scope INTERNALLY via an owned-scoped
+  // Filesystem (aipi-hashline-edit-child.js), like aipi_shell — its write targets live inside the
+  // patch string, so the path-field classifier can't see them; allow it here and trust the tool's guard.
+  "aipi_edit",
 ]);
 
 const PATH_MUTATING_TOOLS = new Set(["write", "edit", "multi_edit", "apply_patch"]);
