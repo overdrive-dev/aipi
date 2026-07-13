@@ -93,12 +93,9 @@ export function aipiAskBridge() {
 // without answering — the question auto-expires after this window so the worker DEGRADES to its best
 // judgment and FINISHES (its tool call returns "no answer, proceed"), instead of hanging forever and
 // wedging the coordinator (never returning runSync -> owned files never released -> #pump stalls at
-// maxConcurrent). Override with AIPI_WORKER_ASK_TIMEOUT_MS.
-const DEFAULT_WORKER_ASK_TIMEOUT_MS = 120_000;
-export function workerAskTimeoutMs(env = process.env) {
-  const raw = Number(env?.AIPI_WORKER_ASK_TIMEOUT_MS);
-  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_WORKER_ASK_TIMEOUT_MS;
-}
+// maxConcurrent). Baked package default (no env knob); the coordinator accepts an override only as a
+// constructor option, which the tests use to expire fast.
+export const DEFAULT_WORKER_ASK_TIMEOUT_MS = 120_000;
 
 export class SubagentCoordinator {
   #pi;
@@ -113,7 +110,8 @@ export class SubagentCoordinator {
   #hostModel;
   #env;
   #defaultIsolation;
-  #pendingQuestions = new Map(); // agent_id -> { question, askedAt, resolve, reject, promise }
+  #pendingQuestions = new Map(); // agent_id -> { question, askedAt, resolve, reject, promise, timer }
+  #workerAskTimeoutMs;
 
   constructor(
     pi,
@@ -124,8 +122,12 @@ export class SubagentCoordinator {
       knownModelClasses = null,
       hostModel = null,
       env = process.env,
+      workerAskTimeoutMs = DEFAULT_WORKER_ASK_TIMEOUT_MS,
     } = {},
   ) {
+    this.#workerAskTimeoutMs = Number.isFinite(workerAskTimeoutMs) && workerAskTimeoutMs > 0
+      ? Math.floor(workerAskTimeoutMs)
+      : DEFAULT_WORKER_ASK_TIMEOUT_MS;
     this.#pi = pi;
     this.#maxConcurrent = maxConcurrent;
     this.#root = root ?? process.cwd();
@@ -387,7 +389,7 @@ export class SubagentCoordinator {
     // orchestrator that isn't there (workflow path) or didn't answer (interactive). On expiry the worker's
     // tool call rejects -> it degrades to best judgment and finishes; the run is NOT aborted, so the work
     // is preserved.
-    const timeoutMs = workerAskTimeoutMs(this.#env);
+    const timeoutMs = this.#workerAskTimeoutMs;
     const timer = setTimeout(() => {
       this.#rejectPendingQuestion(agentId, `no answer within ${timeoutMs}ms`);
     }, timeoutMs);

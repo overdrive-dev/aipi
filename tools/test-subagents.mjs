@@ -17,7 +17,6 @@ import {
   latestSubagentStateFromEntries,
   parseWorkerStepResult,
   resolveInteractiveSpawnModel,
-  workerAskTimeoutMs,
 } from "../extensions/aipi/runtime/subagents.js";
 import {
   AIPI_SUBAGENTS_AGENT_NAME,
@@ -1425,14 +1424,9 @@ console.log("subagents interactive-spawn model resolution: ok");
 
 console.log("subagents ask/answer channel: ok");
 
-// --- workerAskTimeoutMs: sensible default, env override, garbage-fallback ---
-assert.equal(workerAskTimeoutMs({}), 120000, "default per-question ask timeout is 120s");
-assert.equal(workerAskTimeoutMs({ AIPI_WORKER_ASK_TIMEOUT_MS: "5000" }), 5000, "env override honored");
-assert.equal(workerAskTimeoutMs({ AIPI_WORKER_ASK_TIMEOUT_MS: "0" }), 120000, "non-positive falls back to default");
-assert.equal(workerAskTimeoutMs({ AIPI_WORKER_ASK_TIMEOUT_MS: "x" }), 120000, "garbage falls back to default");
-
 // --- BLOCKER regression: an UNANSWERED question expires so the worker degrades and FINISHES (no hang,
-//     no leaked worker slot). This is the escape for the workflow path where nobody calls aipi_answer_agent. ---
+//     no leaked worker slot). This is the escape for the workflow path where nobody calls aipi_answer_agent.
+//     The ask timeout is a BAKED default (120s); tests set it short via the constructor option, not env. ---
 {
   const timeoutCoordinator = new SubagentCoordinator(
     { appendEntry() {} },
@@ -1440,7 +1434,7 @@ assert.equal(workerAskTimeoutMs({ AIPI_WORKER_ASK_TIMEOUT_MS: "x" }), 120000, "g
       root: process.cwd(),
       maxConcurrent: 1,
       hostModel: { provider: "anthropic", id: "claude-opus-4-8" },
-      env: { AIPI_WORKER_ASK_TIMEOUT_MS: "40" }, // expire fast for the test
+      workerAskTimeoutMs: 40, // expire fast for the test (constructor option, not env)
       piSubagentsRunner: {
         async spawn(params) {
           const agentId = params.task.match(/AIPI worker id: ([^\n]+)/)?.[1] ?? params.id ?? "toask";

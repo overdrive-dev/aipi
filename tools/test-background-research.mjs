@@ -6,16 +6,12 @@ import { initProject } from "../extensions/aipi/runtime/project-init.js";
 import {
   MAX_BACKGROUND_RESEARCH,
   registerBackgroundResearchTool,
-  researchMaxToolCalls,
   resolveResearchRoles,
   runBackgroundResearchJob,
 } from "../extensions/aipi/runtime/background-research.js";
 
-// --- researchMaxToolCalls: default budget is generous enough for a real audit; env can override ---
-assert.equal(researchMaxToolCalls({}), 80, "default read-only budget is 80 (30 killed real audits)");
-assert.equal(researchMaxToolCalls({ AIPI_RESEARCH_MAX_TOOL_CALLS: "150" }), 150, "env override honored");
-assert.equal(researchMaxToolCalls({ AIPI_RESEARCH_MAX_TOOL_CALLS: "0" }), 80, "non-positive override falls back to default");
-assert.equal(researchMaxToolCalls({ AIPI_RESEARCH_MAX_TOOL_CALLS: "nope" }), 80, "garbage override falls back to default");
+// The read-only tool-call budget is a BAKED package default of 80 (no env knob); the worker-gets-80
+// assertion below is the coverage.
 
 // --- runBackgroundResearchJob: read-only spawn params + wakes the orchestrator on success (no reviewer) ---
 {
