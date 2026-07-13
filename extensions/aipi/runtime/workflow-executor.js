@@ -22,6 +22,7 @@ const LOCAL_FALLBACK_TAG = Symbol("aipi.local-fallback");
 
 const PROGRESS_PHASE_LABELS = {
   running: "running…",
+  retrying: "retrying…",
   passed: "passed",
   skipped: "skipped",
   blocked: "blocked",
@@ -39,6 +40,7 @@ const PROGRESS_PLAN_GLYPHS = {
   cancelled: "✗",
   approval_required: "✗",
   running: "▶",
+  retrying: "↻",
   active: "▶",
   pending: "○",
 };
@@ -49,6 +51,12 @@ const DEFAULT_TRANSIENT_PROVIDER_RETRY = {
   maxDelayMs: 2_000,
   jitterMs: 100,
 };
+
+// A step that BLOCKS only because the worker returned a verdict but didn't write its required artifact(s)
+// is a MECHANICAL miss (not a real business/destructive gate). Auto-retry the same step this many times
+// with a firm "write the files" remediation before falling back to asking the user — so the workflow
+// self-resolves the common "0 tools, no artifact" case instead of stopping.
+const AUTO_ARTIFACT_RETRIES = 2;
 
 export async function executeWorkflowRun({
   projectRoot,
@@ -286,6 +294,9 @@ export async function executeWorkflowRun({
       if (state.gate_failure_feedback?.[step.id]) {
         delete state.gate_failure_feedback[step.id];
       }
+      if (state.artifact_retries?.[step.id]) {
+        delete state.artifact_retries[step.id];
+      }
       if (state.awaiting_user_input?.step_id === step.id) state.awaiting_user_input = null;
       state.current_step = nextStepId(workflow, step);
       if (!state.current_step) state.status = "completed";
@@ -360,6 +371,26 @@ export async function executeWorkflowRun({
       emitProgress(step.id, "blocked");
       await persistRunState(root, state);
       break;
+    }
+
+    // Auto-resolve a MECHANICAL missing-artifact block: the worker returned a verdict but never wrote the
+    // required file(s) (the "0 tools, no artifact" case). Re-run the SAME step (bounded by
+    // AUTO_ARTIFACT_RETRIES) with a firm "write the files" remediation instead of stopping to ask the user;
+    // only after the retries are spent does it fall through to the block-and-ask below.
+    if (missingArtifacts.length) {
+      const attempt = (state.artifact_retries?.[step.id] ?? 0) + 1;
+      if (attempt <= AUTO_ARTIFACT_RETRIES) {
+        state.artifact_retries ??= {};
+        state.artifact_retries[step.id] = attempt;
+        state.gate_failure_feedback ??= {};
+        state.gate_failure_feedback[step.id] = [artifactWriteRemediation(missingArtifacts)];
+        state.current_step = step.id;
+        state.awaiting_user_input = null;
+        events.push({ type: "artifact_retry", step_id: step.id, attempt, missing: missingArtifacts });
+        emitProgress(step.id, "retrying");
+        await persistRunState(root, state);
+        continue;
+      }
     }
 
     state.consecutive_failures = (state.consecutive_failures ?? 0) + 1;
@@ -1359,6 +1390,23 @@ async function countUndrainedCandidates(root) {
 }
 
 // FIX 4: Extract the first unresolved HIGH/CRITICAL finding from a review-stage step's artifacts.
+// Remediation entry (same shape as a review gate-failure finding, so context-builder forwards it as
+// gate_failure_remediation) telling the re-run worker to actually WRITE the artifacts it skipped.
+function artifactWriteRemediation(missingArtifacts) {
+  const list = (Array.isArray(missingArtifacts) ? missingArtifacts : []).filter(Boolean);
+  return {
+    finding: {
+      severity: "HIGH",
+      artifact: list[0] ?? "",
+      preview:
+        `You returned a verdict but did NOT create the required artifact file(s): ${list.join(", ")}. ` +
+        "This run auto-retries you: you MUST call the write tool to CREATE each of those files (with real, " +
+        "complete content) BEFORE returning your verdict. The gate checks the files exist on disk — a verdict " +
+        "without the files written is an automatic failure, not a pass.",
+    },
+  };
+}
+
 // Returns a feedback entry suitable for state.gate_failure_feedback[targetStepId], or null if no
 // actionable finding can be identified. Pure read — does not modify any files or state.
 async function extractReviewGateFailureFeedback({ root, result, step, state, now }) {

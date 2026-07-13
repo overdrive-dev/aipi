@@ -1087,7 +1087,7 @@ export function buildWorkerPrompt(job) {
     "Expected artifacts:",
     expectedArtifacts,
     "",
-    "Before returning PASS, write every expected artifact with the write tool. If you cannot write one, return BLOCKED or FAIL.",
+    "CRITICAL — WRITE YOUR ARTIFACTS: call the write tool to CREATE each Expected artifact file above (with real, complete content) BEFORE you return any verdict. The gate verifies these files EXIST on disk; returning PASS without having written them is an automatic FAILURE, not a pass — so don't just describe or classify in your JSON, actually write the file(s). If a required artifact genuinely cannot be produced, return BLOCKED or FAIL with the reason.",
     "",
     "Context packet:",
     contextPacket,

@@ -1573,6 +1573,48 @@ try {
     "planner renders ✗ for the failed fix attempt before it loops",
   );
 
+  // Auto-resolve (user request "que o workflow se auto resolvesse"): a worker that returns PASS but does
+  // NOT write its required artifact on the first attempt is AUTO-RETRIED with a "write the files"
+  // remediation and passes on the retry — instead of stopping to ask the user on a mechanical miss.
+  const autoResolveRun = await startWorkflowRun({
+    projectRoot: tempRoot,
+    workflow: "quick",
+    now: () => fixedDate,
+    randomBytes: fixedRandom,
+  });
+  const arPass = createTestPassWorkflowAdapter();
+  let arCalls = 0;
+  const autoResolveAdapter = {
+    async executeStep(args) {
+      arCalls += 1;
+      if (arCalls === 1) {
+        // First step, first attempt: PASS verdict but no artifact written (the "0 tools, no artifact" case).
+        return {
+          schema: "aipi.step-result.v1",
+          step_id: args.step.id,
+          agent_ids: ["auto-resolve-miss"],
+          verdict: "PASS",
+          evidence: [{ rung: "ran", source: "test", ref: "x", result: "returned PASS without writing the artifact" }],
+          artifacts: [],
+        };
+      }
+      return arPass.executeStep(args); // the retry (and later steps) write their artifacts -> gate passes
+    },
+  };
+  const autoResolveNotifies = [];
+  const autoResolveSink = (message) => autoResolveNotifies.push(message);
+  autoResolveSink.setPlan = () => {};
+  const autoResolved = await executeWorkflowRun({
+    projectRoot: tempRoot,
+    runId: autoResolveRun.runId,
+    now: () => fixedDate,
+    adapter: autoResolveAdapter,
+    notify: autoResolveSink,
+  });
+  assert.ok(arCalls >= 2, "the first step was auto-retried after the missing-artifact miss");
+  assert.equal(autoResolved.state.steps[0].status, "passed", "the step auto-resolved on retry instead of stopping to ask");
+  assert.notEqual(autoResolved.status, "blocked", "the run did not block-and-ask on the mechanical miss");
+
   // Regression (ADV-61-3 self-review): a step that THROWS after arming the spinner must still tear it
   // down (clearProgress in the try/finally), or the unref'd setInterval animates the TUI forever for a
   // failed run. Assert the spinner is stopped even though executeWorkflowRun rejects.
