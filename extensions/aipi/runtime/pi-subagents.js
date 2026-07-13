@@ -311,6 +311,8 @@ export async function runAipiForkedSubagent({
         thinking: params.thinking_level ?? undefined,
         // Single-lead workers get the guarded shell; parallel fanout (review) workers do not (allow_shell:false).
         allowShell: (params.allow_shell ?? job?.descriptor?.allow_shell) !== false,
+        // Make the worker budget-aware so it writes its result before the tool-call limit discards its work.
+        maxToolCalls,
       })],
       AIPI_SUBAGENTS_AGENT_NAME,
       params.task ?? "",
@@ -444,7 +446,7 @@ export function loadSubagentView() {
   };
 }
 
-export function createAipiWorkerAgentConfig({ thinking = undefined, allowShell = true } = {}) {
+export function createAipiWorkerAgentConfig({ thinking = undefined, allowShell = true, maxToolCalls = null } = {}) {
   // Shell (aipi_shell, formerly aipi_guarded_bash) is granted ONLY to single-lead, sequential workers —
   // NOT to parallel fanout (review_swarm) workers. A shell bypasses the owned-file/controller-path write
   // guards (it can write outside its owned files, touch .git or .aipi/memory), so giving it to PARALLEL
@@ -489,6 +491,9 @@ export function createAipiWorkerAgentConfig({ thinking = undefined, allowShell =
         : "You have NO shell in this parallel review step; review by reading the code and the verify step's test evidence, and do not claim a result you did not see verified.",
       "Do not use a provider/model other than the selected worker model.",
       "If you hit an ambiguity you cannot resolve from your task or context — a missing or contradictory decision, an underspecified requirement, a 'which option' choice, or missing access/info — call aipi_ask_orchestrator with ONE focused question instead of guessing; you will get an answer and continue. Do not ask about things you can determine yourself from the code, the context packet, or aipi_retrieve.",
+      maxToolCalls
+        ? `You have a LIMITED tool-call budget (about ${maxToolCalls} calls). Exceeding it interrupts you and DISCARDS your work — nothing is delivered. So pace yourself: don't spend the whole budget exploring; write your complete result/findings (and any owned-file artifacts) well BEFORE you run low. A delivered partial result beats being cut off with nothing.`
+        : "You have a LIMITED tool-call budget; exceeding it interrupts you and DISCARDS your work. Pace yourself and write your complete result well before you run low — a delivered partial beats being cut off with nothing.",
       "Follow the task exactly and return the requested output format.",
     ].join("\n"),
   };

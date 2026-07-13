@@ -17,6 +17,7 @@ import {
   latestSubagentStateFromEntries,
   parseWorkerStepResult,
   resolveInteractiveSpawnModel,
+  workerAskTimeoutMs,
 } from "../extensions/aipi/runtime/subagents.js";
 import {
   AIPI_SUBAGENTS_AGENT_NAME,
@@ -1423,3 +1424,54 @@ console.log("subagents interactive-spawn model resolution: ok");
 }
 
 console.log("subagents ask/answer channel: ok");
+
+// --- workerAskTimeoutMs: sensible default, env override, garbage-fallback ---
+assert.equal(workerAskTimeoutMs({}), 120000, "default per-question ask timeout is 120s");
+assert.equal(workerAskTimeoutMs({ AIPI_WORKER_ASK_TIMEOUT_MS: "5000" }), 5000, "env override honored");
+assert.equal(workerAskTimeoutMs({ AIPI_WORKER_ASK_TIMEOUT_MS: "0" }), 120000, "non-positive falls back to default");
+assert.equal(workerAskTimeoutMs({ AIPI_WORKER_ASK_TIMEOUT_MS: "x" }), 120000, "garbage falls back to default");
+
+// --- BLOCKER regression: an UNANSWERED question expires so the worker degrades and FINISHES (no hang,
+//     no leaked worker slot). This is the escape for the workflow path where nobody calls aipi_answer_agent. ---
+{
+  const timeoutCoordinator = new SubagentCoordinator(
+    { appendEntry() {} },
+    {
+      root: process.cwd(),
+      maxConcurrent: 1,
+      hostModel: { provider: "anthropic", id: "claude-opus-4-8" },
+      env: { AIPI_WORKER_ASK_TIMEOUT_MS: "40" }, // expire fast for the test
+      piSubagentsRunner: {
+        async spawn(params) {
+          const agentId = params.task.match(/AIPI worker id: ([^\n]+)/)?.[1] ?? params.id ?? "toask";
+          let degraded = false;
+          try {
+            await aipiAskBridge().ask(agentId, "nobody will answer this");
+          } catch {
+            degraded = true; // the question expired -> the worker proceeds on best judgment
+          }
+          return { content: [{ type: "text", text: JSON.stringify({ ...stepResult, agent_ids: [agentId], degraded }) }], tool_call_count: 0 };
+        },
+      },
+    },
+  );
+  const { agent_id: toAskId } = timeoutCoordinator.spawn({
+    agent_id: "toask", step_id: "review_swarm", context_packet: "x", owned_files: ["src/toask.js"],
+  });
+  // No one answers; the question expires and the worker COMPLETES rather than hanging forever.
+  await waitFor(() => timeoutCoordinator.status(toAskId).state === "done");
+  assert.equal(timeoutCoordinator.status(toAskId).awaiting_answer, false, "expired question cleared");
+  assert.equal(timeoutCoordinator.status(toAskId).pending_question, null);
+}
+
+// --- budget-aware worker prompt: warns the worker to deliver before the tool-call limit ---
+{
+  const withBudget = createAipiWorkerAgentConfig({ maxToolCalls: 80 });
+  assert.ok(/budget/i.test(withBudget.systemPrompt), "prompt mentions the tool-call budget");
+  assert.ok(withBudget.systemPrompt.includes("80"), "prompt states the concrete budget");
+  assert.ok(/DISCARDS/.test(withBudget.systemPrompt), "prompt warns that exceeding it discards the work");
+  const noBudget = createAipiWorkerAgentConfig({});
+  assert.ok(/budget/i.test(noBudget.systemPrompt), "generic budget warning present even without a number");
+}
+
+console.log("subagents ask-timeout + budget-aware prompt: ok");

@@ -75,15 +75,29 @@ export function aipiAskBridge() {
     bridge = {
       coordinators,
       ask(agentId, question) {
+        // Route to the coordinator with a RUNNING job for this id — not merely one that has the id in a
+        // terminal state — so a stale terminal job in one coordinator can't shadow a live worker in another.
         for (const coordinator of coordinators) {
-          if (coordinator.hasAgent?.(agentId)) return coordinator.workerAsk(agentId, question);
+          if (coordinator.hasRunningAgent?.(agentId)) return coordinator.workerAsk(agentId, question);
         }
-        return Promise.reject(new Error(`no live AIPI coordinator owns agent ${agentId}`));
+        return Promise.reject(new Error(`no live AIPI coordinator owns a running agent ${agentId}`));
       },
     };
     globalThis.__AIPI_ASK_BRIDGE__ = bridge;
   }
   return bridge;
+}
+
+// A worker's aipi_ask_orchestrator BLOCKS until answered. If nobody answers — the automated workflow
+// path has no orchestrator LLM to call aipi_answer_agent, or the interactive orchestrator ends its turn
+// without answering — the question auto-expires after this window so the worker DEGRADES to its best
+// judgment and FINISHES (its tool call returns "no answer, proceed"), instead of hanging forever and
+// wedging the coordinator (never returning runSync -> owned files never released -> #pump stalls at
+// maxConcurrent). Override with AIPI_WORKER_ASK_TIMEOUT_MS.
+const DEFAULT_WORKER_ASK_TIMEOUT_MS = 120_000;
+export function workerAskTimeoutMs(env = process.env) {
+  const raw = Number(env?.AIPI_WORKER_ASK_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_WORKER_ASK_TIMEOUT_MS;
 }
 
 export class SubagentCoordinator {
@@ -133,6 +147,10 @@ export class SubagentCoordinator {
 
   hasAgent(agentId) {
     return this.#jobs.has(agentId);
+  }
+
+  hasRunningAgent(agentId) {
+    return this.#jobs.get(agentId)?.state === JobState.RUNNING;
   }
 
   get registry() {
@@ -365,10 +383,19 @@ export class SubagentCoordinator {
       resolveFn = resolve;
       rejectFn = reject;
     });
-    this.#pendingQuestions.set(agentId, { question: text, askedAt: Date.now(), resolve: resolveFn, reject: rejectFn, promise });
+    // Auto-expire the question if nobody answers, so a worker can never hang forever waiting on an
+    // orchestrator that isn't there (workflow path) or didn't answer (interactive). On expiry the worker's
+    // tool call rejects -> it degrades to best judgment and finishes; the run is NOT aborted, so the work
+    // is preserved.
+    const timeoutMs = workerAskTimeoutMs(this.#env);
+    const timer = setTimeout(() => {
+      this.#rejectPendingQuestion(agentId, `no answer within ${timeoutMs}ms`);
+    }, timeoutMs);
+    timer.unref?.();
+    this.#pendingQuestions.set(agentId, { question: text, askedAt: Date.now(), resolve: resolveFn, reject: rejectFn, promise, timer });
     job.pendingQuestion = text;
     job.awaitingAnswer = true;
-    this.#trace("worker_ask", job, { question: truncateText(text, 200) });
+    this.#trace("worker_ask", job, { question: truncateText(text, 200), timeout_ms: timeoutMs });
     this.#persist();
     return promise;
   }
@@ -378,6 +405,7 @@ export class SubagentCoordinator {
   answer(agentId, answerText) {
     const pending = this.#pendingQuestions.get(agentId);
     if (!pending) return { agent_id: agentId, accepted: false, reason: "no pending question" };
+    if (pending.timer) clearTimeout(pending.timer);
     this.#pendingQuestions.delete(agentId);
     const job = this.#jobs.get(agentId);
     if (job) {
@@ -396,6 +424,7 @@ export class SubagentCoordinator {
   #rejectPendingQuestion(agentId, reason) {
     const pending = this.#pendingQuestions.get(agentId);
     if (!pending) return;
+    if (pending.timer) clearTimeout(pending.timer);
     this.#pendingQuestions.delete(agentId);
     const job = this.#jobs.get(agentId);
     if (job) {

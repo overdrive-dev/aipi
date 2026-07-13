@@ -653,13 +653,15 @@ export async function runAipiSetup({
   }
 
   // Seed correct context-windows for AIPI's custom models into ~/.pi/agent/models.json so a fresh
-  // workstation doesn't inherit Pi's 128k default for gpt-5.6-sol/grok-4.5/claude-sonnet-5. Plain
-  // `aipi setup` reports what it would do (dry run); `aipi setup --fix` applies it. Best-effort.
-  const seedModule = await import(
-    pathToFileURL(path.join(packageRoot, "extensions", "aipi", "runtime", "pi-models-seed.js")).href
-  );
+  // workstation doesn't inherit Pi's 128k default for gpt-5.6-sol/claude-sonnet-5. Plain `aipi setup`
+  // reports what it would do (dry run); `aipi setup --fix` applies it. Best-effort — a missing/broken
+  // seed module degrades to a skip note instead of throwing out of setup (import guarded too).
+  let seedModule = null;
   let seedResult;
   try {
+    seedModule = await import(
+      pathToFileURL(path.join(packageRoot, "extensions", "aipi", "runtime", "pi-models-seed.js")).href
+    );
     seedResult = await seedModule.seedPiModels({ env, homeDir, dryRun: !options.fix });
   } catch (error) {
     seedResult = { ok: false, error: String(error?.message ?? error) };
@@ -670,7 +672,7 @@ export async function runAipiSetup({
     log(JSON.stringify(report, null, 2));
   } else {
     log(doctor.formatEnvironmentReport(report));
-    log(seedModule.formatPiModelsSeedResult(seedResult));
+    log(seedModule ? seedModule.formatPiModelsSeedResult(seedResult) : `model context-windows: skipped (${seedResult?.error ?? "unavailable"})`);
     if (report.fixes_applied?.length) {
       log(`fixes applied: ${report.fixes_applied.map((fix) => `${fix.id}=${fix.ok ? "ok" : "failed"}`).join(", ")}`);
     }
