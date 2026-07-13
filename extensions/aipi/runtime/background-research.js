@@ -22,8 +22,17 @@ import { resolveModelClass, resolveCrossModelAdversarialRoute } from "./model-ro
 // "Background" here is IN-PROCESS: the child pi worker runs synchronously (runSync), but WE fire the job
 // without awaiting it, so the orchestrator turn returns immediately and the job wakes it later.
 
-const DEFAULT_MAX_TOOL_CALLS = 30;
+// A read-only researcher/auditor greps and reads a lot; 30 was too tight and killed real audits mid-run
+// ("maxToolCalls 30 (observed 31)"). 80 covers a thorough read-only sweep while the timeout still caps
+// wall-clock. Override with AIPI_RESEARCH_MAX_TOOL_CALLS.
+const DEFAULT_MAX_TOOL_CALLS = 80;
 const DEFAULT_TIMEOUT_MS = 10 * 60_000;
+
+// Resolve the per-worker read-only tool-call budget: AIPI_RESEARCH_MAX_TOOL_CALLS (positive int) or the default.
+export function researchMaxToolCalls(env = process.env) {
+  const raw = Number(env?.AIPI_RESEARCH_MAX_TOOL_CALLS);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_MAX_TOOL_CALLS;
+}
 // A hard cap on concurrent forked workers per call — each task is a full forked pi process.
 export const MAX_BACKGROUND_RESEARCH = 6;
 
@@ -266,6 +275,7 @@ export function registerBackgroundResearchTool(pi, { projectRootResolver = () =>
         if (!roles.researcher.model) return toolJson({ ok: false, error: "no researcher model available to dispatch background research" });
 
         const runner = runnerFactory ? runnerFactory({ root }) : createAipiSubagentsRunner({ root });
+        const maxToolCalls = researchMaxToolCalls(process.env);
         const accepted = tasks.slice(0, MAX_BACKGROUND_RESEARCH);
         const dropped = tasks.slice(MAX_BACKGROUND_RESEARCH);
         const runs = accepted.map((task, index) => {
@@ -283,6 +293,7 @@ export function registerBackgroundResearchTool(pi, { projectRootResolver = () =>
             model: roles.researcher.model,
             thinking: roles.researcher.thinking,
             reviewer: roles.reviewer,
+            maxToolCalls,
           });
           return { run_id: runId, task: label };
         });

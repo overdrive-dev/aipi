@@ -6,9 +6,16 @@ import { initProject } from "../extensions/aipi/runtime/project-init.js";
 import {
   MAX_BACKGROUND_RESEARCH,
   registerBackgroundResearchTool,
+  researchMaxToolCalls,
   resolveResearchRoles,
   runBackgroundResearchJob,
 } from "../extensions/aipi/runtime/background-research.js";
+
+// --- researchMaxToolCalls: default budget is generous enough for a real audit; env can override ---
+assert.equal(researchMaxToolCalls({}), 80, "default read-only budget is 80 (30 killed real audits)");
+assert.equal(researchMaxToolCalls({ AIPI_RESEARCH_MAX_TOOL_CALLS: "150" }), 150, "env override honored");
+assert.equal(researchMaxToolCalls({ AIPI_RESEARCH_MAX_TOOL_CALLS: "0" }), 80, "non-positive override falls back to default");
+assert.equal(researchMaxToolCalls({ AIPI_RESEARCH_MAX_TOOL_CALLS: "nope" }), 80, "garbage override falls back to default");
 
 // --- runBackgroundResearchJob: read-only spawn params + wakes the orchestrator on success (no reviewer) ---
 {
@@ -31,6 +38,7 @@ import {
   assert.equal(spawned[0].params.write_scope, "artifacts", "never merges to the project");
   assert.equal(spawned[0].params.model, "anthropic/claude-opus-4-8");
   assert.equal(spawned[0].params.id, "r1");
+  assert.equal(spawned[0].params.max_tool_calls, 80, "default read-only budget threaded to the worker");
   assert.equal(wakes.length, 1, "wakes the orchestrator exactly once");
   assert.equal(wakes[0].opts.triggerTurn, true, "the wake triggers a turn");
   assert.ok(wakes[0].msg.content.includes("found: explore auth"), "findings are delivered");
