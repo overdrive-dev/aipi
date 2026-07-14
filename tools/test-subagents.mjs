@@ -200,10 +200,11 @@ try {
   assert.equal(spawnedArgs.includes("--model"), true);
   assert.equal(spawnedArgs[spawnedArgs.indexOf("--model") + 1], "anthropic/claude-opus-4-8");
   // The production --tools allowlist MUST include "write" (guarded-write extension), "aipi_shell"
-  // (guarded-shell extension), "aipi_ask_orchestrator" (live orchestrator back-channel), and the hashline
-  // pair "aipi_read_hashline"/"aipi_edit" (ON by default) so every registered tool survives the child's
-  // allowlist filter. Raw bash/shell/exec stay ABSENT — the worker's only shell is the watchdog-wrapped aipi_shell.
-  assert.deepEqual(spawnedTools(spawnedArgs), ["read", "grep", "find", "ls", "write", "aipi_shell", "aipi_ask_orchestrator", "aipi_read_hashline", "aipi_edit"]);
+  // (guarded-shell extension), and "aipi_ask_orchestrator" (live orchestrator back-channel) so every registered
+  // tool survives the child's allowlist filter. This review_swarm worker is artifact-scope (not project), so it
+  // gets NO hashline pair — hashline is wired only for code-writing (project-scope) workers. Raw bash/shell/exec
+  // stay ABSENT — the worker's only shell is the watchdog-wrapped aipi_shell.
+  assert.deepEqual(spawnedTools(spawnedArgs), ["read", "grep", "find", "ls", "write", "aipi_shell", "aipi_ask_orchestrator"]);
   assert.equal(spawnedTools(spawnedArgs).some((tool) => /^(bash|shell|exec|user_bash)$/i.test(tool)), false);
   assert.equal(spawnedArgs.includes("--no-extensions"), true);
   assert.equal(

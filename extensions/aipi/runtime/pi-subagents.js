@@ -321,6 +321,8 @@ export async function runAipiForkedSubagent({
         allowShell: (params.allow_shell ?? job?.descriptor?.allow_shell) !== false,
         // Make the worker budget-aware so it writes its result before the tool-call limit discards its work.
         maxToolCalls,
+        // Hashline is wired only for code-writing (project-scope) workers; artifact-only workers stay lean.
+        writeScope: params.write_scope ?? job?.descriptor?.write_scope ?? null,
       })],
       AIPI_SUBAGENTS_AGENT_NAME,
       params.task ?? "",
@@ -462,8 +464,15 @@ export function createAipiWorkerAgentConfig({
   thinking = undefined,
   allowShell = true,
   maxToolCalls = null,
-  hashlineEdit = HASHLINE_WORKER_EDIT_ENABLED,
+  writeScope = null,
+  hashlineEdit = null,
 } = {}) {
+  // Hashline (editing EXISTING files) is wired ONLY for code-writing workers (write_scope "project":
+  // implementation/fix/tdd). Artifact-only workers (planning/intake/research/review) CREATE their artifacts
+  // with `write` and never edit source — the ~7.7k-char hashline prompt + aipi_edit are pure NOISE for them,
+  // and were distracting the intake worker into fabricating its INTAKE.md write. An explicit `hashlineEdit`
+  // arg overrides the write_scope gate (used by tests).
+  const hashlineEnabled = hashlineEdit ?? (HASHLINE_WORKER_EDIT_ENABLED && writeScope === "project");
   // Shell (aipi_shell, formerly aipi_guarded_bash) is granted ONLY to single-lead, sequential workers —
   // NOT to parallel fanout (review_swarm) workers. A shell bypasses the owned-file/controller-path write
   // guards (it can write outside its owned files, touch .git or .aipi/memory), so giving it to PARALLEL
@@ -472,9 +481,9 @@ export function createAipiWorkerAgentConfig({
   // read the verify step's evidence instead. (Validator/tests still see both names in source — they are
   // conditionally included.)
   const shellTools = allowShell ? ["aipi_shell", guardedBashExtensionPath] : [];
-  // Additive, flag-gated hashline editing. Both worker classes (lead + parallel reviewer) may receive it:
-  // aipi_edit self-enforces the SAME owned-file scope as the guarded write, so it is safe for fanout too.
-  const hashlineTools = hashlineEdit
+  // Additive hashline editing for code-writing workers only (see hashlineEnabled above). aipi_edit self-enforces
+  // the SAME owned-file scope as the guarded write.
+  const hashlineTools = hashlineEnabled
     ? ["aipi_read_hashline", "aipi_edit", hashlineEditExtensionPath]
     : [];
   return {
@@ -517,7 +526,7 @@ export function createAipiWorkerAgentConfig({
       maxToolCalls
         ? `You have a LIMITED tool-call budget (about ${maxToolCalls} calls). Exceeding it interrupts you and DISCARDS your work — nothing is delivered. So pace yourself: don't spend the whole budget exploring; write your complete result/findings (and any owned-file artifacts) well BEFORE you run low. A delivered partial result beats being cut off with nothing.`
         : "You have a LIMITED tool-call budget; exceeding it interrupts you and DISCARDS your work. Pace yourself and write your complete result well before you run low — a delivered partial beats being cut off with nothing.",
-      ...(hashlineEdit
+      ...(hashlineEnabled
         ? [
             "To EDIT an existing file, prefer the hashline flow: call aipi_read_hashline to get the file's `[PATH#TAG]` header and `LINE:TEXT` numbered rows, then aipi_edit with a patch anchored on that TAG. aipi_edit REJECTS a stale TAG instead of corrupting the file — if that happens, re-read with aipi_read_hashline and retry. Use the write tool only to CREATE a new file. The hashline edit format:",
             readHashlinePrompt(),

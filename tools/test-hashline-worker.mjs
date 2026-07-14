@@ -23,30 +23,43 @@ function collectTools(register) {
 }
 const text = (result) => (result?.content ?? []).map((part) => part.text).join("\n");
 
-// --- default is ON: every worker gets hashline editing with no param ---
+// --- hashline is wired for CODE-WRITING (project-scope) workers, and stays OFF for artifact-only workers ---
 {
-  assert.equal(HASHLINE_WORKER_EDIT_ENABLED, true, "hashline worker editing ships ON by default");
-  const on = createAipiWorkerAgentConfig({});
-  assert.ok(on.tools.includes("aipi_read_hashline"), "default: aipi_read_hashline listed");
-  assert.ok(on.tools.includes("aipi_edit"), "default: aipi_edit listed");
+  assert.equal(HASHLINE_WORKER_EDIT_ENABLED, true, "hashline worker editing is enabled at the package level");
+  // A project-scope (implementation/fix/tdd) worker EDITS source → gets hashline.
+  const code = createAipiWorkerAgentConfig({ writeScope: "project" });
+  assert.ok(code.tools.includes("aipi_read_hashline"), "project-scope: aipi_read_hashline listed");
+  assert.ok(code.tools.includes("aipi_edit"), "project-scope: aipi_edit listed");
   assert.ok(
-    on.tools.some((tool) => String(tool).includes("aipi-hashline-edit-child")),
-    "default: hashline extension path loaded",
+    code.tools.some((tool) => String(tool).includes("aipi-hashline-edit-child")),
+    "project-scope: hashline extension path loaded",
   );
-  assert.match(on.systemPrompt, /hashline flow/, "default: prompt teaches the hashline flow");
-  assert.match(on.systemPrompt, /\[PATH#TAG\]/, "default: prompt embeds the hashline format");
+  assert.match(code.systemPrompt, /hashline flow/, "project-scope: prompt teaches the hashline flow");
+  assert.match(code.systemPrompt, /\[PATH#TAG\]/, "project-scope: prompt embeds the hashline format");
   // aipi_edit has no tree-sitter block resolver, so the prompt must OVERRIDE the format doc's block-op guidance.
-  assert.match(on.systemPrompt, /block ops.*NOT available/i, "default: prompt disables the unsupported block ops");
-  assert.ok(on.tools.includes("write"), "guarded write always present");
-  // Fanout (shell-less) workers also get it — aipi_edit self-guards owned scope.
-  const fanout = createAipiWorkerAgentConfig({ allowShell: false });
-  assert.ok(fanout.tools.includes("aipi_edit"), "default: fanout worker also gets aipi_edit");
-  assert.ok(!fanout.tools.includes("aipi_shell"), "fanout worker still has no shell");
+  assert.match(code.systemPrompt, /block ops.*NOT available/i, "project-scope: prompt disables the unsupported block ops");
+  assert.ok(code.tools.includes("write"), "guarded write always present");
+  // A shell-less project-scope fanout still gets hashline (aipi_edit self-guards owned scope).
+  const fanoutCode = createAipiWorkerAgentConfig({ allowShell: false, writeScope: "project" });
+  assert.ok(fanoutCode.tools.includes("aipi_edit"), "project-scope fanout also gets aipi_edit");
+  assert.ok(!fanoutCode.tools.includes("aipi_shell"), "fanout worker still has no shell");
+
+  // An artifact-only worker (planning/intake/research/review — NOT project scope) gets NO hashline noise: it
+  // CREATES its artifacts with write and never edits source, so the ~7.7k prompt would only distract it.
+  const artifact = createAipiWorkerAgentConfig({});
+  assert.ok(!artifact.tools.includes("aipi_edit"), "artifact-only: no aipi_edit tool");
+  assert.ok(!artifact.tools.includes("aipi_read_hashline"), "artifact-only: no aipi_read_hashline tool");
+  assert.ok(
+    !artifact.tools.some((tool) => String(tool).includes("aipi-hashline-edit-child")),
+    "artifact-only: hashline extension not loaded",
+  );
+  assert.ok(!/hashline flow/.test(artifact.systemPrompt), "artifact-only: no hashline prompt noise");
+  assert.ok(artifact.tools.includes("write"), "artifact-only: guarded write present");
 }
 
-// --- explicit opt-out (hashlineEdit:false) still strips the tools + prompt for a specific spawn ---
+// --- explicit hashlineEdit:false overrides the scope gate (belt for a specific project-scope spawn) ---
 {
-  const off = createAipiWorkerAgentConfig({ hashlineEdit: false });
+  const off = createAipiWorkerAgentConfig({ writeScope: "project", hashlineEdit: false });
   assert.ok(!off.tools.includes("aipi_edit"), "opt-out: no aipi_edit tool");
   assert.ok(!off.tools.includes("aipi_read_hashline"), "opt-out: no aipi_read_hashline tool");
   assert.ok(
