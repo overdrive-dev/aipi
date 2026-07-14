@@ -106,8 +106,10 @@ export async function executeWorkflowRun({
     const verb = PROGRESS_PHASE_LABELS[phase] ?? phase;
     const label = stepLabel(stepId, phase === "running");
     try {
-      // Legacy one-line notify (kept for the CLI/notify-only path).
-      notify(`AIPI ${state.workflow}: ${label} ${verb}`, "info");
+      // Legacy one-line notify — ONLY for a plain CLI/notify-only host. On a widget host the plan checklist
+      // (setPlan) + the spinner status line already show the step, so this line is redundant and just clutters
+      // the top with a dim "AIPI planning: intake running…" duplicate. Skip it when widgets are available.
+      if (notify.supportsWidgets !== true) notify(`AIPI ${state.workflow}: ${label} ${verb}`, "info");
       // Richer, feature-detected surfaces (no-ops when notify is a plain function or the host lacks them).
       notify.setPlan?.(buildPlanLines(stepId, phase));
       if (phase === "running") notify.startSpinner?.(`${state.workflow}: ${label}`);

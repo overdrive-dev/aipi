@@ -8,18 +8,39 @@ import { SubagentCoordinator } from "../extensions/aipi/runtime/subagents.js";
 const retry = { maxAttempts: 3, baseDelayMs: 1, maxDelayMs: 2, jitterMs: 0 };
 const rateLimitError = () => Object.assign(new Error('429 {"type":"error","error":{"type":"rate_limit_error"}}'), { status: 429 });
 
-// --- SubagentCoordinator.pickFallbackModel: a concrete model on a DIFFERENT authed provider ---
+// --- SubagentCoordinator.pickFallbackModel: PREFERS the host/default model on a different provider ---
 {
+  // Host = openai-codex/gpt-5.6-sol; several openai-codex models are authed. A rate limit on anthropic must
+  // fall back to the HOST model (gpt-5.6-sol), NOT an arbitrary authed openai-codex model (gpt-5.3-codex-spark).
   const coord = new SubagentCoordinator(
     { appendEntry() {}, log() {} },
-    { root: process.cwd(), maxConcurrent: 0, env: {}, piSubagentsRunner: { spawn() {} } },
+    {
+      root: process.cwd(),
+      maxConcurrent: 0,
+      env: {},
+      hostModel: { provider: "openai-codex", id: "gpt-5.6-sol" },
+      piSubagentsRunner: { spawn() {} },
+    },
   );
-  coord.setAvailableModels(["anthropic/claude-opus-4-8", "xai-auth/grok-4.5", "openai-codex/gpt-5.6-sol"]);
+  coord.setAvailableModels([
+    "anthropic/claude-opus-4-8",
+    "openai-codex/gpt-5.3-codex-spark", // authed but NOT the default — must NOT be preferred
+    "openai-codex/gpt-5.6-sol",
+    "xai-auth/grok-4.5",
+  ]);
   const fb = coord.pickFallbackModel({ excludeProvider: "anthropic" });
-  assert.ok(fb && fb.provider !== "anthropic", "picks a model off the excluded provider");
-  assert.equal(coord.pickFallbackModel({ excludeProvider: "xai-auth" }).provider === "xai-auth", false);
-  // Only the excluded provider authed → no fallback.
-  const solo = new SubagentCoordinator({ appendEntry() {}, log() {} }, { root: process.cwd(), maxConcurrent: 0, env: {}, piSubagentsRunner: { spawn() {} } });
+  assert.deepEqual(fb, { provider: "openai-codex", id: "gpt-5.6-sol" }, "falls back to the HOST/default model, not an arbitrary authed one");
+
+  // When the host model IS on the rate-limited provider, fall back to any other authed provider.
+  const anthropicHost = new SubagentCoordinator(
+    { appendEntry() {}, log() {} },
+    { root: process.cwd(), maxConcurrent: 0, env: {}, hostModel: { provider: "anthropic", id: "claude-opus-4-8" }, piSubagentsRunner: { spawn() {} } },
+  );
+  anthropicHost.setAvailableModels(["anthropic/claude-opus-4-8", "xai-auth/grok-4.5"]);
+  assert.equal(anthropicHost.pickFallbackModel({ excludeProvider: "anthropic" }).provider, "xai-auth", "host on the excluded provider → any other authed provider");
+
+  // Only the excluded provider authed and host is on it → no fallback.
+  const solo = new SubagentCoordinator({ appendEntry() {}, log() {} }, { root: process.cwd(), maxConcurrent: 0, env: {}, hostModel: { provider: "anthropic", id: "claude-opus-4-8" }, piSubagentsRunner: { spawn() {} } });
   solo.setAvailableModels(["anthropic/claude-opus-4-8"]);
   assert.equal(solo.pickFallbackModel({ excludeProvider: "anthropic" }), null, "no distinct provider → null");
 }

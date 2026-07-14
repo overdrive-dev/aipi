@@ -203,14 +203,27 @@ export class SubagentCoordinator {
     return this.#availableProviders ? new Set(this.#availableProviders) : null;
   }
 
-  // Pick a concrete authed model on a DIFFERENT provider than `excludeProvider` — for a rate-limit fallback
-  // (retry a step on another family instead of blocking). Returns { provider, id } or null when the only
-  // authed provider is the excluded one (or availability is unknown).
+  // Pick a concrete model on a DIFFERENT provider than `excludeProvider` — for a rate-limit fallback (retry a
+  // step on another family instead of blocking). PREFERS the host/default model (what the user configured for
+  // the session) when it is on a different provider, so the fallback lands on e.g. the session's
+  // openai-codex/gpt-5.6-sol rather than some other authed model on that provider. Falls back to any authed
+  // model on a distinct provider. Returns { provider, id } or null when the only option is the excluded one.
   pickFallbackModel({ excludeProvider = null } = {}) {
-    if (!this.#availableModelSpecs) return null;
     const exclude = String(excludeProvider ?? "").trim().toLowerCase();
+    const host = this.#hostModelRef();
+    if (host && host.provider !== exclude) return host;
+    if (!this.#availableModelSpecs) return null;
     const candidate = this.#availableModelSpecs.find((model) => model.provider && model.provider !== exclude);
     return candidate ? { provider: candidate.provider, id: candidate.id } : null;
+  }
+
+  // The host/session model normalized to { provider, id }, or null.
+  #hostModelRef() {
+    const id = describeModel(this.#hostModel);
+    const provider = modelProvider(id);
+    if (!provider) return null;
+    const sep = String(id).indexOf("/");
+    return sep > 0 ? { provider, id: String(id).slice(sep + 1) } : null;
   }
 
   getRoot() {
