@@ -107,6 +107,54 @@ import {
   assert.ok(wakes[0].msg.content.includes("failed"));
 }
 
+// --- a rate-limited researcher falls back to the DEFAULT model and wakes with the reroute noted ---
+{
+  const spawned = [];
+  const runner = {
+    spawn: async (params) => {
+      spawned.push(params);
+      if (params.model === "openai-codex/gpt-5.5-limited") {
+        throw Object.assign(new Error('429 {"error":{"type":"rate_limit_error"}}'), { status: 429 });
+      }
+      return { output: `found via default: ${params.task}` };
+    },
+  };
+  const wakes = [];
+  const pi = { sendMessage: async (msg) => { wakes.push(msg); } };
+  const result = await runBackgroundResearchJob({
+    pi, runner, root: "/x", task: "explore auth", runId: "rf", label: "explore auth",
+    model: "openai-codex/gpt-5.5-limited",
+    defaultModel: "anthropic/claude-opus-4-8",
+  });
+  assert.equal(result.ok, true, "rate limit → falls back to the default model instead of failing");
+  assert.equal(result.fallback_from, "openai-codex/gpt-5.5-limited");
+  assert.deepEqual(
+    spawned.map((p) => p.model),
+    ["openai-codex/gpt-5.5-limited", "anthropic/claude-opus-4-8"],
+    "retried on the default model",
+  );
+  assert.equal(spawned[1].id, "rf-fallback", "the fallback run gets its own id");
+  assert.ok(wakes[0].content.includes("found via default"), "findings from the fallback model delivered");
+  assert.ok(
+    /rate-limited/.test(wakes[0].content) && /default model anthropic\/claude-opus-4-8/.test(wakes[0].content),
+    "wake notes the reroute",
+  );
+}
+
+// --- a NON-transient failure does NOT fall back (only rate-limit/transient reroutes) ---
+{
+  const spawned = [];
+  const runner = { spawn: async (params) => { spawned.push(params); throw new Error("TypeError: boom"); } };
+  const wakes = [];
+  const pi = { sendMessage: async (msg) => { wakes.push(msg); } };
+  const result = await runBackgroundResearchJob({
+    pi, runner, root: "/x", task: "t", runId: "rn", model: "openai-codex/gpt-5.5", defaultModel: "anthropic/claude-opus-4-8",
+  });
+  assert.equal(result.ok, false, "a non-transient error is not retried on the default model");
+  assert.equal(spawned.length, 1, "no fallback spawn for a non-transient error");
+  assert.ok(wakes[0].content.includes("failed"));
+}
+
 // --- resolveResearchRoles against the real templates: researcher binds to research-heavy (NOT the orchestrator
 //     model); default same-model adversarial-heavy -> review skipped with actionable guidance ---
 {

@@ -35,6 +35,8 @@ const text = (result) => (result?.content ?? []).map((part) => part.text).join("
   );
   assert.match(on.systemPrompt, /hashline flow/, "default: prompt teaches the hashline flow");
   assert.match(on.systemPrompt, /\[PATH#TAG\]/, "default: prompt embeds the hashline format");
+  // aipi_edit has no tree-sitter block resolver, so the prompt must OVERRIDE the format doc's block-op guidance.
+  assert.match(on.systemPrompt, /block ops.*NOT available/i, "default: prompt disables the unsupported block ops");
   assert.ok(on.tools.includes("write"), "guarded write always present");
   // Fanout (shell-less) workers also get it — aipi_edit self-guards owned scope.
   const fanout = createAipiWorkerAgentConfig({ allowShell: false });
@@ -118,6 +120,68 @@ const text = (result) => (result?.content ?? []).map((part) => part.text).join("
     });
     assert.ok(createRes.isError, "editing a non-existent file is refused");
     assert.match(text(createRes), /not found|write/i, "refusal points to the write tool");
+  } finally {
+    for (const [key, value] of Object.entries({
+      AIPI_SUBAGENTS_PROJECT_ROOT: saved.root,
+      AIPI_SUBAGENTS_OWNED_FILES: saved.owned,
+      AIPI_SUBAGENTS_AGENT_ID: saved.id,
+      AIPI_SUBAGENTS_WRITE_SCOPE: saved.scope,
+    })) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+// --- the exact ops the format prompt teaches, exercised end-to-end through the real worker tools: the plain
+//     line ops apply; the tree-sitter block ops are cleanly rejected (aipi wires no block resolver) ---
+{
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-hl-prompt-"));
+  const saved = {
+    root: process.env.AIPI_SUBAGENTS_PROJECT_ROOT,
+    owned: process.env.AIPI_SUBAGENTS_OWNED_FILES,
+    id: process.env.AIPI_SUBAGENTS_AGENT_ID,
+    scope: process.env.AIPI_SUBAGENTS_WRITE_SCOPE,
+  };
+  try {
+    // The prompt.md greet.py example, verbatim.
+    const greet = 'def greet(name):\n    msg = "Hello, " + name\n    print(msg)\ngreet("world")\n';
+    await fs.writeFile(path.join(root, "greet.py"), greet);
+    process.env.AIPI_SUBAGENTS_PROJECT_ROOT = root;
+    process.env.AIPI_SUBAGENTS_OWNED_FILES = JSON.stringify(["greet.py"]);
+    process.env.AIPI_SUBAGENTS_AGENT_ID = "worker-prompt";
+    process.env.AIPI_SUBAGENTS_WRITE_SCOPE = "artifacts";
+    const tools = collectTools(registerAipiHashlineEditChild);
+
+    // The tag from aipi_read_hashline is what the model would anchor on.
+    const readOut = text(await tools.aipi_read_hashline.execute("r", { path: "greet.py" }));
+    const tag = readOut.match(/\[greet\.py#([0-9A-F]{4})\]/)[1];
+
+    // INS.POST (prompt example: insert a guard after line 1).
+    const ins = await tools.aipi_edit.execute("i", { patch: `[greet.py#${tag}]\nINS.POST 1:\n+    if not name: name = "stranger"` });
+    assert.ok(!ins.isError, `INS.POST applies: ${text(ins)}`);
+    assert.match(await fs.readFile(path.join(root, "greet.py"), "utf8"), /if not name: name = "stranger"/);
+
+    // SWAP over a whole construct's line range (the aipi-supported alternative to SWAP.BLK).
+    const foo = "line1\nline2\nline3\n";
+    await fs.writeFile(path.join(root, "greet.py"), foo);
+    const swap = await tools.aipi_edit.execute("s", { patch: `[greet.py#${hl.computeFileHash(foo)}]\nSWAP 1.=2:\n+A\n+B\n+C` });
+    assert.ok(!swap.isError, `SWAP applies: ${text(swap)}`);
+    assert.equal(await fs.readFile(path.join(root, "greet.py"), "utf8"), "A\nB\nC\nline3\n");
+
+    // DEL (prompt example).
+    const cur = await fs.readFile(path.join(root, "greet.py"), "utf8");
+    const del = await tools.aipi_edit.execute("d", { patch: `[greet.py#${hl.computeFileHash(cur)}]\nDEL 2` });
+    assert.ok(!del.isError, `DEL applies: ${text(del)}`);
+    assert.equal(await fs.readFile(path.join(root, "greet.py"), "utf8"), "A\nC\nline3\n");
+
+    // Block ops are unsupported here (no tree-sitter resolver) — the error is clear, not a corruption.
+    const cur2 = await fs.readFile(path.join(root, "greet.py"), "utf8");
+    const blk = await tools.aipi_edit.execute("b", { patch: `[greet.py#${hl.computeFileHash(cur2)}]\nSWAP.BLK 1:\n+X` });
+    assert.ok(blk.isError, "SWAP.BLK is rejected (aipi wires no block resolver)");
+    assert.match(text(blk), /block|not available|resolver/i, "the block-op rejection is explicit");
+    assert.equal(await fs.readFile(path.join(root, "greet.py"), "utf8"), cur2, "a rejected block op leaves the file untouched");
   } finally {
     for (const [key, value] of Object.entries({
       AIPI_SUBAGENTS_PROJECT_ROOT: saved.root,

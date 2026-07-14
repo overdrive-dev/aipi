@@ -521,6 +521,9 @@ export function createAipiWorkerAgentConfig({
         ? [
             "To EDIT an existing file, prefer the hashline flow: call aipi_read_hashline to get the file's `[PATH#TAG]` header and `LINE:TEXT` numbered rows, then aipi_edit with a patch anchored on that TAG. aipi_edit REJECTS a stale TAG instead of corrupting the file — if that happens, re-read with aipi_read_hashline and retry. Use the write tool only to CREATE a new file. The hashline edit format:",
             readHashlinePrompt(),
+            // aipi_edit has no tree-sitter block resolver, so the block ops the format doc teaches are unavailable
+            // here and would be rejected. Override that guidance: use ONLY the plain line ops.
+            "OVERRIDE for THIS environment: the block ops `SWAP.BLK` / `DEL.BLK` / `INS.BLK.POST` are NOT available (they are rejected). Use ONLY the plain line ops — `SWAP N.=M:`, `DEL N` / `DEL N.=M`, `INS.PRE N:`, `INS.POST N:`, `INS.HEAD:`, `INS.TAIL:`. To replace a whole construct, use a plain `SWAP N.=M:` over its exact line range.",
           ]
         : []),
       "Follow the task exactly and return the requested output format.",

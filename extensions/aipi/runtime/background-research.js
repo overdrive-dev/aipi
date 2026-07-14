@@ -103,22 +103,26 @@ export async function runBackgroundResearchJob({
   reviewer = null,
   maxToolCalls = DEFAULT_MAX_TOOL_CALLS,
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  defaultModel = null,
 }) {
   const spawnRunner = runner ?? createAipiSubagentsRunner({ root });
   const displayLabel = label || runId;
-  try {
+
+  // Run the researcher on `useModel`, review, and wake the orchestrator. `fallbackFrom` is set when this is the
+  // default-model retry after the configured model was rate-limited (so the wake notes the reroute).
+  const runWith = async (useModel, { fallbackFrom = null } = {}) => {
     const raw = await spawnRunner.spawn(
       {
         agent: "aipi-worker",
         task,
         async: false, // the CHILD runs synchronously; the JOB is backgrounded by not awaiting this call
         context: "fresh",
-        model,
+        model: useModel,
         thinking_level: thinking ?? undefined,
         allow_shell: false, // read-only: no shell
         write_scope: "artifacts", // never merges to the project
         max_tool_calls: maxToolCalls,
-        id: runId,
+        id: fallbackFrom ? `${runId}-fallback` : runId,
       },
       { signal: timeoutSignal(timeoutMs) },
     );
@@ -132,7 +136,7 @@ export async function runBackgroundResearchJob({
         runner: spawnRunner,
         task,
         findings,
-        researcherModel: model,
+        researcherModel: useModel,
         reviewer,
         reviewRunId: `${runId}-review`,
         maxToolCalls,
@@ -140,13 +144,40 @@ export async function runBackgroundResearchJob({
       });
     }
 
-    await wakeOrchestrator(pi, formatResearchWake({ displayLabel, model, thinking, findings, reviewer, review }));
-    return { runId, ok: true, findings, review };
+    await wakeOrchestrator(pi, formatResearchWake({ displayLabel, model: useModel, thinking, findings, reviewer, review, fallbackFrom }));
+    return { runId, ok: true, findings, review, ...(fallbackFrom ? { fallback_from: fallbackFrom } : {}) };
+  };
+
+  try {
+    return await runWith(model);
   } catch (error) {
+    // Rate-limit / transient failure → fall back to the DEFAULT (host) model once, instead of just reporting a
+    // dead job. The wake message flags the reroute so it's communicated.
+    const canFallBack = defaultModel && String(defaultModel) !== String(model) && isTransientResearchError(error);
+    if (canFallBack) {
+      try {
+        return await runWith(defaultModel, { fallbackFrom: model });
+      } catch (fallbackError) {
+        const message = `rate-limited on ${model}, and the default model ${defaultModel} also failed: ${String(fallbackError?.message ?? fallbackError)}`;
+        await wakeOrchestrator(pi, `Background research **${displayLabel}** failed: ${message}`);
+        return { runId, ok: false, error: message };
+      }
+    }
     const message = String(error?.message ?? error);
     await wakeOrchestrator(pi, `Background research **${displayLabel}** failed: ${message}`);
     return { runId, ok: false, error: message };
   }
+}
+
+// True for provider errors that a retry on a DIFFERENT model can survive (rate limit, overload, timeout,
+// transient network). Mirrors the workflow executor's transient classifier.
+export function isTransientResearchError(error) {
+  const text = [error?.type, error?.code, error?.status, error?.statusCode, error?.name, error?.message, error?.cause?.message]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  return /\b(overloaded_error|rate_limit_error|rate.?limit|too many requests|timeout|timed out|etimedout|econnreset|network)\b/.test(text) ||
+    /\b(429|529|503|504)\b/.test(text);
 }
 
 // Run ONE adversarial reviewer over a researcher's findings. Read-only, fresh context, distinct model. Never
@@ -199,10 +230,11 @@ function buildReviewPrompt({ task, findings, researcherModel }) {
 
 // Build the wake message: findings are always framed as CLAIMS, with the adversarial review attached so the
 // orchestrator weights them instead of trusting a raw finding.
-function formatResearchWake({ displayLabel, model, thinking, findings, reviewer, review }) {
+function formatResearchWake({ displayLabel, model, thinking, findings, reviewer, review, fallbackFrom = null }) {
   const researcherTag = [model, thinking].filter(Boolean).join(" · ") || String(model ?? "?");
   const lines = [
     `Background research **${displayLabel}** complete.`,
+    ...(fallbackFrom ? [`⚠ ${fallbackFrom} was rate-limited — ran on the default model ${model} instead.`] : []),
     "",
     `Researcher (${researcherTag}) findings — treat as CLAIMS, not verified truth:`,
     "",
@@ -268,6 +300,9 @@ export function registerBackgroundResearchTool(pi, { projectRootResolver = () =>
         const roles = await resolveResearchRoles({ root, ctx });
         if (!roles.researcher.model) return toolJson({ ok: false, error: "no researcher model available to dispatch background research" });
 
+        // The host/default model — a background researcher rate-limited on its configured (research-heavy) model
+        // falls back to this so a 429 doesn't strand the job.
+        const defaultModel = modelToPiModelId(ctx?.model) ?? null;
         const runner = runnerFactory ? runnerFactory({ root }) : createAipiSubagentsRunner({ root });
         const accepted = tasks.slice(0, MAX_BACKGROUND_RESEARCH);
         const dropped = tasks.slice(MAX_BACKGROUND_RESEARCH);
@@ -286,6 +321,7 @@ export function registerBackgroundResearchTool(pi, { projectRootResolver = () =>
             model: roles.researcher.model,
             thinking: roles.researcher.thinking,
             reviewer: roles.reviewer,
+            defaultModel,
             // maxToolCalls omitted -> runBackgroundResearchJob uses the baked DEFAULT_MAX_TOOL_CALLS (80).
           });
           return { run_id: runId, task: label };
