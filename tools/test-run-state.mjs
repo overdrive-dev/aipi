@@ -41,6 +41,10 @@ try {
   assert.deepEqual(parseWorkflowArgs("execute"), {
     action: "execute",
   });
+  assert.deepEqual(parseWorkflowArgs("run-chain planning-feature"), {
+    action: "run-chain",
+    chain: "planning-feature",
+  });
   assert.throws(() => parseWorkflowArgs("unknown"), /Unknown AIPI workflow/);
 
   const list = await runWorkflowCommand({ args: "list", projectRoot: tempRoot });
@@ -77,6 +81,7 @@ try {
   const state = JSON.parse(await fs.readFile(path.join(runDir, "state.json"), "utf8"));
   assert.equal(state.workflow, "feature");
   assert.equal(state.contract_path, ".aipi/runtime/runs/custom/BDD-CONTRACT.md");
+  assert.equal(state.params.contract_path, ".aipi/runtime/runs/custom/BDD-CONTRACT.md");
   assert.equal(await fs.readFile(path.join(tempRoot, ".aipi", "runtime", "runs", "active"), "utf8"), `${started.runId}\n`);
 
   const active = await readActiveRun(tempRoot);
@@ -185,6 +190,19 @@ try {
   assert.equal(keptDecision.runId, started.runId);
   assert.equal(keptDecision.state.status, "blocked");
   assert.equal(keptDecision.state.awaiting_user_input.kind, "workflow_blocked_decision");
+  // A response recorded before a restart makes the decision resumable. Session startup must
+  // preserve it instead of treating it as a stale, unanswered meta-decision.
+  decisionState.awaiting_user_input.answer_recorded_at = fixedDate.toISOString();
+  decisionState.awaiting_user_input.answer_path = ".aipi/runtime/runs/answered/USER-INPUT.jsonl";
+  await fs.writeFile(statePath, `${JSON.stringify(decisionState, null, 2)}\n`);
+  await fs.writeFile(activePath, `${started.runId}\n`);
+  const answeredDecision = await readActiveRun(tempRoot);
+  assert.equal(answeredDecision.runId, started.runId);
+  assert.equal(answeredDecision.state.status, "blocked");
+  assert.equal(answeredDecision.state.awaiting_user_input.answer_recorded_at, fixedDate.toISOString());
+  delete decisionState.awaiting_user_input.answer_recorded_at;
+  delete decisionState.awaiting_user_input.answer_path;
+  await fs.writeFile(statePath, `${JSON.stringify(decisionState, null, 2)}\n`);
   // Re-arm the active pointer the keep-read intentionally left in place, then prove the default
   // read self-recovers: returns null, clears runs/active, and records the detach on state.json.
   await fs.writeFile(activePath, `${started.runId}\n`);

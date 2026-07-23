@@ -75,11 +75,49 @@ try {
     },
   };
 
-  const plainBlockedResult = await handlers.input({ type: "input", text: "responder blocker", source: "interactive" }, ctx);
-  assert.deepEqual(plainBlockedResult, { action: "continue" });
+  const plainBlockedResult = await handlers.input({
+    type: "input",
+    text: "Nao entendi a duvida, pode reformular?",
+    source: "interactive",
+  }, ctx);
+  assert.equal(plainBlockedResult.action, "continue");
+  assert.equal(plainBlockedResult.message.customType, "aipi.blocker-clarification");
+  assert.equal(plainBlockedResult.message.details.clarification_only, true);
   assert.equal(selectCalls.length, 0);
   assert.match(notifications.at(-1).message, /Qual regra fiscal devemos aplicar\?/);
+  assert.equal((await readUserInputRecords(tempRoot, started.runId)).length, 0);
+  assert.equal(piEntries.some((entry) => entry.data?.input === "blocked_clarification_request"), true);
 
+  const directAnswerResult = await handlers.input({ type: "input", text: "2", source: "interactive" }, ctx);
+  assert.deepEqual(directAnswerResult, { action: "handled" });
+  assert.equal(runnerCalls.at(-1).args, "execute");
+  assert.equal((await readUserInputRecords(tempRoot, started.runId)).at(-1).text, "B");
+
+  await writeBlockedState(tempRoot, started.runId, []);
+  const recordsBeforeOptionlessClarification = (await readUserInputRecords(tempRoot, started.runId)).length;
+  const optionlessClarification = await handlers.input({
+    type: "input",
+    text: "Nao entendi a duvida, pode refazer? Eu queria um template para todas as collections.",
+    source: "interactive",
+  }, ctx);
+  assert.equal(optionlessClarification.action, "continue");
+  assert.equal(optionlessClarification.message.customType, "aipi.blocker-clarification");
+  assert.equal(
+    (await readUserInputRecords(tempRoot, started.runId)).length,
+    recordsBeforeOptionlessClarification,
+    "an optionless clarification must not be recorded as the business decision",
+  );
+
+  const optionlessAnswer = "Use um template unico; sem curadoria manual, ordene alfabeticamente pelo titulo.";
+  const optionlessAnswerResult = await handlers.input({
+    type: "input",
+    text: optionlessAnswer,
+    source: "interactive",
+  }, ctx);
+  assert.equal(optionlessAnswerResult.action, "handled");
+  assert.equal((await readUserInputRecords(tempRoot, started.runId)).at(-1).text, optionlessAnswer);
+
+  await writeBlockedState(tempRoot, started.runId);
   const selectedResult = await handleBlockedRunPicker({
     event: { type: "input", text: "responder blocker", source: "interactive" },
     ctx,
@@ -205,11 +243,11 @@ try {
       },
     },
   );
-  assert.deepEqual(headlessResult, { action: "continue" });
+  assert.deepEqual(headlessResult, { action: "handled" });
   assert.equal(selectCalls.length, selectCountBeforeHeadless);
-  assert.equal((await readUserInputRecords(tempRoot, started.runId)).length, inputCountBeforeHeadless);
-  assert.match(notifications.at(-1).message, /Qual regra fiscal devemos aplicar\?/);
-  assert.equal(piEntries.some((entry) => entry.data?.input === "blocked_text_prompt"), true);
+  assert.equal((await readUserInputRecords(tempRoot, started.runId)).length, inputCountBeforeHeadless + 1);
+  assert.equal((await readUserInputRecords(tempRoot, started.runId)).at(-1).text, "B");
+  assert.equal(piEntries.some((entry) => entry.data?.input === "blocked_text_answer"), true);
 
   // ADV-58-1: a run dead-ended on the freestyle/retry/cancel META-decision must
   // self-recover when the user sends a NEW substantive message instead of selecting an
@@ -277,7 +315,7 @@ try {
   await fs.rm(tempRoot, { recursive: true, force: true });
 }
 
-async function writeBlockedState(projectRoot, runId) {
+async function writeBlockedState(projectRoot, runId, options = ["A", "B", "C"]) {
   const statePath = path.join(projectRoot, ".aipi", "runtime", "runs", runId, "state.json");
   const state = JSON.parse(await fs.readFile(statePath, "utf8"));
   state.status = "blocked";
@@ -288,7 +326,7 @@ async function writeBlockedState(projectRoot, runId) {
     reason: "missing business rule answer",
     created_at: fixedDate.toISOString(),
     question: "Qual regra fiscal devemos aplicar?",
-    options: ["A", "B", "C"],
+    options,
     allow_free_text: true,
   };
   for (const step of state.steps) {

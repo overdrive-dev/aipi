@@ -1,0 +1,6 @@
+node_modules/
+dist/
+dist-server/
+playwright-report/
+test-results/
+.aipi/runtime/

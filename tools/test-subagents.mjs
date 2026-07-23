@@ -659,6 +659,36 @@ assert.throws(() => coordinator.status(agentId), /unknown agent/);
 assert.equal(piEntries.some((entry) => entry.name === SUBAGENT_EVENT_ENTRY && entry.value.event === "cleanup"), true);
 await fs.rm(coordinatorRoot, { recursive: true, force: true });
 
+// Pi invalidates captured extension contexts after a session replacement/reload. State-entry
+// persistence at that boundary is best-effort and must not crash spawn or worker cleanup.
+{
+  const staleRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-stale-persist-"));
+  const staleCoordinator = new SubagentCoordinator(
+    {
+      appendEntry() {
+        throw new Error("This extension ctx is stale after session replacement or reload");
+      },
+      log() {},
+    },
+    {
+      root: staleRoot,
+      maxConcurrent: 0,
+      env: {},
+      knownModelClasses: ["code-strong"],
+      hostModel: { provider: "openai-codex", id: "gpt-5.6-sol" },
+      piSubagentsRunner: { spawn() {} },
+    },
+  );
+  assert.doesNotThrow(() => staleCoordinator.spawn({
+    agent_id: "stale-context-worker",
+    model_class: "code-strong",
+    step_id: "stale-context",
+    owned_files: [],
+  }));
+  assert.doesNotThrow(() => staleCoordinator.cleanup());
+  await fs.rm(staleRoot, { recursive: true, force: true });
+}
+
 // Model availability fallback: a worker whose resolved model's provider is NOT authed on the host falls
 // back to the (authed) host model — so the workflow completes on the default model instead of blocking on an
 // unavailable provider (e.g. a configured xai-auth/grok reviewer with the xAI extension not installed) — and

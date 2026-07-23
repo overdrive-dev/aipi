@@ -872,6 +872,7 @@ export async function runAipiWorkflow({
   log = console.log,
   errorLog = console.error,
   workflowFns = null,
+  workflowAdapter = null,
 } = {}) {
   let options;
   try {
@@ -884,6 +885,16 @@ export async function runAipiWorkflow({
 
   try {
     const fns = workflowFns ?? await import("../extensions/aipi/runtime/run-state.js");
+    const workflowArgs = options.workflowArgs.join(" ");
+    const parsed = typeof fns.parseWorkflowArgs === "function"
+      ? fns.parseWorkflowArgs(workflowArgs)
+      : parseWorkflowExecutionIntent(workflowArgs);
+    if (["run", "run-chain", "execute"].includes(parsed.action) && !workflowAdapter) {
+      throw new Error(
+        "this CLI surface has no interactive worker adapter and cannot execute workflow steps; " +
+        "use /aipi-workflow inside an interactive Pi session, or use `aipi workflow start <name>` to create state only",
+      );
+    }
     // CR-59-3 / ADV-58-3: surface per-step progress on the CLI workflow surface so a long
     // `run`/`execute` is not a silent black box. Progress goes to STDERR (errorLog) so it never
     // corrupts the stdout result, and is suppressed entirely under --json to keep machine output
@@ -892,9 +903,10 @@ export async function runAipiWorkflow({
       ? null
       : (message) => errorLog(`aipi workflow: ${message}`);
     const result = await fns.runWorkflowCommand({
-      args: options.workflowArgs.join(" "),
+      args: workflowArgs,
       projectRoot: options.target,
       notify,
+      adapter: workflowAdapter ?? undefined,
     });
     log(options.json ? JSON.stringify(result, null, 2) : fns.formatWorkflowCommandResult(result));
     return result;
@@ -903,6 +915,14 @@ export async function runAipiWorkflow({
     process.exitCode = 1;
     return null;
   }
+}
+
+function parseWorkflowExecutionIntent(args) {
+  const first = String(args ?? "").trim().split(/\s+/).filter(Boolean)[0] ?? "status";
+  if (first === "execute" || first === "continue") return { action: "execute" };
+  if (first === "run-chain") return { action: "run-chain" };
+  if (first === "run") return { action: "run" };
+  return { action: first };
 }
 
 export async function runAipiMemory({
@@ -1086,7 +1106,7 @@ export function formatAipiHelp({ aipiVersion }) {
     "  /aipi-init [--dry-run] [--force] [--reset-memory] [--target <dir>] [--no-pull-embeddings]",
     "  /aipi-onboard [--target <dir>] [--no-questions] [--no-pull-embeddings]",
     "  /aipi-status",
-    "  /aipi-workflow [list | status | start <name> | run <name> | execute]",
+    "  /aipi-workflow [list | status | start <name> | run <name> | run-chain planning-feature | execute]",
     "  /aipi-memory [status | refs | query <terms>]",
     "  /aipi-effort [setup | status | check] [--orchestrator <spec>] [--planner <spec>] [--planner-adversarial <spec>] [--doer <spec>] [--doer-adversarial <spec>] [--mover <spec>] [--class <class>=<spec>]",
     "                  spec = provider/model[:level]; --orchestrator sets the default session model; doer defaults to the authed model; --adversarial = alias of --doer-adversarial",
@@ -1105,8 +1125,8 @@ export function formatAipiHelp({ aipiVersion }) {
     "                  Verify the workstation (Node/Git/Pi + Docker/Playwright/Ollama",
     "                  embedding model per .aipi/environment.json); --fix installs",
     "                  Playwright browsers / pulls the embedding model",
-    "  aipi workflow [--target <dir>] [--json] [list|status|start <name>|run <name>|execute]",
-    "                  Inspect or drive AIPI workflow state outside a Pi session",
+    "  aipi workflow [--target <dir>] [--json] [list|status|start <name>|run <name>|run-chain planning-feature|execute]",
+    "                  Inspect workflow state outside Pi; execution requires the interactive /aipi-workflow surface",
     "  aipi memory [--target <dir>] [--json] [status|refs|query <terms>]",
     "                  Inspect AIPI Markdown memory and code graph state outside a Pi session",
     "  aipi effort [--target <dir>] [--json] [setup|status|check] [--orchestrator <spec>] [--planner <spec>] [--planner-adversarial <spec>] [--doer <spec>] [--doer-adversarial <spec>] [--mover <spec>] [--class <class>=<spec>]",

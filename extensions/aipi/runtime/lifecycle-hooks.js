@@ -67,6 +67,17 @@ const MAX_EXCERPT_CHARS = 1000;
 const MAX_CONTEXT_TOOL_RESULT_CHARS = 1200;
 const KEEP_FULL_AIPI_TOOL_RESULTS = 2;
 const MAX_DISCIPLINE_CHARS = 1800;
+// Provider-owned opaque values must be replayed byte-for-byte. Secret-shaped
+// substrings can occur by chance inside ciphertext/signatures (for example,
+// an OpenAI encrypted reasoning item containing `sk-...`), and redacting one
+// corrupts the item before the provider can verify it.
+const PROVIDER_OPAQUE_STRING_KEYS = new Set([
+  "encrypted_content",
+  "thinkingSignature",
+  "thoughtSignature",
+  "thought_signature",
+  "textSignature",
+]);
 
 export function registerAipiLifecycleHooks(pi, {
   projectRootResolver = (ctx) => ctx?.cwd ?? process.cwd(),
@@ -778,16 +789,79 @@ export async function handleInput({
           intentClassifierTimeoutMs,
         });
       }
-      safeAppendEntry(pi, "aipi.input.route", {
-        schema: "aipi.input-route.v1",
-        routed_at: new Date().toISOString(),
-        input: "blocked_text_prompt",
-        active_run_id: active?.runId ?? null,
-        handled: false,
-        reason: "plain_text_not_captured",
-      });
-      safeNotify(ctx, formatAwaitingUserInputPrompt(active.state.awaiting_user_input), "info");
-      return { action: "continue" };
+      const awaiting = active.state.awaiting_user_input;
+      const rawAnswer = String(event?.text ?? "").trim();
+      if (isBlockerClarificationRequest(rawAnswer)) {
+        safeAppendEntry(pi, "aipi.input.route", {
+          schema: "aipi.input-route.v1",
+          routed_at: new Date().toISOString(),
+          input: "blocked_clarification_request",
+          active_run_id: active?.runId ?? null,
+          handled: false,
+          reason: "user_requested_rephrase",
+        });
+        safeNotify(ctx, formatAwaitingUserInputPrompt(awaiting), "info");
+        return {
+          action: "continue",
+          message: {
+            customType: "aipi.blocker-clarification",
+            display: false,
+            content: [
+              "The user asked for clarification of the active AIPI blocker; they did not answer it yet.",
+              `Rephrase this decision in the user's language and plain, concrete terms: ${awaiting.question ?? awaiting.reason ?? ""}`,
+              "Explain what visible behavior the choice affects and distinguish it from any separate requirement the user mentioned. Do not advance the workflow or invent an answer.",
+            ].join("\n"),
+            details: {
+              run_id: active.runId,
+              step_id: awaiting.step_id ?? null,
+              clarification_only: true,
+            },
+          },
+        };
+      }
+
+      const answer = blockerTextAnswer(rawAnswer, awaiting);
+      let answerRecorded = false;
+      try {
+        await userInputRecorder({
+          projectRoot,
+          runId: active.runId,
+          text: answer,
+          source: event?.source ?? "blocked_text",
+        });
+        answerRecorded = true;
+        const result = await workflowCommandRunner({
+          args: "execute",
+          projectRoot,
+          adapter,
+          parentInteractiveToolCallHook: "registered_parent_interactive_tool_call_hook",
+          notify: makeProgressNotifier(ctx, pi),
+        });
+        const blockedAfterAnswer = activeRunFromWorkflowCommandResult(result);
+        safeAppendEntry(pi, "aipi.input.route", {
+          schema: "aipi.input-route.v1",
+          routed_at: new Date().toISOString(),
+          input: "blocked_text_answer",
+          workflow_args: "execute",
+          recorded_user_input: true,
+          active_run_id: active.runId,
+          result_action: result.action,
+          result_run_id: blockedAfterAnswer?.runId ?? active.runId,
+        });
+        safeNotify(ctx, formatWorkflowCommandResult(result), "info");
+        return { action: "handled" };
+      } catch (error) {
+        safeAppendEntry(pi, "aipi.input.route", {
+          schema: "aipi.input-route.v1",
+          routed_at: new Date().toISOString(),
+          input: "blocked_text_answer_failed",
+          recorded_user_input: answerRecorded,
+          active_run_id: active.runId,
+          error: String(error?.message ?? error),
+        });
+        safeNotify(ctx, `AIPI registrou a resposta, mas não conseguiu retomar o workflow: ${error.message}`, "error");
+        return { action: "handled" };
+      }
     }
     return { action: "continue" };
   }
@@ -1147,10 +1221,13 @@ export function classifyAipiInputRoute(text, { activeRun = null, codePipeline = 
   // test the off branch.
   const autoWorkflow = autoDispatchEnabled ? autoDispatchWorkflowForPipeline(pipeline) : null;
   if (autoWorkflow) {
+    const workflowArgs = pipeline.classification === "substantive_code_work"
+      ? "run-chain planning-feature"
+      : `run ${autoWorkflow}`;
     return {
       intent: "auto_dispatch_workflow",
       workflowSuggestion: autoWorkflow,
-      workflowArgs: `run ${autoWorkflow}`,
+      workflowArgs,
       // Carry the raw task text so it can be plumbed into the workflow's primary param (e.g. bug) —
       // without it the run starts with bug:"" and triage blocks on the unrendered "{{ bug }}".
       taskText: original,
@@ -1174,9 +1251,10 @@ export function classifyAipiInputRoute(text, { activeRun = null, codePipeline = 
 
 // Maps an auto-dispatched workflow to the free-text param that should carry the user's task text, so
 // a pasted request actually reaches the run (bugfix triages a real bug instead of "{{ bug }}"). The
-// feature workflow is contract-driven and has no free-text input param, so it gets none.
+// A feature request first enters the planning-feature chain, where `request` feeds planning.
 const WORKFLOW_PRIMARY_PARAM = Object.freeze({
   bugfix: "bug",
+  feature: "request",
   ops: "objective",
   planning: "request",
   quick: "request",
@@ -1311,15 +1389,15 @@ export function classifyAipiCodePipeline(text, { activeRun = null, projectRoot =
       trace: true,
       non_blocking: true,
       active_run_id: activeRun?.runId ?? null,
-      workflow: "planning",
+      workflow: "feature",
       workflow_alignment: {
-        workflow: "planning.yaml",
-        stages: ["intake", "context", "requirements", "acceptance"],
-        reason: "BDD contract must be created before feature implementation.",
+        chain: ["planning.yaml", "feature.yaml"],
+        stages: ["intake", "context", "requirements", "acceptance", "tdd", "implementation", "verification"],
+        reason: "Planning creates the accepted BDD contract and feature consumes that exact contract.",
       },
       stages: ["plan", "adversarial_review", "diff_review"],
       default_action: activeWorkflow ? "continue_active_workflow" : "auto_dispatch_workflow",
-      dispatch_workflow: activeWorkflow ? null : "planning",
+      dispatch_workflow: activeWorkflow ? null : "feature",
     };
   }
   if (trivialIntent) {
@@ -1339,7 +1417,7 @@ export function classifyAipiCodePipeline(text, { activeRun = null, projectRoot =
 function autoDispatchWorkflowForPipeline(pipeline = {}) {
   if (pipeline.default_action !== "auto_dispatch_workflow") return null;
   if (pipeline.classification === "root_cause_bugfix") return "bugfix";
-  if (pipeline.classification === "substantive_code_work") return "planning";
+  if (pipeline.classification === "substantive_code_work") return "feature";
   return null;
 }
 
@@ -1358,7 +1436,7 @@ function routeExecutesWorkflow(route = null) {
   if (!route || route.answerInline || route.suggestedCommand) return false;
   const args = String(route.workflowArgs ?? "").trim();
   if (!args || args === "status") return false;
-  return Boolean(route.autoDispatch || args === "execute" || args.startsWith("run "));
+  return Boolean(route.autoDispatch || args === "execute" || args.startsWith("run ") || args.startsWith("run-chain "));
 }
 
 async function resolveAipiHostInputReadiness({ event = null, ctx = null, coordinator = null } = {}) {
@@ -2065,6 +2143,26 @@ function isFreshSubstantiveBlockedInput(text) {
     return false;
   }
   return true;
+}
+
+function isBlockerClarificationRequest(text) {
+  const normalized = normalizeInputText(text);
+  if (!normalized) return false;
+  return (
+    /\b(nao entendi|nao ficou claro|nao compreendi|estou confuso|estou confusa|como assim)\b/.test(normalized) ||
+    /\b(pode|consegue|poderia|voce pode)\b[^.!?]{0,50}\b(reformular|reformule|refazer|refaca|explicar|explique|esclarecer|esclareca|simplificar|simplifique)\b/.test(normalized) ||
+    /\b(o que|que que)\b[^.!?]{0,40}\b(significa|quer dizer)\b/.test(normalized) ||
+    /\b(qual|quais)\b[^.!?]{0,30}\b(duvida|pergunta|decisao)\b/.test(normalized) ||
+    /\b(why|what do you mean|i do not understand|i don't understand|rephrase|clarify|explain the question)\b/.test(normalized)
+  );
+}
+
+function blockerTextAnswer(text, awaiting = {}) {
+  const value = String(text ?? "").trim();
+  const numeric = value.match(/^([1-3])$/);
+  const options = normalizeBlockerOptions(awaiting?.options);
+  if (numeric) return options[Number(numeric[1]) - 1] ?? value;
+  return value;
 }
 
 function blockerTerminalAction(value) {
@@ -4097,8 +4195,14 @@ function insertAfterLastUser(messages, message) {
   messages.push(message);
 }
 
-function redactProviderPayloadValue(value, seen = new WeakSet()) {
+function redactProviderPayloadValue(value, seen = new WeakSet(), fieldName = null, parent = null) {
   if (typeof value === "string") {
+    if (
+      PROVIDER_OPAQUE_STRING_KEYS.has(fieldName) ||
+      (fieldName === "signature" && ["thinking", "redacted_thinking", "reasoning"].includes(parent?.type))
+    ) {
+      return { value, modified: false, redacted: 0 };
+    }
     const text = redactSecrets(value);
     return { value: text, modified: text !== value, redacted: text !== value ? 1 : 0 };
   }
@@ -4114,7 +4218,7 @@ function redactProviderPayloadValue(value, seen = new WeakSet()) {
     let modified = false;
     let redacted = 0;
     const output = value.map((item) => {
-      const result = redactProviderPayloadValue(item, seen);
+      const result = redactProviderPayloadValue(item, seen, null, value);
       modified ||= result.modified;
       redacted += result.redacted;
       return result.value;
@@ -4126,7 +4230,7 @@ function redactProviderPayloadValue(value, seen = new WeakSet()) {
   let redacted = 0;
   const output = {};
   for (const [key, item] of Object.entries(value)) {
-    const result = redactProviderPayloadValue(item, seen);
+    const result = redactProviderPayloadValue(item, seen, key, value);
     modified ||= result.modified;
     redacted += result.redacted;
     output[key] = result.value;

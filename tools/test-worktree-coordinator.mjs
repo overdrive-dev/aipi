@@ -99,6 +99,54 @@ async function runWorktreeJob({ root, env = {}, descriptor, workerContent }) {
   };
 }
 
+async function runRuntimeArtifactJob({ root, writeScope = "artifacts", editProject = false }) {
+  const artifact = ".aipi/runtime/runs/r-artifact/steps/review/REVIEW.md";
+  const captured = {};
+  const coordinator = new SubagentCoordinator(
+    { appendEntry() {} },
+    {
+      root,
+      maxConcurrent: 1,
+      piSubagentsRunner: {
+        async spawn(params, options = {}) {
+          const projectRoot = options.ctx?.project_root ?? root;
+          captured.projectRoot = projectRoot;
+          const target = path.join(projectRoot, artifact);
+          fs.mkdirSync(path.dirname(target), { recursive: true });
+          fs.writeFileSync(target, "# review evidence\n", "utf-8");
+          if (editProject) {
+            fs.writeFileSync(path.join(projectRoot, "src", "review.js"), "export const value = 7;\n", "utf-8");
+          }
+          const workerId = params.task.match(/AIPI worker id: ([^\n]+)/)?.[1] ?? "worker";
+          return {
+            content: [{ type: "text", text: JSON.stringify({
+              schema: "aipi.step-result.v1",
+              step_id: "review",
+              agent_ids: [workerId],
+              verdict: "PASS",
+              evidence: [{ rung: "ran", source: "fake-worker", ref: artifact, result: "wrote runtime evidence" }],
+              artifacts: [artifact],
+            }) }],
+            artifacts: [artifact],
+            tool_call_count: 1,
+            exit_code: 0,
+          };
+        },
+      },
+    },
+  );
+  const { agent_id } = coordinator.spawn({
+    agent_id: "artifact-worker",
+    step_id: "review",
+    model: { provider: "anthropic", id: "claude-opus-4-8" },
+    write_scope: writeScope,
+    expected_artifacts: [artifact],
+    owned_files: [artifact],
+  });
+  await waitFor(() => ["done", "failed"].includes(coordinator.status(agent_id).state));
+  return { artifact, seenProjectRoot: captured.projectRoot, collect: coordinator.collect(agent_id) };
+}
+
 function cleanup(root) {
   try { spawnSync("git", ["-C", root, "worktree", "prune"], { encoding: "utf-8" }); } catch {}
   fs.rmSync(root, { recursive: true, force: true });
@@ -182,6 +230,36 @@ function cleanup(root) {
     assert.equal(r.status.state, "done", `fallback job should still finish: ${r.status.error ?? ""}`);
     assert.equal(r.seenProjectRoot, root, "dirty tree -> default worktree falls back to the project root");
     assert.equal(r.collect.step_result.aipi_worktree_merged, undefined, "no merge on the fallback path");
+  } finally {
+    cleanup(root);
+  }
+}
+
+// Case 5: runtime artifacts are gitignored, so they are copied back through the narrow step-artifact
+// channel before the worktree is removed. A Git patch alone cannot preserve this file.
+{
+  const root = setupRepo();
+  try {
+    const r = await runRuntimeArtifactJob({ root, writeScope: "artifacts" });
+    assert.equal(r.collect.step_result.verdict, "PASS");
+    assert.ok(r.seenProjectRoot && r.seenProjectRoot !== root, "artifact worker ran in a worktree");
+    assert.equal(fs.readFileSync(path.join(root, r.artifact), "utf-8"), "# review evidence\n");
+    assert.equal(fs.existsSync(r.seenProjectRoot), false, "artifact survived removal of its source worktree");
+  } finally {
+    cleanup(root);
+  }
+}
+
+// Case 6: a project-write worker cannot pass by writing only its report. It must produce a real
+// non-.aipi diff; the coordinator downgrades the self-reported PASS before merge-back.
+{
+  const root = setupRepo();
+  try {
+    const r = await runRuntimeArtifactJob({ root, writeScope: "project", editProject: false });
+    assert.equal(r.collect.step_result.verdict, "BLOCKED");
+    assert.equal(r.collect.step_result.aipi_verdict_downgraded, true);
+    assert.match(r.collect.step_result.aipi_verdict_downgrade_reason, /no changed file outside \.aipi/);
+    assert.equal(fs.readFileSync(path.join(root, "src", "review.js"), "utf-8"), "export const value = 1;\n");
   } finally {
     cleanup(root);
   }

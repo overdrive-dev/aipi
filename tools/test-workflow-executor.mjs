@@ -19,6 +19,7 @@ import {
 import { SubagentCoordinator } from "../extensions/aipi/runtime/subagents.js";
 import {
   formatWorkflowCommandResult,
+  readWorkflowChain,
   recordWorkflowUserInput,
   runWorkflowCommand,
   startWorkflowRun,
@@ -146,6 +147,72 @@ try {
       "skipped",
     ],
   );
+
+  const chainRun = await runWorkflowCommand({
+    args: "run-chain planning-feature",
+    projectRoot: tempRoot,
+    params: { request: "Add a shareable priority filter" },
+    adapter: createTestPassWorkflowAdapter(),
+  });
+  assert.equal(chainRun.action, "run-chain");
+  assert.equal(chainRun.chain.status, "completed");
+  assert.equal(chainRun.execution.state.workflow, "feature");
+  assert.equal(chainRun.phase_executions.length, 2);
+  assert.notEqual(chainRun.chain.phases.planning.run_id, chainRun.chain.phases.feature.run_id);
+  assert.equal(chainRun.execution.state.upstream_run_id, chainRun.chain.phases.planning.run_id);
+  assert.equal(chainRun.execution.state.contract_path, chainRun.chain.phases.planning.contract_path);
+  assert.equal(chainRun.execution.state.params.contract_path, chainRun.chain.phases.planning.contract_path);
+  assert.equal((await readWorkflowChain(tempRoot, chainRun.chain.chain_id)).status, "completed");
+  assert.match(formatWorkflowCommandResult(chainRun), /chain_status=completed/);
+
+  const resumePassAdapter = createTestPassWorkflowAdapter();
+  let blockChainOnce = true;
+  const resumableChainAdapter = {
+    async executeStep(args) {
+      if (blockChainOnce && args.step.id === "intake") {
+        blockChainOnce = false;
+        return {
+          schema: "aipi.step-result.v1",
+          step_id: args.step.id,
+          agent_ids: ["test-chain-blocker"],
+          verdict: "BLOCKED",
+          evidence: [{ rung: "blocked", source: "test-chain-blocker", ref: "intake", result: "needs one decision" }],
+          artifacts: [],
+          blocker_question: {
+            question: "Which priority vocabulary should the filter use?",
+            options: ["Use low, medium, high"],
+            allow_free_text: true,
+          },
+        };
+      }
+      return resumePassAdapter.executeStep(args);
+    },
+  };
+  const blockedChain = await runWorkflowCommand({
+    args: "run-chain planning-feature",
+    projectRoot: tempRoot,
+    params: { request: "Add a priority filter" },
+    adapter: resumableChainAdapter,
+  });
+  assert.equal(blockedChain.chain.status, "blocked");
+  assert.equal(blockedChain.execution.state.workflow, "planning");
+  const blockedPlanningRunId = blockedChain.execution.runId;
+  await recordWorkflowUserInput({
+    projectRoot: tempRoot,
+    runId: blockedPlanningRunId,
+    text: "Use low, medium, high",
+    source: "test",
+  });
+  const resumedChain = await runWorkflowCommand({
+    args: "execute",
+    projectRoot: tempRoot,
+    adapter: resumePassAdapter,
+  });
+  assert.equal(resumedChain.action, "execute");
+  assert.equal(resumedChain.chain.status, "completed");
+  assert.equal(resumedChain.chain.phases.planning.run_id, blockedPlanningRunId);
+  assert.equal(resumedChain.execution.state.workflow, "feature");
+  assert.equal(resumedChain.execution.state.upstream_run_id, blockedPlanningRunId);
 
   await fs.appendFile(
     path.join(tempRoot, ".aipi", "memory", "project", "business-rules.md"),
@@ -2313,18 +2380,24 @@ function testSkipEvidence({ step, contract, skipCondition }) {
 // every step as a subagent" regression complete the whole quick workflow end-to-end.
 function quickWorkflowRunner({ calls = [], rawWrites = [], root } = {}) {
   return {
-    async spawn(params) {
+    async spawn(params, runtime = {}) {
       calls.push({ params });
       const text = params.task ?? "";
+      const workerRoot = runtime.ctx?.project_root ?? root;
       const agentId = text.match(/AIPI worker id: ([^\n]+)/)?.[1] ?? "worker";
       const stepId = text.match(/"step_id": "([^"]+)"/)?.[1] ?? "quick_change";
       const artifacts = expectedArtifactsFromPrompt(text);
       for (const artifact of artifacts) {
         const content = `# fake S0 worker wrote ${stepId}\n\nartifact: ${artifact}\n`;
         rawWrites.push({ path: artifact, content });
-        const target = path.join(root, artifact);
+        const target = path.join(workerRoot, artifact);
         await fs.mkdir(path.dirname(target), { recursive: true });
         await fs.writeFile(target, content);
+      }
+      if (text.includes("Write scope is PROJECT")) {
+        const productFile = path.join(workerRoot, "src", "aipi-fake-product.txt");
+        await fs.mkdir(path.dirname(productFile), { recursive: true });
+        await fs.appendFile(productFile, `${stepId}:${calls.length}\n`);
       }
       const skip = stepId === "quick_memory";
       const stepResult = skip
@@ -2373,18 +2446,24 @@ function quickWorkflowRunner({ calls = [], rawWrites = [], root } = {}) {
 
 function fakeWorkflowRunner({ calls = [], rawWrites = [], root } = {}) {
   return {
-    async spawn(params) {
+    async spawn(params, runtime = {}) {
       calls.push({ params });
       const text = params.task ?? "";
+      const workerRoot = runtime.ctx?.project_root ?? root;
       const agentId = text.match(/AIPI worker id: ([^\n]+)/)?.[1] ?? "unknown";
       const stepId = text.match(/"step_id": "([^"]+)"/)?.[1] ?? "quick_change";
       const artifacts = expectedArtifactsFromPrompt(text);
       for (const artifact of artifacts) {
         const content = `# fake S0 worker wrote ${stepId}\n\nartifact: ${artifact}\n`;
         rawWrites.push({ path: artifact, content });
-        const target = path.join(root, artifact);
+        const target = path.join(workerRoot, artifact);
         await fs.mkdir(path.dirname(target), { recursive: true });
         await fs.writeFile(target, content);
+      }
+      if (text.includes("Write scope is PROJECT")) {
+        const productFile = path.join(workerRoot, "src", "aipi-fake-product.txt");
+        await fs.mkdir(path.dirname(productFile), { recursive: true });
+        await fs.appendFile(productFile, `${stepId}:${calls.length}\n`);
       }
       return {
         content: [

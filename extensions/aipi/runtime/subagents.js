@@ -10,7 +10,8 @@
 
 import os from "node:os";
 import fsSync from "node:fs";
-import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { OwnedFileRegistry, wrapWriteToolWithOwnership } from "./owned-files.js";
@@ -213,6 +214,12 @@ export class SubagentCoordinator {
     const host = this.#hostModelRef();
     if (host && host.provider !== exclude) return host;
     if (!this.#availableModelSpecs) return null;
+    const configured = loadConfiguredFallbackModelSync({
+      root: this.#root,
+      excludeProvider: exclude,
+      availableProviders: this.#availableProviders,
+    });
+    if (configured) return configured;
     const candidate = this.#availableModelSpecs.find((model) => model.provider && model.provider !== exclude);
     return candidate ? { provider: candidate.provider, id: candidate.id } : null;
   }
@@ -339,6 +346,7 @@ export class SubagentCoordinator {
       pendingQuestion: null,
       awaitingAnswer: false,
       ownedFileBaseline: snapshotOwnedFiles(this.#root, descriptor.owned_files),
+      projectChangeBaseline: descriptor.write_scope === "project" ? snapshotProjectChanges(this.#root) : null,
     });
     const job = this.#jobs.get(agentId);
     this.#queue.push(agentId);
@@ -630,6 +638,7 @@ export class SubagentCoordinator {
       const raw = await this.#spawnWorkerSession(job, job.controller.signal);
       if (job.worktree) this.#captureJobWorktreeDiff(job);
       job.result = this.#parseResult(job, raw);
+      if (job.worktree) this.#copyBackWorktreeArtifacts(job);
       if (job.worktree) this.#mergeBackWorktree(job);
       job.state = JobState.DONE;
       this.#trace("done", job, { verdict: job.lastSummary, ...finishTraceData(job) });
@@ -727,6 +736,34 @@ export class SubagentCoordinator {
     this.#trace("worktree_merge_conflict", job, { reason: outcome.reason ?? null });
   }
 
+  #copyBackWorktreeArtifacts(job) {
+    const stepResult = job.result?.stepResult;
+    if (stepResult?.verdict !== "PASS") return;
+    const candidates = normalizedFileList([
+      ...(job.descriptor?.expected_artifacts ?? []),
+      ...(job.result?.artifacts ?? []),
+      ...(stepResult?.artifacts ?? []),
+    ]).filter(isRunStepArtifact);
+    const copied = [];
+    try {
+      for (const file of candidates) {
+        const source = resolveProjectPath(job.worktree.agentCwd, file);
+        const target = resolveProjectPath(this.#root, file);
+        if (!source || !target || !fsSync.existsSync(source)) continue;
+        fsSync.mkdirSync(path.dirname(target), { recursive: true });
+        fsSync.copyFileSync(source, target);
+        copied.push(file);
+      }
+      this.#trace("worktree_artifacts_copied", job, { files: copied.length });
+    } catch (error) {
+      downgradeWorkerPass(stepResult, {
+        reason: `worktree runtime artifact copy-back failed: ${String(error?.message ?? error)}`,
+      });
+      job.lastSummary = stepResult.verdict;
+      this.#trace("worktree_artifact_copy_failed", job, { error: String(error?.message ?? error) });
+    }
+  }
+
   #parseResult(job, raw) {
     const stepResult = raw?.stepResult ?? raw;
     // TRUSTED provenance: whether this worker ran shell-less is set by the executor on the descriptor
@@ -767,6 +804,7 @@ export class SubagentCoordinator {
         stepResult.aipi_real_evidence = {
           artifacts: evidence.existingArtifacts,
           owned_files_changed: evidence.changedOwnedFiles,
+          project_files_changed: evidence.changedProjectFiles,
           exit_code: evidence.exitCode,
         };
       }
@@ -965,7 +1003,13 @@ export class SubagentCoordinator {
   #persist() {
     // Survives reload/compaction; not in LLM context. Mirror to .aipi/runtime in
     // the run-state module (spike S4).
-    this.#pi?.appendEntry?.(SUBAGENT_STATE_ENTRY, this.snapshot());
+    try {
+      this.#pi?.appendEntry?.(SUBAGENT_STATE_ENTRY, this.snapshot());
+    } catch {
+      // Pi invalidates captured extension contexts after session replacement/reload.
+      // Transcript persistence is best-effort at that boundary; lifecycle hooks keep
+      // the durable project mirror. A stale context must never crash worker cleanup.
+    }
   }
 
   // ===================================================================
@@ -1138,6 +1182,26 @@ export class SubagentCoordinator {
       /* best-effort session trace */
     }
   }
+}
+
+function loadConfiguredFallbackModelSync({ root, excludeProvider, availableProviders }) {
+  if (!(availableProviders instanceof Set) || !availableProviders.size) return null;
+  try {
+    const configPath = path.join(root, ".aipi", "model-capabilities.json");
+    const parsed = JSON.parse(fsSync.readFileSync(configPath, "utf8"));
+    const configuredModels = Object.values(parsed?.classes ?? {});
+    for (const value of configuredModels) {
+      const fullId = describeModel(value);
+      const provider = modelProvider(fullId);
+      if (!provider || provider === excludeProvider || !availableProviders.has(provider)) continue;
+      const separator = String(fullId).indexOf("/");
+      if (separator <= 0) continue;
+      return { provider, id: String(fullId).slice(separator + 1) };
+    }
+  } catch {
+    // Missing/invalid project topology falls back to the live registry order.
+  }
+  return null;
 }
 
 export function latestSubagentStateFromEntries(entries = []) {
@@ -1435,6 +1499,84 @@ function snapshotOwnedFiles(root, files = []) {
   return out;
 }
 
+function snapshotProjectChanges(root) {
+  const git = spawnSync("git", ["-C", root, "rev-parse", "--is-inside-work-tree"], { encoding: "utf8" });
+  if (git.status === 0 && String(git.stdout).trim() === "true") {
+    const tracked = spawnSync("git", ["-C", root, "diff", "--name-only", "-z", "HEAD", "--"], { encoding: "utf8" });
+    const untracked = spawnSync("git", ["-C", root, "ls-files", "--others", "--exclude-standard", "-z"], { encoding: "utf8" });
+    if (tracked.status === 0 && untracked.status === 0) {
+      const files = [...nulSeparatedPaths(tracked.stdout), ...nulSeparatedPaths(untracked.stdout)]
+        .filter(isProjectSourceFile);
+      return { mode: "git", files: fingerprintFiles(root, files) };
+    }
+  }
+  return { mode: "filesystem", files: fingerprintProjectTree(root) };
+}
+
+function changedProjectFilesSinceSnapshot(root, baseline) {
+  if (!baseline) return [];
+  const current = snapshotProjectChanges(root);
+  const before = baseline.files ?? {};
+  const after = current.files ?? {};
+  return [...new Set([...Object.keys(before), ...Object.keys(after)])]
+    .filter((file) => before[file] !== after[file])
+    .sort();
+}
+
+function fingerprintProjectTree(root) {
+  const files = [];
+  const visit = (dir, relDir = "") => {
+    let entries = [];
+    try {
+      entries = fsSync.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const rel = path.posix.join(relDir.replaceAll("\\", "/"), entry.name);
+      if (entry.isDirectory()) {
+        if ([".git", ".aipi", "node_modules", "dist", "dist-server", "coverage"].includes(entry.name)) continue;
+        visit(path.join(dir, entry.name), rel);
+      } else if (entry.isFile() && isProjectSourceFile(rel)) {
+        files.push(rel);
+      }
+    }
+  };
+  visit(root);
+  return fingerprintFiles(root, files);
+}
+
+function fingerprintFiles(root, files) {
+  const out = {};
+  for (const file of [...new Set(files)].sort()) {
+    const normalized = file.replaceAll("\\", "/");
+    if (!isProjectSourceFile(normalized)) continue;
+    const absPath = resolveProjectPath(root, normalized);
+    if (!absPath) continue;
+    try {
+      const content = fsSync.readFileSync(absPath);
+      out[normalized] = createHash("sha256").update(content).digest("hex");
+    } catch {
+      out[normalized] = "missing";
+    }
+  }
+  return out;
+}
+
+function nulSeparatedPaths(value) {
+  return String(value ?? "").split("\0").map((file) => file.trim().replaceAll("\\", "/")).filter(Boolean);
+}
+
+function isProjectSourceFile(file) {
+  const normalized = String(file ?? "").replaceAll("\\", "/").replace(/^\.\//, "");
+  return Boolean(normalized) && normalized !== ".aipi" && !normalized.startsWith(".aipi/");
+}
+
+function isRunStepArtifact(file) {
+  const normalized = path.posix.normalize(String(file ?? "").replaceAll("\\", "/").replace(/^\.\//, ""));
+  return normalized.startsWith(".aipi/runtime/runs/") && normalized.includes("/steps/");
+}
+
 function verifyWorkerPassEvidence({ root, job, raw, stepResult }) {
   const exitCode = numericOrNull(raw?.exit_code ?? raw?.exitCode);
   if (exitCode != null && exitCode !== 0) {
@@ -1456,22 +1598,33 @@ function verifyWorkerPassEvidence({ root, job, raw, stepResult }) {
   // comparison is unreliable because `git worktree add` rewrites mtimes). Intersect with
   // owned files when the worker declared them; otherwise any tracked change counts.
   let changedOwnedFiles;
+  let changedProjectFiles;
   if (job.worktreeDiff) {
     const owned = new Set(normalizedFileList(job.descriptor?.owned_files));
     const changedInDiff = normalizedFileList(job.worktreeDiff.changedFiles);
     changedOwnedFiles = owned.size ? changedInDiff.filter((file) => owned.has(file)) : changedInDiff;
+    changedProjectFiles = changedInDiff.filter(isProjectSourceFile);
   } else {
     changedOwnedFiles = changedOwnedFilesSinceSnapshot(root, job.descriptor?.owned_files, job.ownedFileBaseline);
+    changedProjectFiles = changedProjectFilesSinceSnapshot(root, job.projectChangeBaseline);
   }
-  const passed = existingArtifacts.length > 0 || changedOwnedFiles.length > 0;
+  const writesProject = job.descriptor?.write_scope === "project";
+  const passed = writesProject
+    ? changedProjectFiles.length > 0
+    : existingArtifacts.length > 0 || changedOwnedFiles.length > 0;
   return {
     passed,
     reason: passed
-      ? "PASS has real artifact or owned-file evidence"
-      : "no named artifact exists under the project root and no owned file changed",
+      ? writesProject
+        ? "PASS has a real project diff outside .aipi"
+        : "PASS has real artifact or owned-file evidence"
+      : writesProject
+        ? "project-write step produced no changed file outside .aipi"
+        : "no named artifact exists under the project root and no owned file changed",
     exitCode,
     existingArtifacts,
     changedOwnedFiles,
+    changedProjectFiles,
   };
 }
 

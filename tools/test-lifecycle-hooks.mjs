@@ -189,7 +189,7 @@ try {
   assertWorkflowDispatch(classifyAipiInputRoute("corrigir bug no login", { autoDispatchEnabled: true }), "bugfix", "root_cause_bugfix");
   assertWorkflowSuggestion(classifyAipiInputRoute("pesquisar docs do provider", { autoDispatchEnabled: true }), "research");
   assertWorkflowSuggestion(classifyAipiInputRoute("deploy em homolog", { autoDispatchEnabled: true }), "ops");
-  assertWorkflowDispatch(classifyAipiInputRoute("implementar nova tela", { autoDispatchEnabled: true }), "planning", "substantive_code_work");
+  assertWorkflowDispatch(classifyAipiInputRoute("implementar nova tela", { autoDispatchEnabled: true }), "feature", "substantive_code_work");
   assertWorkflowSuggestion(classifyAipiInputRoute("pequeno ajuste", { autoDispatchEnabled: true }), "quick");
   // Explicit continue/review of an ACTIVE run is NOT auto-dispatch — still works without the flag.
   assert.equal(classifyAipiInputRoute("review adversarial", { activeRun: started }).workflowArgs, "execute");
@@ -239,9 +239,10 @@ try {
   assert.equal(bugPipeline.cross_model_review.reviewer_distinct_from_implementer, true);
   const featurePipeline = classifyAipiCodePipeline("implementar nova tela");
   assert.equal(featurePipeline.classification, "substantive_code_work");
-  assert.equal(featurePipeline.workflow, "planning");
+  assert.equal(featurePipeline.workflow, "feature");
   assert.equal(featurePipeline.default_action, "auto_dispatch_workflow");
-  assert.equal(featurePipeline.dispatch_workflow, "planning");
+  assert.equal(featurePipeline.dispatch_workflow, "feature");
+  assert.deepEqual(featurePipeline.workflow_alignment.chain, ["planning.yaml", "feature.yaml"]);
   assert.deepEqual(featurePipeline.stages, ["plan", "adversarial_review", "diff_review"]);
   assert.equal(
     classifyAipiCodePipeline("corrigir bug no login", { activeRun: started }).default_action,
@@ -390,7 +391,7 @@ try {
       coordinator: routerCoordinator,
       workflowCommandRunner: async (input) => {
         routerRunnerCalls.push(input);
-        if (input.args.startsWith("run ")) {
+        if (input.args.startsWith("run ") || input.args.startsWith("run-chain ")) {
           assert.equal(typeof input.adapter?.executeStep, "function");
           const adapterResult = await input.adapter.executeStep({
             root: input.projectRoot,
@@ -418,7 +419,7 @@ try {
           const active = await readActiveRun(input.projectRoot);
           return { action: "execute", execution: { runId: active.runId, status: active.state.status, state: active.state } };
         }
-        const workflow = input.args.replace(/^run\s+/, "");
+        const workflow = input.args.startsWith("run-chain ") ? "feature" : input.args.replace(/^run\s+/, "");
         const runId = `fake-${workflow}-${routerRunnerCalls.length}`;
         return {
           action: "run",
@@ -581,15 +582,16 @@ try {
 
     assert.equal(routerRunnerCalls.length, 2);
     assert.equal(routerRunnerCalls[0].args, "run bugfix");
-    assert.equal(routerRunnerCalls[1].args, "run planning");
+    assert.equal(routerRunnerCalls[1].args, "run-chain planning-feature");
+    assert.deepEqual(routerRunnerCalls[1].params, { request: "implementar nova tela" });
     assert.equal(routerAdapterProofs.length, 2);
     assert.equal(routerAdapterProofs.every((proof) => proof.descriptor.step_id === "quick_change"), true);
     assert.equal(routerUserInputs.length, 2);
     assert.equal(routerUserInputs[0].runId, "fake-bugfix-1");
-    assert.equal(routerUserInputs[1].runId, "fake-planning-2");
+    assert.equal(routerUserInputs[1].runId, "fake-feature-2");
     assert.match(routerNotifications[0].message, /\/aipi-workflow run ops/);
     assert.match(routerNotifications[1].message, /AIPI workflow ran: bugfix/);
-    assert.match(routerNotifications[2].message, /AIPI workflow ran: planning/);
+    assert.match(routerNotifications[2].message, /AIPI workflow ran: feature/);
     assert.match(routerNotifications.at(-1).message, /\/aipi-workflow run quick/);
     const deployTrace = routerEntries.find(
       (entry) => entry.type === "aipi.code_pipeline.trace" && entry.data.classification === "deploy_precheck",
@@ -610,9 +612,10 @@ try {
       (entry) => entry.type === "aipi.code_pipeline.trace" && entry.data.classification === "substantive_code_work",
     );
     assert.equal(featureTrace.data.default_action, "auto_dispatch_workflow");
-    assert.equal(featureTrace.data.workflow, "planning");
-    assert.equal(featureTrace.data.dispatch.workflow, "planning");
-    assert.equal(featureTrace.data.dispatch.run_id, "fake-planning-2");
+    assert.equal(featureTrace.data.workflow, "feature");
+    assert.equal(featureTrace.data.dispatch.workflow, "feature");
+    assert.equal(featureTrace.data.dispatch.workflow_args, "run-chain planning-feature");
+    assert.equal(featureTrace.data.dispatch.run_id, "fake-feature-2");
     const skipTrace = routerEntries.find(
       (entry) => entry.type === "aipi.code_pipeline.trace" && entry.data.reason === "explicit_skip_phrase",
     );
@@ -736,8 +739,8 @@ try {
       await timeoutHandlers.input({ type: "input", text: "implementar nova tela", source: "interactive" }, routerCtx),
       { action: "handled" },
     );
-    assert.equal(timeoutRunnerCalls.at(-1).args, "run planning");
-    const timeoutEntry = timeoutEntries.find((entry) => entry.type === "aipi.input.route" && entry.data.workflow_args === "run planning");
+    assert.equal(timeoutRunnerCalls.at(-1).args, "run-chain planning-feature");
+    const timeoutEntry = timeoutEntries.find((entry) => entry.type === "aipi.input.route" && entry.data.workflow_args === "run-chain planning-feature");
     assert.equal(timeoutEntry.data.classifier_source, "regex-fallback");
     assert.match(timeoutEntry.data.classifier_reason, /intent_classifier_timeout/);
 
@@ -1368,6 +1371,32 @@ try {
   });
   assert.equal(directPayloadPolicy.modified, true);
   assert.equal(directPayloadPolicy.redactedSecrets, 1);
+  const secretShapedCiphertext = "cipher-prefix-sk-ABCDEFGHIJK-cipher-suffix";
+  const opaqueProviderPayloadPolicy = applyProviderPayloadPolicy({
+    model: "gpt-reasoning",
+    input: [
+      {
+        type: "reasoning",
+        id: "rs_test",
+        encrypted_content: secretShapedCiphertext,
+      },
+      {
+        role: "user",
+        content: [{ type: "input_text", text: "token=SECRETSECRET12345" }],
+      },
+    ],
+    messages: [
+      {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "", signature: secretShapedCiphertext }],
+      },
+    ],
+  });
+  assert.equal(opaqueProviderPayloadPolicy.modified, true);
+  assert.equal(opaqueProviderPayloadPolicy.redactedSecrets, 1);
+  assert.equal(opaqueProviderPayloadPolicy.payload.input[0].encrypted_content, secretShapedCiphertext);
+  assert.equal(opaqueProviderPayloadPolicy.payload.messages[0].content[0].signature, secretShapedCiphertext);
+  assert.doesNotMatch(opaqueProviderPayloadPolicy.payload.input[1].content[0].text, /SECRETSECRET12345/);
   assert.deepEqual(safeProviderHeaders({ authorization: "x", "retry-after": "1" }), { "retry-after": "1" });
   assert.deepEqual(summarizeProviderPayload({ model: "m", messages: [1, 2], tools: [1] }), {
     kind: "object",
@@ -1895,7 +1924,7 @@ function assertWorkflowSuggestion(route, workflow) {
 function assertWorkflowDispatch(route, workflow, classification) {
   assert.equal(route.intent, "auto_dispatch_workflow");
   assert.equal(route.workflowSuggestion, workflow);
-  assert.equal(route.workflowArgs, `run ${workflow}`);
+  assert.equal(route.workflowArgs, workflow === "feature" ? "run-chain planning-feature" : `run ${workflow}`);
   assert.equal(route.autoDispatch, true);
   assert.equal(route.recordInputAfterDispatch, true);
   assert.equal(route.pipelineClassification, classification);

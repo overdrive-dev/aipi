@@ -79,7 +79,11 @@ steps:
       insufficient. When returning BLOCKED_TO_PLANNING for a user decision,
       include blocker_question with question, 1-3 distinct short recommended
       options ordered best-first, and allow_free_text: true; free-text is always
-      available.
+      available. Write the question in the user's language and in plain,
+      concrete terms: name the visible screen or behavior affected, add one
+      short sentence explaining why the choice matters, and explicitly
+      distinguish it from any separate requirement the user already stated.
+      Do not rely on repository paths or domain jargon as the explanation.
     requires: [requirements]
     context_from: [requirements]
     produces:

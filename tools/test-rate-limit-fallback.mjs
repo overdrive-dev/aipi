@@ -2,6 +2,9 @@
 // the executor retries once on a DIFFERENT authed provider and ANNOUNCES it, instead of hard-blocking.
 
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { executeStepWithTransientRetries } from "../extensions/aipi/runtime/workflow-executor.js";
 import { SubagentCoordinator } from "../extensions/aipi/runtime/subagents.js";
 
@@ -38,6 +41,33 @@ const rateLimitError = () => Object.assign(new Error('429 {"type":"error","error
   );
   anthropicHost.setAvailableModels(["anthropic/claude-opus-4-8", "xai-auth/grok-4.5"]);
   assert.equal(anthropicHost.pickFallbackModel({ excludeProvider: "anthropic" }).provider, "xai-auth", "host on the excluded provider → any other authed provider");
+
+  // A provider registry can retain obsolete models ahead of the project's known-good binding.
+  // Prefer the explicit project topology over that incidental registry order.
+  const configuredRoot = await fs.mkdtemp(path.join(os.tmpdir(), "aipi-rate-limit-models-"));
+  await fs.mkdir(path.join(configuredRoot, ".aipi"), { recursive: true });
+  await fs.writeFile(path.join(configuredRoot, ".aipi", "model-capabilities.json"), `${JSON.stringify({
+    schema: "aipi.model-capabilities.v1",
+    classes: {
+      "orchestrator-heavy": "openai-codex/gpt-5.6-sol",
+      "planner-heavy": "anthropic/claude-fable-5",
+    },
+  }, null, 2)}\n`);
+  const configured = new SubagentCoordinator(
+    { appendEntry() {}, log() {} },
+    { root: configuredRoot, maxConcurrent: 0, env: {}, hostModel: { provider: "openai-codex", id: "gpt-5.6-sol" }, piSubagentsRunner: { spawn() {} } },
+  );
+  configured.setAvailableModels([
+    "openai-codex/gpt-5.6-sol",
+    "anthropic/claude-3-5-haiku-20241022",
+    "anthropic/claude-fable-5",
+  ]);
+  assert.deepEqual(
+    configured.pickFallbackModel({ excludeProvider: "openai-codex" }),
+    { provider: "anthropic", id: "claude-fable-5" },
+    "project-configured fallback wins over an obsolete registry-first model",
+  );
+  await fs.rm(configuredRoot, { recursive: true, force: true });
 
   // Only the excluded provider authed and host is on it → no fallback.
   const solo = new SubagentCoordinator({ appendEntry() {}, log() {} }, { root: process.cwd(), maxConcurrent: 0, env: {}, hostModel: { provider: "anthropic", id: "claude-opus-4-8" }, piSubagentsRunner: { spawn() {} } });

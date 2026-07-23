@@ -229,7 +229,7 @@ assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi 0\.1\.0 - BDD-contr
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /aipi with no arguments starts an interactive Pi session/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-init \[--dry-run\] \[--force\] \[--reset-memory\].*\[--no-pull-embeddings\]/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-onboard \[--target <dir>\] \[--no-questions\] \[--no-pull-embeddings\]/);
-assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-workflow \[list \| status \| start <name> \| run <name> \| execute\]/);
+assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-workflow \[list \| status \| start <name> \| run <name> \| run-chain planning-feature \| execute\]/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-memory \[status \| refs \| query <terms>\]/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-models \[setup \| status \| check\]/);
 assert.match(formatAipiHelp({ aipiVersion: "0.1.0" }), /\/aipi-diagnose \[<run_id>\] \[--share\] \[--json\]/);
@@ -415,6 +415,24 @@ await runAipiWorkflow({
 });
 assert.deepEqual(JSON.parse(jsonWorkflowOutput[0]), { action: "status", active: null });
 
+const missingAdapterErrors = [];
+process.exitCode = undefined;
+const missingAdapterResult = await runAipiWorkflow({
+  userArgs: ["run", "quick"],
+  log: () => assert.fail("run without an adapter must not produce a success result"),
+  errorLog: (line) => missingAdapterErrors.push(line),
+  workflowFns: {
+    async runWorkflowCommand() {
+      assert.fail("run without an adapter must fail before entering the workflow executor");
+    },
+    formatWorkflowCommandResult: () => "unused",
+  },
+});
+assert.equal(missingAdapterResult, null);
+assert.equal(process.exitCode, 1);
+assert.match(missingAdapterErrors[0], /no interactive worker adapter/);
+process.exitCode = undefined;
+
 // CR-59-3 / ADV-58-3: the CLI workflow surface forwards a `notify` that routes per-step progress
 // to STDERR (errorLog) in human mode, keeping STDOUT (log) reserved for the final result.
 const progressStdout = [];
@@ -425,6 +443,7 @@ await runAipiWorkflow({
   cwd: path.join("C:", "repo"),
   log: (line) => progressStdout.push(line),
   errorLog: (line) => progressStderr.push(line),
+  workflowAdapter: { executeStep() {} },
   workflowFns: {
     async runWorkflowCommand({ args, notify }) {
       assert.equal(args, "run bugfix");
@@ -450,6 +469,7 @@ await runAipiWorkflow({
   cwd: path.join("C:", "repo"),
   log: (line) => jsonProgressStdout.push(line),
   errorLog: (line) => jsonProgressStderr.push(line),
+  workflowAdapter: { executeStep() {} },
   workflowFns: {
     async runWorkflowCommand({ notify }) {
       assert.equal(notify, null);

@@ -116,7 +116,12 @@
     "release:check": "node tools/run-release-check.mjs --strict",
     "release:audit": "node tools/check-npm-audit.mjs --strict",
     "smoke:subagent-live": "node tools/smoke-live-subagent.mjs",
-    "smoke:pi-subagents": "node tools/smoke-pi-subagents.mjs"
+    "smoke:pi-subagents": "node tools/smoke-pi-subagents.mjs",
+    "lab:init": "node tools/workflow-lab.mjs init",
+    "lab:reset": "node tools/workflow-lab.mjs reset",
+    "lab:run": "node tools/workflow-lab.mjs run",
+    "lab:verify": "node tools/workflow-lab.mjs verify",
+    "lab:status": "node tools/workflow-lab.mjs status"
   },
   "engines": {
     "node": ">=22.19.0"

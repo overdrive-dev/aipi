@@ -124,10 +124,11 @@ steps:
     agents: [code-reviewer, complexity-reviewer, blast-radius, security-auditor]
     name: Adversarial bugfix review
     prompt: >
-      Run the adversarial-review discipline: independently verify the fix against the cited
-      acceptance criteria, hunt for incomplete root cause / hidden callers / new risk /
-      unnecessary complexity, and RUN the affected tests yourself (aipi_shell),
-      separating new regressions from pre-existing test-debt. A "passes" claim needs a ran rung.
+      Run the adversarial-review discipline: independently inspect the fix against the cited
+      acceptance criteria and the prior verification evidence. Hunt for incomplete root cause,
+      hidden callers, new risk, and unnecessary complexity. This parallel review is shell-less:
+      do not claim to rerun tests; distinguish findings in the diff from gaps in the recorded
+      TEST-GATE/INTEGRATION/VERIFICATION evidence and write the assigned review artifact.
     requires: [verify]
     context_from: [triage, fix, verify]
     produces:

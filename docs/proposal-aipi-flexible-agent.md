@@ -1,5 +1,11 @@
 # Proposal — AIPI as a Guided Flexible Agent (not a pipeline orchestrator)
 
+> **Historical / superseded:** this proposal records an earlier design debate and is
+> not the current runtime contract. As of 2026-07, substantive code work auto-dispatches
+> a durable `planning-feature` chain, `per_worker_worktree` is the default isolation
+> mode, and review fanout is intentionally shell-less while verification runs commands
+> in its dedicated step. See the root README and `docs/workflow-lab.md` for current behavior.
+
 Status: DRAFT for review · 2026-06-22
 
 ## 0. Revised after adversarial critique (2026-06-22)

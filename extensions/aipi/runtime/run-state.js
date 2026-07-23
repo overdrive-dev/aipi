@@ -27,6 +27,11 @@ const workflowAliases = new Map([
   ["research", "research"],
 ]);
 
+const workflowChains = new Map([
+  ["planning-feature", ["planning", "feature"]],
+  ["feature", ["planning", "feature"]],
+]);
+
 export function parseWorkflowArgs(args = "") {
   const tokens = String(args)
     .trim()
@@ -39,6 +44,12 @@ export function parseWorkflowArgs(args = "") {
   if (first === "list") return { action: "list" };
   if (first === "status") return { action: "status" };
   if (first === "execute" || first === "continue") return { action: "execute" };
+  if (first === "run-chain") {
+    const chainToken = rest.shift();
+    if (!chainToken) throw new Error("Missing workflow chain name");
+    if (rest.length) throw new Error(`Unknown /aipi-workflow option: ${rest[0]}`);
+    return { action: "run-chain", chain: resolveWorkflowChain(chainToken) };
+  }
 
   const shouldExecute = first === "run";
   const workflowToken = first === "start" || first === "run" ? rest.shift() : first;
@@ -90,10 +101,30 @@ export async function runWorkflowCommand({
   }
 
   if (command.action === "execute") {
+    const execution = await executeWorkflowRun({ projectRoot, adapter, parentInteractiveToolCallHook, notify });
+    const advanced = await advanceWorkflowChain({
+      projectRoot,
+      execution,
+      adapter,
+      parentInteractiveToolCallHook,
+      notify,
+    });
     return {
       action: "execute",
-      execution: await executeWorkflowRun({ projectRoot, adapter, parentInteractiveToolCallHook, notify }),
+      execution: advanced.execution,
+      ...(advanced.chain ? { chain: advanced.chain, phase_executions: advanced.phaseExecutions } : {}),
     };
+  }
+
+  if (command.action === "run-chain") {
+    return runWorkflowChain({
+      chain: command.chain,
+      projectRoot,
+      adapter,
+      parentInteractiveToolCallHook,
+      notify,
+      params,
+    });
   }
 
   const started = await startWorkflowRun({
@@ -115,6 +146,247 @@ export async function runWorkflowCommand({
   return {
     action: "start",
     run: started,
+  };
+}
+
+export async function runWorkflowChain({
+  chain = "planning-feature",
+  projectRoot,
+  adapter = undefined,
+  parentInteractiveToolCallHook = "registered_parent_interactive_tool_call_hook",
+  notify = null,
+  params = {},
+} = {}) {
+  if (!projectRoot) throw new Error("projectRoot is required");
+  const root = path.resolve(projectRoot);
+  await assertAipiInstalled(root);
+  const chainName = resolveWorkflowChain(chain);
+  const request = String(params?.request ?? "").trim();
+  if (!request) throw new Error(`workflow chain ${chainName} requires a non-empty request`);
+
+  const chainId = `chain-${generateRunId(() => new Date(), (size) => crypto.randomBytes(size))}`;
+  let chainState = {
+    schema: "aipi.workflow-chain.v1",
+    chain_id: chainId,
+    chain: chainName,
+    request,
+    status: "starting",
+    active_phase: "planning",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    phases: {
+      planning: { workflow: "planning", status: "pending", run_id: null },
+      feature: { workflow: "feature", status: "pending", run_id: null },
+    },
+  };
+  await persistWorkflowChain(root, chainState);
+
+  try {
+    const planningRun = await startWorkflowRun({
+      projectRoot: root,
+      workflow: "planning",
+      params: { ...params, request },
+      chainId,
+      chainPhase: "planning",
+    });
+    chainState.phases.planning = {
+      workflow: "planning",
+      status: "active",
+      run_id: planningRun.runId,
+      contract_path: planningRun.contractPath,
+    };
+    chainState.status = "running";
+    chainState.updated_at = new Date().toISOString();
+    await persistWorkflowChain(root, chainState);
+
+    const planningExecution = await executeWorkflowRun({
+      projectRoot: root,
+      runId: planningRun.runId,
+      adapter,
+      parentInteractiveToolCallHook,
+      notify,
+    });
+    const advanced = await advanceWorkflowChain({
+      projectRoot: root,
+      execution: planningExecution,
+      adapter,
+      parentInteractiveToolCallHook,
+      notify,
+    });
+    return {
+      action: "run-chain",
+      chain: advanced.chain,
+      run: advanced.run ?? planningRun,
+      execution: advanced.execution,
+      phase_executions: advanced.phaseExecutions,
+    };
+  } catch (error) {
+    chainState = await readWorkflowChain(root, chainId).catch(() => chainState);
+    chainState.status = "failed";
+    chainState.error = String(error?.message ?? error);
+    chainState.updated_at = new Date().toISOString();
+    await persistWorkflowChain(root, chainState).catch(() => null);
+    throw error;
+  }
+}
+
+export async function readWorkflowChain(projectRoot, chainId) {
+  if (!projectRoot) throw new Error("projectRoot is required");
+  if (!chainId) throw new Error("chainId is required");
+  const chainPath = path.join(path.resolve(projectRoot), ".aipi", "runtime", "chains", `${chainId}.json`);
+  return JSON.parse(await fs.readFile(chainPath, "utf8"));
+}
+
+async function advanceWorkflowChain({
+  projectRoot,
+  execution,
+  adapter,
+  parentInteractiveToolCallHook,
+  notify,
+} = {}) {
+  const chainId = execution?.state?.chain_id;
+  const phase = execution?.state?.chain_phase;
+  if (!chainId || !phase) return { execution, chain: null, phaseExecutions: [execution] };
+
+  const root = path.resolve(projectRoot);
+  const chainState = await readWorkflowChain(root, chainId);
+  const phaseState = chainState.phases?.[phase];
+  if (!phaseState) throw new Error(`workflow chain ${chainId} references unknown phase ${phase}`);
+  chainState.phases[phase] = {
+    ...phaseState,
+    status: execution.status,
+    run_id: execution.runId,
+    contract_path: execution.state.contract_path ?? phaseState.contract_path ?? null,
+    finished_at: execution.state.completed_at ?? new Date().toISOString(),
+  };
+  chainState.updated_at = new Date().toISOString();
+
+  if (execution.status !== "completed") {
+    chainState.status = execution.status === "blocked" ? "blocked" : "failed";
+    chainState.active_phase = phase;
+    await persistWorkflowChain(root, chainState);
+    return {
+      execution,
+      chain: chainState,
+      run: runSummaryFromExecution(execution),
+      phaseExecutions: [execution],
+    };
+  }
+
+  if (phase === "feature") {
+    chainState.status = "completed";
+    chainState.active_phase = null;
+    chainState.completed_at = execution.state.completed_at ?? new Date().toISOString();
+    await persistWorkflowChain(root, chainState);
+    return {
+      execution,
+      chain: chainState,
+      run: runSummaryFromExecution(execution),
+      phaseExecutions: [execution],
+    };
+  }
+
+  chainState.status = "running";
+  chainState.active_phase = "planning";
+  await persistWorkflowChain(root, chainState);
+
+  let contractPath;
+  let featureRun;
+  try {
+    contractPath = await assertAcceptedChainContract(root, execution.state.contract_path);
+    featureRun = await startWorkflowRun({
+      projectRoot: root,
+      workflow: "feature",
+      contractPath,
+      chainId,
+      chainPhase: "feature",
+      upstreamRunId: execution.runId,
+    });
+  } catch (error) {
+    chainState.status = "failed";
+    chainState.active_phase = null;
+    chainState.error = String(error?.message ?? error);
+    chainState.updated_at = new Date().toISOString();
+    await persistWorkflowChain(root, chainState);
+    throw error;
+  }
+  chainState.phases.feature = {
+    workflow: "feature",
+    status: "active",
+    run_id: featureRun.runId,
+    contract_path: contractPath,
+  };
+  chainState.status = "running";
+  chainState.active_phase = "feature";
+  chainState.updated_at = new Date().toISOString();
+  await persistWorkflowChain(root, chainState);
+
+  let featureExecution;
+  try {
+    featureExecution = await executeWorkflowRun({
+      projectRoot: root,
+      runId: featureRun.runId,
+      adapter,
+      parentInteractiveToolCallHook,
+      notify,
+    });
+  } catch (error) {
+    chainState.status = "failed";
+    chainState.active_phase = "feature";
+    chainState.phases.feature.status = "failed";
+    chainState.phases.feature.error = String(error?.message ?? error);
+    chainState.error = String(error?.message ?? error);
+    chainState.updated_at = new Date().toISOString();
+    await persistWorkflowChain(root, chainState);
+    throw error;
+  }
+  const completed = await advanceWorkflowChain({
+    projectRoot: root,
+    execution: featureExecution,
+    adapter,
+    parentInteractiveToolCallHook,
+    notify,
+  });
+  return {
+    ...completed,
+    run: featureRun,
+    phaseExecutions: [execution, ...(completed.phaseExecutions ?? [featureExecution])],
+  };
+}
+
+async function assertAcceptedChainContract(root, contractPath) {
+  const value = String(contractPath ?? "").trim();
+  if (!value) throw new Error("planning completed without a contract path");
+  const absRoot = path.resolve(root);
+  const absPath = path.isAbsolute(value) ? path.resolve(value) : path.resolve(absRoot, value);
+  const rel = path.relative(absRoot, absPath);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+    throw new Error(`planning contract escapes the project root: ${value}`);
+  }
+  const stat = await fs.stat(absPath).catch(() => null);
+  if (!stat?.isFile() || stat.size === 0) {
+    throw new Error(`planning completed without a non-empty accepted contract at ${value}`);
+  }
+  return rel.replaceAll("\\", "/");
+}
+
+async function persistWorkflowChain(root, chainState) {
+  const chainDir = path.join(root, ".aipi", "runtime", "chains");
+  const target = path.join(chainDir, `${chainState.chain_id}.json`);
+  const temporary = `${target}.${process.pid}.tmp`;
+  await fs.mkdir(chainDir, { recursive: true });
+  await fs.writeFile(temporary, `${JSON.stringify(chainState, null, 2)}\n`);
+  await fs.rename(temporary, target);
+}
+
+function runSummaryFromExecution(execution) {
+  const state = execution?.state ?? {};
+  return {
+    runId: execution?.runId ?? state.run_id,
+    workflow: state.workflow,
+    runRelDir: state.run_rel_dir,
+    contractPath: state.contract_path,
+    state,
   };
 }
 
@@ -141,6 +413,9 @@ export async function startWorkflowRun({
   params = {},
   planId = null,
   taskId = null,
+  chainId = null,
+  chainPhase = null,
+  upstreamRunId = null,
   now = () => new Date(),
   randomBytes = (size) => crypto.randomBytes(size),
 } = {}) {
@@ -166,6 +441,7 @@ export async function startWorkflowRun({
     ...(workflowDefinition.params ?? {}),
     ...(params && typeof params === "object" ? params : {}),
     run_id: runId,
+    contract_path: resolvedContractPath,
   };
 
   const state = {
@@ -183,6 +459,9 @@ export async function startWorkflowRun({
     // executor can map the run's outcome onto the plan task (and the kanban card). Absent for lone runs.
     ...(planId ? { plan_id: planId } : {}),
     ...(taskId ? { task_id: taskId } : {}),
+    ...(chainId ? { chain_id: chainId } : {}),
+    ...(chainPhase ? { chain_phase: chainPhase } : {}),
+    ...(upstreamRunId ? { upstream_run_id: upstreamRunId } : {}),
     params: resolvedParams,
     current_step: workflowDefinition.steps[0]?.id ?? null,
     steps: workflowDefinition.steps.map((step) => ({
@@ -256,7 +535,8 @@ export async function readActiveRun(projectRoot, { includeTerminal = false, keep
 
 function isRecoverableBlockedDecision(state) {
   return String(state?.status ?? "").toLowerCase() === "blocked" &&
-    state?.awaiting_user_input?.kind === "workflow_blocked_decision";
+    state?.awaiting_user_input?.kind === "workflow_blocked_decision" &&
+    !state?.awaiting_user_input?.answer_recorded_at;
 }
 
 export async function clearActiveRun(projectRoot, runId = null) {
@@ -372,7 +652,25 @@ export function formatWorkflowCommandResult(result) {
   }
 
   if (result.action === "execute") {
-    return formatExecutionResult("executed", result.execution);
+    const formatted = formatExecutionResult("executed", result.execution);
+    return result.chain
+      ? `${formatted}\nchain_id=${result.chain.chain_id}\nchain_status=${result.chain.status}`
+      : formatted;
+  }
+
+  if (result.action === "run-chain") {
+    const phaseRuns = Object.values(result.chain?.phases ?? {})
+      .filter((phase) => phase?.run_id)
+      .map((phase) => `${phase.workflow}=${phase.run_id}`)
+      .join(" ");
+    return [
+      `AIPI workflow chain ran: ${result.chain?.chain ?? "planning-feature"}`,
+      `chain_id=${result.chain?.chain_id ?? "unknown"}`,
+      `chain_status=${result.chain?.status ?? result.execution?.status ?? "unknown"}`,
+      phaseRuns ? `phase_runs=${phaseRuns}` : null,
+      `current_workflow=${result.execution?.state?.workflow ?? "none"}`,
+      `current_step=${result.execution?.state?.current_step ?? "none"}`,
+    ].filter(Boolean).join("\n") + formatRunOutcomeDetail(result.execution?.state);
   }
 
   if (result.action === "run") {
@@ -432,6 +730,14 @@ function resolveWorkflowName(value) {
     throw new Error(`Unknown AIPI workflow: ${value}`);
   }
   return resolved;
+}
+
+function resolveWorkflowChain(value) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (!workflowChains.has(normalized)) {
+    throw new Error(`Unknown AIPI workflow chain: ${value}`);
+  }
+  return normalized === "feature" ? "planning-feature" : normalized;
 }
 
 async function assertAipiInstalled(projectRoot) {

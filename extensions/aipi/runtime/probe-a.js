@@ -324,6 +324,16 @@ function buildWorkerPrompt({ workerId, probeId, targetRelPath }) {
 }
 
 export async function loadPiSdk() {
+  const explicitPath = process.env.AIPI_PI_SDK_PATH?.trim() || process.env.PI_CODING_AGENT_SDK_PATH?.trim();
+  if (explicitPath) {
+    const resolved = path.resolve(explicitPath);
+    try {
+      await fs.access(resolved);
+      return await import(pathToFileURL(resolved).href);
+    } catch (error) {
+      throw new Error(`Explicit Pi SDK import failed at ${resolved}: ${error.message}`);
+    }
+  }
   try {
     return await import("@earendil-works/pi-coding-agent");
   } catch (error) {

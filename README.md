@@ -50,10 +50,10 @@ Alpha. What exists today:
 - An optional MCP bridge extension. When a project has `.aipi/mcp.json`, the
   `aipi` wrapper starts configured stdio MCP servers and exposes their tools to
   Pi as `mcp__<server>__<tool>`. Linear is supported through `mcp-remote`.
-- A workflow executor: `/aipi-workflow run <name>` starts and executes workflow
-  YAML with structured gates, required-artifact checks, context packets,
-  run-limit enforcement, executor-owned controller artifact writes, and an S0
-  worker handoff for `quick_change`.
+- A workflow executor: `/aipi-workflow run <name>` executes one workflow. Substantive
+  feature work uses `/aipi-workflow run-chain planning-feature`, which persists a
+  planning run, validates its accepted contract, and starts a linked feature run.
+  A blocked planning phase resumes into the same durable chain.
 - The S0/S1 `aipi-agent-session` backend: the coordinator can spawn in-process
   Pi `AgentSession` workers with read-only tools plus a guarded `write`, collect
   structured `aipi.step-result.v1`, and reconcile configured fan-out steps such
@@ -89,6 +89,8 @@ Claim evidence anchors for the live runtime surfaces are
 `npm run test:workflow-fixtures`, `npm run test:aipi-tools`,
 `npm run test:permission-removal`, `npm run test:lifecycle-hooks`, `npm run test:subagents`,
 `npm run test:subagents-real-sdk`, and `npm run test:adversarial-readiness`.
+The persistent full-stack dogfood harness is documented in
+[`docs/workflow-lab.md`](docs/workflow-lab.md).
 
 Still not beta-complete: credentialed model-backed pressure runs and richer
 semantic quality for subtle graph conflicts beyond the current deterministic
@@ -143,9 +145,11 @@ aipi models status    # alias of aipi effort
 with the packaged AIPI extensions prepended. `aipi <args>` preserves user Pi
 flags/messages after prepending those extensions. `aipi status [--target <dir>]
 [--json] [--strict]` prints the same readiness report as `/aipi-status` without
-starting a Pi session. `aipi workflow
-[--target <dir>] [--json] ...` exposes workflow list/status/start/run/execute
-from the console using the same run-state runtime as `/aipi-workflow`. `aipi memory
+starting a Pi session. `aipi workflow [--target <dir>] [--json] ...` exposes
+workflow list/status/start from the console using the same run-state runtime as
+`/aipi-workflow`. Execution (`run`, `run-chain`, `execute`) fails loud there because
+the console surface has no interactive worker adapter; execute it inside an interactive
+`aipi` session. `aipi memory
 [--target <dir>] [--json] ...` exposes read-only memory status/refs/query using
 the same Markdown memory query runtime as `aipi_memory_query`. `aipi effort setup`
 (aliased as `aipi models setup`) configures an **orchestrator** (`--orchestrator` /
@@ -186,7 +190,7 @@ the raw Pi flag reference. Point at a specific Pi with `AIPI_PI_CLI_JS` or
 | `/aipi-goal` | Set/inspect the top-level measurable goal (objective + checkable criteria + a binary `done_when`). Passes an acceptance gate; a model measurability judge refines the deterministic floor and degrades to it if the judge is unavailable. Also bound from natural language via `aipi_set_goal`. |
 | `/aipi-plan` | Draw/inspect the task plan that a request is worked from; shown live in the TUI plan widget. Natural-language "monta um plano pra X" routes here automatically. |
 | `/aipi-setup` | In-session environment doctor: Node, Git, Pi, Docker, Playwright, and the Ollama embedding model, per `.aipi/environment.json`. Fixes run from the console: `aipi setup --fix`. |
-| `/aipi-workflow [list \| status \| start <name> \| run <name> \| execute]` | List, inspect, start, execute the active run, or run any installed workflow through the current executor. |
+| `/aipi-workflow [list \| status \| start <name> \| run <name> \| run-chain planning-feature \| execute]` | List, inspect, start, resume, or execute workflows. `run-chain planning-feature` is feature delivery; explicit `run planning` remains plan-only. |
 | `/aipi-memory [status \| refs \| query <terms>]` | Inspect Markdown memory and generated code graph state without writing durable memory. |
 | `/aipi-mcp` | Report MCP server connection state, bridged tool count, and last errors for `.aipi/mcp.json`. |
 | `/aipi-probe-a` | Diagnostic: whether host hooks can attribute worker `tool_call` events (see Probe A). |
@@ -198,6 +202,8 @@ the raw Pi flag reference. Point at a specific Pi with `AIPI_PI_CLI_JS` or
 
 - **Workflows** (`.aipi/workflows/*.yaml`) — the staged process. Six lanes:
   `planning`, `feature`, `bugfix`, `research`, `ops`, and a lightweight `quick`.
+  Natural-language substantive code work dispatches the durable `planning -> feature`
+  chain; bugfix keeps its root-cause workflow and explicit planning stays plan-only.
   Each step emits a structured `aipi.step-result.v1` verdict; gates branch on it
   (`on_verdict`, `runLimits`) — prose is never a gate.
 - **Agents** (`.aipi/agents/catalog.yaml`) — the roles, each bound to a model
@@ -218,9 +224,9 @@ the raw Pi flag reference. Point at a specific Pi with `AIPI_PI_CLI_JS` or
 
 ### Owned-file enforcement and the subagent backend
 
-Parallel workers must not write each other's files. v1 uses one shared tree with
-**owned-file scopes**: the orchestrator allocates a disjoint file set per worker,
-and forked workers receive read-only built-ins plus AIPI's guarded child `write`
+Parallel workers must not write each other's files. The shipped default uses a clean
+Git worktree per worker; a project may opt back into shared-root mode. The orchestrator
+allocates disjoint artifact files, and workers receive read-only built-ins plus AIPI's guarded child `write`
 extension (`extensions/aipi/runtime/aipi-guarded-write-child.js`). That extension
 uses the worker's `AIPI_SUBAGENTS_OWNED_FILES` allocation and blocks writes outside
 scope or under `.aipi/memory`, with no host hooks. `bash`/`user_bash` are denied
@@ -231,10 +237,12 @@ Backend decision: **`pi_subagents`** as the single AIPI worker runtime. The
 runtime is a fork of `pi-subagents@0.28.0` under
 `extensions/aipi/runtime/vendor/pi-subagents`, called through AIPI's own
 `runtime/pi-subagents.js`; it is not an npm dependency, not a separately-loaded
-Pi extension, and not selected by an environment flag. Workers run in the
-project cwd, write runtime state under `.aipi/runtime/subagents/`, inherit the
+Pi extension, and not selected by an environment flag. Workers run in an isolated
+worktree by default, write runtime state under `.aipi/runtime/subagents/`, inherit the
 selected host/configured provider model, and keep worker fallback scoped to that
-selected model. Child sessions receive `read`, `grep`, `find`, `ls`, and the
+selected model. Gitignored step artifacts are copied back only through the
+`.aipi/runtime/runs/*/steps/*` channel before cleanup; project-write PASS also requires
+a real diff outside `.aipi`. Child sessions receive `read`, `grep`, `find`, `ls`, and the
 guarded AIPI `write` extension, not Pi's unguarded `write` builtin.
 
 ### Per-role models and reviewed background research
@@ -356,8 +364,9 @@ only canonical vocabulary, that session writers carry no denied tools, and more.
 - Subagent fan-out is bounded to configured steps and forked pi-subagents workers.
   Parent restart restores the latest subagent snapshot and marks queued/running
   workers as `interrupted`; workflow execution can redispatch matching
-  interrupted workers from a clean boundary. There is no RPC/external/worktree
-  worker backend in the current runtime.
+  interrupted workers from a clean boundary. `per_worker_worktree` is the default
+  isolation mode; a dirty/non-Git tree falls back to shared-root execution and records
+  that downgrade. RPC/external/container execution is not a built-in worker backend.
 - Memory/query tools are operational, and approved promotions can write
   Markdown memory. The code graph writes a rebuildable JSON manifest plus a
   `node:sqlite` sidecar with files, symbols, searchable lines, relationship
